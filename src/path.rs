@@ -6,14 +6,26 @@ use std::time::{Duration, Instant};
 
 /// The smallest send->ack delay of this long is the path's own: round trip plus decode,
 /// with nothing queued. Long enough that a burst of big frames can't become the baseline,
-/// short enough to follow a path that changes. Both windows are measured back from the
+/// short enough to follow a path that changes. The window is measured back from the
 /// newest sample, not from now: a screen that sits still says nothing new about the
 /// path, and what was learned before the stillness still holds after it.
 const BASE_WINDOW: Duration = Duration::from_secs(30);
-/// The best delivery rate of this long is what the path can carry.
+/// Capacity is read from the rate samples of this long, measured back from the newest:
+/// long enough that a stretch of frames that all queued still has, behind it, frames
+/// that didn't.
 const CAPACITY_WINDOW: Duration = Duration::from_secs(10);
-/// A frame smaller than this is delivered within the jitter of the clock and of the
-/// client's decoder: its delay holds no rate.
+/// The capacity is the rate this many of those samples reached. A frame can't cross
+/// faster than the path carries it, so on a path without jitter the fastest sample is
+/// the capacity; on a real one an ack that comes a few ms early reads as a path
+/// several times faster, and one or two of those must not set the rate.
+const CAPACITY_AGREE: usize = 3;
+/// Delays are only known to a few ms (the clock, the client's decoder, the network's
+/// own jitter). A frame the path is thought to carry in less than this holds no rate:
+/// its delay is all jitter. One that should take longer and didn't proves a rate of its
+/// size over this long and no more, so a path faster than thought reads low until
+/// bigger frames cross it, and never high.
+const MIN_WIRE_MS: f64 = 5.0;
+/// Before any rate is known, the size (beyond the baseline's frame) that can tell one.
 const PROBE_BYTES: usize = 16 << 10;
 /// A capacity sample needs a baseline that has seen this many acks, or the first big
 /// frame of a session would be measured against itself.
@@ -22,22 +34,19 @@ const BASE_SAMPLES: u32 = 8;
 /// nothing is queued, however the last frame fared.
 const QUEUE_HALF_LIFE: Duration = Duration::from_millis(150);
 
-/// The extreme (smallest or largest) value over a sliding window of time.
-struct Windowed {
-    /// (when, value, the size of the frame it was measured on), values monotonic from
-    /// the front: the front is the extreme.
+/// The smallest value over a sliding window of time.
+struct Lowest {
+    /// (when, value, the size of the frame it was measured on), values rising from the
+    /// front: the front is the smallest.
     q: VecDeque<(Instant, f64, usize)>,
     window: Duration,
-    /// Whether `a` beats `b` for the front.
-    better: fn(f64, f64) -> bool,
 }
 
-impl Windowed {
-    fn new(window: Duration, better: fn(f64, f64) -> bool) -> Self {
-        Windowed {
+impl Lowest {
+    fn new(window: Duration) -> Self {
+        Lowest {
             q: VecDeque::new(),
             window,
-            better,
         }
     }
     fn expire(&mut self, now: Instant) {
@@ -51,7 +60,7 @@ impl Windowed {
     }
     fn push(&mut self, now: Instant, v: f64, bytes: usize) {
         self.expire(now);
-        while self.q.back().is_some_and(|&(_, b, _)| !(self.better)(b, v)) {
+        while self.q.back().is_some_and(|&(_, b, _)| b >= v) {
             self.q.pop_back();
         }
         self.q.push_back((now, v, bytes));
@@ -65,18 +74,20 @@ impl Windowed {
 ///
 /// A frame's delay beyond the baseline is the time its extra bytes took on the wire
 /// (how much bigger it is than the baseline's frame, over the path's capacity) plus
-/// whatever it waited behind. So the largest extra-size-over-excess of recent frames is
-/// the capacity, measured by the frames themselves, with no need for the stream to
-/// press against its cap first; and what is left of a delay once the frame's own wire
-/// time is taken off is the queue.
+/// whatever it waited behind. So the best extra-size-over-excess that several recent
+/// frames agree on is the capacity, measured by the frames themselves, with no need for
+/// the stream to press against its cap first; and what is left of a delay once the
+/// frame's own wire time is taken off is the queue.
 ///
 /// The baseline needs, in every window, one frame that waited behind nothing. Flow
 /// control gives it that: it drains a queue within seconds, and a desktop is still most
 /// of the time. Without one the baseline reads high, and capacity with it.
 pub struct PathEst {
-    base: Windowed,
+    base: Lowest,
     base_samples: u32,
-    capacity: Windowed,
+    /// The latest rate samples (when, bit/s), oldest first.
+    rates: VecDeque<(Instant, f64)>,
+    capacity: Option<f64>,
     queue_ms: f64,
     queue_at: Instant,
 }
@@ -84,9 +95,10 @@ pub struct PathEst {
 impl PathEst {
     pub fn new(now: Instant) -> Self {
         PathEst {
-            base: Windowed::new(BASE_WINDOW, |a, b| a < b),
+            base: Lowest::new(BASE_WINDOW),
             base_samples: 0,
-            capacity: Windowed::new(CAPACITY_WINDOW, |a, b| a > b),
+            rates: VecDeque::new(),
+            capacity: None,
             queue_ms: 0.0,
             queue_at: now,
         }
@@ -100,17 +112,32 @@ impl PathEst {
         let (base, base_bytes) = self.base.get().unwrap_or((delay_ms, bytes));
         let excess_ms = delay_ms - base;
         let extra_bits = bytes.saturating_sub(base_bytes) as f64 * 8.0;
-        if bytes >= base_bytes + PROBE_BYTES
-            && self.base_samples >= BASE_SAMPLES
-            && excess_ms >= 1.0
-        {
-            self.capacity
-                .push(now, extra_bits / (excess_ms / 1000.0), bytes);
+        let tells = match self.capacity {
+            Some(bps) => extra_bits >= bps * MIN_WIRE_MS / 1000.0,
+            None => bytes >= base_bytes + PROBE_BYTES,
+        };
+        if tells && self.base_samples >= BASE_SAMPLES {
+            while self
+                .rates
+                .front()
+                .is_some_and(|&(t, _)| now.saturating_duration_since(t) > CAPACITY_WINDOW)
+            {
+                self.rates.pop_front();
+            }
+            self.rates
+                .push_back((now, extra_bits / (excess_ms.max(MIN_WIRE_MS) / 1000.0)));
+            let mut best = [0.0f64; CAPACITY_AGREE];
+            for &(_, r) in &self.rates {
+                // `best` holds the fastest samples, fastest first.
+                if let Some(i) = best.iter().position(|&b| r > b) {
+                    best[i..].rotate_right(1);
+                    best[i] = r;
+                }
+            }
+            // Until that many have been seen, the slowest of them.
+            self.capacity = Some(best[self.rates.len().min(CAPACITY_AGREE) - 1]);
         }
-        let wire_ms = self
-            .capacity
-            .get()
-            .map_or(0.0, |(bps, _)| extra_bits / bps * 1000.0);
+        let wire_ms = self.capacity.map_or(0.0, |bps| extra_bits / bps * 1000.0);
         let q = (excess_ms - wire_ms).max(0.0);
         self.queue_ms = self.queue_ms(now, false) * 0.7 + q * 0.3;
         self.queue_at = now;
@@ -128,7 +155,7 @@ impl PathEst {
 
     /// What the path can carry (bit/s), once frames big enough to tell have been acked.
     pub fn capacity_bps(&self) -> Option<f64> {
-        self.capacity.get().map(|(bps, _)| bps)
+        self.capacity
     }
 }
 
@@ -194,10 +221,33 @@ mod tests {
             .collect()
     }
 
+    /// A mostly still screen with the odd burst of big frames that never fills the link:
+    /// `bursts` of 3 to 5 frames of `size()` bytes, far enough apart that none waits
+    /// behind another.
+    fn bursts(
+        rng: &mut Rng,
+        t0: Instant,
+        rate: f64,
+        mut size: impl FnMut(&mut Rng) -> usize,
+    ) -> Vec<(Instant, usize)> {
+        let mut frames = trickle(t0, 30, 16, 600);
+        let mut t = t0 + Duration::from_millis(600);
+        for _ in 0..rng.range(2, 6) {
+            t += Duration::from_millis(rng.range(300, 3000));
+            for _ in 0..rng.range(3, 6) {
+                let bytes = size(rng);
+                frames.push((t, bytes));
+                t += Duration::from_secs_f64(bytes as f64 * 8.0 / rate)
+                    + Duration::from_millis(rng.range(20, 60));
+            }
+        }
+        frames
+    }
+
     #[test]
     fn capacity_comes_from_the_frames_themselves() {
-        // Any link, any round trip, a mostly still screen with the odd burst of big
-        // frames that never fills the link: the estimate lands on the link's rate.
+        // Any link, any round trip, frames that take longer to cross than delays can be
+        // told apart: the estimate lands on the link's rate.
         let mut rng = Rng(0x9E3779B97F4A7C15);
         for _ in 0..200 {
             let rate = rng.range(2_000_000, 80_000_000) as f64;
@@ -205,25 +255,103 @@ mod tests {
             let t0 = Instant::now();
             let mut link = Link::new(rate, rtt, t0);
             let mut est = PathEst::new(t0);
-            let mut frames = trickle(t0, 30, 16, 600);
-            let mut t = t0 + Duration::from_millis(600);
-            for _ in 0..rng.range(2, 6) {
-                // Still for a while, then a few big frames, far enough apart that none
-                // waits behind another.
-                t += Duration::from_millis(rng.range(300, 3000));
-                for _ in 0..rng.range(1, 5) {
-                    let bytes = rng.range(20_000, 120_000) as usize;
-                    frames.push((t, bytes));
-                    t += Duration::from_secs_f64(bytes as f64 * 8.0 / rate)
-                        + Duration::from_millis(rng.range(20, 60));
-                }
-            }
+            let least = (rate * 0.006 / 8.0) as u64 + 600;
+            let frames = bursts(&mut rng, t0, rate, |rng| {
+                rng.range(least.max(20_000), least.max(20_000) * 3) as usize
+            });
             run(&mut est, &mut link, &frames);
             let got = est.capacity_bps().expect("big frames were acked");
             assert!(
                 (got - rate).abs() <= rate * 0.001,
                 "rate {rate}, rtt {rtt} ms: estimated {got}"
             );
+        }
+    }
+
+    #[test]
+    fn frames_too_quick_to_time_read_low_never_high() {
+        // Frames of any size on any link: one that crosses in under MIN_WIRE_MS proves
+        // only its size over that long.
+        let mut rng = Rng(0x94D049BB133111EB);
+        for _ in 0..200 {
+            let rate = rng.range(2_000_000, 200_000_000) as f64;
+            let t0 = Instant::now();
+            let mut link = Link::new(rate, rng.range(5, 200), t0);
+            let mut est = PathEst::new(t0);
+            let frames = bursts(&mut rng, t0, rate, |rng| {
+                rng.range(20_000, 120_000) as usize
+            });
+            let biggest = frames.iter().map(|f| f.1).max().unwrap();
+            run(&mut est, &mut link, &frames);
+            let got = est.capacity_bps().expect("big frames were acked");
+            assert!(got <= rate * 1.001, "rate {rate}: estimated {got}");
+            let provable = (biggest - 600) as f64 * 8.0 / (MIN_WIRE_MS / 1000.0);
+            assert!(
+                got <= provable * 1.001,
+                "rate {rate}: {got} from {biggest} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn jitter_moves_the_estimate_by_no_more_than_its_share_of_the_wire_time() {
+        // Every ack late by up to 4 ms, at random, on frames that take 20 ms or more to
+        // cross: the estimate stays within what 4 ms is of 20.
+        let mut rng = Rng(0x2545F4914F6CDD1D);
+        for _ in 0..200 {
+            let rate = rng.range(2_000_000, 60_000_000) as f64;
+            let t0 = Instant::now();
+            let mut link = Link::new(rate, rng.range(5, 200), t0);
+            let mut est = PathEst::new(t0);
+            let least = (rate * 0.020 / 8.0) as u64 + 600;
+            let frames = bursts(&mut rng, t0, rate, |rng| {
+                rng.range(least, least * 3) as usize
+            });
+            for (sent, bytes) in frames {
+                let (acked, _) = link.send(sent, bytes);
+                est.on_ack(
+                    acked + Duration::from_micros(rng.range(0, 4000)),
+                    sent,
+                    bytes,
+                );
+            }
+            let got = est.capacity_bps().expect("big frames were acked");
+            assert!(
+                got >= rate * 0.8 && got <= rate * 1.25,
+                "rate {rate}: estimated {got}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_early_acks_do_not_set_the_rate() {
+        // An ack now and then that comes long before its frame can have crossed (a
+        // client that acknowledged part of it): fewer than CAPACITY_AGREE of them in
+        // the window read as nothing.
+        let mut rng = Rng(0xDA942042E4DD58B5);
+        for _ in 0..200 {
+            let rate = rng.range(2_000_000, 60_000_000) as f64;
+            let rtt = rng.range(5, 200);
+            let t0 = Instant::now();
+            let mut link = Link::new(rate, rtt, t0);
+            let mut est = PathEst::new(t0);
+            let least = (rate * 0.020 / 8.0) as u64 + 600;
+            let frames = bursts(&mut rng, t0, rate, |rng| {
+                rng.range(least, least * 3) as usize
+            });
+            let early = [frames.len() - 2, frames.len() - 5];
+            for (i, &(sent, bytes)) in frames.iter().enumerate() {
+                let (acked, _) = link.send(sent, bytes);
+                let acked = if early.contains(&i) {
+                    sent + Duration::from_millis(rtt)
+                        + (acked - sent - Duration::from_millis(rtt)) / 4
+                } else {
+                    acked
+                };
+                est.on_ack(acked, sent, bytes);
+            }
+            let got = est.capacity_bps().expect("big frames were acked");
+            assert!(got <= rate * 1.001, "rate {rate}: estimated {got}");
         }
     }
 
