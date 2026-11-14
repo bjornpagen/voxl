@@ -27,26 +27,11 @@ pub struct Client {
     pub inflight: Mutex<VecDeque<Inflight>>,
     /// Smoothed min RTT (ms), from pings.
     pub min_rtt_ms: AtomicU32,
-    /// Exponentially-weighted estimate of delivered bytes/sec, from acks.
-    pub delivered: Mutex<RateEst>,
     pub needs_keyframe: AtomicBool,
     /// Has received a keyframe since (re)starting video.
     pub started: AtomicBool,
-    pub delay: Mutex<DelayEst>,
-}
-
-/// Send->ack delay tracking: `base` is the (slowly expiring) minimum, the excess over
-/// it is queueing somewhere on the path (network buffers or a slow decoder).
-pub struct DelayEst {
-    pub base_ms: f64,
-    pub base_at: Instant,
-    pub queue_ms: f64,
-}
-
-pub struct RateEst {
-    pub window_start: Instant,
-    pub bytes: usize,
-    pub rate_bps: f64,
+    /// What the acks say about the path: its baseline delay, its capacity, its queue.
+    pub path: Mutex<crate::path::PathEst>,
 }
 
 impl Client {
@@ -55,14 +40,13 @@ impl Client {
     }
 
     pub fn on_ack(&self, id: u32) {
+        let now = Instant::now();
         let mut q = self.inflight.lock();
-        let mut acked = 0;
         let mut sample = None;
         while let Some(f) = q.front() {
             if wrapping_le(f.id, id) {
-                acked += f.bytes;
                 if f.id == id {
-                    sample = Some(f.sent.elapsed().as_secs_f64() * 1000.0);
+                    sample = Some((f.sent, f.bytes));
                 }
                 q.pop_front();
             } else {
@@ -70,28 +54,20 @@ impl Client {
             }
         }
         drop(q);
-        if let Some(ms) = sample {
-            let mut e = self.delay.lock();
-            if ms < e.base_ms || e.base_at.elapsed().as_secs() >= 10 {
-                e.base_ms = ms;
-                e.base_at = Instant::now();
-            }
-            let qd = ms - e.base_ms;
-            e.queue_ms = e.queue_ms * 0.7 + qd * 0.3;
+        if let Some((sent, bytes)) = sample {
+            self.path.lock().on_ack(now, sent, bytes);
         }
-        let mut d = self.delivered.lock();
-        d.bytes += acked;
-        let el = d.window_start.elapsed().as_secs_f64();
-        if el >= 0.5 {
-            let r = d.bytes as f64 * 8.0 / el;
-            d.rate_bps = if d.rate_bps == 0.0 {
-                r
-            } else {
-                d.rate_bps * 0.6 + r * 0.4
-            };
-            d.bytes = 0;
-            d.window_start = Instant::now();
-        }
+    }
+
+    /// Delay queued on the path to this client now (ms).
+    pub fn queue_ms(&self) -> f64 {
+        let idle = self.inflight.lock().is_empty();
+        self.path.lock().queue_ms(Instant::now(), idle)
+    }
+
+    /// What the path to this client can carry (kbit/s), once its frames have told.
+    pub fn capacity_kbps(&self) -> Option<f64> {
+        self.path.lock().capacity_bps().map(|bps| bps / 1000.0)
     }
 
     /// Frames in flight and age of the oldest unacknowledged one.
@@ -309,18 +285,9 @@ impl Hub {
             audio: AtomicBool::new(false),
             inflight: Mutex::new(VecDeque::new()),
             min_rtt_ms: AtomicU32::new(0),
-            delivered: Mutex::new(RateEst {
-                window_start: Instant::now(),
-                bytes: 0,
-                rate_bps: 0.0,
-            }),
             needs_keyframe: AtomicBool::new(true),
             started: AtomicBool::new(false),
-            delay: Mutex::new(DelayEst {
-                base_ms: f64::MAX,
-                base_at: Instant::now(),
-                queue_ms: 0.0,
-            }),
+            path: Mutex::new(crate::path::PathEst::new(Instant::now())),
         });
         self.clients.lock().push(c.clone());
         c

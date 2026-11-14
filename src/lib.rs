@@ -25,6 +25,7 @@ mod login;
 mod mac;
 mod mic;
 mod mp4;
+mod path;
 mod record;
 #[cfg(target_os = "linux")]
 mod screen;
