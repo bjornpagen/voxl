@@ -28,7 +28,7 @@ frame, key, paint-over, bytes, server pipeline ms), OUT.acks.tsv, OUT.marks.tsv 
 scenario's phases) and OUT.scroll.tsv (scroll input).
 
 usage: linkviewer.py HOST:PORT SCENARIO OUT [--kbps N] [--rtt MS] [--hold] [--report-hold]
-       [--fifo PATH] [--page FILE] [--passive SECS]
+       [--seed N] [--fifo PATH] [--page FILE] [--passive SECS]
 """
 
 import argparse
@@ -121,7 +121,9 @@ async def main():
     ap.add_argument("--page", default="/etc/services", help="file the scenarios print")
     ap.add_argument("--settle", type=float, default=3.0, help="seconds to watch before the scenario")
     ap.add_argument("--passive", type=float, default=0, help="only watch, for this many seconds")
+    ap.add_argument("--seed", type=int, help="seed for --hold's random part, so a run can be repeated")
     a = ap.parse_args()
+    rng = random.Random(a.seed)
     owd = a.rtt / 2000.0
     rate = a.kbps * 1000.0
     t0 = time.monotonic()
@@ -190,7 +192,7 @@ async def main():
                     continue
                 # The frame's last part is in: hold it for decode and draw, then ack.
                 del frames[fid]
-                hold = 0.002 + f["bytes"] / 1e7 + random.uniform(0, 0.008) if a.hold else 0.003
+                hold = 0.002 + f["bytes"] / 1e7 + rng.uniform(0, 0.008) if a.hold else 0.003
                 ack_at = at + hold + owd
                 acks.write(f"{fid}\t{at:.4f}\t{ack_at:.4f}\t{hold * 1000:.1f}\n")
                 schedule(ack_at, f"a,{fid},{hold * 1000:.1f}" if a.report_hold else f"a,{fid}")
