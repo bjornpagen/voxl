@@ -34,16 +34,93 @@ pub struct VideoConfig {
 struct Job {
     buf: Box<I420>,
     idx: usize,
-    force_idr: bool,
-    paintover: bool,
-    /// The blocks this frame sharpens, to be cleared once it came out sharp.
-    sharpen: Option<Sharpen>,
-    /// Rows that changed in this capture.
-    band: Option<Band>,
-    /// Per-macroblock change map for this capture (None: analyse everything).
-    mb_dirty: Option<Arc<Vec<u8>>>,
+    frame: Frame,
     captured_at: Instant,
     marker_ms: i64,
+}
+
+/// What a captured frame is for. Each kind carries what only it has.
+enum Frame {
+    /// A new viewer, or a decoder that lost its place: every stripe, from nothing. `still`:
+    /// it went out in place of a sharpening pass, so it is coded at paint-over quality.
+    Key { still: bool },
+    /// What changed on screen, and which blocks (None: analyse every block in the band).
+    Motion {
+        band: Band,
+        dirty: Option<Arc<Vec<u8>>>,
+    },
+    /// The screen is still: re-encode `blocks` at paint-over quality.
+    Sharpen { band: Band, blocks: Sharpen },
+    /// Motion, plus blocks elsewhere that have gone still, at paint-over quality.
+    MotionAndSharpen {
+        band: Band,
+        dirty: Arc<Vec<u8>>,
+        blocks: Sharpen,
+    },
+}
+
+impl Frame {
+    /// Whether it encodes any of the rows `y..y + h`. A keyframe encodes them all.
+    fn touches(&self, y: usize, h: usize) -> bool {
+        match self {
+            Frame::Key { .. } => true,
+            Frame::Motion { band, .. }
+            | Frame::Sharpen { band, .. }
+            | Frame::MotionAndSharpen { band, .. } => {
+                (band.y0 as usize) < y + h && (band.y1 as usize) > y
+            }
+        }
+    }
+
+    /// How a stripe codes it, for the configured CRF and the paint-over one.
+    fn coding(&self, crf: f32, paintover_crf: f32) -> Coding {
+        match self {
+            Frame::Key { still: false } => Coding::Key { crf },
+            Frame::Key { still: true } => Coding::Key { crf: paintover_crf },
+            Frame::Motion { .. } => Coding::Motion { crf },
+            Frame::Sharpen { .. } | Frame::MotionAndSharpen { .. } => {
+                Coding::Sharpen { crf: paintover_crf }
+            }
+        }
+    }
+
+    /// Whether it is coded at paint-over quality (a flag in each message's header).
+    fn sharpens(&self) -> bool {
+        match self {
+            Frame::Key { still } => *still,
+            Frame::Motion { .. } => false,
+            Frame::Sharpen { .. } | Frame::MotionAndSharpen { .. } => true,
+        }
+    }
+
+    /// The blocks x264 analyses (None: all of them).
+    fn mb_dirty(&self) -> Option<Arc<Vec<u8>>> {
+        match self {
+            Frame::Key { .. } => None,
+            Frame::Motion { dirty, .. } => dirty.clone(),
+            Frame::Sharpen { blocks, .. } => Some(blocks.map.clone()),
+            Frame::MotionAndSharpen { dirty, .. } => Some(dirty.clone()),
+        }
+    }
+
+    /// The blocks it sharpens, cleared once it came out sharp.
+    fn into_sharpened(self) -> Option<Sharpen> {
+        match self {
+            Frame::Key { .. } | Frame::Motion { .. } => None,
+            Frame::Sharpen { blocks, .. } | Frame::MotionAndSharpen { blocks, .. } => Some(blocks),
+        }
+    }
+}
+
+/// How a stripe worker codes its part of a frame.
+#[derive(Clone, Copy)]
+enum Coding {
+    /// An IDR at this CRF, with a keyframe's allowance.
+    Key { crf: f32 },
+    /// Motion at the configured CRF, which MotionQuality may lower.
+    Motion { crf: f32 },
+    /// Sharpening at the paint-over CRF.
+    Sharpen { crf: f32 },
 }
 
 /// Blocks a frame sharpens, as the Refiner saw them when the frame was captured.
@@ -830,35 +907,43 @@ fn capture_loop(
             // A keyframe is squeezed into the rate cap; sharpen all of it once still.
             refiner.mark_all();
         }
-        let frame_paintover = paintover && refine.is_none();
-        // A refinement frame encodes what moved plus what is due; everything else stays skipped.
-        let mut sharpen = None;
-        let mb_map = if want_key {
-            None
-        } else if frame_paintover {
-            paint_map.map(|(m, b)| {
-                band = Some(match band {
-                    Some(x) => union(Some(x), b),
-                    None => b,
-                });
-                let m = Arc::new(m);
-                sharpen = Some(m.clone());
-                m
-            })
-        } else if let Some((rmap, rband)) = refine.take() {
-            band = Some(match band {
-                Some(b) => union(Some(b), rband),
-                None => rband,
-            });
-            let mut m = mb_dirty.take().unwrap_or_else(|| vec![1; rmap.len()]);
-            for (d, r) in m.iter_mut().zip(&rmap) {
-                *d |= r;
+        let at_ms = refiner.now();
+        let frame = if want_key {
+            Frame::Key { still: paintover }
+        } else if let Some((map, band)) = paint_map {
+            Frame::Sharpen {
+                band,
+                blocks: Sharpen {
+                    map: Arc::new(map),
+                    at_ms,
+                },
             }
-            sharpen = Some(Arc::new(rmap));
-            hub.stats.refines.fetch_add(1, Ordering::Relaxed);
-            Some(Arc::new(m))
+        } else if let Some(moved) = band {
+            match refine.take() {
+                // What moved plus what is due; everything else stays skipped.
+                Some((rmap, rband)) => {
+                    let mut m = mb_dirty.take().unwrap_or_else(|| vec![1; rmap.len()]);
+                    for (d, r) in m.iter_mut().zip(&rmap) {
+                        *d |= r;
+                    }
+                    hub.stats.refines.fetch_add(1, Ordering::Relaxed);
+                    Frame::MotionAndSharpen {
+                        band: union(Some(moved), rband),
+                        dirty: Arc::new(m),
+                        blocks: Sharpen {
+                            map: Arc::new(rmap),
+                            at_ms,
+                        },
+                    }
+                }
+                None => Frame::Motion {
+                    band: moved,
+                    dirty: mb_dirty.take().map(Arc::new),
+                },
+            }
         } else {
-            mb_dirty.take().map(Arc::new)
+            // Neither motion nor a pass: a capture like this was skipped above.
+            continue;
         };
         last_capture = t0;
         next_idx = 1 - idx;
@@ -866,14 +951,7 @@ fn capture_loop(
             .send(Job {
                 buf,
                 idx,
-                force_idr: want_key,
-                paintover,
-                sharpen: sharpen.map(|map| Sharpen {
-                    map,
-                    at_ms: refiner.now(),
-                }),
-                mb_dirty: mb_map,
-                band,
+                frame,
                 captured_at: origin,
                 marker_ms,
             })
@@ -927,10 +1005,7 @@ struct StripeJob {
     /// Valid until the worker replies: the encode loop waits for every stripe.
     buf: SendPtr<I420>,
     ts: i64,
-    force_idr: bool,
-    /// A paint-over or refinement pass (`crf` is the paint-over CRF).
-    paintover: bool,
-    crf: f32,
+    coding: Coding,
     cap: u32,
     mb_dirty: Option<Arc<Vec<u8>>>,
     mb_cols: usize,
@@ -1136,18 +1211,18 @@ fn stripe_worker(
     let mut motion = MotionQuality::default();
     while let Ok(job) = rx.recv() {
         let buf = unsafe { &*job.buf.0 };
-        let is_motion = !job.force_idr && !job.paintover;
-        let crf = if is_motion {
-            motion.crf(job.crf)
-        } else {
-            job.crf
+        // The CRF the job asks for, and the one x264 is given: MotionQuality may lower
+        // a motion frame's.
+        let (asked, crf) = match job.coding {
+            Coding::Key { crf } | Coding::Sharpen { crf } => (crf, crf),
+            Coding::Motion { crf } => (crf, motion.crf(crf)),
         };
-        if job.force_idr {
+        if let Coding::Key { .. } = job.coding {
             // A keyframe is what a new viewer sees first; don't starve it to the
             // steady-state frame budget (up to ~8 frames' worth at 4x the cap).
             let boost = job.cap.saturating_mul(4).max(16_000);
             s.enc
-                .set_rate_buf(job.crf, boost, boost / s.cfg.fps.max(1) * 8);
+                .set_rate_buf(asked, boost, boost / s.cfg.fps.max(1) * 8);
             s.applied_kbps = 0;
         } else {
             let moved = s.applied_kbps == 0
@@ -1186,7 +1261,7 @@ fn stripe_worker(
         let r = s.enc.encode(
             &planes,
             job.ts,
-            job.force_idr,
+            matches!(job.coding, Coding::Key { .. }),
             None,
             info.as_deref_mut(),
             &mut out,
@@ -1232,11 +1307,11 @@ fn stripe_worker(
         let at_crf = r.as_ref().is_ok_and(|e| e.crf_avg < crf + 0.5);
         let res = match r {
             Ok(e) => {
-                let size = is_motion.then(|| MotionSize {
+                let size = matches!(job.coding, Coding::Motion { .. }).then(|| MotionSize {
                     bits: (out.len() - HDR) * 8,
                     changed,
                     mbs: stripe_mbs,
-                    crf: job.crf,
+                    crf: asked,
                 });
                 motion.note(&e, crf, size);
                 (out.len() > HDR).then_some((e.keyframe, out))
@@ -1287,19 +1362,15 @@ fn encode_loop(
         // A sharpening frame's band covers the blocks it sharpens.
         let selected: Vec<bool> = stripes
             .iter()
-            .map(|&(y, h)| {
-                job.force_idr
-                    || job
-                        .band
-                        .is_some_and(|b| (b.y0 as usize) < y + h && (b.y1 as usize) > y)
-            })
+            .map(|&(y, h)| job.frame.touches(y, h))
             .collect();
         if !selected.iter().any(|&x| x) {
             let _ = ret.send((job.idx, job.buf, None));
             continue;
         }
         let target = hub.target_kbps.load(Ordering::Relaxed);
-        let want_crf = if job.paintover { po_crf } else { crf };
+        let coding = job.frame.coding(crf, po_crf);
+        let mb_dirty = job.frame.mb_dirty();
         // The slowest watched path's capacity; unknown until every one has told.
         let capacity = hub
             .video_clients()
@@ -1321,15 +1392,12 @@ fn encode_loop(
             if on {
                 // Sharpening spends from the same budget as motion: what the budget
                 // doesn't cover now is left pending for a later pass.
-                let cap = share;
                 let _ = workers[i].0.send(StripeJob {
                     buf: buf_ptr,
                     ts,
-                    force_idr: job.force_idr,
-                    paintover: job.paintover,
-                    crf: want_crf,
-                    cap,
-                    mb_dirty: job.mb_dirty.clone(),
+                    coding,
+                    cap: share,
+                    mb_dirty: mb_dirty.clone(),
                     mb_cols: job.buf.width.div_ceil(16),
                 });
                 pending += 1;
@@ -1343,7 +1411,12 @@ fn encode_loop(
                 sharp &= at_crf;
             }
         }
-        let _ = ret.send((job.idx, job.buf, job.sharpen.filter(|_| sharp)));
+        let sharpens = job.frame.sharpens();
+        let _ = ret.send((
+            job.idx,
+            job.buf,
+            job.frame.into_sharpened().filter(|_| sharp),
+        ));
         let parts: Vec<(usize, bool, Vec<u8>)> = results
             .into_iter()
             .enumerate()
@@ -1378,7 +1451,7 @@ fn encode_loop(
             .map(|(i, key, mut out)| {
                 // type, flags, frame id, pipe, stripe, stripe count, parts in frame, reserved, y
                 out[0] = 0x01;
-                out[1] = (key as u8) | if job.paintover { 2 } else { 0 };
+                out[1] = (key as u8) | if sharpens { 2 } else { 0 };
                 out[2..6].copy_from_slice(&frame_id.to_be_bytes());
                 out[6..10].copy_from_slice(&pipe.to_be_bytes());
                 out[10] = i as u8;
