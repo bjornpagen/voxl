@@ -305,6 +305,20 @@ fn num<T: std::str::FromStr>(it: &mut std::str::Split<'_, char>) -> Option<T> {
     it.next()?.trim().parse().ok()
 }
 
+/// A distance in desktop pixels, and a finite one. Rust's `f64` parser reads `NaN` and
+/// `inf` too (JavaScript's `toFixed` writes them as `NaN` and `Infinity`); added to the
+/// input thread's scroll remainder, either one stays in it, and every pixel scroll after
+/// it moves nothing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Pixels(f64);
+
+impl Pixels {
+    fn parse(field: &str) -> Option<Pixels> {
+        let px: f64 = field.trim().parse().ok()?;
+        px.is_finite().then_some(Pixels(px))
+    }
+}
+
 fn send_input(hub: &Hub, client: &Client, event: InputEvent) {
     let input = hub.input.lock();
     #[cfg(target_os = "macos")]
@@ -329,7 +343,7 @@ enum Command {
     /// `s,<dx>,<dy>`: wheel ticks.
     Scroll { dx: i32, dy: i32 },
     /// `sp,<dx>,<dy>`: desktop pixels.
-    ScrollPx { dx: f64, dy: f64 },
+    ScrollPx { dx: Pixels, dy: Pixels },
     /// `k,<keysym>,<1|0>`
     Key { keysym: u32, down: bool },
     /// `r`
@@ -383,8 +397,8 @@ impl Command {
             "sp" => {
                 let (dx, dy) = rest.split_once(',')?;
                 Command::ScrollPx {
-                    dx: dx.trim().parse().ok()?,
-                    dy: dy.trim().parse().ok()?,
+                    dx: Pixels::parse(dx)?,
+                    dy: Pixels::parse(dy)?,
                 }
             }
             "k" => Command::Key {
@@ -465,7 +479,7 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
         Command::Move { x, y } => input(InputEvent::Move { x, y }),
         Command::Button { button, down } => input(InputEvent::Button { button, down }),
         Command::Scroll { dx, dy } => input(InputEvent::Scroll { dx, dy }),
-        Command::ScrollPx { dx, dy } => input(InputEvent::ScrollPx { dx, dy }),
+        Command::ScrollPx { dx, dy } => input(InputEvent::ScrollPx { dx: dx.0, dy: dy.0 }),
         Command::Key { keysym, down } => input(InputEvent::Key { keysym, down }),
         Command::ReleaseAll => input(InputEvent::ReleaseAll),
         Command::Clipboard(text) => input(InputEvent::Clipboard(
@@ -630,6 +644,25 @@ mod tests {
         }
         for c in [
             "v,2", "v", "a", "a,x", "k,65", "b,1,7", "sp,1", "po,-1", "zz,1",
+        ] {
+            assert!(Command::parse(c).is_none(), "{c} parsed");
+        }
+    }
+
+    /// A pixel scroll is two finite numbers. `NaN` and `inf` parse as `f64` but are no
+    /// distance, and one of them in the input thread's scroll remainder never leaves it.
+    #[test]
+    fn a_pixel_scroll_is_finite() {
+        let Some(Command::ScrollPx { dx, dy }) = Command::parse("sp,-0.5,1e3") else {
+            panic!("sp,-0.5,1e3 is no pixel scroll");
+        };
+        assert_eq!((dx, dy), (Pixels(-0.5), Pixels(1000.0)));
+        for c in [
+            "sp,NaN,0",
+            "sp,0,Infinity",
+            "sp,-Infinity,1",
+            "sp,inf,0",
+            "sp,0,nan",
         ] {
             assert!(Command::parse(c).is_none(), "{c} parsed");
         }
