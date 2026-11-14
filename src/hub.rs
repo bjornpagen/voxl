@@ -19,6 +19,33 @@ pub struct Inflight {
     pub bytes: usize,
 }
 
+/// How long a client says it kept a frame between its arrival and the ack (decode,
+/// draw, frames ahead of it), as the ack's optional last field.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Hold {
+    /// An older client, or the recorder: its delay samples include its own time.
+    Unsaid,
+    Said(Duration),
+    /// The field isn't a time (not a number, negative, more than a Duration holds):
+    /// the frame is acknowledged and says nothing about the path.
+    Unreadable,
+}
+
+impl Hold {
+    /// From the field in milliseconds, if the ack has one.
+    pub fn parse(field: Option<&str>) -> Hold {
+        let Some(field) = field else {
+            return Hold::Unsaid;
+        };
+        field
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .and_then(|ms| Duration::try_from_secs_f64(ms / 1000.0).ok())
+            .map_or(Hold::Unreadable, Hold::Said)
+    }
+}
+
 pub struct Client {
     pub id: u64,
     pub tx: mpsc::UnboundedSender<Out>,
@@ -42,12 +69,10 @@ impl Client {
         let _ = self.tx.send(m);
     }
 
-    /// Frame `id` (and every one before it) was shown. `held_ms`, from a client that
-    /// says, is how long it kept the frame after it arrived: the client's time, not the
-    /// path's, so the delay sample ends that much earlier.
-    pub fn on_ack(&self, id: u32, held_ms: Option<f64>) {
-        let now = Instant::now();
-        let held = held_ms.filter(|h| h.is_finite() && *h > 0.0);
+    /// At `now`, the ack for frame `id` (and every one before it) arrived. What the
+    /// client held of the delay is its own time, not the path's, so the delay sample
+    /// ends that much earlier.
+    pub fn on_ack(&self, now: Instant, id: u32, hold: Hold) {
         let mut q = self.inflight.lock();
         let mut sample = None;
         while let Some(f) = q.front() {
@@ -61,16 +86,20 @@ impl Client {
             }
         }
         drop(q);
-        if let Some((sent, bytes)) = sample {
-            let arrived = held
-                .and_then(|h| now.checked_sub(Duration::from_secs_f64(h / 1000.0)))
-                .map_or(now, |t| t.max(sent));
-            self.path.lock().on_ack(arrived, sent, bytes);
-        }
-        if let Some(h) = held_ms.filter(|h| h.is_finite() && *h >= 0.0) {
-            let mut m = self.client_ms.lock();
-            *m = *m * 0.9 + h * 0.1;
-        }
+        let Some((sent, bytes)) = sample else {
+            return;
+        };
+        let arrived = match hold {
+            Hold::Unsaid => now,
+            // A hold is part of the delay it was measured in.
+            Hold::Said(held) if held <= now.saturating_duration_since(sent) => {
+                let mut m = self.client_ms.lock();
+                *m = *m * 0.9 + held.as_secs_f64() * 100.0;
+                now - held
+            }
+            Hold::Said(_) | Hold::Unreadable => return,
+        };
+        self.path.lock().on_ack(arrived, sent, bytes);
     }
 
     /// Delay queued on the path to this client now (ms).
@@ -381,15 +410,19 @@ impl Hub {
 mod tests {
     use super::*;
 
-    /// Acks frame `id` as if it spent `path_ms` on the path, then `held_ms` in the client.
-    fn ack(c: &Client, id: u32, path_ms: u64, held_ms: f64, says: bool) {
-        let sent = Instant::now() - Duration::from_millis(path_ms + held_ms as u64);
-        c.inflight.lock().push_back(Inflight {
-            id,
-            sent,
-            bytes: 2000,
-        });
-        c.on_ack(id, says.then_some(held_ms));
+    /// Frame `id` of `bytes`, sent `id` x 100 ms after `t0`, which spent `path_ms` on
+    /// the path and `held_ms` in the client and is acknowledged with `hold`.
+    fn ack(
+        c: &Client,
+        t0: Instant,
+        id: u32,
+        bytes: usize,
+        (path_ms, held_ms): (u64, u64),
+        hold: Hold,
+    ) {
+        let sent = t0 + Duration::from_millis(id as u64 * 100);
+        c.inflight.lock().push_back(Inflight { id, sent, bytes });
+        c.on_ack(sent + Duration::from_millis(path_ms + held_ms), id, hold);
     }
 
     /// The time a client keeps a frame (decoding, drawing) is its own, not the path's:
@@ -397,16 +430,21 @@ mod tests {
     #[test]
     fn the_clients_own_time_is_not_queueing() {
         let hub = Hub::new();
+        let t0 = Instant::now();
         for says in [true, false] {
-            let (tx, _rx) = mpsc::unbounded_channel();
-            let c = hub.add_client(tx);
-            for id in 1..=20 {
-                ack(&c, id, 50, 2.0, says);
+            let c = hub.add_client(mpsc::unbounded_channel().0);
+            for (id, held) in (1..=20)
+                .map(|id| (id, 2))
+                .chain((21..=40).map(|id| (id, 40)))
+            {
+                let hold = if says {
+                    Hold::Said(Duration::from_millis(held))
+                } else {
+                    Hold::Unsaid
+                };
+                ack(&c, t0, id, 2000, (50, held), hold);
             }
-            for id in 21..=40 {
-                ack(&c, id, 50, 40.0, says);
-            }
-            let q = c.queue_ms();
+            let q = c.path.lock().queue_ms(t0, false);
             if says {
                 assert!(q < 5.0, "{q:.1} ms of queue from a client that said");
             } else {
@@ -416,5 +454,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The hold is whatever a client sends. A field that isn't a time parses to
+    /// `Unreadable`, whatever it is; and an ack whose hold is unreadable, or longer
+    /// than the delay it is part of, leaves the path estimate as it is for a twin that
+    /// was never sent that frame.
+    #[test]
+    fn a_hold_that_cannot_be_true_says_nothing() {
+        let unreadable = [
+            "", "x", "NaN", "inf", "-inf", "-1", "-0.001", "1e30", "1e400",
+        ];
+        for field in unreadable {
+            assert_eq!(Hold::parse(Some(field)), Hold::Unreadable, "{field:?}");
+        }
+        assert_eq!(Hold::parse(None), Hold::Unsaid);
+        assert_eq!(
+            Hold::parse(Some(" 3.5")),
+            Hold::Said(Duration::from_micros(3500))
+        );
+
+        let hub = Hub::new();
+        let (c, twin) = (
+            hub.add_client(mpsc::unbounded_channel().0),
+            hub.add_client(mpsc::unbounded_channel().0),
+        );
+        let t0 = Instant::now();
+        let good = Hold::Said(Duration::from_millis(1));
+        for (i, lie) in [Hold::Unreadable, Hold::Said(Duration::from_secs(3600))]
+            .into_iter()
+            .cycle()
+            .take(20)
+            .enumerate()
+        {
+            let id = i as u32 * 2 + 1;
+            ack(&c, t0, id, 90_000, (50, 1), lie);
+            ack(&c, t0, id + 1, 2000 + i * 3000, (50 + i as u64, 1), good);
+            ack(&twin, t0, id + 1, 2000 + i * 3000, (50 + i as u64, 1), good);
+        }
+        assert!(twin.capacity_kbps().is_some());
+        assert_eq!(c.capacity_kbps(), twin.capacity_kbps());
+        assert_eq!(
+            c.path.lock().queue_ms(t0, false),
+            twin.path.lock().queue_ms(t0, false)
+        );
+        assert_eq!(*c.client_ms.lock(), *twin.client_ms.lock());
     }
 }
