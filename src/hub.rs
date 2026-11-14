@@ -108,9 +108,17 @@ impl Client {
         self.path.lock().queue_ms(Instant::now(), idle)
     }
 
-    /// What the path to this client can carry (kbit/s), once its frames have told.
-    pub fn capacity_kbps(&self) -> Option<f64> {
-        self.path.lock().capacity_bps().map(|bps| bps / 1000.0)
+    /// What the path to this client can carry, once its frames have told.
+    pub fn capacity(&self) -> Option<crate::path::Kbps> {
+        self.path.lock().capacity()
+    }
+
+    /// The smallest round trip its pings have shown, once one has been answered.
+    pub fn rtt_ms(&self) -> Option<u32> {
+        match self.min_rtt_ms.load(Ordering::Relaxed) {
+            0 => None,
+            ms => Some(ms),
+        }
     }
 
     /// Frames in flight and age of the oldest unacknowledged one.
@@ -266,8 +274,9 @@ pub struct Hub {
     pub height: AtomicU32,
     /// Encoded stripes as (y, height).
     pub stripes: Mutex<Vec<(u32, u32)>>,
-    /// Adaptive bitrate cap applied by the encoder (kbit/s).
-    pub target_kbps: AtomicU32,
+    /// The bitrate the stream is steered to (kbit/s; 0 until a pipeline has set one).
+    /// Kept across pipelines; read through `target`.
+    target_kbps: AtomicU32,
     /// Last cursor message, replayed to new clients.
     pub cursor: Mutex<Option<Bytes>>,
     /// Wakes the capture thread (acks, joins, keyframe requests).
@@ -349,6 +358,19 @@ impl Hub {
             .filter(|c| c.video.load(Ordering::Relaxed))
             .cloned()
             .collect()
+    }
+
+    /// The bitrate the stream is steered to, once a pipeline has set one.
+    pub fn target(&self) -> Option<crate::path::Kbps> {
+        match self.target_kbps.load(Ordering::Relaxed) {
+            0 => None,
+            kbps => Some(crate::path::Kbps::new(kbps as f64)),
+        }
+    }
+
+    pub fn set_target(&self, target: crate::path::Kbps) {
+        self.target_kbps
+            .store(target.get().max(1.0) as u32, Ordering::Relaxed);
     }
 
     /// The `hello` message: current geometry plus the server's settings.
@@ -492,8 +514,8 @@ mod tests {
             ack(&c, t0, id + 1, 2000 + i * 3000, (50 + i as u64, 1), good);
             ack(&twin, t0, id + 1, 2000 + i * 3000, (50 + i as u64, 1), good);
         }
-        assert!(twin.capacity_kbps().is_some());
-        assert_eq!(c.capacity_kbps(), twin.capacity_kbps());
+        assert!(twin.capacity().is_some());
+        assert_eq!(c.capacity(), twin.capacity());
         assert_eq!(
             c.path.lock().queue_ms(t0, false),
             twin.path.lock().queue_ms(t0, false)

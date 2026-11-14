@@ -176,7 +176,7 @@ async fn stats(State(s): State<AppState>) -> Response {
         .map(|c| {
             let (n, age) = c.backlog();
             serde_json::json!({"id": c.id, "video": c.video.load(Ordering::Relaxed), "inflight": n, "oldest_ms": age,
-                "min_rtt_ms": c.min_rtt_ms.load(Ordering::Relaxed), "queue_ms": c.queue_ms() as u64, "capacity_kbps": c.capacity_kbps().map(|k| k as u64),
+                "min_rtt_ms": c.min_rtt_ms.load(Ordering::Relaxed), "queue_ms": c.queue_ms() as u64, "capacity_kbps": c.capacity().map(|k| k.get() as u64),
                 "client_ms": (*c.client_ms.lock() * 10.0).round() / 10.0})
         })
         .collect();
@@ -191,7 +191,7 @@ async fn stats(State(s): State<AppState>) -> Response {
         "paintovers": st.paintovers.load(Ordering::Relaxed),
         "keyframes": st.keyframes.load(Ordering::Relaxed),
         "refines": st.refines.load(Ordering::Relaxed),
-        "target_kbps": s.hub.target_kbps.load(Ordering::Relaxed),
+        "target_kbps": s.hub.target().map(|k| k.get() as u64),
         "damage_events": crate::capture::DAMAGE_EVENTS.load(Ordering::Relaxed),
         "damage_wait_us_total": st.damage_wait_us.load(Ordering::Relaxed),
         "send_lat_us_total": st.send_lat_us.load(Ordering::Relaxed),

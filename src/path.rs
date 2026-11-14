@@ -34,6 +34,103 @@ const BASE_SAMPLES: u32 = 8;
 /// nothing is queued, however the last frame fared.
 const QUEUE_HALF_LIFE: Duration = Duration::from_millis(150);
 
+/// A rate, in kbit/s.
+#[derive(Clone, Copy, PartialEq, PartialOrd, Debug)]
+pub struct Kbps(f64);
+
+impl Kbps {
+    pub const fn new(kbps: f64) -> Self {
+        Kbps(kbps)
+    }
+    pub fn get(self) -> f64 {
+        self.0
+    }
+    pub fn bps(self) -> f64 {
+        self.0 * 1000.0
+    }
+    /// What this rate carries in `time`.
+    pub fn over(self, time: Duration) -> Bits {
+        Bits(self.bps() * time.as_secs_f64())
+    }
+    pub fn times(self, factor: f64) -> Self {
+        Kbps(self.0 * factor)
+    }
+    pub fn min(self, other: Self) -> Self {
+        Kbps(self.0.min(other.0))
+    }
+    pub fn max(self, other: Self) -> Self {
+        Kbps(self.0.max(other.0))
+    }
+}
+
+/// An amount of data, in bits. Below zero it is a debt.
+#[derive(Clone, Copy, PartialEq, PartialOrd, Debug)]
+pub struct Bits(f64);
+
+impl Bits {
+    pub const ZERO: Bits = Bits(0.0);
+    pub fn of_bytes(bytes: usize) -> Self {
+        Bits(bytes as f64 * 8.0)
+    }
+    #[cfg(test)]
+    pub fn bytes(self) -> f64 {
+        self.0 / 8.0
+    }
+    pub fn times(self, factor: f64) -> Self {
+        Bits(self.0 * factor)
+    }
+    pub fn min(self, other: Self) -> Self {
+        Bits(self.0.min(other.0))
+    }
+    pub fn max(self, other: Self) -> Self {
+        Bits(self.0.max(other.0))
+    }
+    /// The rate that sends this much in every frame at `fps`: how x264's VBV is told
+    /// what one frame may take.
+    pub fn a_frame_at(self, fps: u32) -> Kbps {
+        Kbps(self.0 * fps as f64 / 1000.0)
+    }
+}
+
+impl std::ops::Add for Bits {
+    type Output = Bits;
+    fn add(self, other: Bits) -> Bits {
+        Bits(self.0 + other.0)
+    }
+}
+
+impl std::ops::Sub for Bits {
+    type Output = Bits;
+    fn sub(self, other: Bits) -> Bits {
+        Bits(self.0 - other.0)
+    }
+}
+
+/// What the paths of everyone watching can carry: one stream serves them all, so the
+/// slowest decides.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Capacity {
+    /// Nobody is watching.
+    NoViewers,
+    /// Somebody's path has not shown its rate yet.
+    Unknown,
+    /// The slowest path's rate.
+    Known(Kbps),
+}
+
+impl Capacity {
+    /// From each watched path's own capacity (None: not known yet).
+    pub fn of(paths: impl IntoIterator<Item = Option<Kbps>>) -> Capacity {
+        paths
+            .into_iter()
+            .fold(Capacity::NoViewers, |all, path| match (all, path) {
+                (Capacity::Unknown, _) | (_, None) => Capacity::Unknown,
+                (Capacity::NoViewers, Some(c)) => Capacity::Known(c),
+                (Capacity::Known(slowest), Some(c)) => Capacity::Known(slowest.min(c)),
+            })
+    }
+}
+
 /// The smallest value over a sliding window of time.
 struct Lowest {
     /// (when, value, the size of the frame it was measured on), values rising from the
@@ -153,9 +250,9 @@ impl PathEst {
         self.queue_ms * 0.5f64.powf(since / QUEUE_HALF_LIFE.as_secs_f64())
     }
 
-    /// What the path can carry (bit/s), once frames big enough to tell have been acked.
-    pub fn capacity_bps(&self) -> Option<f64> {
-        self.capacity
+    /// What the path can carry, once frames big enough to tell have been acked.
+    pub fn capacity(&self) -> Option<Kbps> {
+        self.capacity.map(|bps| Kbps::new(bps / 1000.0))
     }
 }
 
@@ -245,6 +342,33 @@ mod tests {
     }
 
     #[test]
+    fn the_slowest_known_path_decides_and_an_unknown_one_makes_it_unknown() {
+        // Against the sentence, for every way three paths can be: absent, not known
+        // yet, or known at one of two rates.
+        let rates = [None, Some(Kbps::new(3000.0)), Some(Kbps::new(40_000.0))];
+        for case in 0..4usize.pow(3) {
+            let paths: Vec<Option<Kbps>> = (0..3)
+                .map(|i| case / 4usize.pow(i) % 4)
+                .filter(|&s| s > 0)
+                .map(|s| rates[s - 1])
+                .collect();
+            let want = if paths.is_empty() {
+                Capacity::NoViewers
+            } else if paths.contains(&None) {
+                Capacity::Unknown
+            } else {
+                let slowest = paths
+                    .iter()
+                    .flatten()
+                    .map(|k| k.get())
+                    .fold(f64::MAX, f64::min);
+                Capacity::Known(Kbps::new(slowest))
+            };
+            assert_eq!(Capacity::of(paths.clone()), want, "{paths:?}");
+        }
+    }
+
+    #[test]
     fn capacity_comes_from_the_frames_themselves() {
         // Any link, any round trip, frames that take longer to cross than delays can be
         // told apart: the estimate lands on the link's rate.
@@ -260,7 +384,10 @@ mod tests {
                 rng.range(least.max(20_000), least.max(20_000) * 3) as usize
             });
             run(&mut est, &mut link, &frames);
-            let got = est.capacity_bps().expect("big frames were acked");
+            let got = est
+                .capacity()
+                .map(Kbps::bps)
+                .expect("big frames were acked");
             assert!(
                 (got - rate).abs() <= rate * 0.001,
                 "rate {rate}, rtt {rtt} ms: estimated {got}"
@@ -283,7 +410,10 @@ mod tests {
             });
             let biggest = frames.iter().map(|f| f.1).max().unwrap();
             run(&mut est, &mut link, &frames);
-            let got = est.capacity_bps().expect("big frames were acked");
+            let got = est
+                .capacity()
+                .map(Kbps::bps)
+                .expect("big frames were acked");
             assert!(got <= rate * 1.001, "rate {rate}: estimated {got}");
             let provable = (biggest - 600) as f64 * 8.0 / (MIN_WIRE_MS / 1000.0);
             assert!(
@@ -315,7 +445,10 @@ mod tests {
                     bytes,
                 );
             }
-            let got = est.capacity_bps().expect("big frames were acked");
+            let got = est
+                .capacity()
+                .map(Kbps::bps)
+                .expect("big frames were acked");
             assert!(
                 got >= rate * 0.8 && got <= rate * 1.25,
                 "rate {rate}: estimated {got}"
@@ -350,7 +483,10 @@ mod tests {
                 };
                 est.on_ack(acked, sent, bytes);
             }
-            let got = est.capacity_bps().expect("big frames were acked");
+            let got = est
+                .capacity()
+                .map(Kbps::bps)
+                .expect("big frames were acked");
             assert!(got <= rate * 1.001, "rate {rate}: estimated {got}");
         }
     }
@@ -382,7 +518,7 @@ mod tests {
                 let (acked, _) = link.send(t, bytes);
                 est.on_ack(acked, t, bytes);
             }
-            if let Some(got) = est.capacity_bps() {
+            if let Some(got) = est.capacity().map(Kbps::bps) {
                 assert!(got <= rate * 1.001, "rate {rate}: estimated {got}");
             }
         }
@@ -470,7 +606,7 @@ mod tests {
         let end = run(&mut est, &mut link, &frames);
         let q = est.queue_ms(end, false);
         assert!(q < 3.0, "queue {q} ms: the big frames became the baseline");
-        let got = est.capacity_bps().unwrap();
+        let got = est.capacity().map(Kbps::bps).unwrap();
         assert!((got - 8_000_000.0).abs() < 200_000.0, "capacity {got}");
     }
 

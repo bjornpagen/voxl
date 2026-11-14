@@ -5,6 +5,7 @@ use crate::convert::I420;
 use crate::encoder::{Encoded, Encoder, EncoderConfig, Planes, Quality};
 use crate::hub::wait_any;
 use crate::hub::{Hub, Inflight, Out};
+use crate::path::{Bits, Capacity, Kbps};
 use bytes::Bytes;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -35,6 +36,10 @@ struct Job {
     buf: Box<I420>,
     idx: usize,
     frame: Frame,
+    /// The bitrate the stream is steered to, and what the viewers' paths can carry,
+    /// as the rate controller had them when the frame was captured.
+    target: Kbps,
+    capacity: Capacity,
     captured_at: Instant,
     marker_ms: i64,
 }
@@ -349,10 +354,7 @@ fn flow_ok(hub: &Hub, interval_ms: f64) -> bool {
         if n == 0 {
             continue;
         }
-        let rtt = match c.min_rtt_ms.load(Ordering::Relaxed) {
-            0 => 40,
-            r => r,
-        } as f64;
+        let rtt = c.rtt_ms().unwrap_or(RTT_GUESS_MS) as f64;
         // Enough frames in flight to cover one RTT plus decode, but never more than ~rtt+120ms of queue.
         let max_n = (((rtt + 40.0) / interval_ms).ceil() as usize + 2).clamp(3, 40);
         let max_age = rtt as u128 + 120;
@@ -381,8 +383,8 @@ fn flow_ok(hub: &Hub, interval_ms: f64) -> bool {
 struct PathNow {
     /// Delay queued on the path (ms).
     queue_ms: f64,
-    /// What the path can carry (kbit/s), once its frames have told.
-    capacity_kbps: Option<f64>,
+    /// What the path can carry, once its frames have told.
+    capacity: Option<Kbps>,
     /// Its oldest unacknowledged frame is overdue.
     overdue: bool,
 }
@@ -392,99 +394,101 @@ struct PathNow {
 /// nothing queues, down below it when something does. Nothing has to press against the
 /// cap for the cap to rise, and an idle screen doesn't lower it.
 struct RateCtl {
-    target: f64,
-    max: f64,
-    min: f64,
-    last_eval: Instant,
-    last_dec: Instant,
-    last_inc: Instant,
+    target: Kbps,
+    max: Kbps,
+    min: Kbps,
+    /// When it last decided, lowered the target for a queue, and raised it.
+    last_eval: Option<Instant>,
+    last_dec: Option<Instant>,
+    last_inc: Option<Instant>,
 }
 
-/// The bitrate cap (kbit/s) of a path nothing is known about yet.
-const START_KBPS: f64 = 8000.0;
+/// The bitrate cap of a path nothing is known about yet.
+const START: Kbps = Kbps::new(8000.0);
 /// How much of the measured capacity the stream may fill. The rest is headroom for the
 /// path's own variation, so a steady stream sits below the queue instead of in it.
 const CAPACITY_SHARE: f64 = 0.9;
+/// A path with more than this queued is congested; with no more than `QUEUE_CLEAR_MS`,
+/// clear. Between the two the target stays where it is.
+const QUEUE_CONGESTED_MS: f64 = 30.0;
+const QUEUE_CLEAR_MS: f64 = 15.0;
+/// A frame unacknowledged this long past the round trip is overdue.
+const OVERDUE_MS: f64 = 80.0;
+/// The round trip assumed for a client whose pings haven't been answered yet.
+const RTT_GUESS_MS: u32 = 40;
 
 impl RateCtl {
-    /// Carries on from `resume` (the last target, 0 for none): a pipeline rebuilt for
-    /// a new screen size streams over the same paths as before.
-    fn new(max: f64, min: f64, resume: u32, now: Instant) -> Self {
-        let past = now.checked_sub(Duration::from_secs(10)).unwrap_or(now);
-        let start = if resume > 0 {
-            resume as f64
-        } else {
-            START_KBPS
-        };
+    /// Carries on from `resume`, the last pipeline's target: one rebuilt for a new
+    /// screen size streams over the same paths as before.
+    fn new(max: Kbps, min: Kbps, resume: Option<Kbps>) -> Self {
         RateCtl {
-            target: start.clamp(min.min(max), max),
+            target: resume.unwrap_or(START).max(min.min(max)).min(max),
             max,
             min,
-            last_eval: past,
-            last_dec: past,
-            last_inc: past,
+            last_eval: None,
+            last_dec: None,
+            last_inc: None,
         }
     }
 
-    fn update(&mut self, hub: &Hub, clients: &[Arc<crate::hub::Client>]) {
+    /// Steers by what the clients' paths say now; what they can carry together.
+    fn update(&mut self, hub: &Hub, clients: &[Arc<crate::hub::Client>]) -> Capacity {
         let paths: Vec<PathNow> = clients
             .iter()
             .filter(|c| c.started.load(Ordering::Relaxed))
             .map(|c| {
                 let (_, age) = c.backlog();
-                let rtt = match c.min_rtt_ms.load(Ordering::Relaxed) {
-                    0 => 40,
-                    r => r,
-                } as f64;
+                let rtt = c.rtt_ms().unwrap_or(RTT_GUESS_MS) as f64;
                 PathNow {
                     queue_ms: c.queue_ms(),
-                    capacity_kbps: c.capacity_kbps(),
-                    overdue: age as f64 > rtt + 80.0,
+                    capacity: c.capacity(),
+                    overdue: age as f64 > rtt + OVERDUE_MS,
                 }
             })
             .collect();
         self.step(Instant::now(), &paths);
-        hub.target_kbps.store(self.target as u32, Ordering::Relaxed);
+        hub.set_target(self.target);
+        Capacity::of(paths.iter().map(|p| p.capacity))
     }
 
     /// One decision, at most every 100 ms, from what every watched path says now.
     fn step(&mut self, now: Instant, paths: &[PathNow]) {
-        if now.saturating_duration_since(self.last_eval) < Duration::from_millis(100) {
+        let waited = |since: Option<Instant>, time: Duration| {
+            since.is_none_or(|t| now.saturating_duration_since(t) >= time)
+        };
+        if !waited(self.last_eval, Duration::from_millis(100)) {
             return;
         }
-        self.last_eval = now;
-        if paths.is_empty() {
-            return;
-        }
-        let congested = paths.iter().any(|p| p.queue_ms > 30.0 || p.overdue);
-        let clear = paths.iter().all(|p| p.queue_ms <= 15.0);
-        // The slowest path decides; one that hasn't told yet counts as unknown.
-        let capacity = paths
-            .iter()
-            .map(|p| p.capacity_kbps)
-            .try_fold(f64::MAX, |m, c| c.map(|c| m.min(c)));
-        let since = |t: Instant| now.saturating_duration_since(t);
-        match capacity {
+        self.last_eval = Some(now);
+        // The most the target may be, and what it may rise to.
+        let (ceiling, goal) = match Capacity::of(paths.iter().map(|p| p.capacity)) {
+            Capacity::NoViewers => return,
             // An unknown path gets the cautious start, whatever was reached before it.
-            None => self.target = self.target.min(START_KBPS.min(self.max)),
+            Capacity::Unknown => (START.min(self.max), None),
             // A path that got slower is followed down at once, queue or no queue.
-            Some(c) => self.target = self.target.min((c * CAPACITY_SHARE).max(self.min)),
-        }
-        if congested && since(self.last_dec) >= Duration::from_millis(300) {
-            self.target = (self.target * 0.85).max(self.min);
-            self.last_dec = now;
-            log::debug!("rate: congested, target {:.0} kbps", self.target);
-        } else if !congested
-            && clear
-            && since(self.last_dec) >= Duration::from_secs(1)
-            && since(self.last_inc) >= Duration::from_millis(200)
+            Capacity::Known(c) => {
+                let share = c.times(CAPACITY_SHARE);
+                (share.max(self.min), Some(share.min(self.max)))
+            }
+        };
+        self.target = self.target.min(ceiling);
+        let congested = paths
+            .iter()
+            .any(|p| p.queue_ms > QUEUE_CONGESTED_MS || p.overdue);
+        let clear = paths.iter().all(|p| p.queue_ms <= QUEUE_CLEAR_MS);
+        if congested {
+            if waited(self.last_dec, Duration::from_millis(300)) {
+                self.target = self.target.times(0.85).max(self.min);
+                self.last_dec = Some(now);
+                log::debug!("rate: congested, target {:.0} kbps", self.target.get());
+            }
+        } else if clear
+            && waited(self.last_dec, Duration::from_secs(1))
+            && waited(self.last_inc, Duration::from_millis(200))
         {
-            if let Some(c) = capacity {
-                let goal = (c * CAPACITY_SHARE).min(self.max);
-                if self.target < goal {
-                    self.target = (self.target * 1.25 + 100.0).min(goal);
-                    self.last_inc = now;
-                }
+            if let Some(goal) = goal.filter(|&goal| self.target < goal) {
+                self.target = Kbps::new(self.target.get() * 1.25 + 100.0).min(goal);
+                self.last_inc = Some(now);
             }
         }
     }
@@ -493,45 +497,42 @@ impl RateCtl {
 /// How long a frame may take to cross the path: what a burst after stillness may cost
 /// in delay, once.
 const LATENCY_BUDGET: Duration = Duration::from_millis(60);
-
 /// The bits a frame may spend. Tokens come in at the target rate by the time that
 /// really passed, and pile up while the screen is still to what the path carries in
 /// `LATENCY_BUDGET`: so the first frames of a scroll after stillness go out sharp, and
 /// a long run of frames averages the target, which is then what the stream really
 /// sends. A frame never gets less than the target's part of one frame time.
 struct FrameBudget {
-    bits: f64,
+    tokens: Bits,
     at: Instant,
 }
 
 impl FrameBudget {
     fn new(now: Instant) -> Self {
-        FrameBudget { bits: 0.0, at: now }
+        FrameBudget {
+            tokens: Bits::ZERO,
+            at: now,
+        }
     }
 
-    /// The cap (kbit/s, as x264's VBV rate at `fps`) for a frame encoded at `now`.
-    fn cap_kbps(
-        &mut self,
-        now: Instant,
-        target_kbps: f64,
-        capacity_kbps: Option<f64>,
-        fps: u32,
-    ) -> u32 {
-        let fps = fps.max(1) as f64;
-        let steady = target_kbps * 1000.0 / fps;
-        // A path nothing is known about gets two frame times of the target at most.
-        let depth = capacity_kbps.map_or(steady * 2.0, |c| {
-            (c * 1000.0 * LATENCY_BUDGET.as_secs_f64()).max(steady * 2.0)
-        });
-        let dt = now.saturating_duration_since(self.at).as_secs_f64();
+    /// What a frame encoded at `now` may spend.
+    fn allow(&mut self, now: Instant, target: Kbps, capacity: Capacity, fps: u32) -> Bits {
+        let steady = target.over(Duration::from_secs_f64(1.0 / fps.max(1) as f64));
+        let depth = match capacity {
+            Capacity::Known(c) => c.over(LATENCY_BUDGET).max(steady.times(2.0)),
+            // A path nothing is known about gets two frame times of the target at most.
+            Capacity::Unknown | Capacity::NoViewers => steady.times(2.0),
+        };
+        let passed = now.saturating_duration_since(self.at);
         self.at = now;
-        self.bits = (self.bits + target_kbps * 1000.0 * dt).min(depth);
-        (self.bits.max(steady) * fps / 1000.0) as u32
+        self.tokens = (self.tokens + target.over(passed)).min(depth);
+        self.tokens.max(steady)
     }
 
-    /// A frame of `bytes` was sent.
+    /// A lossy frame of `bytes` was sent. What it took beyond the tokens is forgiven:
+    /// the rate cap held it to what `allow` gave.
     fn spend(&mut self, bytes: usize) {
-        self.bits = (self.bits - bytes as f64 * 8.0).max(0.0);
+        self.tokens = (self.tokens - Bits::of_bytes(bytes)).max(Bits::ZERO);
     }
 }
 
@@ -737,12 +738,11 @@ fn capture_loop(
     let paintover_delay = Duration::from_millis(cfg.paintover_delay_ms);
     let mut sharpening = Sharpening::Idle;
     let mut rc = RateCtl::new(
-        cfg.max_kbps as f64,
-        cfg.min_kbps as f64,
-        hub.target_kbps.load(Ordering::Relaxed),
-        Instant::now(),
+        Kbps::new(cfg.max_kbps as f64),
+        Kbps::new(cfg.min_kbps as f64),
+        hub.target(),
     );
-    hub.target_kbps.store(rc.target as u32, Ordering::Relaxed);
+    hub.set_target(rc.target);
     let mut had_clients = false;
     let mut full_next = true;
     let mut refiner = Refiner::new(
@@ -799,7 +799,7 @@ fn capture_loop(
             wait_any(&[cap.fd(), hub.waker.waitable()], 500);
             continue;
         }
-        rc.update(&hub, &clients);
+        let capacity = rc.update(&hub, &clients);
         let want_key = clients
             .iter()
             .any(|c| c.needs_keyframe.load(Ordering::Relaxed));
@@ -1004,6 +1004,8 @@ fn capture_loop(
                 buf,
                 idx,
                 frame,
+                target: rc.target,
+                capacity,
                 captured_at: origin,
                 marker_ms,
             })
@@ -1445,21 +1447,15 @@ fn encode_loop(
             });
             continue;
         }
-        let target = hub.target_kbps.load(Ordering::Relaxed);
         let coding = job.frame.coding(crf, po_crf);
         let mb_dirty = job.frame.mb_dirty();
-        // The slowest watched path's capacity; unknown until every one has told.
-        let capacity = hub
-            .video_clients()
-            .iter()
-            .filter(|c| c.started.load(Ordering::Relaxed))
-            .map(|c| c.capacity_kbps())
-            .try_fold(f64::MAX, |m, c| c.map(|c| m.min(c)))
-            .filter(|&c| c < f64::MAX);
         // Each stripe may use up to twice its area share of the frame's budget, and
         // never more than all of it: what was sent is taken off the budget afterwards,
         // so several stripes moving at once is paid for by the frames that follow.
-        let frame = budget.cap_kbps(t0, target as f64, capacity, fps);
+        let frame = budget
+            .allow(t0, job.target, job.capacity, fps)
+            .a_frame_at(fps)
+            .get() as u32;
         let share = (frame.saturating_mul(2) / n as u32).clamp(1, frame.max(1));
         let ts = job.captured_at.duration_since(epoch).as_millis() as i64;
         // Persistent per-stripe workers keep each encoder's state warm in one core's cache.
@@ -2028,7 +2024,7 @@ mod rate_tests {
                 free: now,
                 flying: VecDeque::new(),
                 est: PathEst::new(now),
-                rc: RateCtl::new(max_kbps, 2000.0, 0, now),
+                rc: RateCtl::new(Kbps::new(max_kbps), Kbps::new(2000.0), None),
                 budget: FrameBudget::new(now),
                 worst_wait: Duration::ZERO,
                 worst_share: 1.0,
@@ -2055,7 +2051,7 @@ mod rate_tests {
                 .map_or(Duration::ZERO, |f| self.now.duration_since(f.1));
             let path = PathNow {
                 queue_ms: self.est.queue_ms(self.now, self.flying.is_empty()),
-                capacity_kbps: self.est.capacity_bps().map(|b| b / 1000.0),
+                capacity: self.est.capacity(),
                 overdue: oldest > self.rtt + Duration::from_millis(80),
             };
             self.rc.step(self.now, &[path]);
@@ -2063,11 +2059,11 @@ mod rate_tests {
             if want == 0 || oldest > self.rtt + Duration::from_millis(120) {
                 return;
             }
-            let cap = self
+            // x264 under the rate cap: a frame holds at most what the budget allows.
+            let room = self
                 .budget
-                .cap_kbps(self.now, self.rc.target, path.capacity_kbps, FPS);
-            // x264 under a VBV of `cap` at FPS: a frame holds at most one frame time of it.
-            let room = (cap as f64 * 1000.0 / FPS as f64 / 8.0) as usize;
+                .allow(self.now, self.rc.target, Capacity::of([path.capacity]), FPS)
+                .bytes() as usize;
             let bytes = want.min(room).max(200);
             self.budget.spend(bytes);
             let start = self.free.max(self.now);
@@ -2161,7 +2157,7 @@ mod rate_tests {
         sim.run(120, rest);
         sim.run(40, |_| 45_000);
         sim.run(600, rest);
-        let learned = sim.rc.target;
+        let learned = sim.rc.target.get();
         assert!(
             learned >= 0.85 * 30_000.0,
             "target {learned} after one scroll"
@@ -2171,9 +2167,9 @@ mod rate_tests {
             sim.run(3, |_| 80_000);
         }
         assert!(
-            sim.rc.target >= learned,
+            sim.rc.target.get() >= learned,
             "target fell from {learned} to {}",
-            sim.rc.target
+            sim.rc.target.get()
         );
     }
 
@@ -2210,9 +2206,9 @@ mod rate_tests {
         sim.run(120, rest);
         sim.run(60 * 5, |_| 60_000);
         assert!(
-            sim.rc.target > 20_000.0,
+            sim.rc.target.get() > 20_000.0,
             "target {} on 40 Mbit/s",
-            sim.rc.target
+            sim.rc.target.get()
         );
         sim.rate = 4_000_000.0;
         sim.run(60 * 15, |_| 60_000);
@@ -2229,26 +2225,29 @@ mod rate_tests {
 
     #[test]
     fn a_frame_gets_its_steady_share_and_no_more_than_the_latency_budget() {
-        // Whatever the tokens, a frame's cap is at least the target's part of one frame
+        // Whatever the tokens, a frame may spend at least the target's part of one frame
         // time, and at most what the path carries in the latency budget.
         let mut rng = Rng(0xBF58476D1CE4E5B9);
         let t0 = Instant::now();
+        let frame_time = Duration::from_secs_f64(1.0 / FPS as f64);
         for _ in 0..500 {
             let mut b = FrameBudget::new(t0);
-            let target = rng.range(500, 30_000) as f64;
-            let capacity = (rng.range(0, 3) > 0).then(|| rng.range(500, 100_000) as f64);
+            let target = Kbps::new(rng.range(500, 30_000) as f64);
+            let capacity = match rng.range(0, 3) {
+                0 => Capacity::Unknown,
+                _ => Capacity::Known(Kbps::new(rng.range(500, 100_000) as f64)),
+            };
             let mut now = t0;
             for _ in 0..200 {
                 now += Duration::from_micros(rng.range(100, 3_000_000));
-                let cap = b.cap_kbps(now, target, capacity, FPS);
-                assert!(cap as f64 + 1.0 >= target, "cap {cap}, target {target}");
-                if let Some(c) = capacity {
-                    let most = (c * LATENCY_BUDGET.as_secs_f64() * FPS as f64).max(target * 2.0);
-                    assert!(
-                        cap as f64 <= most + 1.0,
-                        "cap {cap} over the latency budget {most}"
-                    );
-                }
+                let may = b.allow(now, target, capacity, FPS);
+                let steady = target.over(frame_time);
+                assert!(may >= steady, "{may:?} under the steady share {steady:?}");
+                let most = match capacity {
+                    Capacity::Known(c) => c.over(LATENCY_BUDGET).max(steady.times(2.0)),
+                    Capacity::Unknown | Capacity::NoViewers => steady.times(2.0),
+                };
+                assert!(may <= most, "{may:?} over the latency budget {most:?}");
                 b.spend(rng.range(0, 400_000) as usize);
             }
         }
