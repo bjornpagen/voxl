@@ -25,7 +25,9 @@ const CAPACITY_AGREE: usize = 3;
 /// size over this long and no more, so a path faster than thought reads low until
 /// bigger frames cross it, and never high.
 const MIN_WIRE_MS: f64 = 5.0;
-/// Before any rate is known, the size (beyond the baseline's frame) that can tell one.
+/// Before any rate is known, the size (beyond the baseline's frame) that can tell one
+/// whatever it took: on a fast path nothing takes `MIN_WIRE_MS`, and the first rate has
+/// to come from a frame's size over that floor.
 const PROBE_BYTES: usize = 16 << 10;
 /// A capacity sample needs a baseline that has seen this many acks, or the first big
 /// frame of a session would be measured against itself.
@@ -211,7 +213,11 @@ impl PathEst {
         let extra_bits = bytes.saturating_sub(base_bytes) as f64 * 8.0;
         let tells = match self.capacity {
             Some(bps) => extra_bits >= bps * MIN_WIRE_MS / 1000.0,
-            None => bytes >= base_bytes + PROBE_BYTES,
+            // Before any rate is known: a big frame, or on a slow path any frame that
+            // did take that long.
+            None => {
+                bytes >= base_bytes + PROBE_BYTES || (extra_bits > 0.0 && excess_ms >= MIN_WIRE_MS)
+            }
         };
         if tells && self.base_samples >= BASE_SAMPLES {
             while self
@@ -391,6 +397,38 @@ mod tests {
             assert!(
                 (got - rate).abs() <= rate * 0.001,
                 "rate {rate}, rtt {rtt} ms: estimated {got}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_slow_path_shows_its_rate_through_small_frames() {
+        // A stream that never sends a big frame, on a path slow enough that its frames
+        // take time to cross: the rate is read from them, where a fixed size to qualify
+        // would wait for a frame that never comes.
+        let mut rng = Rng(0x2545F4914F6CDD1D);
+        for _ in 0..200 {
+            let rate = rng.range(500_000, 4_000_000) as f64;
+            let t0 = Instant::now();
+            let mut link = Link::new(rate, rng.range(5, 200), t0);
+            let mut est = PathEst::new(t0);
+            let mut frames = trickle(t0, 30, 16, 300);
+            let mut t = t0 + Duration::from_secs(1);
+            for _ in 0..40 {
+                // 5 to 12 ms of wire time each, far enough apart never to queue.
+                let bytes = (rate * rng.range(5_000, 12_000) as f64 / 8e6) as usize + 300;
+                frames.push((t, bytes));
+                t += Duration::from_millis(rng.range(40, 200));
+            }
+            assert!(frames.iter().all(|f| f.1 < PROBE_BYTES), "rate {rate}");
+            run(&mut est, &mut link, &frames);
+            let got = est
+                .capacity()
+                .map(Kbps::bps)
+                .expect("frames took time to cross");
+            assert!(
+                (got - rate).abs() <= rate * 0.001,
+                "rate {rate}: estimated {got}"
             );
         }
     }
