@@ -5,7 +5,7 @@ use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 pub enum Out {
@@ -32,6 +32,9 @@ pub struct Client {
     pub started: AtomicBool,
     /// What the acks say about the path: its baseline delay, its capacity, its queue.
     pub path: Mutex<crate::path::PathEst>,
+    /// How long the client keeps a frame between its arrival and the ack (decode, draw,
+    /// frames ahead of it), as it reports it: smoothed ms, 0 for a client that doesn't.
+    pub client_ms: Mutex<f64>,
 }
 
 impl Client {
@@ -39,8 +42,12 @@ impl Client {
         let _ = self.tx.send(m);
     }
 
-    pub fn on_ack(&self, id: u32) {
+    /// Frame `id` (and every one before it) was shown. `held_ms`, from a client that
+    /// says, is how long it kept the frame after it arrived: the client's time, not the
+    /// path's, so the delay sample ends that much earlier.
+    pub fn on_ack(&self, id: u32, held_ms: Option<f64>) {
         let now = Instant::now();
+        let held = held_ms.filter(|h| h.is_finite() && *h > 0.0);
         let mut q = self.inflight.lock();
         let mut sample = None;
         while let Some(f) = q.front() {
@@ -55,7 +62,14 @@ impl Client {
         }
         drop(q);
         if let Some((sent, bytes)) = sample {
-            self.path.lock().on_ack(now, sent, bytes);
+            let arrived = held
+                .and_then(|h| now.checked_sub(Duration::from_secs_f64(h / 1000.0)))
+                .map_or(now, |t| t.max(sent));
+            self.path.lock().on_ack(arrived, sent, bytes);
+        }
+        if let Some(h) = held_ms.filter(|h| h.is_finite() && *h >= 0.0) {
+            let mut m = self.client_ms.lock();
+            *m = *m * 0.9 + h * 0.1;
         }
     }
 
@@ -288,6 +302,7 @@ impl Hub {
             needs_keyframe: AtomicBool::new(true),
             started: AtomicBool::new(false),
             path: Mutex::new(crate::path::PathEst::new(Instant::now())),
+            client_ms: Mutex::new(0.0),
         });
         self.clients.lock().push(c.clone());
         c
@@ -359,5 +374,47 @@ impl Hub {
             client.send(Out::Text("{\"t\":\"close\"}".into()));
         }
         Some(crate::mac::DisplayRequest { id, sender, ready })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Acks frame `id` as if it spent `path_ms` on the path, then `held_ms` in the client.
+    fn ack(c: &Client, id: u32, path_ms: u64, held_ms: f64, says: bool) {
+        let sent = Instant::now() - Duration::from_millis(path_ms + held_ms as u64);
+        c.inflight.lock().push_back(Inflight {
+            id,
+            sent,
+            bytes: 2000,
+        });
+        c.on_ack(id, says.then_some(held_ms));
+    }
+
+    /// The time a client keeps a frame (decoding, drawing) is its own, not the path's:
+    /// frames it was slow to show don't read as a queue once it says how long it took.
+    #[test]
+    fn the_clients_own_time_is_not_queueing() {
+        let hub = Hub::new();
+        for says in [true, false] {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let c = hub.add_client(tx);
+            for id in 1..=20 {
+                ack(&c, id, 50, 2.0, says);
+            }
+            for id in 21..=40 {
+                ack(&c, id, 50, 40.0, says);
+            }
+            let q = c.queue_ms();
+            if says {
+                assert!(q < 5.0, "{q:.1} ms of queue from a client that said");
+            } else {
+                assert!(
+                    q > 15.0,
+                    "{q:.1} ms: the old ack should still read the queue"
+                );
+            }
+        }
     }
 }

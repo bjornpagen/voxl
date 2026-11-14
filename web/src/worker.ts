@@ -40,6 +40,8 @@ interface PendingFrame {
 	need: number;
 	got: StripeFrame[];
 	t0: number;
+	/** When its last part arrived. */
+	arrived: number;
 }
 let layout: Stripe[] = [];
 const stripes: StripeState[] = [];
@@ -243,7 +245,7 @@ function flush() {
 					g.frame.close();
 				}
 		}
-		send(cmd.ack(id));
+		send(cmd.ack(id, performance.now() - f.arrived));
 		st.frames++;
 		st.decodeMs += performance.now() - f.t0;
 	}
@@ -255,11 +257,12 @@ function onVideo(b: Uint8Array) {
 	st.bytes += b.length;
 	let f = frames.get(h.frame);
 	if (!f) {
-		f = { need: h.parts, got: [], t0: performance.now() };
+		f = { need: h.parts, got: [], t0: performance.now(), arrived: 0 };
 		frames.set(h.frame, f);
 		order.push(h.frame);
 		st.pipeMs += h.pipe / 10;
 	}
+	f.arrived = performance.now();
 	const sd = stripeState(h.stripe);
 	if (sd.waitingKey && !h.key) {
 		f.need--;

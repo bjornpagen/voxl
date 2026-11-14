@@ -59,7 +59,9 @@ export type ServerMessage =
 
 /** Text commands to the server. */
 export const cmd = {
-	ack: (frame: number) => `a,${frame}`,
+	/** A frame was shown, `held` ms after it finished arriving (decode, draw, frames
+	 * ahead of it): the server takes that out of the path's delay. */
+	ack: (frame: number, held: number) => `a,${frame},${held.toFixed(1)}`,
 	move: (x: number, y: number) => `m,${x},${y}`,
 	button: (button: number, down: boolean) => `b,${button},${down ? 1 : 0}`,
 	/** Scroll in desktop pixels; the server turns it into smooth scrolling or wheel clicks. */

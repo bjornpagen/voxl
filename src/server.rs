@@ -176,7 +176,8 @@ async fn stats(State(s): State<AppState>) -> Response {
         .map(|c| {
             let (n, age) = c.backlog();
             serde_json::json!({"id": c.id, "video": c.video.load(Ordering::Relaxed), "inflight": n, "oldest_ms": age,
-                "min_rtt_ms": c.min_rtt_ms.load(Ordering::Relaxed), "queue_ms": c.queue_ms() as u64, "capacity_kbps": c.capacity_kbps().map(|k| k as u64)})
+                "min_rtt_ms": c.min_rtt_ms.load(Ordering::Relaxed), "queue_ms": c.queue_ms() as u64, "capacity_kbps": c.capacity_kbps().map(|k| k as u64),
+                "client_ms": (*c.client_ms.lock() * 10.0).round() / 10.0})
         })
         .collect();
     let body = serde_json::json!({
@@ -351,7 +352,8 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
         }
         "a" => {
             if let Some(id) = num::<u32>(&mut it) {
-                c.on_ack(id);
+                // An older client sends no hold time.
+                c.on_ack(id, num::<f64>(&mut it));
                 s.hub.wake();
             }
         }
@@ -461,6 +463,7 @@ mod tests {
     /// Every command the web client sends (web/src/protocol.ts), with arguments.
     const ALL: &[&str] = &[
         "a,1",
+        "a,2,3.5",
         "m,10,20",
         "b,1,1",
         "b,1,0",
