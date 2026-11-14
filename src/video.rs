@@ -36,8 +36,8 @@ struct Job {
     idx: usize,
     force_idr: bool,
     paintover: bool,
-    /// Last pass of a paint-over burst.
-    paintover_final: bool,
+    /// The blocks this frame sharpens, to be cleared once it came out sharp.
+    sharpen: Option<Sharpen>,
     /// Rows that changed in this capture.
     band: Option<Band>,
     /// Per-macroblock change map for this capture (None: analyse everything).
@@ -45,6 +45,17 @@ struct Job {
     captured_at: Instant,
     marker_ms: i64,
 }
+
+/// Blocks a frame sharpens, as the Refiner saw them when the frame was captured.
+struct Sharpen {
+    map: Arc<Vec<u8>>,
+    /// Refiner time (ms) of the capture: blocks that changed after it stay pending.
+    at_ms: u32,
+}
+
+/// A buffer back from the encoder, with the blocks it sharpened if it came out at
+/// paint-over quality.
+type Returned = (usize, Box<I420>, Option<Sharpen>);
 
 fn union(a: Option<Band>, b: Band) -> Band {
     match a {
@@ -60,7 +71,7 @@ fn union(a: Option<Band>, b: Band) -> Band {
 struct Pipeline {
     cap: Capturer,
     job_tx: mpsc::SyncSender<Job>,
-    ret_rx: mpsc::Receiver<(usize, Box<I420>)>,
+    ret_rx: mpsc::Receiver<Returned>,
     encode: std::thread::JoinHandle<()>,
 }
 
@@ -186,7 +197,7 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
     );
 
     let (job_tx, job_rx) = mpsc::sync_channel::<Job>(1);
-    let (ret_tx, ret_rx) = mpsc::channel::<(usize, Box<I420>)>();
+    let (ret_tx, ret_rx) = mpsc::channel::<Returned>();
     let layout = stripe_layout(h, cfg.stripes);
     let mut stripes = Vec::new();
     for &(y, sh) in &layout {
@@ -446,11 +457,16 @@ impl FrameBudget {
 /// Regional sharpening. Blocks encoded while they changed carry motion-level quality;
 /// once a block has been still for a while it is re-encoded at paint-over quality,
 /// even while other parts of the screen keep moving (a playing video would otherwise
-/// keep the frame-level paint-over from ever running).
+/// keep the frame-level paint-over from ever running). A block stays pending until a
+/// frame that re-encoded it came out at paint-over quality (`sharpened`): one the rate
+/// cap squeezed leaves it for the next pass.
 struct Refiner {
     epoch: Instant,
     changed_ms: Vec<u32>,
     pending: Vec<bool>,
+    /// Sharpened on a frame that also carried motion since the block last changed:
+    /// once is enough while things move, the rest waits for the screen to go still.
+    tried: Vec<bool>,
     last_refine: Instant,
     cols: usize,
 }
@@ -464,6 +480,7 @@ impl Refiner {
             epoch: Instant::now(),
             changed_ms: vec![0; blocks],
             pending: vec![false; blocks],
+            tried: vec![false; blocks],
             last_refine: Instant::now(),
             cols,
         }
@@ -476,6 +493,7 @@ impl Refiner {
         for (i, &d) in dirty.iter().enumerate() {
             if d != 0 {
                 self.pending[i] = true;
+                self.tried[i] = false;
                 self.changed_ms[i] = now;
             }
         }
@@ -483,10 +501,17 @@ impl Refiner {
     fn mark_all(&mut self) {
         let now = self.now();
         self.pending.fill(true);
+        self.tried.fill(false);
         self.changed_ms.fill(now);
     }
-    fn clear_all(&mut self) {
-        self.pending.fill(false);
+    /// A frame captured at `at_ms` coded `map`'s blocks at paint-over quality: they are
+    /// sharp now, unless they changed again since.
+    fn sharpened(&mut self, map: &[u8], at_ms: u32) {
+        for (i, &m) in map.iter().enumerate() {
+            if m != 0 && self.changed_ms[i] <= at_ms {
+                self.pending[i] = false;
+            }
+        }
     }
     /// Every block not yet sharpened (1 = encode) and the row band they span.
     fn pending_map(&self) -> Option<(Vec<u8>, Band)> {
@@ -522,9 +547,12 @@ impl Refiner {
         let mut map = vec![0u8; self.pending.len()];
         let (mut r0, mut r1, mut any) = (usize::MAX, 0, false);
         for (i, m) in map.iter_mut().enumerate() {
-            if self.pending[i] && now.saturating_sub(self.changed_ms[i]) >= REFINE_STILL_MS {
+            if self.pending[i]
+                && !self.tried[i]
+                && now.saturating_sub(self.changed_ms[i]) >= REFINE_STILL_MS
+            {
                 *m = 1;
-                self.pending[i] = false;
+                self.tried[i] = true;
                 let row = i / self.cols;
                 r0 = r0.min(row);
                 r1 = r1.max(row + 1);
@@ -558,7 +586,7 @@ fn capture_loop(
     cfg: VideoConfig,
     hub: Arc<Hub>,
     job_tx: mpsc::SyncSender<Job>,
-    ret_rx: mpsc::Receiver<(usize, Box<I420>)>,
+    ret_rx: mpsc::Receiver<Returned>,
 ) -> Result<(), String> {
     let (w, h) = (cap.width as usize, cap.height as usize);
     let mut pool: Vec<Option<Box<I420>>> = vec![
@@ -572,7 +600,11 @@ fn capture_loop(
     let min_interval = interval.mul_f64(0.85);
     let interval_ms = interval.as_secs_f64() * 1000.0;
     let mut last_capture = Instant::now() - interval;
-    let mut last_motion = Instant::now();
+    // Sharpening comes in bursts of `paintover_burst` passes, the first once the screen
+    // has been still for `paintover_delay_ms`, the next that long after a burst that
+    // left blocks pending, until none are.
+    let paintover_delay = Duration::from_millis(cfg.paintover_delay_ms);
+    let mut sharpen_at = Instant::now();
     let mut paintover_left = 0u32;
     let mut rc = RateCtl::new(
         cfg.max_kbps as f64,
@@ -619,8 +651,11 @@ fn capture_loop(
                 let _ = tx.send(shot.clone());
             }
         }
-        while let Ok((i, b)) = ret_rx.try_recv() {
+        while let Ok((i, b, sharp)) = ret_rx.try_recv() {
             pool[i] = Some(b);
+            if let Some(s) = sharp {
+                refiner.sharpened(&s.map, s.at_ms);
+            }
         }
         let clients = hub.video_clients();
         if clients.is_empty() {
@@ -642,14 +677,14 @@ fn capture_loop(
             cap.damaged = true;
             full_next = true;
         }
-        let paintover_due = paintover_left > 0
-            && last_motion.elapsed() >= Duration::from_millis(cfg.paintover_delay_ms);
+        let paintover_due = paintover_left > 0 && Instant::now() >= sharpen_at;
         if !cap.damaged && !want_key && !paintover_due {
             let timeout = if paintover_left == 0 {
                 100
             } else {
-                cfg.paintover_delay_ms
-                    .saturating_sub(last_motion.elapsed().as_millis() as u64) as i32
+                sharpen_at
+                    .saturating_duration_since(Instant::now())
+                    .as_millis() as i32
                     + 1
             };
             wait_any(&[cap.fd(), hub.waker.waitable()], timeout);
@@ -682,7 +717,12 @@ fn capture_loop(
         // Need a free buffer (the encoder may still hold the other).
         if pool[next_idx].is_none() {
             match ret_rx.recv_timeout(Duration::from_millis(50)) {
-                Ok((i, b)) => pool[i] = Some(b),
+                Ok((i, b, sharp)) => {
+                    pool[i] = Some(b);
+                    if let Some(s) = sharp {
+                        refiner.sharpened(&s.map, s.at_ms);
+                    }
+                }
                 Err(_) => continue,
             }
             if pool[next_idx].is_none() {
@@ -765,13 +805,19 @@ fn capture_loop(
 
         let mut refine = None;
         let paintover = if is_motion {
-            last_motion = Instant::now();
+            sharpen_at = Instant::now() + paintover_delay;
             paintover_left = cfg.paintover_burst;
             // Piggyback sharpening of blocks that have gone still on this frame.
             refine = if want_key { None } else { refiner.due() };
             refine.is_some()
         } else if paintover_due {
             paintover_left -= 1;
+            if paintover_left == 0 {
+                // Another burst once the budget has refilled, if this one leaves
+                // anything pending; an empty pending map ends it.
+                paintover_left = cfg.paintover_burst;
+                sharpen_at = Instant::now() + paintover_delay;
+            }
             hub.stats.paintovers.fetch_add(1, Ordering::Relaxed);
             true
         } else {
@@ -785,10 +831,8 @@ fn capture_loop(
             refiner.mark_all();
         }
         let frame_paintover = paintover && refine.is_none();
-        if frame_paintover && paintover_left == 0 {
-            refiner.clear_all();
-        }
         // A refinement frame encodes what moved plus what is due; everything else stays skipped.
+        let mut sharpen = None;
         let mb_map = if want_key {
             None
         } else if frame_paintover {
@@ -797,7 +841,9 @@ fn capture_loop(
                     Some(x) => union(Some(x), b),
                     None => b,
                 });
-                Arc::new(m)
+                let m = Arc::new(m);
+                sharpen = Some(m.clone());
+                m
             })
         } else if let Some((rmap, rband)) = refine.take() {
             band = Some(match band {
@@ -805,9 +851,10 @@ fn capture_loop(
                 None => rband,
             });
             let mut m = mb_dirty.take().unwrap_or_else(|| vec![1; rmap.len()]);
-            for (d, r) in m.iter_mut().zip(rmap) {
+            for (d, r) in m.iter_mut().zip(&rmap) {
                 *d |= r;
             }
+            sharpen = Some(Arc::new(rmap));
             hub.stats.refines.fetch_add(1, Ordering::Relaxed);
             Some(Arc::new(m))
         } else {
@@ -821,7 +868,10 @@ fn capture_loop(
                 idx,
                 force_idr: want_key,
                 paintover,
-                paintover_final: frame_paintover && paintover_left == 0,
+                sharpen: sharpen.map(|map| Sharpen {
+                    map,
+                    at_ms: refiner.now(),
+                }),
                 mb_dirty: mb_map,
                 band,
                 captured_at: origin,
@@ -886,7 +936,9 @@ struct StripeJob {
     mb_cols: usize,
 }
 
-type StripeResult = (usize, Option<(bool, Vec<u8>)>);
+/// A stripe's output (keyframe, bytes), if any, and whether it came out at the CRF it
+/// was given: the rate cap raised none of its quantizers.
+type StripeResult = (usize, Option<(bool, Vec<u8>)>, bool);
 
 /// x264's sliced threading costs ~3x the CPU of one thread on desktop content (and on
 /// small updates is even slower), so a stripe encodes single-threaded and only fans out
@@ -1177,6 +1229,7 @@ fn stripe_worker(
                 }
             }
         }
+        let at_crf = r.as_ref().is_ok_and(|e| e.crf_avg < crf + 0.5);
         let res = match r {
             Ok(e) => {
                 let size = is_motion.then(|| MotionSize {
@@ -1193,7 +1246,7 @@ fn stripe_worker(
                 None
             }
         };
-        if done.send((i, res)).is_err() {
+        if done.send((i, res, at_crf)).is_err() {
             return;
         }
     }
@@ -1202,7 +1255,7 @@ fn stripe_worker(
 fn encode_loop(
     stripes_in: Vec<Stripe>,
     rx: mpsc::Receiver<Job>,
-    ret: mpsc::Sender<(usize, Box<I420>)>,
+    ret: mpsc::Sender<Returned>,
     hub: Arc<Hub>,
     crf: f32,
     po_crf: f32,
@@ -1213,9 +1266,8 @@ fn encode_loop(
     let fps = stripes_in.first().map_or(60, |s| s.cfg.fps);
     let mut budget = FrameBudget::new(epoch);
     let debug_stripes = std::env::var("VOXL_DEBUG_STRIPES").is_ok();
-    // Geometry and paint-over bookkeeping stay here; encoders move to their workers.
-    let mut stripes: Vec<(usize, usize, bool)> =
-        stripes_in.iter().map(|s| (s.y, s.h, false)).collect();
+    // Geometry stays here; encoders move to their workers.
+    let stripes: Vec<(usize, usize)> = stripes_in.iter().map(|s| (s.y, s.h)).collect();
     let (done_tx, done_rx) = mpsc::channel::<StripeResult>();
     let workers: Vec<(mpsc::Sender<StripeJob>, std::thread::JoinHandle<()>)> = stripes_in
         .into_iter()
@@ -1232,18 +1284,18 @@ fn encode_loop(
         .collect();
     while let Ok(job) = rx.recv() {
         let t0 = Instant::now();
+        // A sharpening frame's band covers the blocks it sharpens.
         let selected: Vec<bool> = stripes
             .iter()
-            .map(|&(y, h, touched)| {
+            .map(|&(y, h)| {
                 job.force_idr
-                    || (job.paintover && touched)
                     || job
                         .band
                         .is_some_and(|b| (b.y0 as usize) < y + h && (b.y1 as usize) > y)
             })
             .collect();
         if !selected.iter().any(|&x| x) {
-            let _ = ret.send((job.idx, job.buf));
+            let _ = ret.send((job.idx, job.buf, None));
             continue;
         }
         let target = hub.target_kbps.load(Ordering::Relaxed);
@@ -1267,11 +1319,9 @@ fn encode_loop(
         let mut pending = 0;
         for (i, &on) in selected.iter().enumerate() {
             if on {
-                let cap = if job.paintover {
-                    share.saturating_mul(2)
-                } else {
-                    share
-                };
+                // Sharpening spends from the same budget as motion: what the budget
+                // doesn't cover now is left pending for a later pass.
+                let cap = share;
                 let _ = workers[i].0.send(StripeJob {
                     buf: buf_ptr,
                     ts,
@@ -1286,23 +1336,14 @@ fn encode_loop(
             }
         }
         let mut results: Vec<Option<(bool, Vec<u8>)>> = (0..n).map(|_| None).collect();
+        let mut sharp = true;
         for _ in 0..pending {
-            if let Ok((i, r)) = done_rx.recv() {
+            if let Ok((i, r, at_crf)) = done_rx.recv() {
                 results[i] = r;
+                sharp &= at_crf;
             }
         }
-        let _ = ret.send((job.idx, job.buf));
-        for (y, h, touched) in stripes.iter_mut() {
-            if job.paintover_final {
-                *touched = false;
-            }
-            if job
-                .band
-                .is_some_and(|b| (b.y0 as usize) < *y + *h && (b.y1 as usize) > *y)
-            {
-                *touched = true;
-            }
-        }
+        let _ = ret.send((job.idx, job.buf, job.sharpen.filter(|_| sharp)));
         let parts: Vec<(usize, bool, Vec<u8>)> = results
             .into_iter()
             .enumerate()
@@ -1660,6 +1701,25 @@ mod tests {
         );
         let lowered = corrected.iter().filter(|f| f.crf != crf).count();
         assert_eq!(lowered, 0, "{lowered} noise frames got a lowered CRF");
+    }
+
+    /// A block stays pending until a frame that sharpened it comes back sharp, and one
+    /// that changed again after that frame was captured stays pending even then.
+    #[test]
+    fn only_what_came_out_sharp_is_cleared() {
+        let mut r = Refiner::new(4, 2);
+        r.mark(&[1, 1, 1, 0]);
+        let (map, _) = r.pending_map().unwrap();
+        let at = r.now();
+        // The pass went out squeezed: nothing comes back, so the next pass has it all.
+        assert_eq!(r.pending_map().unwrap().0, map);
+        std::thread::sleep(Duration::from_millis(2));
+        r.mark(&[0, 1, 0, 0]);
+        r.sharpened(&map, at);
+        assert_eq!(r.pending_map().unwrap().0, vec![0, 1, 0, 0]);
+        let (map, _) = r.pending_map().unwrap();
+        r.sharpened(&map, r.now());
+        assert!(r.pending_map().is_none());
     }
 
     /// Once the screen goes still the paint-overs show x264 forgetting the drag, so the
