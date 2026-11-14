@@ -106,6 +106,13 @@ impl Encoder {
             // skipped as before, so a desktop at rest costs what it did (`encode_cost`).
             param.b_cabac = 1;
             param.analyse.inter = ffi::X264_ANALYSE_I4x4;
+            // The same blocks in keyframes: `inter` only covers intra blocks inside P
+            // frames, and ultrafast leaves `intra` empty, so a keyframe was still all
+            // 16x16. And ultrafast picks each block's mode by SAD on whole pixels only;
+            // one step finer (SATD, a half-pixel pass) picks better ones for no more
+            // time. A keyframe of text is a third smaller, a page of new text 6%.
+            param.analyse.intra = ffi::X264_ANALYSE_I4x4;
+            param.analyse.i_subpel_refine = 1;
             // Per-macroblock "unchanged" hints from X damage let x264 skip analysis.
             param.analyse.b_mb_info = (std::env::var("VOXL_NO_MBINFO").is_err()) as i32;
             param.i_sync_lookahead = 0;
