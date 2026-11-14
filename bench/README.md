@@ -31,6 +31,12 @@ is its log. CBR from 30 Mbps, with congestion control down to 2 Mbps.
 
 - `nclient.py voxl|selkies host:port secs [x y]`: native client (FFmpeg decode)
   that reads the marker at (x, y). Reports unique FPS, latency and Mbps.
+- `linkviewer.py host:port scenario out`: a headless viewer behind an emulated link (a
+  rate and a round trip, an unbounded queue served in order, like `shaper.py`). It acks
+  each frame once its last part has crossed the link, after a decode hold (3 ms, or a
+  software decoder's with `--hold`, reported in the ack with `--report-hold`), and can
+  scroll and type into a terminal on the benchmark display (`--fifo`). It does not decode:
+  it is for rate control, and writes when each message arrived and each ack left.
 - `kclient.py host:port secs [x y]`: native KasmVNC client. Speaks RFB over its
   WebSocket the way KasmVNC's web client does (same pixel format and encodings,
   including JPEG, WebP and CopyRect, continuous updates and fences), keeps a full
