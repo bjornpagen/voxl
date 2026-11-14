@@ -246,6 +246,28 @@ pub struct Encoded {
     pub crf_avg: f32,
 }
 
+/// Whether x264 coded a frame at the CRF it was asked for.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Quality {
+    AsAsked,
+    /// The rate cap raised its quantizers.
+    Squeezed,
+}
+
+impl Encoded {
+    /// Whether the rate cap left the frame at `crf`. `crf_avg` is `crf` plus what the cap
+    /// added to the frame's average QP, before the frame and within it. Every macroblock's
+    /// QP is a whole step, so a frame the cap left alone averages within half a step of
+    /// `crf`: under that is rounding, at or over it a raised quantizer.
+    pub fn quality(&self, crf: f32) -> Quality {
+        if self.crf_avg < crf + 0.5 {
+            Quality::AsAsked
+        } else {
+            Quality::Squeezed
+        }
+    }
+}
+
 impl Drop for Encoder {
     fn drop(&mut self) {
         unsafe { ffi::x264_encoder_close(self.h) }
