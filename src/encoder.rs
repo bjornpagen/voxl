@@ -89,6 +89,15 @@ impl Encoder {
             // those shifts (a third of the bits for a window drag) for about the same CPU.
             param.analyse.i_me_method = ffi::X264_ME_UMH as i32;
             param.analyse.i_me_range = 64;
+            // What a scroll or a page of new text costs is the pixels that weren't on the
+            // screen before, and ultrafast codes those the dearest way H.264 has: whole
+            // 16x16 blocks, with the simple entropy coder. Text is edges a few pixels wide:
+            // 4x4 intra blocks follow them, and CABAC packs what is left. Together a
+            // scrolling page of text costs 30% fewer bits at the same quantizer for about
+            // 2 ms more a frame at 3024x1898 (`scroll_cost` below); unchanged areas are
+            // skipped as before, so a desktop at rest costs what it did (`encode_cost`).
+            param.b_cabac = 1;
+            param.analyse.inter = ffi::X264_ANALYSE_I4x4;
             // Per-macroblock "unchanged" hints from X damage let x264 skip analysis.
             param.analyse.b_mb_info = (std::env::var("VOXL_NO_MBINFO").is_err()) as i32;
             param.i_sync_lookahead = 0;
@@ -238,6 +247,75 @@ impl Drop for Encoder {
 #[cfg(test)]
 mod bench {
     use super::*;
+
+    /// A full-screen page of text-like lines scrolled `D` px a frame (default 132):
+    /// motion the search finds, plus `D` rows of new text every frame.
+    /// D=132 cargo test --release scroll_cost -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn scroll_cost() {
+        let (w, h) = (3024usize, 1898usize);
+        let step: usize = std::env::var("D")
+            .ok()
+            .and_then(|t| t.parse().ok())
+            .unwrap_or(132);
+        let mut enc = Encoder::new(&EncoderConfig {
+            width: w as u32,
+            height: h as u32,
+            fps: 60,
+            preset: "ultrafast".into(),
+            threads: 4,
+            crf: 24.0,
+            max_kbps: 0,
+        })
+        .unwrap();
+        let mut y = vec![0u8; w * h];
+        let (u, v) = (vec![128u8; w * h / 4], vec![128u8; w * h / 4]);
+        let mut out = Vec::new();
+        let (mut bytes, mut total) = (0usize, std::time::Duration::ZERO);
+        let (frames, warm) = (40, 5);
+        for f in 0..frames {
+            for row in 0..h {
+                let r = row + f * step;
+                let line = (r / 44) as u64;
+                for x in 0..w {
+                    // 22x44 cells, each a "glyph" of light strokes on dark, its own per
+                    // line and column.
+                    let cell = (x / 22) as u64;
+                    let g = (cell.wrapping_mul(2654435761) ^ line.wrapping_mul(0x9E3779B97F4A7C15))
+                        >> 11;
+                    let (gx, gy) = (x % 22, r % 44);
+                    let ink = gy > 6
+                        && gy < 36
+                        && gx > 2
+                        && gx < 19
+                        && (g >> (((gx / 3) + (gy / 6) * 5) % 40)) & 1 == 1;
+                    y[row * w + x] = if ink { 200 } else { 12 };
+                }
+            }
+            let planes = Planes {
+                y: &y,
+                u: &u,
+                v: &v,
+                stride_y: w,
+                stride_uv: w / 2,
+            };
+            out.clear();
+            let t = std::time::Instant::now();
+            enc.encode(&planes, f as i64 * 16, f == 0, None, None, &mut out)
+                .unwrap();
+            if f >= warm {
+                total += t.elapsed();
+                bytes += out.len();
+            }
+        }
+        let n = (frames - warm) as f64;
+        println!(
+            "scroll {step} px/frame: {:.1} KB/frame, {:.1} ms/frame",
+            bytes as f64 / n / 1024.0,
+            total.as_secs_f64() * 1000.0 / n
+        );
+    }
 
     /// cargo test --release encode_cost -- --ignored --nocapture
     #[test]
