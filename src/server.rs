@@ -318,81 +318,160 @@ fn send_input(hub: &Hub, client: &Client, event: InputEvent) {
     }
 }
 
-/// Commands a --read-only viewer may send: acks, video and audio on/off, keyframe
-/// requests and ping replies. Everything else acts on the desktop (input, clipboard,
-/// microphone, resizing) and is dropped. The web client keeps the same list.
-const READ_ONLY_COMMANDS: &[&str] = &["a", "v", "au", "kf", "po"];
+/// A text command from a viewer (web/src/protocol.ts), parsed once where it arrives.
+enum Command {
+    /// `a,<frame>[,<hold ms>]`
+    Ack { frame: u32, hold: crate::hub::Hold },
+    /// `m,<x>,<y>`
+    Move { x: i32, y: i32 },
+    /// `b,<button>,<1|0>`
+    Button { button: u8, down: bool },
+    /// `s,<dx>,<dy>`: wheel ticks.
+    Scroll { dx: i32, dy: i32 },
+    /// `sp,<dx>,<dy>`: desktop pixels.
+    ScrollPx { dx: f64, dy: f64 },
+    /// `k,<keysym>,<1|0>`
+    Key { keysym: u32, down: bool },
+    /// `r`
+    ReleaseAll,
+    /// `c,<text>`: the text is everything after the first comma.
+    Clipboard(String),
+    /// `v,<1|0>`
+    Video(bool),
+    /// `au,<1|0>`
+    Audio(bool),
+    /// `mi,<1|0>`
+    Mic(bool),
+    /// `sz,<w>,<h>`: the desktop size the viewer's window wants.
+    Resize { w: u32, h: u32 },
+    /// `kf`
+    Keyframe,
+    /// `po,<sent>`: a ping's reply.
+    Pong { sent: u64 },
+    /// `ds,<id>`: switch to another display.
+    #[cfg(target_os = "macos")]
+    Display(u32),
+}
+
+impl Command {
+    /// The command `t` is, if it is one this server knows, well formed.
+    fn parse(t: &str) -> Option<Command> {
+        let (name, rest) = t.split_once(',').unwrap_or((t, ""));
+        let mut it = rest.split(',');
+        let flag = |v: &str| match v {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        };
+        Some(match name {
+            "a" => Command::Ack {
+                frame: num(&mut it)?,
+                hold: crate::hub::Hold::parse(it.next()),
+            },
+            "m" => Command::Move {
+                x: num(&mut it)?,
+                y: num(&mut it)?,
+            },
+            "b" => Command::Button {
+                button: num(&mut it)?,
+                down: flag(it.next()?)?,
+            },
+            "s" => Command::Scroll {
+                dx: num(&mut it)?,
+                dy: num(&mut it)?,
+            },
+            "sp" => {
+                let (dx, dy) = rest.split_once(',')?;
+                Command::ScrollPx {
+                    dx: dx.trim().parse().ok()?,
+                    dy: dy.trim().parse().ok()?,
+                }
+            }
+            "k" => Command::Key {
+                keysym: num(&mut it)?,
+                down: flag(it.next()?)?,
+            },
+            "r" => Command::ReleaseAll,
+            "c" => Command::Clipboard(rest.to_string()),
+            "v" => Command::Video(flag(rest)?),
+            "au" => Command::Audio(flag(rest)?),
+            "mi" => Command::Mic(flag(rest)?),
+            "sz" => Command::Resize {
+                w: num(&mut it)?,
+                h: num(&mut it)?,
+            },
+            "kf" => Command::Keyframe,
+            "po" => Command::Pong {
+                sent: num(&mut it)?,
+            },
+            #[cfg(target_os = "macos")]
+            "ds" => Command::Display(rest.parse().ok()?),
+            _ => return None,
+        })
+    }
+
+    /// Whether a --read-only viewer may send it: what watching needs (acks, video,
+    /// audio, keyframe requests, ping replies). Everything else acts on the desktop
+    /// (input, clipboard, microphone, resizing, displays). Checked right where commands
+    /// are applied, so a client that ignores the hello flag cannot drive the desktop;
+    /// web/src/client/main.ts keeps the same list.
+    fn watches(&self) -> bool {
+        match self {
+            Command::Ack { .. }
+            | Command::Video(_)
+            | Command::Audio(_)
+            | Command::Keyframe
+            | Command::Pong { .. } => true,
+            Command::Move { .. }
+            | Command::Button { .. }
+            | Command::Scroll { .. }
+            | Command::ScrollPx { .. }
+            | Command::Key { .. }
+            | Command::ReleaseAll
+            | Command::Clipboard(_)
+            | Command::Mic(_)
+            | Command::Resize { .. } => false,
+            #[cfg(target_os = "macos")]
+            Command::Display(_) => false,
+        }
+    }
+}
 
 fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collections::VecDeque<u32>) {
-    let (cmd, rest) = t.split_once(',').unwrap_or((t, ""));
-    // --read-only: accept only what watching needs, right where commands are applied,
-    // so a client that ignores the hello flag cannot drive the desktop, whatever
-    // commands are added later.
-    if s.read_only && !READ_ONLY_COMMANDS.contains(&cmd) {
+    let Some(command) = Command::parse(t) else {
+        return;
+    };
+    if s.read_only && !command.watches() {
         return;
     }
     let input = |ev| send_input(&s.hub, c, ev);
-    let mut it = rest.split(',');
-    match cmd {
+    match command {
         #[cfg(target_os = "macos")]
-        "ds" => {
-            if let Ok(id) = rest.parse() {
-                match crate::mac::request_display(&s.hub, id, c.id) {
-                    Ok(true) => {}
-                    result => {
-                        if let Err(e) = result {
-                            log::warn!("display switch: {e}");
-                        }
-                        c.needs_keyframe.store(true, Ordering::Relaxed);
-                        c.send(Out::Text(s.hub.hello()));
-                        s.hub.wake();
-                    }
+        Command::Display(id) => match crate::mac::request_display(&s.hub, id, c.id) {
+            Ok(true) => {}
+            result => {
+                if let Err(e) = result {
+                    log::warn!("display switch: {e}");
                 }
-            }
-        }
-        "a" => {
-            if let Some(id) = num::<u32>(&mut it) {
-                c.on_ack(Instant::now(), id, crate::hub::Hold::parse(it.next()));
+                c.needs_keyframe.store(true, Ordering::Relaxed);
+                c.send(Out::Text(s.hub.hello()));
                 s.hub.wake();
             }
+        },
+        Command::Ack { frame, hold } => {
+            c.on_ack(Instant::now(), frame, hold);
+            s.hub.wake();
         }
-        "m" => {
-            if let (Some(x), Some(y)) = (num(&mut it), num(&mut it)) {
-                input(InputEvent::Move { x, y });
-            }
-        }
-        "b" => {
-            if let (Some(button), Some(d)) = (num::<u8>(&mut it), num::<u8>(&mut it)) {
-                input(InputEvent::Button {
-                    button,
-                    down: d == 1,
-                });
-            }
-        }
-        "s" => {
-            if let (Some(dx), Some(dy)) = (num(&mut it), num(&mut it)) {
-                input(InputEvent::Scroll { dx, dy });
-            }
-        }
-        "sp" => {
-            if let (Some(dx), Some(dy)) = (num::<f64>(&mut it), num::<f64>(&mut it)) {
-                input(InputEvent::ScrollPx { dx, dy });
-            }
-        }
-        "k" => {
-            if let (Some(keysym), Some(d)) = (num::<u32>(&mut it), num::<u8>(&mut it)) {
-                input(InputEvent::Key {
-                    keysym,
-                    down: d == 1,
-                });
-            }
-        }
-        "r" => input(InputEvent::ReleaseAll),
-        "c" => input(InputEvent::Clipboard(crate::desktop::ClipContent::Text(
-            rest.to_string(),
-        ))),
-        "v" => {
-            let on = rest == "1";
+        Command::Move { x, y } => input(InputEvent::Move { x, y }),
+        Command::Button { button, down } => input(InputEvent::Button { button, down }),
+        Command::Scroll { dx, dy } => input(InputEvent::Scroll { dx, dy }),
+        Command::ScrollPx { dx, dy } => input(InputEvent::ScrollPx { dx, dy }),
+        Command::Key { keysym, down } => input(InputEvent::Key { keysym, down }),
+        Command::ReleaseAll => input(InputEvent::ReleaseAll),
+        Command::Clipboard(text) => input(InputEvent::Clipboard(
+            crate::desktop::ClipContent::Text(text),
+        )),
+        Command::Video(on) => {
             c.video.store(on, Ordering::Relaxed);
             if on {
                 c.inflight.lock().clear();
@@ -401,30 +480,29 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
             }
             s.hub.wake();
         }
-        "au" => c.audio.store(rest == "1" && s.audio, Ordering::Relaxed),
-        "mi" => {
+        Command::Audio(on) => c.audio.store(on && s.audio, Ordering::Relaxed),
+        Command::Mic(on) => {
             if let Some(tx) = &s.mic {
-                let _ = tx.send(if rest == "1" {
+                let _ = tx.send(if on {
                     crate::mic::MicMsg::Start(c.id)
                 } else {
                     crate::mic::MicMsg::Stop(c.id)
                 });
             }
         }
-        // sz,w,h: the desktop size this client's window wants (dynamic resolution).
-        // The latest request wins; the video thread clamps it and applies it.
-        "sz" if s.resize => {
+        // The desktop size this client's window wants (dynamic resolution). The latest
+        // request wins; the video thread clamps it and applies it.
+        Command::Resize { w, h } => {
+            if !s.resize {
+                return;
+            }
             #[cfg(target_os = "macos")]
             let input = s.hub.input.lock();
             #[cfg(target_os = "macos")]
             if input.is_none() || c.id < s.hub.input_floor.load(Ordering::Relaxed) {
                 return;
             }
-            if let (Some(w), Some(h), Some(max)) = (
-                num::<u32>(&mut it),
-                num::<u32>(&mut it),
-                *s.hub.resize_max.lock(),
-            ) {
+            if let Some(max) = *s.hub.resize_max.lock() {
                 let want = crate::screen::fit(w, h, max);
                 let current = (
                     s.hub.width.load(Ordering::Relaxed),
@@ -434,24 +512,21 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
                 s.hub.wake();
             }
         }
-        "kf" => {
+        Command::Keyframe => {
             c.started.store(false, Ordering::Relaxed);
             c.needs_keyframe.store(true, Ordering::Relaxed);
             s.hub.wake();
         }
-        "po" => {
-            if let Some(sent) = num::<u64>(&mut it) {
-                let now = s.epoch.elapsed().as_micros() as u64;
-                let rtt = (now.saturating_sub(sent) / 1000) as u32;
-                rtts.push_back(rtt.max(1));
-                if rtts.len() > 20 {
-                    rtts.pop_front();
-                }
-                c.min_rtt_ms
-                    .store(*rtts.iter().min().unwrap(), Ordering::Relaxed);
+        Command::Pong { sent } => {
+            let now = s.epoch.elapsed().as_micros() as u64;
+            let rtt = (now.saturating_sub(sent) / 1000) as u32;
+            rtts.push_back(rtt.max(1));
+            if rtts.len() > 20 {
+                rtts.pop_front();
             }
+            c.min_rtt_ms
+                .store(*rtts.iter().min().unwrap(), Ordering::Relaxed);
         }
-        _ => {}
     }
 }
 
@@ -540,6 +615,24 @@ mod tests {
         assert!(input >= 9, "{input} input events");
         assert_eq!(mic, 1);
         assert!(resized);
+    }
+
+    /// Every command the web client sends parses here (a display switch only on
+    /// macOS), and one that is malformed is no command at all.
+    #[test]
+    fn commands_are_parsed_once_at_the_door() {
+        for c in ALL {
+            let known = Command::parse(c).is_some();
+            assert!(
+                known || (c.starts_with("ds,") && !cfg!(target_os = "macos")),
+                "{c}"
+            );
+        }
+        for c in [
+            "v,2", "v", "a", "a,x", "k,65", "b,1,7", "sp,1", "po,-1", "zz,1",
+        ] {
+            assert!(Command::parse(c).is_none(), "{c} parsed");
+        }
     }
 
     #[test]
