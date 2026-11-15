@@ -3144,68 +3144,34 @@ mod tests {
         }
     }
 
-    /// What came of a frame in four states per stripe, against the two they replace (the
-    /// oracle: the parent's StripeOut, worker and encode loop, as they were): over
-    /// generated frames of 1-8 stripes, each untouched, failed, or coded by x264 (a
-    /// keyframe or not, at a CRF average either side of as asked, with bytes or none, a
-    /// picture x264 put nothing out for reading as one it didn't fill in), the frame comes
-    /// out as sharp, as much a whole keyframe, and with the same parts.
+    /// What came of a frame, from what came of it in each stripe: over generated frames
+    /// of 1-8 stripes, each untouched, failed, or coded by x264 (a keyframe or not, at a
+    /// CRF average either side of as asked, with bytes or none, a picture x264 put
+    /// nothing out for reading as one it didn't fill in), the frame is sharp when every
+    /// stripe it touched was coded as asked or put nothing out, a whole keyframe when
+    /// every stripe put out a keyframe, and its parts are the stripes that put out bytes,
+    /// in order.
     #[test]
     fn a_frame_comes_out_as_its_stripes_did() {
-        enum OldOut {
-            Failed,
-            Sent {
-                key: bool,
-                bytes: Vec<u8>,
-                quality: Quality,
-            },
-        }
-        type Parts = Vec<(usize, bool, Vec<u8>)>;
-        fn old(n: usize, selected: &[bool], results: Vec<OldOut>) -> (bool, bool, Parts) {
-            let sharp = selected.iter().zip(&results).all(|(&on, r)| {
-                !on || matches!(
-                    r,
-                    OldOut::Sent {
-                        quality: Quality::AsAsked,
-                        ..
-                    }
-                )
-            });
-            let parts: Vec<(usize, bool, Vec<u8>)> = results
-                .into_iter()
-                .enumerate()
-                .filter_map(|(i, r)| match r {
-                    OldOut::Sent { key, bytes, .. } => {
-                        (bytes.len() > Header::LEN).then_some((i, key, bytes))
-                    }
-                    OldOut::Failed => None,
-                })
-                .collect();
-            let all_key = parts.len() == n && parts.iter().all(|p| p.1);
-            (sharp, all_key, parts)
-        }
-
         let mut g = Gen(0xD1B54A32D192ED03);
         // Frames that came out sharp, not sharp, a whole keyframe, and with an empty stripe.
         let mut reached = [0; 4];
         for case in 0..20_000 {
             let n = 1 + g.below(8) as usize;
-            let (mut selected, mut olds, mut news) = (vec![], vec![], vec![]);
-            for _ in 0..n {
+            let mut outs = vec![];
+            let (mut sharp, mut all_key, mut parts, mut empty) = (true, true, vec![], false);
+            for i in 0..n {
                 let crf = g.below(52) as f32;
                 match g.below(5) {
                     0 => {
-                        selected.push(false);
-                        olds.push(OldOut::Failed);
-                        news.push(StripeOut::Skipped);
+                        outs.push(StripeOut::Skipped);
+                        all_key = false;
                     }
                     1 => {
-                        selected.push(true);
-                        olds.push(OldOut::Failed);
-                        news.push(StripeOut::Failed);
+                        outs.push(StripeOut::Failed);
+                        (sharp, all_key) = (false, false);
                     }
                     _ => {
-                        selected.push(true);
                         let len = match g.below(4) {
                             0 => 0,
                             _ => 1 + g.below(64) as usize,
@@ -3225,36 +3191,37 @@ mod tests {
                         };
                         let mut bytes = vec![0; Header::LEN];
                         bytes.extend(g.bytes(len));
-                        olds.push(OldOut::Sent {
-                            key: e.keyframe,
-                            quality: e.quality(crf),
-                            bytes: bytes.clone(),
-                        });
+                        sharp &= len == 0 || e.crf_avg < crf + 0.5;
+                        all_key &= len > 0 && e.keyframe;
+                        empty |= len == 0;
+                        if len > 0 {
+                            parts.push((i, e.keyframe, bytes.clone()));
+                        }
                         let at = Instant::now();
                         let coded = Coded {
                             woke: at,
                             x264: at,
                             encoded: at,
                         };
-                        news.push(StripeOut::coded(&e, crf, bytes, coded));
+                        outs.push(StripeOut::coded(&e, crf, bytes, coded));
                     }
                 }
             }
-            let empty = news.iter().any(|o| matches!(o, StripeOut::Empty));
-            let want = old(n, &selected, olds);
-            let out = FrameOut(news);
-            let (sharp, all_key) = (out.sharp(), out.all_key());
-            // When each stripe was coded is the timeline's, and none of the old parts'.
-            let parts: Parts = out
+            let out = FrameOut(outs);
+            let (got_sharp, got_key) = (out.sharp(), out.all_key());
+            // When each stripe was coded is the timeline's, and not the model's.
+            let got: Vec<(usize, bool, Vec<u8>)> = out
                 .into_parts()
                 .into_iter()
                 .map(|(i, key, bytes, _)| (i, key, bytes))
                 .collect();
-            let got = (sharp, all_key, parts);
-            reached[usize::from(!want.0)] += 1;
-            reached[2] += usize::from(want.1);
-            reached[3] += usize::from(empty && want.0);
-            assert!(got == want, "case {case}: {:?} for {:?}", got.0, want.0);
+            reached[usize::from(!sharp)] += 1;
+            reached[2] += usize::from(all_key);
+            reached[3] += usize::from(empty && sharp);
+            assert!(
+                (got_sharp, got_key, got) == (sharp, all_key, parts),
+                "case {case}"
+            );
         }
         assert!(
             reached.iter().all(|&r| r >= 200),
