@@ -86,7 +86,7 @@ hyper-util = { version = "0.1", features = [
 ] }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", features = ["fs", "poll", "time"] }
+nix = { version = "0.31", features = ["fs", "poll", "signal", "time"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = [

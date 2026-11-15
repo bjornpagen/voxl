@@ -486,34 +486,37 @@ impl Wake {
     }
 }
 
-/// Blocks until one of `w` is ready.
-pub fn wait_event(w: &[Waitable]) {
-    wait_any(w, -1)
-}
-
-/// Blocks until one of `w` is ready or `timeout_ms` passes (negative: no timeout).
-pub fn wait_any(w: &[Waitable], timeout_ms: i32) {
+/// Blocks until one of `w` is ready or `timeout` passes, with no limit if it is None.
+/// It allocates nothing. Linux and Android wait to the nanosecond (`ppoll`); other Unix
+/// systems and Windows count whole milliseconds, rounded up so a wait never ends early.
+pub fn wait_any<const N: usize>(w: [Waitable; N], timeout: Option<std::time::Duration>) {
     #[cfg(unix)]
     {
-        use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
-        let mut p: Vec<PollFd> = w
-            .iter()
-            .map(|&fd| PollFd::new(fd, PollFlags::POLLIN))
-            .collect();
-        let _ = poll(
+        use nix::poll::{PollFd, PollFlags};
+        let mut p = w.map(|fd| PollFd::new(fd, PollFlags::POLLIN));
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let _ = nix::poll::ppoll(
             &mut p,
-            PollTimeout::try_from(timeout_ms).unwrap_or(PollTimeout::NONE),
+            timeout.map(nix::sys::time::TimeSpec::from_duration),
+            None,
+        );
+        // Whole milliseconds, rounded up; one past what `poll` counts (24 days) is no limit.
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let _ = nix::poll::poll(
+            &mut p,
+            timeout
+                .and_then(|t| nix::poll::PollTimeout::try_from(t.as_micros().div_ceil(1000)).ok()),
         );
     }
     #[cfg(windows)]
     {
         use std::os::windows::io::AsRawHandle;
         use windows::Win32::Foundation::HANDLE;
-        let hs: Vec<HANDLE> = w.iter().map(|h| HANDLE(h.as_raw_handle())).collect();
-        let ms = if timeout_ms < 0 {
-            windows::Win32::System::Threading::INFINITE
-        } else {
-            timeout_ms as u32
+        let hs = w.map(|h| HANDLE(h.as_raw_handle()));
+        // Whole milliseconds, rounded up; one past what the call counts (49 days) is no limit.
+        let ms = match timeout.and_then(|t| u32::try_from(t.as_micros().div_ceil(1000)).ok()) {
+            Some(ms) => ms,
+            None => windows::Win32::System::Threading::INFINITE,
         };
         unsafe { windows::Win32::System::Threading::WaitForMultipleObjects(&hs, false, ms) };
     }

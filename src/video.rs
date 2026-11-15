@@ -4,7 +4,7 @@ use crate::capture::{Band, Capturer};
 use crate::convert::I420;
 use crate::encoder::{Encoded, Encoder, EncoderConfig, Fps, Pictures, Planes, Preset, Quality};
 use crate::env::{Debugging, Marker};
-use crate::hub::{wait_any, wait_event};
+use crate::hub::wait_any;
 use crate::hub::{Backlog, Client, Hub, Out, ServerMessage, Takes, Viewer};
 use crate::path::Kbps;
 use crate::rate::{Bounds, FrameBudget, RateCtl, RTT_GUESS_MS};
@@ -855,8 +855,7 @@ enum Wait {
     Change,
     /// The sharpening pass due in this long, or damage or a wake.
     Pass(Duration),
-    /// The rest of the least interval since the last capture, or a wake. It ends on
-    /// time: the whole milliseconds are polled for, and under one is slept.
+    /// The rest of the least interval since the last capture, or a wake.
     Interval(Duration),
     /// The rest of the coalesce window, whatever happens.
     Settle(Duration),
@@ -879,34 +878,21 @@ enum On {
 
 impl Wait {
     fn wait(self, cap: &Capturer, hub: &Hub) {
-        let events = [cap.fd(), hub.waker.waitable()];
-        let poll = |on, ms: Option<i32>| {
-            let fds = match on {
-                On::Event => &events[..],
-                On::Wake => &events[1..],
-            };
-            match ms {
-                Some(ms) => wait_any(fds, ms),
-                None => wait_event(fds),
-            }
+        let poll = |on, timeout| match on {
+            On::Event => wait_any([cap.fd(), hub.waker.waitable()], timeout),
+            On::Wake => wait_any([hub.waker.waitable()], timeout),
         };
         self.through(poll, std::thread::sleep);
     }
 
-    /// The wait, made through `poll` (for whole milliseconds, up from the microsecond,
-    /// or with no limit) or `sleep`.
-    fn through(self, poll: impl FnOnce(On, Option<i32>), sleep: impl FnOnce(Duration)) {
-        let ms = |d: Duration| Some(d.as_micros().div_ceil(1000) as i32);
+    /// The wait, made through `poll` (until its time, or with no limit) or `sleep`.
+    fn through(self, poll: impl FnOnce(On, Option<Duration>), sleep: impl FnOnce(Duration)) {
         match self {
             Wait::Change => poll(On::Event, None),
-            Wait::Pass(due) => poll(On::Event, ms(due)),
-            // `poll` counts whole milliseconds: the rest of one is slept.
-            Wait::Interval(rest) => match rest.as_millis() {
-                0 => sleep(rest),
-                ms => poll(On::Wake, Some(ms as i32)),
-            },
+            Wait::Pass(due) => poll(On::Event, Some(due)),
+            Wait::Interval(rest) => poll(On::Wake, Some(rest)),
             Wait::Settle(rest) => sleep(rest),
-            Wait::Gate(stalls) => poll(On::Event, ms(stalls)),
+            Wait::Gate(stalls) => poll(On::Event, Some(stalls)),
             Wait::Buffer => poll(On::Wake, None),
         }
     }
@@ -3709,16 +3695,13 @@ mod tests {
         assert_eq!(cases, CASES);
     }
 
-    /// Each wait wakes on what it waits for, and on its time: a change on damage or a
-    /// wake, with no limit; a pass on damage or a wake, or once due, in whole milliseconds
-    /// less than one late; the gate the same way, until a viewer stalls; a buffer only on
-    /// a wake, with no limit; the coalesce window as a sleep of exactly its rest; the
-    /// interval only on a wake or after its whole milliseconds, and under one as a sleep
-    /// of exactly its rest, so it never ends late. Over every wait `step` makes in
-    /// `each_case`.
+    /// Each wait wakes on what it waits for, and ends on its time: a change on damage or
+    /// a wake, with no limit; a pass on damage or a wake, or once due; the interval only on
+    /// a wake, or once over; the gate on damage or a wake, or once a viewer will have
+    /// stalled; a buffer only on a wake, with no limit; the coalesce window as a sleep of
+    /// exactly its rest. Over every wait `step` makes in `each_case`.
     #[test]
     fn a_wait_wakes_on_what_it_waits_for() {
-        let ms = |ms: i32| Duration::from_millis(ms as u64);
         let mut waits = 0;
         each_case(|c| {
             let Step::Wait(wait) = step(&c.look()) else {
@@ -3726,24 +3709,16 @@ mod tests {
             };
             waits += 1;
             let (mut polled, mut slept) = (None, None);
-            wait.through(|on, m| polled = Some((on, m)), |t| slept = Some(t));
-            // A poll for whole milliseconds less than one late.
-            let up_to = |time: Duration, m: i32| {
-                ms(m) + Duration::from_micros(1) > time && ms(m) < time + ms(1)
+            wait.through(|on, t| polled = Some((on, t)), |t| slept = Some(t));
+            let want = match wait {
+                Wait::Change => (Some((On::Event, None)), None),
+                Wait::Pass(due) => (Some((On::Event, Some(due))), None),
+                Wait::Interval(rest) => (Some((On::Wake, Some(rest))), None),
+                Wait::Settle(rest) => (None, Some(rest)),
+                Wait::Gate(stalls) => (Some((On::Event, Some(stalls))), None),
+                Wait::Buffer => (Some((On::Wake, None)), None),
             };
-            let ok = match (wait, polled, slept) {
-                (Wait::Change, Some((On::Event, None)), None) => true,
-                (Wait::Buffer, Some((On::Wake, None)), None) => true,
-                (Wait::Pass(due), Some((On::Event, Some(m))), None) => up_to(due, m),
-                (Wait::Interval(rest), Some((On::Wake, Some(m))), None) => {
-                    m > 0 && ms(m) <= rest && rest < ms(m + 1)
-                }
-                (Wait::Interval(rest), None, Some(t)) => t == rest && rest < ms(1),
-                (Wait::Gate(stalls), Some((On::Event, Some(m))), None) => up_to(stalls, m),
-                (Wait::Settle(rest), None, Some(t)) => t == rest,
-                _ => false,
-            };
-            assert!(ok, "{wait:?}: polled {polled:?}, slept {slept:?}");
+            assert_eq!((polled, slept), want, "{wait:?}");
         });
         assert!(waits > 0);
     }
