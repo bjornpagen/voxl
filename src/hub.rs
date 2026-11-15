@@ -293,8 +293,19 @@ pub enum Takes {
 }
 
 /// What asking for a keyframe makes of a viewer: one that watches wants one, at once,
-/// whatever is on its way.
+/// whatever is on its way. One already promised a keyframe keeps that promise: a request
+/// already granted changes nothing, and asking again would plan a second keyframe.
 fn asked(viewer: Viewer) -> Viewer {
+    match viewer {
+        Viewer::NotWatching => Viewer::NotWatching,
+        Viewer::Promised => Viewer::Promised,
+        Viewer::Waiting | Viewer::Behind | Viewer::Started => Viewer::Waiting,
+    }
+}
+
+/// What starting the stream over makes of a viewer: one that watches waits for a keyframe
+/// of the new stream. A keyframe planned for it went with the old one.
+fn restarted(viewer: Viewer) -> Viewer {
     match viewer {
         Viewer::NotWatching => Viewer::NotWatching,
         Viewer::Waiting | Viewer::Behind | Viewer::Promised | Viewer::Started => Viewer::Waiting,
@@ -392,7 +403,8 @@ impl Client {
     }
 
     /// It asks for a keyframe (`kf`, or a hello after a failed display switch): if it
-    /// watches, it wants one at once, whatever is on its way.
+    /// watches, it wants one at once, whatever is on its way, unless one is already
+    /// promised it.
     pub fn ask_keyframe(&self) {
         let mut v = self.viewing.lock();
         v.viewer = asked(v.viewer);
@@ -403,7 +415,7 @@ impl Client {
     pub fn start_over(&self, now: Instant) {
         let mut v = self.viewing.lock();
         v.forget(now);
-        v.viewer = asked(v.viewer);
+        v.viewer = restarted(v.viewer);
     }
 
     /// At `now` a capture goes to the viewers that have room. One that has started and
@@ -974,10 +986,12 @@ mod tests {
         let mut m = before.clone();
         let c = &mut m.c;
         let (mut planned, mut sent) = (false, vec![]);
-        // Asking for a keyframe: one that watches wants it at once.
+        // Asking for a keyframe: one that watches wants it at once, unless one is already
+        // promised it.
         let asked = |(v, n): (Viewer, usize)| match v {
             NotWatching => (NotWatching, n),
-            Waiting | Behind | Promised | Started => (Waiting, n),
+            Promised => (Promised, n),
+            Waiting | Behind | Started => (Waiting, n),
         };
         match step {
             Step::Watch(i) | Step::Record(i) => c[i] = (Waiting, 0),
@@ -991,6 +1005,7 @@ mod tests {
                     }
                     c.1 = 0;
                 }
+                m.held.clear();
             }
             Step::Capture => {
                 planned = c.iter().any(|c| c.0 == Waiting);
@@ -1008,7 +1023,7 @@ mod tests {
                     if starts[i] && c.0 == Promised {
                         *c = match whole {
                             true => (Started, 0),
-                            false => asked(*c),
+                            false => (Waiting, c.1),
                         };
                     }
                     match c.0 {
@@ -1045,20 +1060,24 @@ mod tests {
 
     /// Whether the hub takes `step` in this state: a recording begins only on a new
     /// client; a capture leaves behind only a client that has started, with frames in
-    /// flight; a
-    /// restart comes once the encoder has sent what it held; the encoder holds two frames
-    /// at most and sends only what it holds, and only a keyframe comes out whole.
+    /// flight; a restart may come with frames the old stream never sent (a keyframe
+    /// planned for a viewer whose job never reached an encoder that is gone), which it
+    /// drops; the encoder holds two frames at most and sends only what it holds, and only
+    /// a keyframe comes out whole.
     fn applies(m: &Model, step: Step) -> bool {
         match step {
             Step::Record(i) => m.fresh[i],
             Step::Stall(i) => m.c[i].0 == Viewer::Started && m.c[i].1 > 0,
-            Step::Restart => m.held.is_empty(),
             Step::Capture => m.held.len() < 2,
             Step::Send { whole } => match m.held.first() {
                 None => false,
                 Some(held) => !whole || held.is_some(),
             },
-            Step::Watch(_) | Step::StopWatching(_) | Step::AskKeyframe(_) | Step::Ack(_) => true,
+            Step::Watch(_)
+            | Step::StopWatching(_)
+            | Step::AskKeyframe(_)
+            | Step::Ack(_)
+            | Step::Restart => true,
         }
     }
 
@@ -1095,7 +1114,10 @@ mod tests {
                 // Its frames went at `t0`: it has stalled `STALLED` later.
                 c[i].falls_behind(t0 + crate::video::STALLED);
             }
-            Step::Restart => hub.restart_clients(t0),
+            Step::Restart => {
+                hub.restart_clients(t0);
+                after.held.clear();
+            }
             Step::Capture => {
                 let viewers = hub.viewers();
                 planned = viewers.iter().any(|(_, v)| *v == Viewer::Waiting);
@@ -1162,7 +1184,8 @@ mod tests {
     /// client, a stall, `restart_clients`, a capture, a frame sent, an ack), breadth first,
     /// every step from every state, run on a real hub's clients through the methods: each
     /// step does what the rule says, the hub reads each client as its value is, a client
-    /// that starts was promised a keyframe and was sent a whole one, and from every state,
+    /// that starts was promised a keyframe and was sent a whole one, a request for a keyframe
+    /// already promised changes nothing, and from every state,
     /// once the encoder has sent what it holds, one capture and its keyframe sent whole
     /// start every viewer watching.
     #[test]
@@ -1176,8 +1199,9 @@ mod tests {
         let mut seen = std::collections::HashSet::from([start.clone()]);
         let mut frontier = vec![start];
         let mut steps = 0;
-        // Viewers that asked for a keyframe with frames on their way.
-        let mut asked_with_frames = 0;
+        // Viewers that asked for a keyframe with frames on their way, and while one was
+        // promised them.
+        let (mut asked_with_frames, mut asked_while_promised) = (0, 0);
         for _depth in 0..12 {
             let mut next = vec![];
             for before in frontier {
@@ -1209,10 +1233,17 @@ mod tests {
                         "{what}"
                     );
                     // A viewer that asks for a keyframe is promised one by the next capture,
-                    // whatever is on its way.
-                    if let (Step::AskKeyframe(i), true) = (step, applies(&after, Step::Capture)) {
-                        let (planned, _, then, _) = new_step(&hub, &after, Step::Capture);
-                        if after.c[i].0 != Viewer::NotWatching {
+                    // whatever is on its way; one already promised one keeps that promise,
+                    // and its request changes nothing.
+                    if let Step::AskKeyframe(i) = step {
+                        if before.c[i].0 == Viewer::Promised {
+                            assert_eq!(after.c, before.c, "{what}");
+                            assert_eq!(after.held, before.held, "{what}");
+                            asked_while_promised += 1;
+                        } else if after.c[i].0 != Viewer::NotWatching
+                            && applies(&after, Step::Capture)
+                        {
+                            let (planned, _, then, _) = new_step(&hub, &after, Step::Capture);
                             assert!(planned && then.c[i].0 == Viewer::Promised, "{what}");
                             asked_with_frames += usize::from(after.c[i].1 > 0);
                         }
@@ -1257,7 +1288,10 @@ mod tests {
         let reached: std::collections::HashSet<Viewer> =
             seen.iter().flat_map(|m| m.c.map(|c| c.0)).collect();
         assert_eq!(reached.len(), 5, "{reached:?}");
-        assert!(steps > 0 && asked_with_frames > 0, "{asked_with_frames}");
+        assert!(
+            steps > 0 && asked_with_frames > 0 && asked_while_promised > 0,
+            "{asked_with_frames} {asked_while_promised}"
+        );
     }
 
     /// What a client's window says at `at`: what its path carries, what is on its way,
