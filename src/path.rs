@@ -24,13 +24,13 @@ const CAPACITY_AGREE: usize = 3;
 /// its delay is all jitter. One that should take longer and didn't proves a rate of its
 /// size over this long and no more, so a path faster than thought reads low until
 /// bigger frames cross it, and never high.
-const MIN_WIRE_MS: f64 = 5.0;
+const MIN_WIRE: Duration = Duration::from_millis(5);
 /// Before any rate is known, the size (beyond the baseline's frame) that can tell one
-/// whatever it took: on a fast path nothing takes `MIN_WIRE_MS`, and the first rate has
+/// whatever it took: on a fast path nothing takes `MIN_WIRE`, and the first rate has
 /// to come from a frame's size over that floor.
 const PROBE_BYTES: usize = 16 << 10;
 /// A frame too small to tell a rate by its size can still show a slow path by its time:
-/// sent with nothing ahead of it, it took `MIN_WIRE_MS` or more. One such frame is as
+/// sent with nothing ahead of it, it took `MIN_WIRE` or more. One such frame is as
 /// likely a late ack as a slow path, so they count only as a run: `CAPACITY_AGREE` or
 /// more in a row, with no frame between them that was on time, over at least this long.
 /// Jitter comes in spikes and leaves frames on time between them; a slow path does not.
@@ -183,11 +183,6 @@ impl Lowest {
     }
 }
 
-/// A delay in milliseconds, for the arithmetic that needs a float.
-fn ms(delay: Duration) -> f64 {
-    delay.as_secs_f64() * 1000.0
-}
-
 /// Send->ack delays turned into the three things flow control needs.
 ///
 /// A frame's delay beyond the baseline is the time its extra bytes took on the wire
@@ -202,7 +197,7 @@ fn ms(delay: Duration) -> f64 {
 /// that waited behind nothing; flow control gives it that. Where it matters that is not
 /// assumed but checked against `clean`, the smallest delay of frames sent with nothing
 /// of ours ahead of them: such a frame did not queue, so a baseline no more than
-/// `MIN_WIRE_MS` under it did not either.
+/// `MIN_WIRE` under it did not either.
 pub struct PathEst {
     base: Lowest,
     clean: Lowest,
@@ -213,7 +208,7 @@ pub struct PathEst {
     /// The run of frames, each sent with nothing ahead of it, that were too small to
     /// tell a rate by size and still took time to cross (see `SLOW_RUN`).
     slow: Vec<Rate>,
-    queue_ms: f64,
+    queue: Duration,
     queue_at: Instant,
 }
 
@@ -232,7 +227,7 @@ impl PathEst {
             acked: None,
             rates: VecDeque::new(),
             slow: Vec::new(),
-            queue_ms: 0.0,
+            queue: Duration::ZERO,
             queue_at: now,
         }
     }
@@ -245,14 +240,14 @@ impl PathEst {
             bytes,
         };
         let base = self.base.push(now, ack);
-        let excess_ms = ms(ack.delay) - ms(base.delay);
+        let excess = ack.delay - base.delay;
         // What the path was known to carry before this frame.
         let known = agreed(&self.rates);
         // The baseline did not queue: a frame known not to have was no slower.
         let trusted = |clean: &Lowest| {
             clean
                 .get()
-                .is_some_and(|clean| ms(clean.delay) <= ms(base.delay) + MIN_WIRE_MS)
+                .is_some_and(|clean| clean.delay <= base.delay + MIN_WIRE)
         };
         // This frame did not queue behind ours. Either nothing was unacknowledged when
         // it went, which is a fact whatever the path. Or the frame before it had left
@@ -276,13 +271,13 @@ impl PathEst {
         let extra_bits = bytes.saturating_sub(base.bytes) as f64 * 8.0;
         let rate = Rate {
             at: now,
-            bps: extra_bits / (excess_ms.max(MIN_WIRE_MS) / 1000.0),
+            bps: extra_bits / excess.max(MIN_WIRE).as_secs_f64(),
         };
-        // Big enough to tell a rate: the path should take `MIN_WIRE_MS` to carry it.
+        // Big enough to tell a rate: the path should take `MIN_WIRE` to carry it.
         // Before any rate is known, a fixed size, and only against a baseline that
         // queued behind nothing: a session's first frames may all have.
         let by_size = match known {
-            Some(bps) => extra_bits >= bps * MIN_WIRE_MS / 1000.0,
+            Some(bps) => extra_bits >= bps * MIN_WIRE.as_secs_f64(),
             None => base_clean && bytes >= base.bytes + PROBE_BYTES,
         };
         if by_size {
@@ -300,7 +295,7 @@ impl PathEst {
             }
             self.rates.push_back(rate);
         } else if clear && base_clean {
-            if extra_bits > 0.0 && excess_ms >= MIN_WIRE_MS {
+            if extra_bits > 0.0 && excess >= MIN_WIRE {
                 self.slow.push(rate);
                 let long = self
                     .slow
@@ -316,20 +311,25 @@ impl PathEst {
                 self.slow.clear();
             }
         }
-        let wire_ms = agreed(&self.rates).map_or(0.0, |bps| extra_bits / bps * 1000.0);
-        let q = (excess_ms - wire_ms).max(0.0);
-        self.queue_ms = self.queue_ms(now, false) * 0.7 + q * 0.3;
+        // What is left once the frame's own time on the wire is taken off.
+        let wire = agreed(&self.rates).map_or(Duration::ZERO, |bps| {
+            Duration::from_secs_f64(extra_bits / bps)
+        });
+        self.queue = self.queue.mul_f64(0.7) + excess.saturating_sub(wire).mul_f64(0.3);
         self.queue_at = now;
     }
 
-    /// Delay queued on the path now (ms). With nothing in flight (`idle`) the last
-    /// estimate fades: no ack is coming to correct it.
+    /// Delay queued on the path now, in ms as its callers read it. With nothing in
+    /// flight (`idle`) the last estimate fades: no ack is coming to correct it.
     pub fn queue_ms(&self, now: Instant, idle: bool) -> f64 {
-        if !idle {
-            return self.queue_ms;
-        }
-        let since = now.saturating_duration_since(self.queue_at).as_secs_f64();
-        self.queue_ms * 0.5f64.powf(since / QUEUE_HALF_LIFE.as_secs_f64())
+        let queue = if idle {
+            let since = now.saturating_duration_since(self.queue_at);
+            self.queue
+                .mul_f64(0.5f64.powf(since.div_duration_f64(QUEUE_HALF_LIFE)))
+        } else {
+            self.queue
+        };
+        queue.as_secs_f64() * 1000.0
     }
 
     /// What the path can carry, once frames big enough to tell have been acked.
@@ -535,7 +535,7 @@ mod tests {
 
     #[test]
     fn frames_too_quick_to_time_read_low_never_high() {
-        // Frames of any size on any link: one that crosses in under MIN_WIRE_MS proves
+        // Frames of any size on any link: one that crosses in under MIN_WIRE proves
         // only its size over that long.
         let mut rng = Rng(0x94D049BB133111EB);
         for _ in 0..200 {
@@ -553,7 +553,7 @@ mod tests {
                 .map(Kbps::bps)
                 .expect("big frames were acked");
             assert!(got <= rate * 1.001, "rate {rate}: estimated {got}");
-            let provable = (biggest - 600) as f64 * 8.0 / (MIN_WIRE_MS / 1000.0);
+            let provable = (biggest - 600) as f64 * 8.0 / MIN_WIRE.as_secs_f64();
             assert!(
                 got <= provable * 1.001,
                 "rate {rate}: {got} from {biggest} bytes"
@@ -917,10 +917,10 @@ mod tests {
         );
     }
 
-    /// MIN_WIRE_MS's doc: a frame the path is thought to carry in
+    /// MIN_WIRE's doc: a frame the path is thought to carry in
     /// less than that holds no rate, its delay is all jitter. Since 4dc5b5a a frame
-    /// sent alone that took MIN_WIRE_MS tells whatever its size, so a small frame whose
-    /// ack is that late reads as a path of its size over MIN_WIRE_MS; and after a still
+    /// sent alone that took MIN_WIRE tells whatever its size, so a small frame whose
+    /// ack is that late reads as a path of its size over MIN_WIRE; and after a still
     /// spell the window keeps two old samples and the new one, so that one sample is
     /// the capacity.
     #[test]
@@ -1009,353 +1009,41 @@ mod tests {
         }
     }
 
-    /// The estimator as it was before its capacity stopped being kept beside the samples
-    /// it comes from and its delays became Durations: the oracle for that change.
-    mod old {
-        use crate::path::{
-            Kbps, BASE_WINDOW, CAPACITY_AGREE, CAPACITY_WINDOW, MIN_WIRE_MS, PROBE_BYTES,
-            QUEUE_HALF_LIFE, SLOWED_SHARE, SLOW_RUN,
-        };
-        use std::collections::VecDeque;
-        use std::time::{Duration, Instant};
-
-        /// The smallest value over a sliding window of time.
-        struct Lowest {
-            /// (when, value, the size of the frame it was measured on), values rising from the
-            /// front: the front is the smallest.
-            q: VecDeque<(Instant, f64, usize)>,
-            window: Duration,
-        }
-
-        impl Lowest {
-            fn new(window: Duration) -> Self {
-                Lowest {
-                    q: VecDeque::new(),
-                    window,
-                }
-            }
-            fn expire(&mut self, now: Instant) {
-                while self
-                    .q
-                    .front()
-                    .is_some_and(|&(t, _, _)| now.saturating_duration_since(t) > self.window)
-                {
-                    self.q.pop_front();
-                }
-            }
-            /// Takes a value in and returns the smallest of the window, which holds it.
-            fn push(&mut self, now: Instant, v: f64, bytes: usize) -> (f64, usize) {
-                self.expire(now);
-                while self.q.back().is_some_and(|&(_, b, _)| b >= v) {
-                    self.q.pop_back();
-                }
-                self.q.push_back((now, v, bytes));
-                let &(_, v, bytes) = self.q.front().unwrap_or(&(now, v, bytes));
-                (v, bytes)
-            }
-            fn get(&self) -> Option<(f64, usize)> {
-                self.q.front().map(|&(_, v, bytes)| (v, bytes))
-            }
-        }
-
-        /// Send->ack delays turned into the three things flow control needs.
-        ///
-        /// A frame's delay beyond the baseline is the time its extra bytes took on the wire
-        /// (how much bigger it is than the baseline's frame, over the path's capacity) plus
-        /// whatever it waited behind. So the best extra-size-over-excess that several recent
-        /// frames agree on is the capacity, measured by the frames themselves, with no need for
-        /// the stream to press against its cap first; and what is left of a delay once the
-        /// frame's own wire time is taken off is the queue.
-        ///
-        /// The baseline is the smallest delay of the window, so it follows a round trip that
-        /// grows even while the screen never stops moving. It needs, in every window, one frame
-        /// that waited behind nothing; flow control gives it that. Where it matters that is not
-        /// assumed but checked against `clean`, the smallest delay of frames sent with nothing
-        /// of ours ahead of them: such a frame did not queue, so a baseline no more than
-        /// `MIN_WIRE_MS` under it did not either.
-        pub struct PathEst {
-            base: Lowest,
-            clean: Lowest,
-            /// When the frame before this one was acknowledged.
-            acked: Option<Instant>,
-            /// The latest rate samples, oldest first.
-            rates: VecDeque<Rate>,
-            /// The run of frames, each sent with nothing ahead of it, that were too small to
-            /// tell a rate by size and still took time to cross (see `SLOW_RUN`).
-            slow: Vec<Rate>,
-            capacity: Option<f64>,
-            queue_ms: f64,
-            queue_at: Instant,
-        }
-
-        /// The rate one frame crossed at.
-        #[derive(Clone, Copy)]
-        struct Rate {
-            at: Instant,
-            bps: f64,
-        }
-
-        impl PathEst {
-            pub fn new(now: Instant) -> Self {
-                PathEst {
-                    base: Lowest::new(BASE_WINDOW),
-                    clean: Lowest::new(BASE_WINDOW),
-                    acked: None,
-                    rates: VecDeque::new(),
-                    slow: Vec::new(),
-                    capacity: None,
-                    queue_ms: 0.0,
-                    queue_at: now,
-                }
-            }
-
-            /// A frame of `bytes`, sent at `sent`, was acknowledged at `now`. `alone`: nothing
-            /// sent before it was still unacknowledged when it went.
-            pub fn on_ack(&mut self, now: Instant, sent: Instant, bytes: usize, alone: bool) {
-                let delay_ms = now.saturating_duration_since(sent).as_secs_f64() * 1000.0;
-                let (base, base_bytes) = self.base.push(now, delay_ms, bytes);
-                let excess_ms = delay_ms - base;
-                // The baseline did not queue: a frame known not to have was no slower.
-                let trusted = |clean: &Lowest| {
-                    clean
-                        .get()
-                        .is_some_and(|(clean, _)| clean <= base + MIN_WIRE_MS)
-                };
-                // This frame did not queue behind ours. Either nothing was unacknowledged when
-                // it went, which is a fact whatever the path. Or the frame before it had left
-                // the bottleneck by then: that frame's ack came one baseline after it left, less
-                // the baseline frame's own time on the wire, which takes a known capacity to
-                // say. The second is what lets a path with a long round trip, where a frame is
-                // rarely sent alone, keep saying so.
-                let wire_of_base = self
-                    .capacity
-                    .filter(|_| trusted(&self.clean))
-                    .map(|bps| Duration::from_secs_f64(base_bytes as f64 * 8.0 / bps));
-                let clear = alone
-                    || wire_of_base.is_some_and(|wire| {
-                        self.acked.is_none_or(|acked| {
-                            sent + Duration::from_secs_f64(base / 1000.0) >= acked + wire
-                        })
-                    });
-                if clear {
-                    self.clean.push(now, delay_ms, bytes);
-                }
-                let base_clean = trusted(&self.clean);
-                self.acked = Some(now);
-                let extra_bits = bytes.saturating_sub(base_bytes) as f64 * 8.0;
-                let rate = Rate {
-                    at: now,
-                    bps: extra_bits / (excess_ms.max(MIN_WIRE_MS) / 1000.0),
-                };
-                // Big enough to tell a rate: the path should take `MIN_WIRE_MS` to carry it.
-                // Before any rate is known, a fixed size, and only against a baseline that
-                // queued behind nothing: a session's first frames may all have.
-                let by_size = match self.capacity {
-                    Some(bps) => extra_bits >= bps * MIN_WIRE_MS / 1000.0,
-                    None => base_clean && bytes >= base_bytes + PROBE_BYTES,
-                };
-                if by_size {
-                    self.slow.clear();
-                    // The window is measured back from the newest sample, and never empties
-                    // below what has to agree: after a still spell one sample alone is not
-                    // the capacity.
-                    while self.rates.len() >= CAPACITY_AGREE
-                        && self
-                            .rates
-                            .front()
-                            .is_some_and(|r| now.saturating_duration_since(r.at) > CAPACITY_WINDOW)
-                    {
-                        self.rates.pop_front();
-                    }
-                    self.rates.push_back(rate);
-                    self.capacity = self.agreed();
-                } else if clear && base_clean {
-                    if extra_bits > 0.0 && excess_ms >= MIN_WIRE_MS {
-                        self.slow.push(rate);
-                        let long = self.slow.first().is_some_and(|first| {
-                            now.saturating_duration_since(first.at) >= SLOW_RUN
-                        });
-                        let slowed = self.capacity.is_none_or(|known| {
-                            self.slow.iter().all(|r| r.bps < known * SLOWED_SHARE)
-                        });
-                        if long && self.slow.len() >= CAPACITY_AGREE && slowed {
-                            self.rates = self.slow.drain(..).collect();
-                            self.capacity = self.agreed();
-                        }
-                    } else {
-                        // On time: whatever made the frames before it late was not the path.
-                        self.slow.clear();
-                    }
-                }
-                let wire_ms = self.capacity.map_or(0.0, |bps| extra_bits / bps * 1000.0);
-                let q = (excess_ms - wire_ms).max(0.0);
-                self.queue_ms = self.queue_ms(now, false) * 0.7 + q * 0.3;
-                self.queue_at = now;
-            }
-
-            /// The rate `CAPACITY_AGREE` of the samples reached; until that many have been
-            /// seen, the slowest of them.
-            fn agreed(&self) -> Option<f64> {
-                let mut best = [0.0f64; CAPACITY_AGREE];
-                for r in &self.rates {
-                    // `best` holds the fastest samples, fastest first.
-                    if let Some(i) = best.iter().position(|&b| r.bps > b) {
-                        best[i..].rotate_right(1);
-                        best[i] = r.bps;
-                    }
-                }
-                (!self.rates.is_empty()).then(|| best[self.rates.len().min(CAPACITY_AGREE) - 1])
-            }
-
-            /// Delay queued on the path now (ms). With nothing in flight (`idle`) the last
-            /// estimate fades: no ack is coming to correct it.
-            pub fn queue_ms(&self, now: Instant, idle: bool) -> f64 {
-                if !idle {
-                    return self.queue_ms;
-                }
-                let since = now.saturating_duration_since(self.queue_at).as_secs_f64();
-                self.queue_ms * 0.5f64.powf(since / QUEUE_HALF_LIFE.as_secs_f64())
-            }
-
-            /// What the path can carry, once frames big enough to tell have been acked.
-            pub fn capacity(&self) -> Option<Kbps> {
-                self.capacity.map(|bps| Kbps::new(bps / 1000.0))
-            }
-        }
-    }
-
-    /// Between `lo` and `hi`, spread evenly in the logarithm: every scale as likely.
-    fn scale(rng: &mut Rng, lo: f64, hi: f64) -> f64 {
-        lo * (hi / lo).powf(rng.next() as f64 / u64::MAX as f64)
-    }
-
     #[test]
-    fn any_acks_read_as_they_did_before_the_capacity_was_derived() {
-        // The estimator before this shape is the oracle. The same acks go to both: any
-        // link from 8 kbit/s to 2 Gbit/s, which may change its rate as it goes, any
-        // round trip up to 400 ms, frames of any size, alone or queued, acked on time,
-        // late, early, or before they were sent, said to be sent alone as the link had
-        // them or at random, and silences longer than either window. After every ack
-        // both say the same capacity and the same queue, to the bit, idle or not, read
-        // at any time.
-        //
-        // Every other run keeps every time on whole milliseconds and every frame a
-        // whole number of milliseconds on the wire. Its silences are a window long or a
-        // few ms short of it; its frames are often a whole fraction of a second apart and
-        // acked exactly on time; its link often slows to exactly half; and now and then
-        // a frame is exactly the probe size over the smallest yet. So delays meet the
-        // 5 ms floor, acks meet the windows' and a slow run's edges, and samples meet
-        // half the rate, exactly.
-        let mut rng = Rng(0x5851F42D4C957F2D);
+    fn a_frame_late_by_exactly_the_floor_took_that_long_at_any_round_trip() {
+        // The floor is a Duration, and so is a delay beyond the baseline: at any round
+        // trip, a frame acked exactly MIN_WIRE after the baseline's took that long, and
+        // one acked a nanosecond sooner did not. Here, at every microsecond of round
+        // trip from none to 20 ms: an empty frame sent alone is the baseline, then three
+        // frames of 1000 bytes, each sent alone, 600 ms apart. Taking the floor, they
+        // are a slow run, and the path's rate is theirs: 1000 bytes over MIN_WIRE. A
+        // nanosecond short, they are on time, and show no rate.
         let t0 = Instant::now();
-        let bits = |c: Option<Kbps>| c.map(|k| k.get().to_bits());
-        // How often the acks reached the cases that could tell the two apart.
-        let (mut formed, mut fell, mut rose, mut slow_run, mut queued) = (0, 0, 0, 0, 0);
-        const RUNS: usize = 4000;
-        for run in 0..RUNS {
-            let grid = run.is_multiple_of(2);
-            // On the grid, one run in two is steady: a whole fraction of a second
-            // between frames, long runs of one size, acked exactly on time. The other
-            // is ragged; one in two of those is acked exactly on time.
-            let (steady, exact) = (grid && run.is_multiple_of(4), grid && run % 8 != 2);
-            // A link's rate, and on the grid the bytes a millisecond carries: even, so
-            // that the link can slow to exactly half.
-            let draw = |rng: &mut Rng, per_ms: usize| {
-                let per_ms = match (grid, rng.range(0, 2)) {
-                    (true, 0) if per_ms.is_multiple_of(2) => per_ms / 2,
-                    _ => 2 * (scale(rng, 1.0, 12_500.0) as usize),
-                };
-                match grid {
-                    true => (per_ms, per_ms as f64 * 8000.0),
-                    false => (per_ms, scale(rng, 8e3, 2e9)),
+        let rate = 1000.0 * 8.0 / MIN_WIRE.as_secs_f64();
+        for rtt in (0..20_000).map(Duration::from_micros) {
+            for (late, shows) in [
+                (MIN_WIRE, true),
+                (MIN_WIRE - Duration::from_nanos(1), false),
+            ] {
+                let mut est = PathEst::new(t0);
+                est.on_ack(t0 + rtt, t0, 0, true);
+                for i in 1..=3 {
+                    let sent = t0 + Duration::from_millis(600) * i;
+                    est.on_ack(sent + rtt + late, sent, 1000, true);
                 }
-            };
-            let (mut per_ms, rate) = draw(&mut rng, 1);
-            // On the grid, the time between frames when it is steady.
-            let step = Duration::from_millis(
-                [20, 25, 40, 50, 100, 125, 200, 250][rng.range(0, 8) as usize],
-            );
-            // A time from nothing to `most`.
-            let pick = |rng: &mut Rng, most: Duration| match grid {
-                true => Duration::from_millis(rng.range(0, most.as_millis() as u64 + 1)),
-                false => Duration::from_micros(rng.range(0, most.as_micros() as u64 + 1)),
-            };
-            let mut link = Link::new(rate, rng.range(0, 400), t0);
-            let mut new = PathEst::new(t0);
-            let mut old = old::PathEst::new(t0);
-            let mut sent = t0 + Duration::from_secs(1);
-            let (mut bytes, mut least) = (0, usize::MAX);
-            let mut was = None;
-            let mut seen = (false, false, false, false, false);
-            for i in 0..rng.range(1, 400) {
-                if rng.range(0, 60) == 0 {
-                    (per_ms, link.rate) = draw(&mut rng, per_ms);
-                }
-                sent += match (rng.range(0, 40), grid) {
-                    (0, true) => {
-                        [CAPACITY_WINDOW, BASE_WINDOW][rng.range(0, 2) as usize]
-                            - pick(&mut rng, Duration::from_millis(5))
-                    }
-                    (0, false) => Duration::from_secs_f64(scale(&mut rng, 1.0, 45.0)),
-                    (1..=3, _) => Duration::ZERO,
-                    (4..=35, true) if steady => step,
-                    (4..=20, true) => step,
-                    _ => pick(&mut rng, Duration::from_millis(100)),
-                };
-                // Runs of one size, as a still screen sends, give equal delays.
-                bytes = match (rng.range(0, 36), grid) {
-                    (0..=11, _) => bytes,
-                    (12..=29, _) if steady => bytes,
-                    (30, _) => least.min(1 << 20) + PROBE_BYTES,
-                    (_, true) => per_ms * rng.range(0, 40) as usize,
-                    (_, false) => scale(&mut rng, 1.0, 2e6) as usize - 1,
-                };
-                least = least.min(bytes);
-                let (acked, _) = link.send(sent, bytes);
-                let alone = link.alone != (rng.range(0, 10) == 0);
-                let now = match (rng.range(0, 16), grid) {
-                    (0, _) => sent - pick(&mut rng, Duration::from_millis(5)),
-                    (1, _) => sent + pick(&mut rng, acked - sent),
-                    (2, _) => acked + pick(&mut rng, Duration::from_millis(200)),
-                    (3..=9, _) if exact => acked,
-                    _ => acked + pick(&mut rng, Duration::from_millis(4)),
-                };
-                let run_from = new.slow.first().map(|r| r.at);
-                new.on_ack(now, sent, bytes, alone);
-                old.on_ack(now, sent, bytes, alone);
-                let capacity = new.capacity();
-                assert_eq!(bits(capacity), bits(old.capacity()), "run {run}, ack {i}");
-                let at = sent + pick(&mut rng, Duration::from_millis(1500));
-                for idle in [false, true] {
-                    assert_eq!(
-                        new.queue_ms(at, idle).to_bits(),
-                        old.queue_ms(at, idle).to_bits(),
-                        "run {run}, ack {i}, idle {idle}"
+                let got = est.capacity().map(Kbps::bps);
+                assert_eq!(
+                    got.is_some(),
+                    shows,
+                    "round trip {rtt:?}, late {late:?}: {got:?}"
+                );
+                if let Some(got) = got {
+                    assert!(
+                        (got - rate).abs() <= rate * 1e-12,
+                        "round trip {rtt:?}: {got}"
                     );
                 }
-                seen.0 |= capacity.is_some();
-                if let (Some(c), Some(w)) = (capacity, was) {
-                    seen.1 |= c < w;
-                    seen.2 |= c > w;
-                }
-                seen.3 |= run_from.is_some() && new.rates.front().map(|r| r.at) == run_from;
-                seen.4 |= new.queue_ms(now, false) > 1.0;
-                was = capacity;
             }
-            formed += usize::from(seen.0);
-            fell += usize::from(seen.1);
-            rose += usize::from(seen.2);
-            slow_run += usize::from(seen.3);
-            queued += usize::from(seen.4);
-        }
-        for (case, n, least) in [
-            ("a capacity formed", formed, RUNS / 3),
-            ("it fell", fell, RUNS / 3),
-            ("it rose", rose, RUNS / 3),
-            ("a slow run became the samples", slow_run, RUNS / 100),
-            ("a queue showed", queued, RUNS / 3),
-        ] {
-            assert!(n >= least, "{case} in only {n} of {RUNS} runs");
         }
     }
 }
