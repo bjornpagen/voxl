@@ -26,6 +26,7 @@ mod mac;
 mod mic;
 mod mp4;
 mod path;
+mod rate;
 mod record;
 #[cfg(target_os = "linux")]
 mod screen;
@@ -99,11 +100,11 @@ fn rate_flag(flag: &str, v: Option<&String>, default: u32) -> Result<u32, String
 /// stream is steered between; 2000 and 30000 kbit/s when not given. A ceiling of 0 is
 /// none: the target goes as high as the viewers' paths carry, and encoders open without
 /// a rate cap.
-fn bounds(min: Option<&String>, max: Option<&String>) -> Result<video::Bounds, String> {
+fn bounds(min: Option<&String>, max: Option<&String>) -> Result<rate::Bounds, String> {
     let floor = rate_flag("min-kbps", min, 2000)?;
     let ceiling = rate_flag("max-kbps", max, 30000)?;
     let kbps = |kbps: u32| path::Kbps::new(kbps as f64);
-    Ok(video::Bounds::new(
+    Ok(rate::Bounds::new(
         kbps(floor),
         (ceiling > 0).then(|| kbps(ceiling)),
     ))
@@ -505,7 +506,7 @@ async fn serve(a: HashMap<String, String>) {
 mod tests {
     use super::*;
     use path::Kbps;
-    use video::Bounds;
+    use rate::Bounds;
 
     fn read(min: Option<&str>, max: Option<&str>) -> Result<Bounds, String> {
         bounds(
