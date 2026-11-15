@@ -10,7 +10,47 @@ use tokio::sync::mpsc;
 
 pub enum Out {
     Bin(Bytes),
-    Text(String),
+    Text(ServerMessage),
+}
+
+/// A text message to a viewer: JSON, named by its `t`. `ServerMessage` in
+/// web/src/protocol.ts names the same five, and `json` is the one place one is written.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(tag = "t", rename_all = "lowercase")]
+pub enum ServerMessage {
+    Hello(Hello),
+    /// Names a ping; the viewer's reply echoes it.
+    Ping {
+        s: Token,
+    },
+    /// The desktop's clipboard, as text.
+    Clip {
+        d: String,
+    },
+    /// Whether the desktop's microphone is this viewer's.
+    Mic {
+        on: bool,
+    },
+    /// This viewer's subscription is over.
+    Close,
+}
+
+impl ServerMessage {
+    pub fn json(&self) -> String {
+        serde_json::to_string(self).expect("a message to a viewer is JSON")
+    }
+}
+
+/// The `hello` message: the stream's geometry and the server's settings.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct Hello {
+    pub w: u32,
+    pub h: u32,
+    /// Encoded stripes as (y, height).
+    pub stripes: Vec<(u32, u32)>,
+    /// What else a viewer is told (audio, files, ...), as `Hub::hello_extra` holds it.
+    #[serde(flatten)]
+    pub settings: serde_json::Map<String, serde_json::Value>,
 }
 
 pub struct Inflight {
@@ -88,6 +128,13 @@ impl Token {
 impl std::fmt::Display for Token {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "{:016x}", self.0)
+    }
+}
+
+/// As a ping carries it: its 16 hex digits.
+impl serde::Serialize for Token {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
     }
 }
 
@@ -460,13 +507,15 @@ impl Hub {
     }
 
     /// The `hello` message: current geometry plus the server's settings.
-    pub fn hello(&self) -> String {
-        let mut m = self.hello_extra.lock().clone();
-        m.insert("t".into(), "hello".into());
-        m.insert("w".into(), self.width.load(Ordering::Relaxed).into());
-        m.insert("h".into(), self.height.load(Ordering::Relaxed).into());
-        m.insert("stripes".into(), serde_json::json!(*self.stripes.lock()));
-        serde_json::Value::Object(m).to_string()
+    pub fn hello(&self) -> ServerMessage {
+        let settings = self.hello_extra.lock().clone();
+        let stripes = self.stripes.lock().clone();
+        ServerMessage::Hello(Hello {
+            w: self.width.load(Ordering::Relaxed),
+            h: self.height.load(Ordering::Relaxed),
+            stripes,
+            settings,
+        })
     }
 
     /// After the stream restarts (new size): every client needs the new geometry and
@@ -508,7 +557,7 @@ impl Hub {
         // Retire their subscriptions too: an old client ignoring close must not
         // stall flow control for the replacement connections.
         for client in self.clients.lock().drain(..) {
-            client.send(Out::Text("{\"t\":\"close\"}".into()));
+            client.send(Out::Text(ServerMessage::Close));
         }
         Some(crate::mac::DisplayRequest { id, sender, ready })
     }
@@ -708,5 +757,197 @@ mod tests {
             shortest.is_none_or(|rt| rt >= real_round_trip),
             "a {shortest:?} round trip on a {real_round_trip:?} path"
         );
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        /// Text that JSON escapes and text it doesn't, and the words the recorder looks for.
+        fn text(&mut self) -> String {
+            const PIECES: [&str; 14] = [
+                "hello",
+                "close",
+                "\"",
+                "\\",
+                "/",
+                "a",
+                " ",
+                "\u{7f}",
+                "é",
+                "€",
+                "😀",
+                "\u{2028}",
+                "\"t\":\"close\"",
+                "{}",
+            ];
+            (0..self.below(8))
+                .map(|_| match self.below(3) {
+                    0 => char::from(self.below(0x20) as u8).to_string(),
+                    _ => PIECES[self.below(PIECES.len() as u64) as usize].to_string(),
+                })
+                .collect()
+        }
+        fn value(&mut self, depth: u32) -> serde_json::Value {
+            use serde_json::Value;
+            match self.below(if depth == 0 { 5 } else { 7 }) {
+                0 => Value::Null,
+                1 => Value::Bool(self.next() & 1 == 1),
+                2 => Value::from(self.next() as i64 >> self.below(64)),
+                // Not finite: null, as serde_json writes it.
+                3 => Value::from(f64::from_bits(self.next())),
+                4 => Value::String(self.text()),
+                5 => Value::Array((0..self.below(4)).map(|_| self.value(depth - 1)).collect()),
+                _ => Value::Object(
+                    (0..self.below(4))
+                        .map(|_| (self.text(), self.value(depth - 1)))
+                        .collect(),
+                ),
+            }
+        }
+        fn message(&mut self) -> ServerMessage {
+            match self.below(5) {
+                0 => {
+                    // What lib.rs and the macOS pipeline put there, with anything in them.
+                    let mut settings = serde_json::Map::new();
+                    for k in [
+                        "os", "audio", "mic", "readOnly", "files", "resize", "displays",
+                    ] {
+                        if self.next() & 1 == 1 {
+                            settings.insert(k.into(), self.value(2));
+                        }
+                    }
+                    ServerMessage::Hello(Hello {
+                        w: self.next() as u32,
+                        h: self.next() as u32,
+                        stripes: (0..self.below(17))
+                            .map(|_| (self.next() as u32, self.next() as u32))
+                            .collect(),
+                        settings,
+                    })
+                }
+                1 => ServerMessage::Ping {
+                    s: Token(self.next()),
+                },
+                2 => ServerMessage::Clip { d: self.text() },
+                3 => ServerMessage::Mic {
+                    on: self.next() & 1 == 1,
+                },
+                _ => ServerMessage::Close,
+            }
+        }
+    }
+
+    /// Gives `hub` the geometry and settings of `m`, if it is a hello.
+    fn say(hub: &Hub, m: &ServerMessage) {
+        if let ServerMessage::Hello(h) = m {
+            hub.width.store(h.w, Ordering::Relaxed);
+            hub.height.store(h.h, Ordering::Relaxed);
+            *hub.stripes.lock() = h.stripes.clone();
+            *hub.hello_extra.lock() = h.settings.clone();
+        }
+    }
+
+    /// The model: a message is a JSON object of its fields, and its kind as `t`, first (a
+    /// viewer may know a ping by its first bytes, as bench/nclient.py does). A hub's hello
+    /// is its geometry and its settings.
+    #[test]
+    fn a_message_is_its_fields_after_its_kind() {
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let hub = Hub::new();
+        for _ in 0..100_000 {
+            let m = rng.message();
+            say(&hub, &m);
+            if let ServerMessage::Hello(_) = m {
+                assert_eq!(hub.hello(), m);
+            }
+            let (kind, fields) = match &m {
+                ServerMessage::Hello(h) => {
+                    let mut f = h.settings.clone();
+                    f.insert("w".into(), h.w.into());
+                    f.insert("h".into(), h.h.into());
+                    f.insert("stripes".into(), serde_json::json!(h.stripes));
+                    ("hello", serde_json::Value::Object(f))
+                }
+                ServerMessage::Ping { s } => ("ping", serde_json::json!({ "s": s.to_string() })),
+                ServerMessage::Clip { d } => ("clip", serde_json::json!({ "d": d })),
+                ServerMessage::Mic { on } => ("mic", serde_json::json!({ "on": on })),
+                ServerMessage::Close => ("close", serde_json::json!({})),
+            };
+            let json = m.json();
+            assert!(json.starts_with(&format!("{{\"t\":\"{kind}\"")), "{json}");
+            let mut object: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(&json).unwrap();
+            assert_eq!(object.remove("t"), Some(kind.into()), "{json}");
+            // Read back as the message is: serde_json reads some floats one unit off.
+            let fields: serde_json::Value = serde_json::from_str(&fields.to_string()).unwrap();
+            assert_eq!(serde_json::Value::Object(object), fields, "{json}");
+        }
+    }
+
+    /// The oracle: each message as its sender wrote it by hand before `ServerMessage`, a
+    /// hello from `hub`.
+    fn old_json(m: &ServerMessage, hub: &Hub) -> String {
+        match m {
+            // video.rs (a viewer hopelessly behind) and hub.rs (a macOS display switch).
+            ServerMessage::Close => "{\"t\":\"close\"}".into(),
+            // mic.rs.
+            ServerMessage::Mic { on } => format!("{{\"t\":\"mic\",\"on\":{on}}}"),
+            // server.rs's pinger.
+            ServerMessage::Ping { s: token } => format!("{{\"t\":\"ping\",\"s\":\"{token}\"}}"),
+            // desktop.rs, mac/desktop.rs and win/desktop.rs.
+            ServerMessage::Clip { d: text } => {
+                serde_json::json!({"t": "clip", "d": text}).to_string()
+            }
+            // Hub::hello.
+            ServerMessage::Hello(_) => {
+                let mut m = hub.hello_extra.lock().clone();
+                m.insert("t".into(), "hello".into());
+                m.insert("w".into(), hub.width.load(Ordering::Relaxed).into());
+                m.insert("h".into(), hub.height.load(Ordering::Relaxed).into());
+                m.insert("stripes".into(), serde_json::json!(*hub.stripes.lock()));
+                serde_json::Value::Object(m).to_string()
+            }
+        }
+    }
+
+    /// The oracle: what ended a recording, before `ServerMessage`.
+    fn old_ends_a_recording(t: &str) -> bool {
+        t.contains("\"hello\"") || t.contains("\"close\"")
+    }
+
+    #[test]
+    fn every_message_is_what_its_sender_wrote_by_hand() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let hub = Hub::new();
+        for _ in 0..100_000 {
+            let m = rng.message();
+            say(&hub, &m);
+            let (new, old) = (m.json(), old_json(&m, &hub));
+            match m {
+                // Written by hand: the same bytes.
+                ServerMessage::Close | ServerMessage::Mic { .. } | ServerMessage::Ping { .. } => {
+                    assert_eq!(new, old)
+                }
+                // Written from a map, whose keys came out sorted: the same JSON, with `t` now
+                // first, and the same verdict from the recorder.
+                ServerMessage::Clip { .. } | ServerMessage::Hello(_) => {
+                    let parse = |t: &str| serde_json::from_str::<serde_json::Value>(t).unwrap();
+                    assert_eq!(parse(&new), parse(&old), "{new}");
+                    assert_eq!(
+                        old_ends_a_recording(&new),
+                        old_ends_a_recording(&old),
+                        "{new}"
+                    );
+                }
+            }
+        }
     }
 }

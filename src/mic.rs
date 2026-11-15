@@ -10,7 +10,7 @@
 //! jitter queue that drops its oldest samples past MAX_QUEUED, so bursts after a
 //! network stall or clock drift never become growing delay.
 
-use crate::hub::{Hub, Out};
+use crate::hub::{Hub, Out, ServerMessage};
 use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -169,7 +169,7 @@ pub fn spawn(sink: String, hub: Arc<Hub>) -> mpsc::Sender<MicMsg> {
             let mut pcm = vec![0i16; 5760];
             let tell = |id: u64, on: bool| {
                 if let Some(c) = hub.clients.lock().iter().find(|c| c.id == id) {
-                    c.send(Out::Text(format!("{{\"t\":\"mic\",\"on\":{on}}}")));
+                    c.send(Out::Text(ServerMessage::Mic { on }));
                 }
             };
             let push = |samples: &[i16]| {

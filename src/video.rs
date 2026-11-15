@@ -5,7 +5,7 @@ use crate::convert::I420;
 use crate::encoder::{Encoded, Encoder, EncoderConfig, Pictures, Planes, Quality};
 use crate::env::{Debugging, Marker};
 use crate::hub::{wait_any, wait_event};
-use crate::hub::{Hub, Inflight, Out};
+use crate::hub::{Hub, Inflight, Out, ServerMessage};
 use crate::path::{Capacity, Kbps};
 use crate::rate::{Bounds, FrameBudget, RateCtl, RTT_GUESS_MS};
 use bytes::Bytes;
@@ -1440,7 +1440,7 @@ fn encode_loop(
                 if q.len() > 600 {
                     log::warn!("client {} hopelessly behind; dropping", c.id);
                     drop(q);
-                    c.send(Out::Text("{\"t\":\"close\"}".into()));
+                    c.send(Out::Text(ServerMessage::Close));
                     continue;
                 }
                 let alone = q.is_empty();

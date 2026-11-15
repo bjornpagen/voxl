@@ -195,8 +195,10 @@ async fn collect(
                     });
                 }
                 // A capture restart or closed subscription ends this recording.
-                Some(Out::Text(t)) if !frames.is_empty()
-                    && (t.contains("\"hello\"") || t.contains("\"close\"")) => break,
+                Some(Out::Text(m)) if !frames.is_empty() && {
+                    let t = m.json();
+                    t.contains("\"hello\"") || t.contains("\"close\"")
+                } => break,
                 _ => {}
             },
         }

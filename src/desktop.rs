@@ -1,6 +1,6 @@
 //! Cursor shape tracking and two-way CLIPBOARD sync on a dedicated X connection.
 
-use crate::hub::{Hub, Out};
+use crate::hub::{Hub, Out, ServerMessage};
 use bytes::Bytes;
 use nix::fcntl::OFlag;
 use nix::poll::{poll, PollFd, PollFlags};
@@ -349,7 +349,7 @@ fn publish(hub: &Hub, atoms: &Atoms, target: u32, data: Vec<u8>, last_image: &mu
         }
         *last = Some(text.clone());
     }
-    let msg = serde_json::json!({"t": "clip", "d": text}).to_string();
+    let msg = ServerMessage::Clip { d: text };
     hub.broadcast(|| Out::Text(msg.clone()));
 }
 
