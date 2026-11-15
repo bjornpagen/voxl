@@ -315,8 +315,7 @@ struct Stream {
     /// what it was given.
     job_tx: mpsc::SyncSender<Job>,
     ret_rx: mpsc::Receiver<Returned>,
-    /// None while the encoder holds it.
-    buf: Option<Arc<I420>>,
+    buf: Buffer<Arc<I420>>,
     /// The rows that changed on screen since the buffer was last converted into: the
     /// whole screen, until the first capture.
     pending: Option<Band>,
@@ -397,7 +396,7 @@ impl Stream {
         Ok(Stream {
             job_tx,
             ret_rx,
-            buf: Some(Arc::new(I420::new(w as usize, h as usize))),
+            buf: Buffer::Home(Arc::new(I420::new(w as usize, h as usize))),
             pending: Some(Band { y0: 0, y1: h }),
             _encode: encode,
         })
@@ -406,17 +405,9 @@ impl Stream {
     /// The buffer the encoder is done with: back home, and the blocks it sharpened are
     /// sharp.
     fn returned(&mut self, r: Returned, refiner: &mut Refiner) {
-        self.buf = Some(r.buf);
+        self.buf = Buffer::Home(r.buf);
         if let Some(sharp) = r.sharpened {
             refiner.sharpened(&sharp.map, sharp.at);
-        }
-    }
-
-    /// Whether the encoder holds the buffer.
-    fn encoding(&self) -> Encoding {
-        match self.buf {
-            Some(_) => Encoding::Idle,
-            None => Encoding::Busy,
         }
     }
 }
@@ -843,10 +834,11 @@ const MIN_INTERVAL_SHARE: f64 = 0.85;
 
 /// What the capture loop does next.
 #[derive(Debug, PartialEq)]
-enum Step {
-    Wait(Wait),
-    /// Capture a change or a pass into the buffer that is home.
-    Capture(Next),
+enum Step<B> {
+    /// Wait, the buffer where it was.
+    Wait(Wait, Buffer<B>),
+    /// Capture a change or a pass into the buffer that was home.
+    Capture(Next, B),
 }
 
 /// What the capture loop waits for before it looks again. Damage wakes it through the
@@ -975,11 +967,12 @@ enum Gated {
     },
 }
 
-/// Whether the encoder holds the capture loop's buffer.
+/// Where the capture loop's buffer is: home, with what is home (the buffer itself in the
+/// loop; nothing in a test of what the loop decides), or away at the encoder.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Encoding {
-    Idle,
-    Busy,
+enum Buffer<B> {
+    Home(B),
+    Away,
 }
 
 /// What the viewers have yet to acknowledge, as a sharpening pass sees it. A pass goes out
@@ -1018,7 +1011,7 @@ impl InFlight {
 }
 
 /// What the capture loop knows when it looks, while somebody watches.
-struct Look {
+struct Look<B> {
     key: Key,
     damage: Damage,
     due: Due,
@@ -1029,52 +1022,67 @@ struct Look {
     /// How long damage may settle before it is captured (`--coalesce-us`).
     coalesce: Duration,
     gate: Gated,
-    encoding: Encoding,
+    buffer: Buffer<B>,
     in_flight: InFlight,
 }
 
-/// What the loop does next, from what it knows.
-fn step(look: &Look) -> Step {
-    let next = match (look.damage, look.key) {
+/// What the loop does next, from what it knows. A capture takes the buffer, so one is
+/// made only when it is home; a wait leaves it where it was.
+fn step<B>(look: Look<B>) -> Step<B> {
+    let Look {
+        key,
+        damage,
+        due,
+        now,
+        captured,
+        min_interval,
+        coalesce,
+        gate,
+        buffer,
+        in_flight,
+    } = look;
+    let next = match (damage, key) {
         // Nothing moved and no keyframe is wanted. A pass goes only to an idle encoder,
         // as every capture does (below); until then a change may come, and with it the
         // capture is motion's.
-        (Damage::None, Key::NotWanted) => match (look.due, look.encoding, look.in_flight) {
-            (Due::Now, Encoding::Idle, InFlight::Nothing) => Next::Pass,
+        (Damage::None, Key::NotWanted) => match (due, &buffer, in_flight) {
+            (Due::Now, Buffer::Home(_), InFlight::Nothing) => Next::Pass,
             // Nor onto a path that has frames on it: behind them, it would hold the next
             // keystroke back by all of them.
-            (Due::Now, Encoding::Idle, InFlight::Frames(last)) => {
-                return Step::Wait(Wait::Pass(last))
+            (Due::Now, Buffer::Home(_), InFlight::Frames(last)) => {
+                return Step::Wait(Wait::Pass(last), buffer)
             }
-            (Due::Now, Encoding::Busy, _) | (Due::Never, _, _) => return Step::Wait(Wait::Change),
-            (Due::In(due), _, _) => return Step::Wait(Wait::Pass(due)),
+            (Due::Now, Buffer::Away, _) | (Due::Never, _, _) => {
+                return Step::Wait(Wait::Change, buffer)
+            }
+            (Due::In(due), _, _) => return Step::Wait(Wait::Pass(due), buffer),
         },
         (Damage::Unreported | Damage::Rows { .. }, Key::Wanted | Key::NotWanted)
         | (Damage::None, Key::Wanted) => Next::Change,
     };
-    let since = look.now.saturating_duration_since(look.captured.gate(next));
-    if since < look.min_interval {
-        let rest = look.min_interval - since;
-        return Step::Wait(Wait::Interval { rest, next });
+    let since = now.saturating_duration_since(captured.gate(next));
+    if since < min_interval {
+        let rest = min_interval - since;
+        return Step::Wait(Wait::Interval { rest, next }, buffer);
     }
     // Apps present a frame as a burst of puts; give the burst a moment to land so
     // the capture holds one whole frame instead of its first tiles.
-    if let Damage::Rows { since, .. } = look.damage {
-        let settled = look.now.saturating_duration_since(since);
-        if settled < look.coalesce {
-            return Step::Wait(Wait::Settle(look.coalesce - settled));
+    if let Damage::Rows { since, .. } = damage {
+        let settled = now.saturating_duration_since(since);
+        if settled < coalesce {
+            return Step::Wait(Wait::Settle(coalesce - settled), buffer);
         }
     }
     // A keyframe is not held by the gate.
-    if let (Key::NotWanted, Gated::Held { until }) = (look.key, look.gate) {
-        return Step::Wait(Wait::Gate(until.map(|until| until - look.now)));
+    if let (Key::NotWanted, Gated::Held { until }) = (key, gate) {
+        return Step::Wait(Wait::Gate(until.map(|until| until - now)), buffer);
     }
     // A capture goes only to an idle encoder. One made while it codes the frame before
     // would wait for it, a whole encode older by the time it is coded; made once it is
     // done, it holds what changed meanwhile, and goes at once.
-    match look.encoding {
-        Encoding::Idle => Step::Capture(next),
-        Encoding::Busy => Step::Wait(Wait::Buffer),
+    match buffer {
+        Buffer::Home(buf) => Step::Capture(next, buf),
+        Buffer::Away => Step::Wait(Wait::Buffer, Buffer::Away),
     }
 }
 
@@ -1299,19 +1307,20 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
             min_interval,
             coalesce: cfg.coalesce,
             gate: Gated::ask(&viewers, interval_ms, now),
-            encoding: s.encoding(),
+            buffer: std::mem::replace(&mut s.buf, Buffer::Away),
             in_flight: InFlight::of(viewers.iter().map(|(c, _)| c.backlog(now))),
         };
-        let step = step(&look);
-        let next = match step {
-            Step::Wait(wait) => {
+        let step = step(look);
+        let (next, mut buf) = match step {
+            Step::Wait(wait, buffer) => {
+                s.buf = buffer;
                 if let Wait::Gate(_) = wait {
                     hub.stats.flow_blocked.fetch_add(1, Ordering::Relaxed);
                 }
                 wait.wait(cap, &hub);
                 continue;
             }
-            Step::Capture(next) => next,
+            Step::Capture(next, buf) => (next, buf),
         };
 
         let t0 = Instant::now();
@@ -1338,16 +1347,20 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
             );
         }
         let marker_ms = marker_reading(cap.bgrx(), probe);
-        // What this capture is sent as, decided once, before a buffer is taken.
+        // What this capture is sent as, decided once; with nothing to send, the buffer
+        // goes back home.
         let plan = match plan(key, band, due, &refiner) {
             Planned::Send(plan) => plan,
             Planned::Sharp => {
+                s.buf = Buffer::Home(buf);
                 sharpening.on_nothing_pending();
                 continue;
             }
-            Planned::Empty => continue,
+            Planned::Empty => {
+                s.buf = Buffer::Home(buf);
+                continue;
+            }
         };
-        let mut buf = s.buf.take().unwrap();
         let todo = match (s.pending.take(), band) {
             (p, Some(b)) => Some(union(p, b)),
             (p, None) => p,
@@ -3189,7 +3202,7 @@ mod tests {
         let ms = Duration::from_millis;
         let now = Instant::now() + Duration::from_secs(10);
         // A still screen, long since the last capture.
-        let still = |due, encoding| {
+        let still = |due, buffer| {
             let look = Look {
                 key: Key::NotWanted,
                 damage: Damage::None,
@@ -3199,18 +3212,18 @@ mod tests {
                 min_interval: ms(14),
                 coalesce: ms(2),
                 gate: Gated::Open,
-                encoding,
+                buffer,
                 in_flight: InFlight::Nothing,
             };
-            step(&look)
+            step(look)
         };
-        let on_wake = Step::Wait(Wait::Change);
-        assert_eq!(still(Due::Now, Encoding::Idle), Step::Capture(Next::Pass));
-        assert_eq!(still(Due::Now, Encoding::Busy), on_wake);
-        assert_eq!(still(Due::Never, Encoding::Idle), on_wake);
+        let (home, away) = (Buffer::Home(()), Buffer::Away);
+        assert_eq!(still(Due::Now, home), Step::Capture(Next::Pass, ()));
+        assert_eq!(still(Due::Now, away), Step::Wait(Wait::Change, away));
+        assert_eq!(still(Due::Never, home), Step::Wait(Wait::Change, home));
         assert_eq!(
-            still(Due::In(ms(40)), Encoding::Busy),
-            Step::Wait(Wait::Pass(ms(40)))
+            still(Due::In(ms(40)), away),
+            Step::Wait(Wait::Pass(ms(40)), away)
         );
     }
 
@@ -5034,11 +5047,16 @@ mod tests {
                     glyph.fill(if ink { 30 } else { 235 });
                 }
             }
-            while stream.buf.is_none() {
-                let r = stream.ret_rx.recv().unwrap();
-                stream.returned(r, &mut refiner);
-            }
-            let mut buf = stream.buf.take().unwrap();
+            // The buffer, once it is home.
+            let mut buf = loop {
+                match std::mem::replace(&mut stream.buf, Buffer::Away) {
+                    Buffer::Home(buf) => break buf,
+                    Buffer::Away => {
+                        let r = stream.ret_rx.recv().unwrap();
+                        stream.returned(r, &mut refiner);
+                    }
+                }
+            };
             let pic = Arc::get_mut(&mut buf).unwrap();
             crate::convert::convert_band(&screen, w * 4, pic, y0, y1, cfg.convert_threads);
             stream
@@ -5490,14 +5508,14 @@ mod tests {
                     min_interval,
                     coalesce,
                     gate: Gated::Open,
-                    encoding: match encoder {
-                        None => Encoding::Idle,
-                        Some(_) => Encoding::Busy,
+                    buffer: match encoder {
+                        None => Buffer::Home(()),
+                        Some(_) => Buffer::Away,
                     },
                     in_flight: InFlight::of([backlog]),
                 };
-                let wait = match step(&look) {
-                    Step::Capture(what) => {
+                let wait = match step(look) {
+                    Step::Capture(what, ()) => {
                         let pass = what == Next::Pass;
                         if pass {
                             let since = clear.expect("a pass went onto a path in use");
@@ -5513,7 +5531,7 @@ mod tests {
                         captured.on_capture(what, now);
                         continue;
                     }
-                    Step::Wait(wait) => wait,
+                    Step::Wait(wait, _) => wait,
                 };
                 // Each wait ends as `Wait::through` makes it: on damage, on the hub's waker
                 // (a buffer home, an ack), on its time.
@@ -5571,7 +5589,13 @@ mod tests {
                 false => Key::NotWanted,
             }
         }
-        fn look(&self) -> Look {
+        fn buffer(&self) -> Buffer<()> {
+            match self.home {
+                true => Buffer::Home(()),
+                false => Buffer::Away,
+            }
+        }
+        fn look(&self) -> Look<()> {
             Look {
                 key: self.key(),
                 damage: self.damage,
@@ -5581,10 +5605,7 @@ mod tests {
                 min_interval: self.min_interval,
                 coalesce: self.coalesce,
                 gate: self.gate,
-                encoding: match self.home {
-                    true => Encoding::Idle,
-                    false => Encoding::Busy,
-                },
+                buffer: self.buffer(),
                 in_flight: self.in_flight,
             }
         }
@@ -5722,7 +5743,7 @@ mod tests {
     #[test]
     fn a_capture_waits_only_for_what_holds_it() {
         let cases = each_case(|c| {
-            let got = step(&c.look());
+            let got = step(c.look());
             // A due pass goes only to an idle encoder, and onto empty paths.
             let pass_goes = c.due == Due::Now && c.home && c.in_flight == InFlight::Nothing;
             let still = !(c.damage != Damage::None || c.want_key || pass_goes);
@@ -5740,21 +5761,23 @@ mod tests {
             .filter(|&settled| settled < c.coalesce)
             .map(|settled| c.coalesce - settled);
             let gate_asked = !still && early.is_none() && settling.is_none() && !c.want_key;
+            // A wait leaves the buffer where it was; a capture takes it.
+            let wait = |w| Step::Wait(w, c.buffer());
             let want = match (still, early, settling) {
-                (true, _, _) => Step::Wait(match (c.due, c.home, c.in_flight) {
+                (true, _, _) => wait(match (c.due, c.home, c.in_flight) {
                     (Due::In(due), _, _) => Wait::Pass(due),
                     (Due::Now, true, InFlight::Frames(last)) => Wait::Pass(last),
                     (Due::Now, true, InFlight::Nothing) => unreachable!("a pass that goes"),
                     (Due::Now, false, _) | (Due::Never, _, _) => Wait::Change,
                 }),
-                (false, Some(rest), _) => Step::Wait(Wait::Interval { rest, next }),
-                (false, None, Some(rest)) => Step::Wait(Wait::Settle(rest)),
+                (false, Some(rest), _) => wait(Wait::Interval { rest, next }),
+                (false, None, Some(rest)) => wait(Wait::Settle(rest)),
                 (false, None, None) => match (gate_asked, c.gate, c.home) {
                     (true, Gated::Held { until }, _) => {
-                        Step::Wait(Wait::Gate(until.map(|until| until - c.now)))
+                        wait(Wait::Gate(until.map(|until| until - c.now)))
                     }
-                    (_, _, true) => Step::Capture(next),
-                    (_, _, false) => Step::Wait(Wait::Buffer),
+                    (_, _, true) => Step::Capture(next, ()),
+                    (_, _, false) => wait(Wait::Buffer),
                 },
             };
             assert_eq!(
@@ -5763,6 +5786,117 @@ mod tests {
                  {gate_asked} and {:?}, buffer home {}",
                 c.gate, c.home
             );
+        });
+        assert_eq!(cases, CASES);
+    }
+
+    /// The oracle: `step` as it was, deciding from whether the encoder held the buffer
+    /// and leaving the buffer where it was.
+    mod oracle {
+        use super::super::{Captured, Damage, Due, Gated, InFlight, Key, Next, Wait};
+        use std::time::{Duration, Instant};
+
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        pub enum Encoding {
+            Idle,
+            Busy,
+        }
+
+        #[derive(Debug, PartialEq)]
+        pub enum Step {
+            Wait(Wait),
+            Capture(Next),
+        }
+
+        /// What the capture loop knows when it looks, while somebody watches.
+        pub struct Look {
+            pub key: Key,
+            pub damage: Damage,
+            pub due: Due,
+            pub now: Instant,
+            pub captured: Captured,
+            /// The least time between two captures.
+            pub min_interval: Duration,
+            /// How long damage may settle before it is captured (`--coalesce-us`).
+            pub coalesce: Duration,
+            pub gate: Gated,
+            pub encoding: Encoding,
+            pub in_flight: InFlight,
+        }
+
+        /// What the loop does next, from what it knows.
+        pub fn step(look: &Look) -> Step {
+            let next = match (look.damage, look.key) {
+                // Nothing moved and no keyframe is wanted. A pass goes only to an idle encoder,
+                // as every capture does (below); until then a change may come, and with it the
+                // capture is motion's.
+                (Damage::None, Key::NotWanted) => match (look.due, look.encoding, look.in_flight) {
+                    (Due::Now, Encoding::Idle, InFlight::Nothing) => Next::Pass,
+                    // Nor onto a path that has frames on it: behind them, it would hold the
+                    // next keystroke back by all of them.
+                    (Due::Now, Encoding::Idle, InFlight::Frames(last)) => {
+                        return Step::Wait(Wait::Pass(last))
+                    }
+                    (Due::Now, Encoding::Busy, _) | (Due::Never, _, _) => {
+                        return Step::Wait(Wait::Change)
+                    }
+                    (Due::In(due), _, _) => return Step::Wait(Wait::Pass(due)),
+                },
+                (Damage::Unreported | Damage::Rows { .. }, Key::Wanted | Key::NotWanted)
+                | (Damage::None, Key::Wanted) => Next::Change,
+            };
+            let since = look.now.saturating_duration_since(look.captured.gate(next));
+            if since < look.min_interval {
+                let rest = look.min_interval - since;
+                return Step::Wait(Wait::Interval { rest, next });
+            }
+            // Apps present a frame as a burst of puts; give the burst a moment to land so
+            // the capture holds one whole frame instead of its first tiles.
+            if let Damage::Rows { since, .. } = look.damage {
+                let settled = look.now.saturating_duration_since(since);
+                if settled < look.coalesce {
+                    return Step::Wait(Wait::Settle(look.coalesce - settled));
+                }
+            }
+            // A keyframe is not held by the gate.
+            if let (Key::NotWanted, Gated::Held { until }) = (look.key, look.gate) {
+                return Step::Wait(Wait::Gate(until.map(|until| until - look.now)));
+            }
+            // A capture goes only to an idle encoder. One made while it codes the frame before
+            // would wait for it, a whole encode older by the time it is coded; made once it is
+            // done, it holds what changed meanwhile, and goes at once.
+            match look.encoding {
+                Encoding::Idle => Step::Capture(next),
+                Encoding::Busy => Step::Wait(Wait::Buffer),
+            }
+        }
+    }
+
+    /// A step decides as it did, and the buffer goes with what it decides: a capture
+    /// takes it, a wait leaves it where it was. Over every look of `each_case`.
+    #[test]
+    fn a_step_decides_as_it_did_and_carries_the_buffer() {
+        let cases = each_case(|c| {
+            let old = oracle::step(&oracle::Look {
+                key: c.key(),
+                damage: c.damage,
+                due: c.due,
+                now: c.now,
+                captured: c.captured,
+                min_interval: c.min_interval,
+                coalesce: c.coalesce,
+                gate: c.gate,
+                encoding: match c.home {
+                    true => oracle::Encoding::Idle,
+                    false => oracle::Encoding::Busy,
+                },
+                in_flight: c.in_flight,
+            });
+            let want = match old {
+                oracle::Step::Wait(wait) => Step::Wait(wait, c.buffer()),
+                oracle::Step::Capture(next) => Step::Capture(next, ()),
+            };
+            assert_eq!(step(c.look()), want);
         });
         assert_eq!(cases, CASES);
     }
@@ -5777,7 +5911,7 @@ mod tests {
     fn a_wait_wakes_on_what_it_waits_for() {
         let mut waits = 0;
         each_case(|c| {
-            let Step::Wait(wait) = step(&c.look()) else {
+            let Step::Wait(wait, _) = step(c.look()) else {
                 return;
             };
             waits += 1;
@@ -5906,7 +6040,7 @@ mod tests {
     fn damage_ends_the_wait_before_a_pass() {
         let mut waits = [0; 2];
         each_case(|c| {
-            let Step::Wait(wait @ Wait::Interval { .. }) = step(&c.look()) else {
+            let Step::Wait(wait @ Wait::Interval { .. }, _) = step(c.look()) else {
                 return;
             };
             // What the capture held back would be, as the look says.
