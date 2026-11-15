@@ -90,12 +90,18 @@ export const cmd = {
  * `node web/src/video-header.test.ts`. */
 export interface VideoHeader {
 	key: boolean;
+	/** The frame sharpens what it codes. */
+	sharpens: boolean;
 	frame: number;
 	/** Server-side pipeline time (capture to send), in 0.1 ms. */
 	pipe: number;
 	stripe: number;
+	/** How many stripes the screen is cut into. */
+	stripes: number;
 	/** Stripe updates that make up this frame. */
 	parts: number;
+	/** The stripe's top row. */
+	y: number;
 }
 
 export function parseVideoHeader(b: Uint8Array): VideoHeader {
@@ -103,10 +109,13 @@ export function parseVideoHeader(b: Uint8Array): VideoHeader {
 		((b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3]) >>> 0;
 	return {
 		key: (b[1] & 1) === 1,
+		sharpens: (b[1] & 2) === 2,
 		frame: u32(2),
 		pipe: u32(6),
 		stripe: b[10],
+		stripes: b[11],
 		parts: b[12],
+		y: (b[14] << 8) | b[15],
 	};
 }
 export const VIDEO_HEADER_BYTES = 16;

@@ -58,8 +58,7 @@ HEADER_LEN = 16
 
 
 def read_header(m):
-    """The fields this viewer reads from a video message's header (src/video.rs `Header`),
-    None for any other message."""
+    """A video message's header (src/video.rs `Header`), None for any other message."""
     if len(m) <= HEADER_LEN or m[0] != VIDEO:
         return None
     return {
@@ -67,7 +66,10 @@ def read_header(m):
         "sharpens": m[1] & 2 == 2,
         "frame": int.from_bytes(m[2:6], "big"),
         "pipe": int.from_bytes(m[6:10], "big"),
+        "stripe": m[10],
+        "stripes": m[11],
         "parts": m[12],
+        "y": int.from_bytes(m[14:16], "big"),
     }
 
 
@@ -76,7 +78,8 @@ def check_header():
         cases = json.load(f)
     for c in cases:
         h = read_header(bytes.fromhex(c["header"] + c["picture"]))
-        if h != {field: c[field] for field in h}:
+        # Every field the fixture names, and nothing else.
+        if h != {field: v for field, v in c.items() if field not in ("header", "picture")}:
             sys.exit(f"{c['header']} reads as {h}")
     print(f"read_header: {len(cases)} messages as {HEADER_FIXTURE} says")
 

@@ -2,7 +2,11 @@
 // src/video.rs's tests and bench/linkviewer.py check theirs against too:
 //   node web/src/video-header.test.ts
 import fixture from './video-header.json' with { type: 'json' };
-import { parseVideoHeader, VIDEO_HEADER_BYTES } from './protocol.ts';
+import {
+	parseVideoHeader,
+	VIDEO_HEADER_BYTES,
+	type VideoHeader,
+} from './protocol.ts';
 
 const bytes = (hex: string) => {
 	const digits = hex.replaceAll(' ', '');
@@ -11,20 +15,18 @@ const bytes = (hex: string) => {
 	);
 };
 
-for (const want of fixture) {
-	const message = new Uint8Array([
-		...bytes(want.header),
-		...bytes(want.picture),
-	]);
+// Every field the fixture names and every field the reader returns: one it leaves out
+// reads as undefined, one the fixture does not name is expected as undefined.
+for (const { header, picture, ...fields } of fixture) {
+	const message = new Uint8Array([...bytes(header), ...bytes(picture)]);
 	const got = parseVideoHeader(message);
-	for (const [field, value] of Object.entries(got)) {
-		const expected = want[field as keyof typeof want];
+	for (const name of new Set([...Object.keys(fields), ...Object.keys(got)])) {
+		const value = got[name as keyof VideoHeader];
+		const expected = fields[name as keyof typeof fields];
 		if (value !== expected)
-			throw new Error(
-				`${want.header}: ${field} reads ${value}, not ${expected}`
-			);
+			throw new Error(`${header}: ${name} reads ${value}, not ${expected}`);
 	}
-	const picture = message.subarray(VIDEO_HEADER_BYTES).join();
-	if (picture !== bytes(want.picture).join())
-		throw new Error(`${want.header}: the picture reads ${picture}`);
+	const rest = message.subarray(VIDEO_HEADER_BYTES).join();
+	if (rest !== bytes(picture).join())
+		throw new Error(`${header}: the picture reads ${rest}`);
 }
