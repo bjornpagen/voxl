@@ -364,7 +364,7 @@ impl Stream {
             paintover: cfg.paintover_crf,
         };
         let (fps, debug) = (cfg.fps, cfg.debug);
-        let encode = Stopped::spawn("encode", move || {
+        let encode = encoder_thread(hub.clone(), move || {
             encode_loop(stripes, job_rx, ret_tx, hub, fps, crfs, debug)
         });
         Ok(Stream {
@@ -1421,70 +1421,73 @@ struct StripeJob {
 
 /// What a stripe worker sends back for its part of a frame.
 struct StripeResult {
-    stripe: usize,
     out: StripeOut,
     /// The picture it was lent, handed back with the result, so that once every result
     /// is in the capture loop has it alone again.
     buf: Arc<I420>,
 }
 
-/// The stripe workers, each with its stripe's encoder, and the channel they answer on.
-struct Crew {
-    jobs: Vec<mpsc::Sender<StripeJob>>,
+/// The stripe workers, each with its stripe's encoder. Each is reached by two channels
+/// of its own, and the encode loop holds one end of each and nothing else does: a
+/// worker that is gone has dropped the other ends, so a job handed to it is refused and
+/// a wait for its result ends at once. Each channel holds one message, since a worker
+/// has one job at a time.
+struct Crew(Vec<Hand>);
+
+/// The encode loop's ends of one stripe worker's channels.
+struct Hand {
+    jobs: mpsc::SyncSender<StripeJob>,
     done: mpsc::Receiver<StripeResult>,
-    /// The encode loop's own end of `done`.
-    _done: mpsc::Sender<StripeResult>,
 }
+
+/// A stripe worker is gone, so its stripe can't be coded again: the pipeline ends, as it
+/// does when the encode loop is gone.
+#[derive(Debug)]
+struct Gone(usize);
 
 impl Crew {
     /// Starts a thread per stripe: `work` codes the jobs that arrive on its receiver and
-    /// answers on its sender.
+    /// answers each on its sender.
     fn spawn<W>(workers: impl IntoIterator<Item = W>) -> Crew
     where
-        W: FnOnce(mpsc::Receiver<StripeJob>, mpsc::Sender<StripeResult>) + Send + 'static,
+        W: FnOnce(mpsc::Receiver<StripeJob>, mpsc::SyncSender<StripeResult>) + Send + 'static,
     {
-        let (done_tx, done) = mpsc::channel();
-        let jobs = workers
-            .into_iter()
-            .enumerate()
-            .map(|(i, work)| {
-                let (tx, rx) = mpsc::channel();
-                let answer = done_tx.clone();
-                std::thread::Builder::new()
-                    .name(format!("enc-{i}"))
-                    .spawn(move || work(rx, answer))
-                    .unwrap();
-                tx
-            })
-            .collect();
-        Crew {
-            jobs,
-            done,
-            _done: done_tx,
-        }
+        Crew(
+            workers
+                .into_iter()
+                .enumerate()
+                .map(|(i, work)| {
+                    let (jobs, rx) = mpsc::sync_channel(1);
+                    let (answer, done) = mpsc::sync_channel(1);
+                    std::thread::Builder::new()
+                        .name(format!("enc-{i}"))
+                        .spawn(move || work(rx, answer))
+                        .unwrap();
+                    Hand { jobs, done }
+                })
+                .collect(),
+        )
     }
 
     /// Lends the job's picture to the workers of the selected stripes and waits for
     /// their results. The picture comes back with them, no longer shared.
-    fn run(&self, selected: &[bool], job: StripeJob) -> (Vec<StripeOut>, Arc<I420>) {
-        let mut pending = 0;
-        for (tx, _) in self.jobs.iter().zip(selected).filter(|(_, &on)| on) {
-            let _ = tx.send(job.clone());
-            pending += 1;
+    fn run(&self, selected: &[bool], job: StripeJob) -> Result<(Vec<StripeOut>, Arc<I420>), Gone> {
+        let asked = || self.0.iter().enumerate().filter(|&(i, _)| selected[i]);
+        for (i, hand) in asked() {
+            hand.jobs.send(job.clone()).map_err(|_| Gone(i))?;
         }
-        let mut results: Vec<StripeOut> = (0..self.jobs.len()).map(|_| StripeOut::Failed).collect();
-        for _ in 0..pending {
-            if let Ok(r) = self.done.recv() {
-                results[r.stripe] = r.out;
-                drop(r.buf);
-            }
+        let mut results: Vec<StripeOut> = (0..self.0.len()).map(|_| StripeOut::Failed).collect();
+        for (i, hand) in asked() {
+            let StripeResult { out, buf } = hand.done.recv().map_err(|_| Gone(i))?;
+            results[i] = out;
+            drop(buf);
         }
-        (results, job.buf)
+        Ok((results, job.buf))
     }
 }
 
 enum StripeOut {
-    /// The encode failed, or the worker never answered.
+    /// The encode failed, or the frame didn't touch the stripe.
     Failed,
     Sent {
         key: bool,
@@ -1590,10 +1593,9 @@ struct MotionSize {
 }
 
 fn stripe_worker(
-    i: usize,
     mut s: Stripe,
     rx: mpsc::Receiver<StripeJob>,
-    done: mpsc::Sender<StripeResult>,
+    done: mpsc::SyncSender<StripeResult>,
     fps: Fps,
     crfs: Crfs,
     debug: bool,
@@ -1700,7 +1702,6 @@ fn stripe_worker(
         };
         if done
             .send(StripeResult {
-                stripe: i,
                 out: result,
                 buf: job.buf,
             })
@@ -1725,6 +1726,28 @@ fn stripe_worker(
 /// these are 5 s and 4 s; at double 20 s and 19 s, with twice that queued.
 const HOPELESSLY_BEHIND: usize = 600;
 
+/// Starts the encode loop's thread with `run`, which owns the way home for the capture
+/// loop's pictures. However `run` ends, by returning or by a panic, it has closed that
+/// way by then, and the capture loop is woken to find it closed: it ends on "encoder
+/// gone", and never waits for a picture that cannot come. Dropped, it waits for `run` to
+/// end.
+fn encoder_thread(hub: Arc<Hub>, run: impl FnOnce() + Send + 'static) -> Stopped {
+    let woken = Woken(hub);
+    Stopped::spawn("encode", move || {
+        let _woken = woken;
+        run()
+    })
+}
+
+/// Wakes the hub when it is dropped.
+struct Woken(Arc<Hub>);
+
+impl Drop for Woken {
+    fn drop(&mut self) {
+        self.0.wake();
+    }
+}
+
 fn encode_loop(
     stripes_in: Vec<Stripe>,
     rx: mpsc::Receiver<Job>,
@@ -1734,10 +1757,6 @@ fn encode_loop(
     crfs: Crfs,
     debug: Debugging,
 ) {
-    let epoch = Instant::now();
-    let mut frame_id: u32 = 0;
-    let n = stripes_in.len();
-    let mut budget = FrameBudget::new(epoch);
     let debug_stripes = debug.stripes;
     // Geometry stays here; encoders move to their workers.
     let stripes: Vec<(usize, usize)> = stripes_in.iter().map(|s| (s.y, s.h)).collect();
@@ -1745,9 +1764,27 @@ fn encode_loop(
     let crew = Crew::spawn(
         stripes_in
             .into_iter()
-            .enumerate()
-            .map(|(i, s)| move |rx, done| stripe_worker(i, s, rx, done, fps, crfs, debug_stripes)),
+            .map(|s| move |rx, done| stripe_worker(s, rx, done, fps, crfs, debug_stripes)),
     );
+    if let Err(Gone(i)) = encode_frames(&crew, &stripes, fps, rx, ret, &hub) {
+        log::error!("stripe {i}'s encoder is gone");
+    }
+}
+
+/// Codes each frame the capture loop sends with the crew, and sends it to the viewers,
+/// until the capture loop is gone or a stripe worker is.
+fn encode_frames(
+    crew: &Crew,
+    stripes: &[(usize, usize)],
+    fps: Fps,
+    rx: mpsc::Receiver<Job>,
+    ret: mpsc::Sender<Returned>,
+    hub: &Hub,
+) -> Result<(), Gone> {
+    let epoch = Instant::now();
+    let mut frame_id: u32 = 0;
+    let n = stripes.len();
+    let mut budget = FrameBudget::new(epoch);
     while let Ok(job) = rx.recv() {
         let t0 = Instant::now();
         // A sharpening frame's band covers the blocks it sharpens.
@@ -1788,7 +1825,7 @@ fn encode_loop(
                 mb_dirty,
                 mb_cols,
             },
-        );
+        )?;
         let collected = Instant::now();
         // A frame's blocks are sharp when every stripe it touched came back as asked.
         let sharp = selected.iter().zip(&results).all(|(&on, r)| {
@@ -1894,6 +1931,7 @@ fn encode_loop(
             );
         }
     }
+    Ok(())
 }
 
 /// CPU time this thread has used, in microseconds.
@@ -2952,8 +2990,8 @@ mod tests {
                 .map(|(y, h)| (y as usize, h as usize))
                 .collect();
             let n = layout.len();
-            let crew = Crew::spawn(layout.iter().enumerate().map(|(i, &rows)| {
-                move |rx: mpsc::Receiver<StripeJob>, done: mpsc::Sender<StripeResult>| {
+            let crew = Crew::spawn(layout.iter().map(|&rows| {
+                move |rx: mpsc::Receiver<StripeJob>, done: mpsc::SyncSender<StripeResult>| {
                     let mut served = 0;
                     while let Ok(job) = rx.recv() {
                         let out = fake_answer(
@@ -2967,11 +3005,7 @@ mod tests {
                             served,
                         );
                         served += 1;
-                        let back = StripeResult {
-                            stripe: i,
-                            out,
-                            buf: job.buf,
-                        };
+                        let back = StripeResult { out, buf: job.buf };
                         if done.send(back).is_err() {
                             return;
                         }
@@ -3031,17 +3065,19 @@ mod tests {
                     })
                     .collect();
 
-                let (outs, mut back) = crew.run(
-                    &selected,
-                    StripeJob {
-                        buf,
-                        ts,
-                        coding,
-                        cap: share,
-                        mb_dirty,
-                        mb_cols,
-                    },
-                );
+                let (outs, mut back) = crew
+                    .run(
+                        &selected,
+                        StripeJob {
+                            buf,
+                            ts,
+                            coding,
+                            cap: share,
+                            mb_dirty,
+                            mb_cols,
+                        },
+                    )
+                    .expect("no worker dies");
                 assert_eq!(shown(&outs), shown(&want), "case {case} frame {frame}");
                 assert_eq!(
                     (back.y.as_ptr(), back.u.as_ptr(), back.v.as_ptr()),
@@ -3059,6 +3095,301 @@ mod tests {
                 pool[idx] = Some(back);
             }
         }
+    }
+
+    /// How a fake stripe worker ends.
+    #[derive(Clone, Copy, Debug)]
+    enum End {
+        /// It answers every job it is given.
+        Never,
+        /// It answers `n` jobs, then returns before taking another.
+        Returns(u32),
+        /// It answers `n` jobs, takes the next one and returns without answering it.
+        Drops(u32),
+        /// It answers `n` jobs, takes the next one and panics.
+        Panics(u32),
+    }
+
+    impl End {
+        /// How many jobs it answers, if not all.
+        fn answers(self) -> Option<u32> {
+            match self {
+                End::Never => None,
+                End::Returns(n) | End::Drops(n) | End::Panics(n) => Some(n),
+            }
+        }
+    }
+
+    /// A fake stripe worker for stripe `i`: it answers each job with a header's room, its
+    /// stripe and how many jobs it answered before, until its `end`. Once it has dropped
+    /// both of its channels' ends, by returning or by unwinding, it says `i` on `ended`.
+    fn mortal(
+        i: usize,
+        end: End,
+        ended: mpsc::Sender<usize>,
+    ) -> impl FnOnce(mpsc::Receiver<StripeJob>, mpsc::SyncSender<StripeResult>) + Send + 'static
+    {
+        struct Ended(usize, mpsc::Sender<usize>);
+        impl Drop for Ended {
+            fn drop(&mut self) {
+                let _ = self.1.send(self.0);
+            }
+        }
+        move |rx, done| {
+            // Declared first, so dropped after both ends.
+            let _ended = Ended(i, ended);
+            let (rx, done) = (rx, done);
+            for served in 0u32.. {
+                if let End::Returns(n) = end {
+                    if n == served {
+                        return;
+                    }
+                }
+                let Ok(job) = rx.recv() else { return };
+                match end {
+                    End::Drops(n) if n == served => return,
+                    End::Panics(n) if n == served => panic!("stripe {i} dies on its job {n}"),
+                    End::Never | End::Returns(_) | End::Drops(_) | End::Panics(_) => {}
+                }
+                let mut bytes = vec![0; Header::LEN];
+                bytes.extend([i as u8, served as u8]);
+                let at = Instant::now();
+                let out = StripeOut::Sent {
+                    key: true,
+                    bytes,
+                    quality: Quality::AsAsked,
+                    coded: Coded {
+                        woke: at,
+                        x264: at,
+                        encoded: at,
+                    },
+                };
+                if done.send(StripeResult { out, buf: job.buf }).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+
+    fn a_job(n: usize) -> StripeJob {
+        StripeJob {
+            buf: Arc::new(I420::new(16, 16 * n)),
+            ts: 0,
+            coding: Coding::Motion,
+            cap: 1,
+            mb_dirty: Dirty::All,
+            mb_cols: 1,
+        }
+    }
+
+    /// A stripe worker that is gone leaves the encode loop nothing to wait on: once it
+    /// has dropped its ends, by returning before a job, after taking one, or by
+    /// panicking, its job channel refuses and its result channel reads disconnected,
+    /// for any crew and any of its workers gone, while the others' stay open.
+    #[test]
+    fn a_gone_worker_closes_both_its_channels() {
+        let mut g = Gen(0x2545F4914F6CDD1D);
+        for case in 0..300 {
+            let n = 1 + g.below(8) as usize;
+            let ends: Vec<End> = (0..n)
+                .map(|_| match g.below(4) {
+                    0 => End::Returns(0),
+                    1 => End::Drops(0),
+                    2 => End::Panics(0),
+                    _ => End::Never,
+                })
+                .collect();
+            let (ended_tx, ended) = mpsc::channel();
+            let crew = Crew::spawn((0..n).map(|i| mortal(i, ends[i], ended_tx.clone())));
+            for hand in &crew.0 {
+                let _ = hand.jobs.send(a_job(n));
+            }
+            let mut gone: Vec<usize> = (0..n).filter(|&i| ends[i].answers().is_some()).collect();
+            let mut seen: Vec<usize> = (0..gone.len()).map(|_| ended.recv().unwrap()).collect();
+            seen.sort();
+            gone.sort();
+            assert_eq!(seen, gone, "case {case}: {ends:?}");
+            for (i, hand) in crew.0.iter().enumerate() {
+                let what = format!("case {case}: stripe {i}, {:?}", ends[i]);
+                match ends[i] {
+                    End::Never => {
+                        assert!(hand.done.recv().is_ok(), "{what}");
+                        assert!(
+                            matches!(hand.done.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                            "{what}: there, and its results are closed"
+                        );
+                        assert!(hand.jobs.send(a_job(n)).is_ok(), "{what}");
+                    }
+                    End::Returns(_) | End::Drops(_) | End::Panics(_) => {
+                        assert!(
+                            matches!(hand.done.try_recv(), Err(mpsc::TryRecvError::Disconnected)),
+                            "{what}: gone, and its results are open"
+                        );
+                        assert!(
+                            hand.jobs.send(a_job(n)).is_err(),
+                            "{what}: gone, and it takes jobs"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Any stripe worker may die at any point, and the pipeline then ends with it gone
+    /// and never waits for it. Over generated stripe layouts, deaths (returning before
+    /// a job, taking one and returning, taking one and panicking, after any number of
+    /// jobs) and runs of frames over any band of rows, fed as the capture loop feeds
+    /// them: every frame before the first one that needs a dead worker comes back with
+    /// the picture it was given, and no other does; the encode loop ends with a worker
+    /// that frame needed gone; the capture loop, waiting for its pictures as it does (on
+    /// the hub's waker, with no limit), is woken to find the way home closed, which it
+    /// ends on ("encoder gone"); and its frame after the next is refused, as a closed
+    /// encoder refuses it. Every wait here is on a channel or the waker, none on a clock.
+    #[test]
+    fn a_dead_worker_ends_the_pipeline() {
+        let mut g = Gen(0x9E3779B97F4A7C15);
+        // Cases that ended with each way of dying, that ended well, and that refused.
+        let mut reached = [0; 5];
+        for case in 0..400 {
+            let width = 16 + g.below(40) as usize;
+            let height = 16 + g.below(160) as usize;
+            let stripes: Vec<(usize, usize)> = stripe_layout(height as u32, 1 + g.below(6) as u32)
+                .into_iter()
+                .map(|(y, h)| (y as usize, h as usize))
+                .collect();
+            let n = stripes.len();
+            let ends: Vec<End> = (0..n)
+                .map(|_| {
+                    let after = g.below(5) as u32;
+                    match g.below(6) {
+                        0 => End::Returns(after),
+                        1 => End::Drops(after),
+                        2 => End::Panics(after),
+                        _ => End::Never,
+                    }
+                })
+                .collect();
+            let (ended_tx, _ended) = mpsc::channel();
+            let crew = Crew::spawn((0..n).map(|i| mortal(i, ends[i], ended_tx.clone())));
+            // Each frame is a band of rows; one past the picture needs no stripe.
+            let frames: Vec<Band> = (0..1 + g.below(16))
+                .map(|_| {
+                    let y0 = g.below(height as u64 + 8) as u32;
+                    let y1 = y0 + 1 + g.below(height as u64) as u32;
+                    Band { y0, y1 }
+                })
+                .collect();
+            // The model: how many frames come back, and the stripes dead at the first
+            // one that doesn't.
+            let mut served = vec![0u32; n];
+            let mut back = 0;
+            let mut dying = vec![];
+            for band in &frames {
+                let needs: Vec<usize> = (0..n)
+                    .filter(|&i| {
+                        let (y, h) = stripes[i];
+                        (band.y0 as usize) < y + h && (band.y1 as usize) > y
+                    })
+                    .collect();
+                dying = needs
+                    .iter()
+                    .copied()
+                    .filter(|&i| ends[i].answers() == Some(served[i]))
+                    .collect();
+                if !dying.is_empty() {
+                    break;
+                }
+                for &i in &needs {
+                    served[i] += 1;
+                }
+                back += 1;
+            }
+            // The capture loop can hand over one frame past the one the encode loop
+            // ends on before it is refused, since the job channel holds one.
+            let refused = !dying.is_empty() && frames.len() > back + 2;
+
+            let (job_tx, rx) = mpsc::sync_channel::<Job>(1);
+            let (ret, ret_rx) = mpsc::channel();
+            let hub = Hub::new();
+            let (ended_tx, ended) = mpsc::channel();
+            let encode = encoder_thread(hub.clone(), {
+                let hub = hub.clone();
+                let fps = Fps::new(60).unwrap();
+                move || {
+                    let r = encode_frames(&crew, &stripes, fps, rx, ret, &hub);
+                    drop(crew);
+                    let _ = ended_tx.send(r);
+                }
+            });
+            let frames_n = frames.len();
+            let pictures: Vec<Arc<I420>> = (0..frames.len())
+                .map(|_| Arc::new(I420::new(width, height)))
+                .collect();
+            let at: Vec<*const I420> = pictures.iter().map(Arc::as_ptr).collect();
+            // The capture loop: it hands over each frame, and stops at one refused.
+            let capture = std::thread::spawn(move || {
+                for (band, buf) in frames.into_iter().zip(pictures) {
+                    let job = Job {
+                        buf,
+                        frame: super::Frame::Motion {
+                            band,
+                            dirty: Arc::new(vec![]),
+                        },
+                        target: Kbps::new(1000.0),
+                        capacity: None,
+                        captured: CaptureMarks::at(Instant::now()),
+                        marker_ms: None,
+                    };
+                    if job_tx.send(job).is_err() {
+                        return true;
+                    }
+                }
+                false
+            });
+            let what = format!("case {case}: {n} stripes, {ends:?}, {dying:?} dying");
+            // The capture loop's wait for its pictures. Once every frame is in, a capture
+            // loop that ended well has closed the stream and waits for nothing.
+            let mut home = 0;
+            while !(dying.is_empty() && home == frames_n) {
+                hub.drain_wake();
+                match ret_rx.try_recv() {
+                    Ok(r) => {
+                        assert!(home < back, "{what}: frame {home} came back");
+                        assert_eq!(Arc::as_ptr(&r.buf), at[home], "{what}: frame {home}");
+                        home += 1;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => wait_any([hub.waker.waitable()], None),
+                    Err(mpsc::TryRecvError::Disconnected) => break,
+                }
+            }
+            assert_eq!(home, back, "{what}");
+            drop(encode);
+            match ended.recv().unwrap() {
+                Ok(()) => {
+                    assert!(dying.is_empty(), "{what}: ended well");
+                    reached[3] += 1;
+                }
+                Err(Gone(i)) => {
+                    assert!(dying.contains(&i), "{what}: ended with {i} gone");
+                    reached[match ends[i] {
+                        End::Returns(_) => 0,
+                        End::Drops(_) => 1,
+                        End::Panics(_) => 2,
+                        End::Never => unreachable!("{what}: {i} never dies"),
+                    }] += 1;
+                }
+            }
+            if refused {
+                assert!(capture.join().unwrap(), "{what}: no frame was refused");
+                reached[4] += 1;
+            } else {
+                capture.join().unwrap();
+            }
+        }
+        assert!(
+            reached.iter().all(|&r| r >= 20),
+            "too few cases reached: {reached:?}"
+        );
     }
 
     /// Once the screen goes still the paint-overs show x264 forgetting the drag, so the
