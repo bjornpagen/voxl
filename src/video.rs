@@ -1870,6 +1870,150 @@ mod tests {
         assert_eq!(r.pending_map().map(|p| p.0), Some(vec![1, 1]));
     }
 
+    /// Typing beside an animation on a slow link: what the viewer is shown of blocks that
+    /// stopped changing is sharp within a bounded time, however long the motion beside them
+    /// goes on.
+    ///
+    /// One stripe: an animation's block changes on every frame, so the screen is never
+    /// still and the text is sharpened only by passes that frames with motion carry. The
+    /// text's blocks change in bursts of keystrokes, each burst followed by a pause. The
+    /// link: the cap squeezes a pass that has much left to send, but what a squeezed pass
+    /// sends stays, so a pass comes back as asked once every block it carries has had
+    /// `needs` passes since it last changed (live at 6 Mbit/s a still page takes 25-45).
+    /// The oracle is the model's own record of what the viewer is shown: a block at motion
+    /// quality from its last change until a pass that carried it, captured after that
+    /// change, comes back as asked.
+    ///
+    /// The bound, from the last keystroke: `REFINE_STILL` of stillness, then `needs`
+    /// passes `REFINE_EVERY` apart, each waiting up to a frame for a capture, then a frame
+    /// for the last one to come back. Throughout, a pass carries only blocks still for
+    /// `REFINE_STILL`, never the animation's, passes stay `REFINE_EVERY` apart, and none
+    /// goes once the text is shown sharp.
+    #[test]
+    fn still_blocks_are_sharpened_beside_motion() {
+        // Block 0 is the animation's, the others the text's.
+        const BLOCKS: usize = 8;
+        const FRAME: Duration = Duration::from_nanos(1_000_000_000 / 60);
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Shown {
+            AtMotionQuality,
+            Sharp,
+        }
+        struct Model {
+            r: Refiner,
+            now: Instant,
+            needs: u32,
+            changed: [Instant; BLOCKS],
+            /// Passes each block has had since it last changed.
+            passes: [u32; BLOCKS],
+            shown: [Shown; BLOCKS],
+            /// A pass that came back as asked, taken in before the next capture.
+            back: Option<(Vec<u8>, Instant)>,
+            last_pass: Option<Instant>,
+        }
+        impl Model {
+            /// One capture: the animation moved, and the block `typed`, if any.
+            fn capture(&mut self, typed: Option<usize>) {
+                self.now += FRAME;
+                if let Some((map, at)) = self.back.take() {
+                    for b in (0..BLOCKS).filter(|&b| map[b] != 0 && self.changed[b] <= at) {
+                        self.shown[b] = Shown::Sharp;
+                    }
+                    self.r.sharpened(&map, at);
+                }
+                let mut dirty = [0u8; BLOCKS];
+                dirty[0] = 1;
+                if let Some(b) = typed {
+                    dirty[b] = 1;
+                }
+                for b in (0..BLOCKS).filter(|&b| dirty[b] != 0) {
+                    (self.changed[b], self.passes[b], self.shown[b]) =
+                        (self.now, 0, Shown::AtMotionQuality);
+                }
+                self.r.mark(&dirty, self.now);
+                let Some((map, _)) = self.r.due(self.now) else {
+                    return;
+                };
+                assert_eq!(map[0], 0, "the animation's block went into a pass");
+                for b in (0..BLOCKS).filter(|&b| map[b] != 0) {
+                    let still = self.now - self.changed[b];
+                    assert!(
+                        still >= REFINE_STILL,
+                        "block {b} in a pass, still {still:?}"
+                    );
+                }
+                if let Some(last) = self.last_pass {
+                    assert!(
+                        self.now - last >= REFINE_EVERY,
+                        "passes {:?} apart",
+                        self.now - last
+                    );
+                }
+                self.last_pass = Some(self.now);
+                for (p, &m) in self.passes.iter_mut().zip(&map) {
+                    *p += m as u32;
+                }
+                if map
+                    .iter()
+                    .zip(&self.passes)
+                    .all(|(&m, &p)| m == 0 || p >= self.needs)
+                {
+                    self.back = Some((map, self.now));
+                }
+            }
+            fn text_at_motion_quality(&self) -> Vec<usize> {
+                (1..BLOCKS)
+                    .filter(|&b| self.shown[b] == Shown::AtMotionQuality)
+                    .collect()
+            }
+        }
+        let t0 = Instant::now();
+        let mut m = Model {
+            r: Refiner::new(BLOCKS, BLOCKS, t0),
+            now: t0,
+            needs: 1,
+            changed: [t0; BLOCKS],
+            passes: [0; BLOCKS],
+            shown: [Shown::Sharp; BLOCKS],
+            back: None,
+            last_pass: None,
+        };
+        let mut rng = 0x2545F4914F6CDD1Du64;
+        let mut next = |n: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % n
+        };
+        for _ in 0..300 {
+            m.needs = 1 + next(8) as u32;
+            let bound = REFINE_STILL + (REFINE_EVERY + FRAME) * m.needs + FRAME;
+            // Keystrokes 1 to 20 frames apart.
+            for _ in 0..1 + next(12) {
+                for _ in 0..next(20) {
+                    m.capture(None);
+                }
+                m.capture(Some(1 + next(BLOCKS as u64 - 1) as usize));
+            }
+            let typed = m.now;
+            while m.now < typed + bound {
+                m.capture(None);
+            }
+            assert_eq!(
+                m.text_at_motion_quality(),
+                Vec::<usize>::new(),
+                "needing {} passes, text shown at motion quality {:?} after the last keystroke",
+                m.needs,
+                m.now - typed
+            );
+            let sharp = m.last_pass;
+            for _ in 0..next(60) {
+                m.capture(None);
+            }
+            assert_eq!(m.last_pass, sharp, "a pass once the text was shown sharp");
+        }
+    }
+
     /// The sharpening schedule against a model of it (when passes are due from, if they
     /// are), over a long run of motion, passes, keyframes and empty pending maps at stated
     /// times: a pass is due at the same moments in both, and the rules hold.
