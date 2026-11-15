@@ -23,12 +23,20 @@ commands at 60 Hz) and shell commands written to a FIFO that a terminal on the
 benchmark display reads (`--fifo`; a terminal running `while read -r l < FIFO; do eval
 "$l"; done`). Scenarios name what to do; `{page}` in their commands is `--page`.
 
+The `hold` scenario holds a key (`--keysym`) for `--key-hold` seconds as a browser does:
+a down, a repeat after the first `--key-repeat` delay and then every interval, an up. Key
+messages leave `--key-delay` ms late, and the up `--key-stall` ms later still, as when the
+segment carrying it is lost and sent again. What lands is counted on the desktop (xev);
+OUT.marks.tsv says how many characters were sent (`sent`: the down and its repeats).
+
 Writes OUT.msgs.tsv (each video message: when received, when it arrived on the link,
 frame, key, paint-over, bytes, server pipeline ms), OUT.acks.tsv, OUT.marks.tsv (the
-scenario's phases) and OUT.scroll.tsv (scroll input).
+scenario's phases), OUT.scroll.tsv (scroll input) and OUT.keys.tsv (key messages, when
+each was due and when it was sent).
 
 usage: linkviewer.py HOST:PORT SCENARIO OUT [--kbps N] [--rtt MS] [--hold] [--report-hold]
        [--seed N] [--fifo PATH] [--page FILE] [--passive SECS]
+       [--keysym K] [--key-hold S] [--key-repeat MS,MS] [--key-delay MS] [--key-stall MS]
 """
 
 import argparse
@@ -94,6 +102,13 @@ SCENARIOS = {
         ("wait", 4.0),
         ("mark", "end"),
     ],
+    # A key held for --key-hold seconds, repeated as a browser does, behind the link.
+    "hold": [
+        ("wait", 1.0),
+        ("mark", "down"),
+        ("key", None),
+        ("mark", "end"),
+    ],
     # A burst of output, then stillness, then a flick.
     "idle": [
         ("term", "clear; head -300 {page}"),
@@ -122,6 +137,13 @@ async def main():
     ap.add_argument("--settle", type=float, default=3.0, help="seconds to watch before the scenario")
     ap.add_argument("--passive", type=float, default=0, help="only watch, for this many seconds")
     ap.add_argument("--seed", type=int, help="seed for --hold's random part, so a run can be repeated")
+    ap.add_argument("--keysym", type=lambda v: int(v, 0), default=0x61, help="key the hold scenario holds")
+    ap.add_argument("--key-hold", type=float, default=3.0, help="seconds the key is held")
+    # Not X's own schedule (500 ms then 50 ms under xfsettingsd, 660 then 40 bare), so the
+    # count of characters says whose repeats landed.
+    ap.add_argument("--key-repeat", default="300,33", help="the browser's repeat: delay,interval in ms")
+    ap.add_argument("--key-delay", type=float, default=0, help="one-way delay of every key message (ms)")
+    ap.add_argument("--key-stall", type=float, default=0, help="extra delay of the key-up alone (ms)")
     a = ap.parse_args()
     rng = random.Random(a.seed)
     owd = a.rtt / 2000.0
@@ -138,6 +160,8 @@ async def main():
     acks = open(f"{a.out}.acks.tsv", "w")
     marks = open(f"{a.out}.marks.tsv", "w")
     scrolls = open(f"{a.out}.scroll.tsv", "w")
+    keys = open(f"{a.out}.keys.tsv", "w")
+    keys.write("t_intended\tt_sent\tmsg\n")
 
     def arrive(nbytes):
         """When a message received now has crossed the emulated link."""
@@ -163,7 +187,10 @@ async def main():
             # Sends each scheduled message once its time has come (at most 2 ms late).
             while True:
                 if sendq and sendq[0][0] <= clock():
-                    await ws.send(heapq.heappop(sendq)[2])
+                    at, _, msg = heapq.heappop(sendq)
+                    await ws.send(msg)
+                    if msg.startswith("k,"):
+                        keys.write(f"{at:.4f}\t{clock():.4f}\t{msg}\n")
                     continue
                 wait = sendq[0][0] - clock() if sendq else 0.002
                 await asyncio.sleep(min(max(wait, 0), 0.002))
@@ -214,6 +241,24 @@ async def main():
                     await asyncio.sleep(arg)
                 elif kind == "mark":
                     marks.write(f"{arg}\t{clock():.4f}\n")
+                elif kind == "key":
+                    # Down, the browser's repeats, up: each leaves after --key-delay, and
+                    # the up --key-stall later still (a lost segment, retransmitted).
+                    delay, interval = (float(v) / 1000 for v in a.key_repeat.split(","))
+                    t = clock()
+                    d = a.key_delay / 1000
+                    schedule(t + d, f"k,{a.keysym},1")
+                    n = 0
+                    r = t + delay
+                    while r < t + a.key_hold:
+                        schedule(r + d, f"k,{a.keysym},2")
+                        n += 1
+                        r += interval
+                    up = t + a.key_hold + d + a.key_stall / 1000
+                    schedule(up, f"k,{a.keysym},0")
+                    marks.write(f"sent\t{n + 1}\n")
+                    # Stay until the up has landed: closing the socket releases every key.
+                    await asyncio.sleep(up - clock() + 1.0)
                 elif kind == "scroll":
                     start = time.monotonic()
                     for i, d in enumerate(arg):
@@ -222,7 +267,7 @@ async def main():
                         await asyncio.sleep(max(0, start + (i + 1) / 60 - time.monotonic()))
         for t in tasks:
             t.cancel()
-    for f in (msgs, acks, marks, scrolls):
+    for f in (msgs, acks, marks, scrolls, keys):
         f.close()
 
 

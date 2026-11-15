@@ -57,6 +57,10 @@ export type ServerMessage =
 	| { t: 'mic'; on: boolean }
 	| { t: 'close' };
 
+/** What a key did. */
+export type KeyAct = 'down' | 'repeat' | 'up';
+const KEY_ACT: Record<KeyAct, number> = { down: 1, repeat: 2, up: 0 };
+
 /** Text commands to the server. */
 export const cmd = {
 	/** A frame was shown, `held` ms after it finished arriving (decode, draw, frames
@@ -66,7 +70,8 @@ export const cmd = {
 	button: (button: number, down: boolean) => `b,${button},${down ? 1 : 0}`,
 	/** Scroll in desktop pixels; the server turns it into smooth scrolling or wheel clicks. */
 	scroll: (dx: number, dy: number) => `sp,${dx.toFixed(1)},${dy.toFixed(1)}`,
-	key: (keysym: number, down: boolean) => `k,${keysym},${down ? 1 : 0}`,
+	/** A key went down, repeated while held (this viewer's own autorepeat) or came up. */
+	key: (keysym: number, act: KeyAct) => `k,${keysym},${KEY_ACT[act]}`,
 	releaseAll: 'r',
 	clipboard: (text: string) => `c,${text}`,
 	video: (on: boolean) => `v,${on ? 1 : 0}`,

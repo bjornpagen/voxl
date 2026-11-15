@@ -13,6 +13,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WHEEL_DELTA,
 };
 
+/// What a viewer's key did. Its own keyboard decides when a held key repeats.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum KeyAct {
+    Down,
+    /// The viewer's keyboard repeated the key it holds.
+    Repeat,
+    Up,
+}
+
 pub enum InputEvent {
     Move {
         x: i32,
@@ -34,7 +43,7 @@ pub enum InputEvent {
     },
     Key {
         keysym: u32,
-        down: bool,
+        act: KeyAct,
     },
     /// Remote clipboard update, ordered with the key events around it.
     Clipboard(super::desktop::ClipContent),
@@ -353,7 +362,7 @@ impl Injector {
                 }
                 send(&v);
             }
-            InputEvent::Key { keysym, down } => self.key(keysym, down),
+            InputEvent::Key { keysym, act } => self.key(keysym, act),
             InputEvent::Clipboard(content) => {
                 if let Some(c) = &self.clipboard {
                     c.set_blocking(content);
@@ -363,11 +372,14 @@ impl Injector {
         }
     }
 
-    fn key(&mut self, keysym: u32, down: bool) {
+    fn key(&mut self, keysym: u32, act: KeyAct) {
         if let Some(vk) = modifier(keysym) {
-            if down == self.mods.contains_key(&keysym) {
-                return;
-            }
+            let down = match (act, self.mods.contains_key(&keysym)) {
+                (KeyAct::Down, false) => true,
+                (KeyAct::Up, true) => false,
+                // Down or up already, or repeated: a modifier is sent once, held or not.
+                (KeyAct::Down, true) | (KeyAct::Up, false) | (KeyAct::Repeat, _) => return,
+            };
             if down {
                 self.mods.insert(keysym, vk);
             } else {
@@ -376,18 +388,22 @@ impl Injector {
             send(&[self.key_event(vk, extended(keysym, vk), down)]);
             return;
         }
-        if !down {
-            // Shift was already put back right after the key went down.
-            if let Some((vk, ext, _)) = self.pressed.remove(&keysym) {
+        match (act, self.pressed.get(&keysym).copied()) {
+            (KeyAct::Down, None) => self.key_down(keysym),
+            (KeyAct::Repeat, Some((vk, ext, fix))) => self.press(vk, ext, fix),
+            (KeyAct::Up, Some((vk, ext, _))) => {
+                // Shift was already put back right after the key went down.
+                self.pressed.remove(&keysym);
                 send(&[self.key_event(vk, ext, false)]);
             }
-            return;
+            // Down already (a second viewer, or a page that sends repeats as downs), or
+            // not down at all.
+            (KeyAct::Down, Some(_)) | (KeyAct::Repeat, None) | (KeyAct::Up, None) => {}
         }
-        if let Some(&(vk, ext, fix)) = self.pressed.get(&keysym) {
-            // Autorepeat.
-            self.press(vk, ext, fix);
-            return;
-        }
+    }
+
+    /// A key going down that isn't held.
+    fn key_down(&mut self, keysym: u32) {
         if let Some(vk) = named(keysym) {
             let ext = extended(keysym, vk);
             self.pressed.insert(keysym, (vk, ext, ShiftFix::None));
@@ -485,7 +501,7 @@ impl Injector {
             send(&[self.key_event(vk, ext, false)]);
         }
         for ks in self.mods.keys().copied().collect::<Vec<_>>() {
-            self.key(ks, false);
+            self.key(ks, KeyAct::Up);
         }
         for b in 1..self.buttons.len() {
             if self.buttons[b] {
