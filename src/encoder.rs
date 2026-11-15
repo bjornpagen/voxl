@@ -12,7 +12,7 @@ mod ffi {
 
 use crate::env::{Debugging, X264Log};
 use crate::path::Kbps;
-use std::ffi::{CStr, CString};
+use std::ffi::{c_char, c_int, CStr, CString};
 use std::num::NonZeroU32;
 use std::ptr;
 
@@ -163,6 +163,8 @@ impl Encoder {
                 // Per-frame QP, macroblock types and size.
                 X264Log::Debug => ffi::X264_LOG_DEBUG,
             } as i32;
+            // Into voxl's log, where x264's own would write to stderr from the encoding thread.
+            param.pf_log = Some(ffi::voxl_x264_log);
             param.rc.i_rc_method = ffi::X264_RC_CRF as i32;
             param.rc.f_rf_constant = crf;
             param.rc.i_lookahead = 0;
@@ -372,6 +374,21 @@ impl Encoded {
     }
 }
 
+/// A line x264 logged (src/x264_log.c), as voxl's under the target `x264`. x264's level
+/// already chose what it says.
+#[no_mangle]
+extern "C" fn voxl_x264_line(level: c_int, line: *const c_char, len: usize) {
+    // SAFETY: x264_log.c hands over `len` bytes of the line it formatted, alive for this call.
+    let line = unsafe { std::slice::from_raw_parts(line.cast::<u8>(), len) };
+    let level = match level as u32 {
+        ffi::X264_LOG_ERROR => log::Level::Error,
+        ffi::X264_LOG_WARNING => log::Level::Warn,
+        ffi::X264_LOG_INFO => log::Level::Info,
+        ffi::X264_LOG_DEBUG.. => log::Level::Debug,
+    };
+    log::log!(target: "x264", level, "{}", String::from_utf8_lossy(line).trim_end());
+}
+
 impl Drop for Encoder {
     fn drop(&mut self) {
         unsafe { ffi::x264_encoder_close(self.h) }
@@ -512,6 +529,71 @@ mod tests {
             capped.len(),
             uncapped.len()
         );
+    }
+
+    /// What x264 logs while this test runs, as voxl's log would get it.
+    struct Logged;
+
+    static LOGGED: std::sync::Mutex<Vec<(log::Level, String, String)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    impl log::Log for Logged {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, r: &log::Record) {
+            let line = (r.level(), r.target().to_string(), r.args().to_string());
+            LOGGED.lock().unwrap().push(line);
+        }
+        fn flush(&self) {}
+    }
+
+    /// x264's log reaches voxl's, with the arguments x264 formatted into it: a size x264
+    /// refuses (an odd side, none, or past its limit) is said once, as an error under
+    /// `x264`, ending in the size, where x264's own log would have written it to stderr.
+    #[test]
+    fn x264_says_what_it_refuses_in_voxls_log() {
+        log::set_logger(&Logged).unwrap();
+        log::set_max_level(log::LevelFilter::Trace);
+        let mut seed = 0x264_u64 << 40 | 0x1065;
+        let mut range = |lo: u32, hi: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            lo + (seed % u64::from(hi - lo)) as u32
+        };
+        for i in 0..500 {
+            // Odd or nothing on one side or both; past x264's 16384 x 16384 once in a while.
+            let side = |range: &mut dyn FnMut(u32, u32) -> u32, refused: bool| match refused {
+                true => [0, range(0, 2048) * 2 + 1, range(8193, 40000) * 2][range(0, 3) as usize],
+                false => range(1, 2048) * 2,
+            };
+            let refused = range(0, 3);
+            let w = side(&mut range, refused != 1);
+            let h = side(&mut range, refused != 0);
+            let open = Encoder::new(&EncoderConfig {
+                pictures: Pictures {
+                    width: w,
+                    height: h,
+                    fps: Fps::new(60).unwrap(),
+                    preset: Preset::parse("ultrafast").unwrap(),
+                    threads: 1,
+                    debug: Debugging::read(|_| None).0,
+                },
+                crf: 24.0,
+                max_kbps: None,
+            });
+            assert!(open.is_err(), "{w}x{h} opened");
+            let said = format!("({w}x{h})");
+            let lines: Vec<_> = std::mem::take(&mut *LOGGED.lock().unwrap())
+                .into_iter()
+                .filter(|(_, target, _)| target == "x264")
+                .collect();
+            assert!(
+                matches!(&lines[..], [(log::Level::Error, _, m)] if m.ends_with(&said)),
+                "{i}: {w}x{h}: {lines:?}"
+            );
+        }
     }
 }
 

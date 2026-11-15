@@ -6,8 +6,14 @@ fn main() {
         unix_libs(&target)
     };
     let mut b = bindgen::Builder::default()
-        .header_contents("wrap.h", "#include <stdint.h>\n#include <x264.h>\n")
+        .header_contents(
+            "wrap.h",
+            "#include <stdint.h>\n#include <x264.h>\n\
+             void voxl_x264_log(void *, int, const char *, va_list);\n",
+        )
         .allowlist_function("x264_.*")
+        // x264's log callback (src/x264_log.c), declared as x264 declares pf_log.
+        .allowlist_function("voxl_x264_log")
         .allowlist_type("x264_.*")
         .allowlist_var("X264_.*")
         .layout_tests(false);
@@ -28,6 +34,10 @@ fn main() {
         .to_string();
     code.push_str(&format!("\npub use {open} as x264_encoder_open;\n"));
     std::fs::write(out.join("x264.rs"), code).unwrap();
+    cc::Build::new()
+        .file("src/x264_log.c")
+        .compile("voxl_x264_log");
+    println!("cargo:rerun-if-changed=src/x264_log.c");
     bundle_web(&out);
     println!("cargo:rerun-if-changed=build.rs");
 }
