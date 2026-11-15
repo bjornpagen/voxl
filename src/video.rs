@@ -525,11 +525,16 @@ impl RateCtl {
 /// How long a frame may take to cross the path: what a burst after stillness may cost
 /// in delay, once.
 const LATENCY_BUDGET: Duration = Duration::from_millis(60);
+/// A frame in debt may still spend this share of the target's part of one frame time:
+/// the stream keeps moving while it pays back, and pays back because it is under one.
+const DEBT_SHARE: f64 = 0.5;
+
 /// The bits a frame may spend. Tokens come in at the target rate by the time that
 /// really passed, and pile up while the screen is still to what the path carries in
-/// `LATENCY_BUDGET`: so the first frames of a scroll after stillness go out sharp, and
-/// a long run of frames averages the target, which is then what the stream really
-/// sends. A frame never gets less than the target's part of one frame time.
+/// `LATENCY_BUDGET`: so the first frames of a scroll after stillness go out sharp.
+/// Everything sent is taken off, into debt when a frame took more than there was (a
+/// keyframe's boost, several stripes moving at once), so over any stretch the stream
+/// sends what the target carries in it, give or take one depth.
 struct FrameBudget {
     tokens: Bits,
     at: Instant,
@@ -554,13 +559,12 @@ impl FrameBudget {
         let passed = now.saturating_duration_since(self.at);
         self.at = now;
         self.tokens = (self.tokens + target.over(passed)).min(depth);
-        self.tokens.max(steady)
+        self.tokens.max(steady.times(DEBT_SHARE))
     }
 
-    /// A lossy frame of `bytes` was sent. What it took beyond the tokens is forgiven:
-    /// the rate cap held it to what `allow` gave.
+    /// A frame of `bytes` was sent.
     fn spend(&mut self, bytes: usize) {
-        self.tokens = (self.tokens - Bits::of_bytes(bytes)).max(Bits::ZERO);
+        self.tokens = self.tokens - Bits::of_bytes(bytes);
     }
 }
 
@@ -1622,10 +1626,12 @@ fn encode_loop(
                     c.send(Out::Text("{\"t\":\"close\"}".into()));
                     continue;
                 }
+                let alone = q.is_empty();
                 q.push_back(Inflight {
                     id: frame_id,
                     sent: now,
                     bytes: total,
+                    alone,
                 });
             }
             for m in &msgs {
@@ -2067,8 +2073,8 @@ mod rate_tests {
         rtt: Duration,
         /// When the link is free again.
         free: Instant,
-        /// (acked at, sent at, bytes) of frames on their way.
-        flying: VecDeque<(Instant, Instant, usize)>,
+        /// (acked at, sent at, bytes, sent with nothing ahead of it) of frames on their way.
+        flying: VecDeque<(Instant, Instant, usize, bool)>,
         est: PathEst,
         rc: RateCtl,
         budget: FrameBudget,
@@ -2107,8 +2113,8 @@ mod rate_tests {
         fn tick(&mut self, want: usize) {
             self.now += Duration::from_secs_f64(1.0 / FPS as f64);
             while self.flying.front().is_some_and(|f| f.0 <= self.now) {
-                let (acked, sent, bytes) = self.flying.pop_front().unwrap();
-                self.est.on_ack(acked, sent, bytes);
+                let (acked, sent, bytes, alone) = self.flying.pop_front().unwrap();
+                self.est.on_ack(acked, sent, bytes, alone);
             }
             let oldest = self
                 .flying
@@ -2135,8 +2141,9 @@ mod rate_tests {
             self.worst_wait = self.worst_wait.max(start - self.now);
             self.worst_share = self.worst_share.min(bytes as f64 / want as f64);
             self.free = start + Duration::from_secs_f64(bytes as f64 * 8.0 / self.rate);
+            let alone = self.flying.is_empty();
             self.flying
-                .push_back((self.free + self.rtt, self.now, bytes));
+                .push_back((self.free + self.rtt, self.now, bytes, alone));
             self.sent_bytes += bytes;
         }
 
@@ -2290,8 +2297,9 @@ mod rate_tests {
 
     #[test]
     fn a_frame_gets_its_steady_share_and_no_more_than_the_latency_budget() {
-        // Whatever the tokens, a frame may spend at least the target's part of one frame
-        // time, and at most what the path carries in the latency budget.
+        // Whatever the tokens, a frame may spend at least its share in debt of the
+        // target's part of one frame time, and at most what the path carries in the
+        // latency budget.
         let mut rng = Rng(0xBF58476D1CE4E5B9);
         let t0 = Instant::now();
         let frame_time = Duration::from_secs_f64(1.0 / FPS as f64);
@@ -2307,7 +2315,8 @@ mod rate_tests {
                 now += Duration::from_micros(rng.range(100, 3_000_000));
                 let may = b.allow(now, target, capacity, FPS);
                 let steady = target.over(frame_time);
-                assert!(may >= steady, "{may:?} under the steady share {steady:?}");
+                let least = steady.times(DEBT_SHARE);
+                assert!(may >= least, "{may:?} under the share in debt {least:?}");
                 let most = match capacity {
                     Capacity::Known(c) => c.over(LATENCY_BUDGET).max(steady.times(2.0)),
                     Capacity::Unknown | Capacity::NoViewers => steady.times(2.0),
@@ -2316,5 +2325,43 @@ mod rate_tests {
                 b.spend(rng.range(0, 400_000) as usize);
             }
         }
+    }
+
+    /// Over any stretch, what frames spend is at most what the target carries in it,
+    /// plus the depth, plus one frame's floor: at the capture loop's own pace (0.85 of
+    /// a frame time apart, its `min_interval`), and with two stripes that each take
+    /// their share of twice the frame's budget. What a frame takes beyond the tokens is
+    /// a debt, and the frames after it pay it.
+    #[test]
+    fn a_long_run_of_frames_averages_the_target() {
+        let t0 = Instant::now();
+        let target = Kbps::new(9_000.0);
+        let capacity = Capacity::Known(Kbps::new(10_000.0));
+        let frame_time = Duration::from_secs_f64(1.0 / FPS as f64);
+        let steady = target.over(frame_time);
+        let depth = Kbps::new(10_000.0)
+            .over(LATENCY_BUDGET)
+            .max(steady.times(2.0));
+        let mut over = vec![];
+        // (frame times between frames, what a frame spends over what it may)
+        for (pace, spends) in [(0.85, 1.0), (1.0, 2.0)] {
+            let mut b = FrameBudget::new(t0);
+            let (mut now, mut sent) = (t0, Bits::ZERO);
+            for _ in 0..600 {
+                now += frame_time.mul_f64(pace);
+                let may = b.allow(now, target, capacity, FPS);
+                let bytes = (may.bytes() * spends) as usize;
+                b.spend(bytes);
+                sent = sent + Bits::of_bytes(bytes);
+            }
+            let most = target.over(now - t0) + depth + steady;
+            if sent > most {
+                over.push((pace, spends, sent.bytes() / most.bytes()));
+            }
+        }
+        assert!(
+            over.is_empty(),
+            "(pace, spends, sent over the most): {over:?}"
+        );
     }
 }

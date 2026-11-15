@@ -17,6 +17,9 @@ pub struct Inflight {
     pub id: u32,
     pub sent: Instant,
     pub bytes: usize,
+    /// Nothing sent before it was still unacknowledged when it went: whatever its
+    /// delay, it did not queue behind this client's own frames.
+    pub alone: bool,
 }
 
 /// How long a client says it kept a frame between its arrival and the ack (decode,
@@ -78,7 +81,7 @@ impl Client {
         while let Some(f) = q.front() {
             if wrapping_le(f.id, id) {
                 if f.id == id {
-                    sample = Some((f.sent, f.bytes));
+                    sample = Some((f.sent, f.bytes, f.alone));
                 }
                 q.pop_front();
             } else {
@@ -86,7 +89,7 @@ impl Client {
             }
         }
         drop(q);
-        let Some((sent, bytes)) = sample else {
+        let Some((sent, bytes, alone)) = sample else {
             return;
         };
         let arrived = match hold {
@@ -99,7 +102,7 @@ impl Client {
             }
             Hold::Said(_) | Hold::Unreadable => return,
         };
-        self.path.lock().on_ack(arrived, sent, bytes);
+        self.path.lock().on_ack(arrived, sent, bytes, alone);
     }
 
     /// Delay queued on the path to this client now (ms).
@@ -443,7 +446,12 @@ mod tests {
         hold: Hold,
     ) {
         let sent = t0 + Duration::from_millis(id as u64 * 100);
-        c.inflight.lock().push_back(Inflight { id, sent, bytes });
+        c.inflight.lock().push_back(Inflight {
+            id,
+            sent,
+            bytes,
+            alone: true,
+        });
         c.on_ack(sent + Duration::from_millis(path_ms + held_ms), id, hold);
     }
 
