@@ -7003,4 +7003,154 @@ mod tests {
         }
         assert!(seen.iter().all(|&n| n > 100), "unreached: {seen:?}");
     }
+
+    /// A path that serves in order: bytes a second, a round trip, the outages in which it
+    /// carries nothing, and when it is free again.
+    struct Link {
+        rate: f64,
+        rtt: Duration,
+        out: Vec<(Instant, Instant)>,
+        free: Instant,
+    }
+
+    impl Link {
+        /// A message of `bytes` leaves at `now`: when its last byte reaches the viewer.
+        fn send(&mut self, now: Instant, bytes: usize) -> Instant {
+            let mut at = self.free.max(now);
+            let mut left = Duration::from_secs_f64(bytes as f64 / self.rate);
+            for &(a, b) in &self.out {
+                if b <= at {
+                    continue;
+                }
+                if a > at {
+                    if a - at >= left {
+                        break;
+                    }
+                    left -= a - at;
+                }
+                at = b;
+            }
+            self.free = at + left;
+            self.free + self.rtt / 2
+        }
+    }
+
+    /// Two viewers on very different paths, a LAN and a slow link, and the slow one's
+    /// path goes out for longer than `STALLED`: it holds the other until it has stalled,
+    /// and then no longer. But what it is sent while it has stalled is the stream the
+    /// other's path takes, and its own path must still carry all of it: so once its path
+    /// is back, no message the server sends it (its close included) reaches it more than
+    /// a minute after it was sent, or after its path came back if it was sent before. A
+    /// model of the capture loop's flow, one frame time at a time at 60 fps with a scroll
+    /// that wants a frame of 60 KB (a terminal page at 3024x1898) or 400 KB (the whole
+    /// page): the hub's own clients and gate, each viewer's acks coming back over its
+    /// path, pings every `PING_EVERY`. A LAN of 50 to 200 Mbit/s and 1 to 5 ms beside a
+    /// slow link of 0.3 to 3 Mbit/s and 60 to 300 ms, out for 4.5 to 8 s.
+    #[test]
+    #[ignore = "fails until a viewer that stalls beside others is left behind (the next commit): 98.6 s behind, a 2.9 Mbit/s, 225 ms viewer out 4.8 s beside a 150 Mbit/s LAN, 60 KB a frame"]
+    fn a_viewer_that_stalls_beside_a_fast_one_is_never_minutes_behind() {
+        let mut rng = Xorshift::new(0xBF58_476D_1CE4_E5B9);
+        let mut next = |n: u64| rng.below(n);
+        let ms = Duration::from_millis;
+        let frame = Duration::from_micros(16_667);
+        for case in 0..20 {
+            let want = [60_000, 400_000][next(2) as usize];
+            let start = Instant::now() + Duration::from_secs(10);
+            let back = start + Duration::from_secs(10);
+            let outage = ms(4500 + next(3500));
+            let mut links = [
+                Link {
+                    rate: (50_000_000 + next(150_000_000)) as f64 / 8.0,
+                    rtt: ms(1 + next(5)),
+                    out: vec![],
+                    free: start,
+                },
+                Link {
+                    rate: (300_000 + next(2_700_000)) as f64 / 8.0,
+                    rtt: ms(60 + next(240)),
+                    out: vec![(back - outage, back)],
+                    free: start,
+                },
+            ];
+            let hub = Hub::new(crate::hub::Paths::ANY);
+            let cs: Vec<_> = (0..2)
+                .map(|_| hub.add_client(tokio::sync::mpsc::unbounded_channel().0, start))
+                .collect();
+            for c in &cs {
+                c.watch(start);
+            }
+            // Acks and pongs on their way back, in order: (arrives, frame or the ping's
+            // send time).
+            let mut acks: [std::collections::VecDeque<(Instant, u32)>; 2] = Default::default();
+            let mut pongs: [std::collections::VecDeque<(Instant, Instant)>; 2] = Default::default();
+            // How far behind the slow viewer is: the most any message to it reached it
+            // after it was sent, or after its path came back.
+            let mut behind = Duration::ZERO;
+            let (mut id, mut t, mut ping) = (0u32, start, start);
+            while t < start + Duration::from_secs(60) {
+                for (i, c) in cs.iter().enumerate() {
+                    while let Some(&(at, f)) = acks[i].front().filter(|a| a.0 <= t) {
+                        c.on_ack(at, f, crate::hub::Hold::Unsaid);
+                        acks[i].pop_front();
+                    }
+                    while let Some(&(at, sent)) = pongs[i].front().filter(|p| p.0 <= t) {
+                        c.pinged(at, at - sent);
+                        pongs[i].pop_front();
+                    }
+                }
+                if t >= ping {
+                    for (i, link) in links.iter_mut().enumerate() {
+                        let at = link.send(t, 40) + link.rtt / 2;
+                        let at = pongs[i].back().map_or(at, |p| p.0.max(at));
+                        pongs[i].push_back((at, t));
+                    }
+                    ping += crate::hub::PING_EVERY;
+                }
+                let key = cs.iter().any(|c| c.viewer() == crate::hub::Viewer::Waiting);
+                let room = match key {
+                    true => {
+                        for c in &cs {
+                            c.keyframe_planned();
+                        }
+                        for c in &cs {
+                            c.keyframe_sent(true, t);
+                        }
+                        let carries = cs.iter().map(|c| c.window(|w| w.carries())).min();
+                        carries.map(|c| window::scale(c, KEY_TIME, window::LATENESS))
+                    }
+                    false => match Gated::ask(&hub.viewers(), t) {
+                        Gated::Open(room) => Some(room),
+                        Gated::Held { .. } => None,
+                    },
+                };
+                if let Some(room) = room {
+                    let bytes = want.min(room);
+                    for (i, c) in cs.iter().enumerate() {
+                        let sent = match c.takes(id, t, bytes, key, HOPELESSLY_BEHIND) {
+                            Takes::Nothing => continue,
+                            Takes::Frame => bytes,
+                            Takes::Close => 20,
+                        };
+                        let arrives = links[i].send(t, sent);
+                        if i == 1 {
+                            behind = behind.max(arrives.saturating_duration_since(t.max(back)));
+                        }
+                        let at = arrives + links[i].rtt / 2;
+                        let at = acks[i].back().map_or(at, |a| a.0.max(at));
+                        acks[i].push_back((at, id));
+                    }
+                    id += 1;
+                }
+                t += frame;
+            }
+            assert!(
+                behind <= Duration::from_secs(60),
+                "case {case}: {want} B a frame, LAN {:.0} Mbit/s beside {:.1} Mbit/s, {:?}, out \
+                 {outage:?}: the slow viewer is {behind:?} behind",
+                links[0].rate * 8e-6,
+                links[1].rate * 8e-6,
+                links[1].rtt
+            );
+        }
+    }
 }
