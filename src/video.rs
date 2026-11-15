@@ -7364,4 +7364,125 @@ mod tests {
             );
         }
     }
+
+    /// Sustained motion stays on the path for as long as it lasts, past the fastest trip's
+    /// memory (`FASTEST_FOR`, 30 s). The ping that met an empty path is then forgotten, and
+    /// every trip there is to remember queued behind the motion's own frames, pings
+    /// included: none of it may read as a path that carries more. So from 5 s in (the
+    /// window starts at ten packets, more than a slow path carries) to two minutes, no
+    /// frame waits behind the frames ahead of it longer than three times `LATENESS` (what
+    /// `sustained_motion_fills_the_link_and_adds_about_the_lateness` allows a frame's
+    /// whole lateness). The loop's own `step` and gate drive a modelled stream: an encoder
+    /// that codes one capture at a time into what the capture may take, a screen that
+    /// changes every frame and wants 60 KB (a scroll) or 400 KB (a whole page) of it, a
+    /// path of a rate and a round trip that serves in order, a viewer that acknowledges
+    /// each frame as it arrives, and a ping every `PING_EVERY` behind whatever is queued.
+    /// Paths of 0.2 to 40 Mbit/s, round trips of 2 to 300 ms, encodes of 1 to 30 ms.
+    #[test]
+    #[ignore = "fails until a ping is the path's own only if nothing left between the last empty moment and it (the next commit): case 0, 13.4 Mbit/s, 289 ms, 60 KB a frame, a frame 68.6 s in waits 729 ms behind the queue"]
+    fn sustained_motion_stays_on_the_path_past_the_fastest_trips_memory() {
+        let mut rng = Xorshift::new(0x7FB5_D329_728E_A185);
+        let mut next = |n: u64| rng.below(n);
+        let us = Duration::from_micros;
+        let interval = Duration::from_secs_f64(1.0 / 60.0);
+        let min_interval = interval.mul_f64(MIN_INTERVAL_SHARE);
+        for case in 0..40 {
+            let bps = 200_000 + next(40_000_000);
+            let rtt = us(2000 + next(298_000));
+            let want = [60_000, 400_000][next(2) as usize];
+            let encode = us(1000 + next(29_000));
+            let crossing = |bytes: usize| us(bytes as u64 * 8_000_000 / bps);
+            let t0 = Instant::now() + Duration::from_secs(10);
+            let end = t0 + Duration::from_secs(120);
+            let (mut now, mut captured) = (t0, Captured::new(t0 - Duration::from_secs(1)));
+            let mut window = Window::new(t0, 0, usize::MAX);
+            let (mut damage, mut drawn) = (Damage::None, t0);
+            let mut encoder: Option<(Instant, usize)> = None;
+            // Frames on their way (what the window made of each, its bytes, when its ack
+            // comes), and pings (when the pong comes, when the ping went), in order.
+            let mut frames = std::collections::VecDeque::<(window::Left, usize, Instant)>::new();
+            let mut pings = std::collections::VecDeque::<(Instant, Instant)>::new();
+            let (mut path_free, mut ping) = (t0, t0);
+            // The longest a frame waited behind the queue, and when it left.
+            let mut worst = (Duration::ZERO, t0);
+            while now < end {
+                while let Some(&(left, bytes, acked)) = frames.front().filter(|f| f.2 <= now) {
+                    window.came_back(left, acked, bytes);
+                    frames.pop_front();
+                }
+                while let Some(&(back, went)) = pings.front().filter(|p| p.0 <= now) {
+                    window.pinged(back, back - went);
+                    pings.pop_front();
+                }
+                if now >= ping {
+                    pings.push_back((path_free.max(now) + rtt, now));
+                    ping += crate::hub::PING_EVERY;
+                }
+                if now >= drawn {
+                    damage.add(0, 16, now);
+                    drawn += interval;
+                }
+                if let Some((done, allowance)) = encoder.filter(|e| e.0 <= now) {
+                    encoder = None;
+                    let bytes = allowance.min(want);
+                    let waits = path_free.saturating_duration_since(done);
+                    if done - t0 >= Duration::from_secs(5) && waits > worst.0 {
+                        worst = (waits, done);
+                    }
+                    path_free = done.max(path_free) + crossing(bytes);
+                    frames.push_back((window.leave(done, bytes), bytes, path_free + rtt));
+                }
+                let look = Look {
+                    key: Key::NotWanted,
+                    damage,
+                    due: Due::Never,
+                    now,
+                    captured,
+                    min_interval,
+                    quiet: Duration::ZERO,
+                    deadline: interval,
+                    gate: Gated::of([window.way(now, STALLED)]),
+                    buffer: match encoder {
+                        None => Buffer::Home(()),
+                        Some(_) => Buffer::Away,
+                    },
+                    in_flight: InFlight::Nothing,
+                };
+                let wait = match step(look) {
+                    Step::Capture(what, (), allowance) => {
+                        damage = Damage::None;
+                        encoder = Some((now + encode, allowance));
+                        captured.on_capture(what, now);
+                        continue;
+                    }
+                    Step::Wait(wait, _) => wait,
+                };
+                // Each wait ends on damage, on the hub's waker (a buffer home, an ack, a
+                // pong), or on its time.
+                let woken = encoder
+                    .map(|e| e.0)
+                    .into_iter()
+                    .chain(frames.front().map(|f| f.2))
+                    .chain(pings.front().map(|p| p.0))
+                    .chain([ping]);
+                now = match wait {
+                    Wait::Change | Wait::Gate(None) | Wait::Buffer => woken.chain([drawn]).min(),
+                    Wait::Pass(rest) | Wait::Gate(Some(rest)) | Wait::Settle(rest) => {
+                        woken.chain([drawn, now + rest]).min()
+                    }
+                    Wait::Interval { rest, .. } => woken.chain([now + rest]).min(),
+                }
+                .unwrap_or(end)
+                .max(now);
+            }
+            assert!(
+                worst.0 <= window::LATENESS * 3,
+                "case {case}: {:.2} Mbit/s, {rtt:?}, {want} B a frame: a frame {:.1} s in \
+                 waited {:?} behind the queue",
+                bps as f64 / 1e6,
+                (worst.1 - t0).as_secs_f64(),
+                worst.0
+            );
+        }
+    }
 }
