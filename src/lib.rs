@@ -41,6 +41,8 @@ mod video;
 mod wait;
 #[cfg(windows)]
 mod win;
+#[allow(dead_code)]
+mod window;
 #[cfg(test)]
 mod xorshift;
 
