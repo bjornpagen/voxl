@@ -27,18 +27,19 @@ pub enum KeyAct {
 }
 
 pub enum InputEvent {
+    /// A desktop pixel, in X's own 16-bit coordinates.
     Move {
-        x: i32,
-        y: i32,
+        x: i16,
+        y: i16,
     },
     Button {
-        button: u8,
+        button: crate::server::Button,
         down: bool,
     },
-    /// Wheel ticks: positive dy scrolls down, positive dx scrolls right.
+    /// Wheel notches: positive dy scrolls down, positive dx scrolls right.
     Scroll {
-        dx: i32,
-        dy: i32,
+        dx: crate::server::Notches,
+        dy: crate::server::Notches,
     },
     /// Precise scroll in desktop pixels (trackpads, smooth wheels).
     ScrollPx {
@@ -567,47 +568,40 @@ impl Injector {
         let _ = std::fs::remove_file(&self.scratch_path);
     }
 
+    /// Turns the wheel by `notches`, a press and a release of one of X's wheel buttons
+    /// for each: the first of `(back, forth)` for a negative count (4 up, 6 left), the
+    /// second for a positive one (5 down, 7 right).
+    fn wheel(&self, notches: i8, (back, forth): (u8, u8)) {
+        let button = if notches < 0 { back } else { forth };
+        for _ in 0..notches.unsigned_abs() {
+            self.fake(xproto::BUTTON_PRESS_EVENT, button, 0, 0);
+            self.fake(xproto::BUTTON_RELEASE_EVENT, button, 0, 0);
+        }
+    }
+
     fn handle(&mut self, ev: InputEvent) {
         match ev {
-            InputEvent::Move { x, y } => {
-                self.fake(xproto::MOTION_NOTIFY_EVENT, 0, x as i16, y as i16)
-            }
+            InputEvent::Move { x, y } => self.fake(xproto::MOTION_NOTIFY_EVENT, 0, x, y),
             InputEvent::Button { button, down } => {
-                if (button as usize) < self.buttons.len() {
-                    if self.buttons[button as usize] == down {
-                        return;
-                    }
-                    self.buttons[button as usize] = down;
+                let held = &mut self.buttons[usize::from(button.number())];
+                if *held == down {
+                    return;
                 }
+                *held = down;
                 self.fake(
                     if down {
                         xproto::BUTTON_PRESS_EVENT
                     } else {
                         xproto::BUTTON_RELEASE_EVENT
                     },
-                    button,
+                    button.number(),
                     0,
                     0,
                 )
             }
             InputEvent::Scroll { dx, dy } => {
-                let click = |b: u8, n: i32| {
-                    for _ in 0..n.min(20) {
-                        self.fake(xproto::BUTTON_PRESS_EVENT, b, 0, 0);
-                        self.fake(xproto::BUTTON_RELEASE_EVENT, b, 0, 0);
-                    }
-                };
-                // X buttons: 4/5 scroll up/down, 6/7 left/right.
-                match dy.cmp(&0) {
-                    std::cmp::Ordering::Greater => click(5, dy),
-                    std::cmp::Ordering::Less => click(4, -dy),
-                    std::cmp::Ordering::Equal => {}
-                }
-                match dx.cmp(&0) {
-                    std::cmp::Ordering::Greater => click(7, dx),
-                    std::cmp::Ordering::Less => click(6, -dx),
-                    std::cmp::Ordering::Equal => {}
-                }
+                self.wheel(dy.get(), (4, 5));
+                self.wheel(dx.get(), (6, 7));
             }
             InputEvent::ScrollPx { dx, dy } => {
                 let k = NOTCH / self.px_per_notch;
@@ -622,18 +616,17 @@ impl Injector {
                     }
                 } else {
                     // Whole notches only; the remainder carries into the next gesture event.
+                    // Like a wheel message, one turns at most MAX_NOTCHES each way, and the
+                    // rest of a longer scroll is dropped.
                     let (nx, ny) = (
                         (self.scroll_acc.0 / NOTCH).trunc(),
                         (self.scroll_acc.1 / NOTCH).trunc(),
                     );
                     self.scroll_acc.0 -= nx * NOTCH;
                     self.scroll_acc.1 -= ny * NOTCH;
-                    if nx != 0.0 || ny != 0.0 {
-                        self.handle(InputEvent::Scroll {
-                            dx: nx as i32,
-                            dy: ny as i32,
-                        });
-                    }
+                    let most = f64::from(crate::server::MAX_NOTCHES);
+                    self.wheel(ny.clamp(-most, most) as i8, (4, 5));
+                    self.wheel(nx.clamp(-most, most) as i8, (6, 7));
                 }
             }
             InputEvent::Key { keysym, act } => self.key(keysym, act),
@@ -676,9 +669,9 @@ pub fn spawn(
         .name("input".into())
         .spawn(move || {
             while let Ok(first) = rx.recv() {
-                let mut pending_move: Option<(i32, i32)> = None;
+                let mut pending_move: Option<(i16, i16)> = None;
                 let handle =
-                    |inj: &mut Injector, ev: InputEvent, pm: &mut Option<(i32, i32)>| match ev {
+                    |inj: &mut Injector, ev: InputEvent, pm: &mut Option<(i16, i16)>| match ev {
                         InputEvent::Move { x, y } => *pm = Some((x, y)),
                         other => {
                             if let Some((x, y)) = pm.take() {
