@@ -556,6 +556,8 @@ pub struct Hub {
     pub snapshots: Mutex<Vec<tokio::sync::oneshot::Sender<Arc<crate::record::Snapshot>>>>,
     /// When each part of the screen last changed (`/wait`).
     pub activity: crate::wait::Activity,
+    /// When each of the last frames passed each point of the pipeline.
+    pub timeline: crate::timeline::Timeline,
 }
 
 impl Hub {
@@ -581,6 +583,7 @@ impl Hub {
             hello_extra: Mutex::new(serde_json::Map::new()),
             snapshots: Mutex::new(Vec::new()),
             activity: Default::default(),
+            timeline: crate::timeline::Timeline::new(Instant::now()),
         })
     }
 

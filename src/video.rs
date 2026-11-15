@@ -8,6 +8,7 @@ use crate::hub::{wait_any, wait_event};
 use crate::hub::{Client, Hub, Out, ServerMessage, Takes, Viewer};
 use crate::path::{Capacity, Kbps};
 use crate::rate::{Bounds, FrameBudget, RateCtl, RTT_GUESS_MS};
+use crate::timeline::{CaptureMarks, Coded};
 use bytes::Bytes;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -123,7 +124,8 @@ struct Job {
     /// as the rate controller had them when the frame was captured.
     target: Kbps,
     capacity: Capacity,
-    captured_at: Instant,
+    /// When the capture loop's part of it happened.
+    captured: CaptureMarks,
     /// What the bench loadgen's marker said when the frame was captured, while
     /// `VOXL_DEBUG_MARKER` is set (see `marker_reading`).
     marker_ms: Option<u32>,
@@ -991,6 +993,7 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
             cap.convert(&mut buf, t.y0 as usize, t.y1 as usize, &s.rows);
         }
         let t2 = Instant::now();
+        let rows = todo.map_or(0, |t| t.y1 - t.y0);
         hub.stats
             .grab_us
             .fetch_add((t1 - t0).as_micros() as u64, Ordering::Relaxed);
@@ -1067,7 +1070,14 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
                 frame,
                 target: rc.target,
                 capacity,
-                captured_at: origin,
+                captured: CaptureMarks {
+                    damage: origin,
+                    capture: t0,
+                    grabbed: t1,
+                    converted: t2,
+                    queued: Instant::now(),
+                    rows,
+                },
                 marker_ms,
             })
             .is_err()
@@ -1075,6 +1085,11 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
             return Err("encoder gone".into());
         }
     }
+}
+
+/// The number of the frame a video message is part of; None for any other message.
+pub fn frame_of(m: &[u8]) -> Option<u32> {
+    Header::read(m).map(|header| header.frame)
 }
 
 /// Split the screen into horizontal stripes, each an independent H.264 stream.
@@ -1134,6 +1149,8 @@ enum StripeOut {
         key: bool,
         bytes: Vec<u8>,
         quality: Quality,
+        /// When the worker took the stripe, handed it to x264 and had it back.
+        coded: Coded,
     },
 }
 
@@ -1242,6 +1259,7 @@ fn stripe_worker(
 ) {
     let mut motion = MotionQuality::default();
     while let Ok(job) = rx.recv() {
+        let woke = Instant::now();
         let buf = unsafe { &*job.buf.0 };
         // The CRF the job asks for, and the one x264 is given: MotionQuality may lower
         // a motion frame's.
@@ -1298,6 +1316,7 @@ fn stripe_worker(
             info.as_deref_mut(),
             &mut out,
         );
+        let encoded = Instant::now();
         if debug {
             let cpu_now = thread_cpu_us();
             log::info!(
@@ -1321,6 +1340,11 @@ fn stripe_worker(
                     key: e.keyframe,
                     quality: e.quality(crf),
                     bytes: out,
+                    coded: Coded {
+                        woke,
+                        x264: te,
+                        encoded,
+                    },
                 }
             }
             Err(e) => {
@@ -1409,10 +1433,11 @@ fn encode_loop(
             .a_frame_at(fps)
             .get() as u32;
         let share = (frame.saturating_mul(2) / n as u32).clamp(1, frame.max(1));
-        let ts = job.captured_at.duration_since(epoch).as_millis() as i64;
+        let ts = job.captured.damage.duration_since(epoch).as_millis() as i64;
         // Persistent per-stripe workers keep each encoder's state warm in one core's cache.
         let buf_ptr = SendPtr(&*job.buf as *const I420);
         let mut pending = 0;
+        let dispatched = Instant::now();
         for (i, &on) in selected.iter().enumerate() {
             if on {
                 // Sharpening spends from the same budget as motion: what the budget
@@ -1434,6 +1459,7 @@ fn encode_loop(
                 results[r.stripe] = r.out;
             }
         }
+        let collected = Instant::now();
         // A frame's blocks are sharp when every stripe it touched came back as asked.
         let sharp = selected.iter().zip(&results).all(|(&on, r)| {
             !on || matches!(
@@ -1452,13 +1478,13 @@ fn encode_loop(
             sharpened: sharpened.filter(|_| sharp),
         });
         hub.wake();
-        let parts: Vec<(usize, bool, Vec<u8>)> = results
+        let parts: Vec<(usize, bool, Vec<u8>, Coded)> = results
             .into_iter()
             .enumerate()
             .filter_map(|(i, r)| match r {
-                StripeOut::Sent { key, bytes, .. } => {
-                    (bytes.len() > Header::LEN).then_some((i, key, bytes))
-                }
+                StripeOut::Sent {
+                    key, bytes, coded, ..
+                } => (bytes.len() > Header::LEN).then_some((i, key, bytes, coded)),
                 StripeOut::Failed => None,
             })
             .collect();
@@ -1467,9 +1493,10 @@ fn encode_loop(
         for c in &starts {
             c.keyframe_sent(all_key);
         }
-        if parts.is_empty() {
+        // A frame waits for the stripe coded last; one with nothing to send is not sent.
+        let Some(coded) = parts.iter().map(|p| p.3).reduce(Coded::later) else {
             continue;
-        }
+        };
         let enc_us = t0.elapsed().as_micros() as u64;
         let total: usize = parts.iter().map(|p| p.2.len()).sum();
         hub.stats.encode_us.fetch_add(enc_us, Ordering::Relaxed);
@@ -1480,11 +1507,11 @@ fn encode_loop(
             hub.stats.keyframes.fetch_add(1, Ordering::Relaxed);
         }
         frame_id = frame_id.wrapping_add(1);
-        let pipe = Pipe::of(job.captured_at.elapsed());
+        let pipe = Pipe::of(job.captured.damage.elapsed());
         let nparts = parts.len() as u8;
         let msgs: Vec<Bytes> = parts
             .into_iter()
-            .map(|(i, key, mut out)| {
+            .map(|(i, key, mut out, _)| {
                 let header = Header {
                     key,
                     sharpens,
@@ -1500,6 +1527,18 @@ fn encode_loop(
             })
             .collect();
         let now = Instant::now();
+        hub.timeline.record(
+            frame_id,
+            &crate::timeline::Frame {
+                captured: job.captured,
+                taken: t0,
+                dispatched,
+                coded,
+                collected,
+                sent: now,
+                bytes: total,
+            },
+        );
         for (c, _) in hub.viewers() {
             match c.takes(frame_id, now, total, HOPELESSLY_BEHIND) {
                 Takes::Nothing => {}
@@ -1515,7 +1554,7 @@ fn encode_loop(
             }
         }
         hub.stats.send_lat_us.fetch_add(
-            job.captured_at.elapsed().as_micros() as u64,
+            job.captured.damage.elapsed().as_micros() as u64,
             Ordering::Relaxed,
         );
         if let Some(ms) = job.marker_ms {
@@ -1785,7 +1824,7 @@ mod tests {
                     frame,
                     target: Kbps::new(8000.0),
                     capacity: Capacity::Unknown,
-                    captured_at: Instant::now(),
+                    captured: CaptureMarks::at(Instant::now()),
                     marker_ms: None,
                 })
                 .unwrap();
@@ -1887,7 +1926,7 @@ mod tests {
                                 frame,
                                 target: Kbps::new(8000.0),
                                 capacity: Capacity::Unknown,
-                                captured_at: Instant::now(),
+                                captured: CaptureMarks::at(Instant::now()),
                                 marker_ms: None,
                             })
                             .unwrap();
@@ -2645,7 +2684,7 @@ mod tests {
             },
             target: Kbps::new(8000.0),
             capacity: Capacity::Unknown,
-            captured_at: Instant::now(),
+            captured: CaptureMarks::at(Instant::now()),
             marker_ms: None,
         };
         // A resize ends the capture loop, and a recording joins, before the encode loop
@@ -2940,17 +2979,21 @@ mod tests {
                     frame,
                     target: Kbps::new(6000.0),
                     capacity: Capacity::Unknown,
-                    captured_at: Instant::now(),
+                    captured: CaptureMarks::at(Instant::now()),
                     marker_ms: None,
                 })
                 .unwrap();
-            // The viewer: what was handed to its socket task goes, and every frame is
+            // The viewer: its socket task writes what was handed to it, and every frame is
             // acknowledged as it arrives.
             while let Ok(m) = socket.try_recv() {
-                if let Out::Bin(m) = m {
-                    let id = u32::from_be_bytes([m[2], m[3], m[4], m[5]]);
-                    viewer.on_ack(Instant::now(), id, crate::hub::Hold::Unsaid);
-                }
+                let Some(id) = (match &m {
+                    Out::Bin(b) => frame_of(b),
+                    Out::Text(_) => None,
+                }) else {
+                    continue;
+                };
+                hub.timeline.written(id, Instant::now());
+                viewer.on_ack(Instant::now(), id, crate::hub::Hold::Unsaid);
             }
         };
         // Every kind of frame, over every band, twice: every buffer the stream keeps has

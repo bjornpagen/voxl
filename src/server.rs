@@ -3,7 +3,7 @@
 use crate::event::{InputEvent, KeyAct};
 use crate::hub::{Client, Hub, Out, ServerMessage};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -167,7 +167,14 @@ pub fn router(state: AppState) -> Router {
         .merge(wait_routes)
 }
 
-async fn stats(State(s): State<AppState>) -> Response {
+/// What `/stats` is asked for besides the counters.
+#[derive(serde::Deserialize)]
+struct StatsQuery {
+    /// The newest this many frames' timelines (crate::timeline), at most the ring's.
+    frames: Option<usize>,
+}
+
+async fn stats(State(s): State<AppState>, Query(q): Query<StatsQuery>) -> Response {
     let st = &s.hub.stats;
     let clients: Vec<_> = s
         .hub
@@ -181,7 +188,7 @@ async fn stats(State(s): State<AppState>) -> Response {
                 "client_ms": (*c.client_ms.lock() * 10.0).round() / 10.0})
         })
         .collect();
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "captured": st.captured.load(Ordering::Relaxed),
         "encoded": st.encoded.load(Ordering::Relaxed),
         "bytes": st.bytes.load(Ordering::Relaxed),
@@ -198,6 +205,13 @@ async fn stats(State(s): State<AppState>) -> Response {
         "send_lat_us_total": st.send_lat_us.load(Ordering::Relaxed),
         "clients": clients,
     });
+    if let Some(n) = q.frames {
+        body["timeline"] = serde_json::json!({
+            "now_us": s.hub.timeline.now_us(Instant::now()),
+            "marks": crate::timeline::MARKS,
+            "frames": s.hub.timeline.newest(n),
+        });
+    }
     (
         [(header::CONTENT_TYPE, "application/json")],
         body.to_string(),
@@ -230,16 +244,24 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
         client.send(Out::Bin(c));
     }
     let dbg = s.debug.marker.is_some();
+    let hub = s.hub.clone();
     let writer = tokio::spawn(async move {
         while let Some(m) = rx.recv().await {
             let t = Instant::now();
             let big = matches!(&m, Out::Bin(b) if b.len() > 2000);
+            let frame = match &m {
+                Out::Bin(b) => crate::video::frame_of(b),
+                Out::Text(_) => None,
+            };
             let msg = match m {
                 Out::Bin(b) => Message::Binary(b),
                 Out::Text(m) => Message::Text(m.json().into()),
             };
             if sink.send(msg).await.is_err() {
                 break;
+            }
+            if let Some(frame) = frame {
+                hub.timeline.written(frame, Instant::now());
             }
             if dbg && big {
                 log::info!(
