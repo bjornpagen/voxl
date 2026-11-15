@@ -73,6 +73,21 @@ fn range_max(v: Option<&String>, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
+/// `--max-kbps`, or Selkies' `--video-bitrate` (of a range, the upper bound): the most
+/// the stream is steered to, in whole kbit/s; 30000 when not given. 0 is no ceiling: the
+/// target goes as high as the viewers' paths carry, and encoders open without a rate cap.
+fn ceiling(v: Option<&String>) -> Result<Option<path::Kbps>, String> {
+    let Some(v) = v else {
+        return Ok(Some(path::Kbps::new(30000.0)));
+    };
+    let upper = v.rsplit_once('-').map_or(v.as_str(), |(_, upper)| upper);
+    match upper.trim().parse::<u32>() {
+        Ok(0) => Ok(None),
+        Ok(kbps) => Ok(Some(path::Kbps::new(kbps as f64))),
+        Err(_) => Err(format!("--max-kbps {v:?}: not a whole number of kbit/s")),
+    }
+}
+
 pub(crate) fn truthy(v: Option<&String>, default: bool) -> bool {
     v.map(|s| matches!(s.as_str(), "true" | "1" | "yes" | "on"))
         .unwrap_or(default)
@@ -142,6 +157,10 @@ async fn serve(a: HashMap<String, String>) {
     let ncpu = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4) as u32;
+    let max_kbps = ceiling(a.get("max-kbps").or(a.get("video-bitrate"))).unwrap_or_else(|e| {
+        log::error!("{e}");
+        std::process::exit(1);
+    });
     let vcfg = video::VideoConfig {
         display: display.clone(),
         #[cfg(target_os = "macos")]
@@ -162,8 +181,7 @@ async fn serve(a: HashMap<String, String>) {
             .and_then(|v| v.parse().ok())
             .unwrap_or(4),
         crf: range_max(a.get("crf"), 24.0) as f32,
-        // Selkies' --video-bitrate becomes the ceiling for adaptive bitrate.
-        max_kbps: range_max(a.get("max-kbps").or(a.get("video-bitrate")), 30000.0) as u32,
+        max_kbps,
         paintover_crf: range_max(a.get("paintover-crf"), 16.0) as f32,
         paintover_burst: range_max(a.get("paintover-burst"), 3.0) as u32,
         paintover_delay_ms: range_max(a.get("paintover-delay-ms"), 150.0) as u64,
@@ -460,4 +478,40 @@ async fn serve(a: HashMap<String, String>) {
         let _ = tcp.set_nodelay(true);
     });
     axum::serve(listener, app).await.unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use path::Kbps;
+
+    /// `--max-kbps` is a ceiling or none, decided where the flag is read: 0 is none, and
+    /// what is not a whole number of kbit/s starts nothing.
+    #[test]
+    fn the_ceiling_is_a_rate_or_none() {
+        let at = |kbps: f64| Ok(Some(Kbps::new(kbps)));
+        for (flag, want) in [
+            (None, at(30000.0)),
+            (Some("0"), Ok(None)),
+            (Some("12000"), at(12000.0)),
+            (Some(" 12000 "), at(12000.0)),
+            (Some("8000-12000"), at(12000.0)),
+            (Some("0-0"), Ok(None)),
+        ] {
+            assert_eq!(ceiling(flag.map(String::from).as_ref()), want, "{flag:?}");
+        }
+        for flag in [
+            "",
+            "fast",
+            "12k",
+            "1.5",
+            "NaN",
+            "inf",
+            "8000-",
+            "99999999999",
+            "true",
+        ] {
+            assert!(ceiling(Some(&flag.into())).is_err(), "{flag:?} parsed");
+        }
+    }
 }

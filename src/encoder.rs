@@ -10,6 +10,7 @@ mod ffi {
     include!(concat!(env!("OUT_DIR"), "/x264.rs"));
 }
 
+use crate::path::Kbps;
 use std::ffi::CString;
 use std::ptr;
 
@@ -29,8 +30,9 @@ pub struct Pictures {
 pub struct EncoderConfig {
     pub pictures: Pictures,
     pub crf: f32,
-    /// VBV cap in kbit/s (0 = uncapped).
-    pub max_kbps: u32,
+    /// The VBV cap. None: uncapped for good, since x264 turns VBV on only when it opens
+    /// and `set_rate` cannot add a cap later.
+    pub max_kbps: Option<Kbps>,
 }
 
 /// How far x264's motion search looks, in pixels. A trackpad flick through a terminal
@@ -128,10 +130,11 @@ impl Encoder {
             param.analyse.b_mb_info = (std::env::var("VOXL_NO_MBINFO").is_err()) as i32;
             param.i_sync_lookahead = 0;
             param.rc.b_mb_tree = 0;
-            if max_kbps > 0 {
-                param.rc.i_vbv_max_bitrate = max_kbps as i32;
+            if let Some(cap) = max_kbps {
+                let kbps = cap.get() as u32;
+                param.rc.i_vbv_max_bitrate = kbps as i32;
                 // ~1.25 frames of buffer keeps single-frame spikes bounded.
-                param.rc.i_vbv_buffer_size = vbv_buffer_kbit(max_kbps, pictures.fps) as i32;
+                param.rc.i_vbv_buffer_size = vbv_buffer_kbit(kbps, pictures.fps) as i32;
             }
             // sRGB content (BT.709 primaries, sRGB transfer) in BT.601 limited range,
             // matching libyuv ARGBToI420 and the macOS NV12 capture.
@@ -181,6 +184,13 @@ impl Encoder {
             max_kbps,
             vbv_buffer_kbit(max_kbps, self.param.i_fps_num),
         );
+    }
+
+    /// Change the CRF alone; the cap stays what it was.
+    #[cfg(test)]
+    pub fn set_crf(&mut self, crf: f32) {
+        self.param.rc.f_rf_constant = crf;
+        unsafe { ffi::x264_encoder_reconfig(self.h, &mut self.param) };
     }
 
     /// Reconfigure rate control with an explicit VBV buffer (kbit).
@@ -358,7 +368,7 @@ mod tests {
                     threads: 1,
                 },
                 crf: 24.0,
-                max_kbps: 0,
+                max_kbps: None,
             },
             me_range,
         )
@@ -393,6 +403,55 @@ mod tests {
             "{default} bytes at the default search range, {short} at 64"
         );
     }
+
+    /// Without a cap at open (`--max-kbps 0`), the caps `set_rate` gives each frame change
+    /// nothing: x264 turns VBV on only when it opens. With one, they hold the stream down.
+    #[test]
+    fn an_encoder_opened_uncapped_stays_uncapped() {
+        let (w, h) = (640usize, 384usize);
+        let page = text_page(w, h + 20 * 30 + 30);
+        let (u, v) = (vec![128u8; w * h / 4], vec![128u8; w * h / 4]);
+        let stream = |max_kbps, cap| {
+            let mut enc = Encoder::new(&EncoderConfig {
+                pictures: Pictures {
+                    width: w as u32,
+                    height: h as u32,
+                    fps: 60,
+                    preset: "ultrafast".into(),
+                    threads: 1,
+                },
+                crf: 24.0,
+                max_kbps,
+            })
+            .unwrap();
+            let mut out = Vec::new();
+            for f in 0..20 {
+                enc.set_rate(24.0, cap);
+                let planes = Planes {
+                    y: &page[f * 30 * w..(f * 30 + h) * w],
+                    u: &u,
+                    v: &v,
+                    stride_y: w,
+                    stride_uv: w / 2,
+                };
+                enc.encode(&planes, f as i64 * 16, f == 0, None, None, &mut out)
+                    .unwrap();
+            }
+            out
+        };
+        let uncapped = stream(None, 300);
+        assert!(
+            uncapped == stream(None, 60_000),
+            "a later cap changed the stream"
+        );
+        let capped = stream(Some(Kbps::new(300.0)), 300);
+        assert!(
+            capped.len() * 2 < uncapped.len(),
+            "{} bytes capped, {} uncapped",
+            capped.len(),
+            uncapped.len()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -424,7 +483,7 @@ mod bench {
                     threads: 4,
                 },
                 crf: 24.0,
-                max_kbps: 0,
+                max_kbps: None,
             },
             range,
         )
@@ -507,7 +566,7 @@ mod bench {
                     threads,
                 },
                 crf: 24.0,
-                max_kbps: 30000,
+                max_kbps: Some(Kbps::new(30000.0)),
             })
             .unwrap();
             let mut y = vec![0u8; w * h];

@@ -22,7 +22,9 @@ pub struct VideoConfig {
     pub threads: u32,
     pub convert_threads: usize,
     pub crf: f32,
-    pub max_kbps: u32,
+    /// The most the stream is steered to (`--max-kbps`). None: no ceiling, and encoders
+    /// opened without a rate cap.
+    pub max_kbps: Option<Kbps>,
     pub paintover_crf: f32,
     pub paintover_burst: u32,
     pub paintover_delay_ms: u64,
@@ -428,7 +430,8 @@ struct PathNow {
 /// cap for the cap to rise, and an idle screen doesn't lower it.
 struct RateCtl {
     target: Kbps,
-    max: Kbps,
+    /// The most the target may be. None: as much as the paths carry.
+    max: Option<Kbps>,
     min: Kbps,
     /// When it last decided, lowered the target for a queue, and raised it.
     last_eval: Option<Instant>,
@@ -450,12 +453,17 @@ const OVERDUE_MS: f64 = 80.0;
 /// The round trip assumed for a client whose pings haven't been answered yet.
 const RTT_GUESS_MS: u32 = 40;
 
+/// `rate`, held to `ceiling` if there is one.
+fn at_most(ceiling: Option<Kbps>, rate: Kbps) -> Kbps {
+    ceiling.into_iter().fold(rate, Kbps::min)
+}
+
 impl RateCtl {
     /// Carries on from `resume`, the last pipeline's target: one rebuilt for a new
     /// screen size streams over the same paths as before.
-    fn new(max: Kbps, min: Kbps, resume: Option<Kbps>) -> Self {
+    fn new(max: Option<Kbps>, min: Kbps, resume: Option<Kbps>) -> Self {
         RateCtl {
-            target: resume.unwrap_or(START).max(min.min(max)).min(max),
+            target: at_most(max, resume.unwrap_or(START).max(at_most(max, min))),
             max,
             min,
             last_eval: None,
@@ -500,13 +508,13 @@ impl RateCtl {
             // no more than it, and up to it, since frames at a target far under it
             // are too small to show the path's rate, and the target would stay there.
             Capacity::Unknown => {
-                let start = START.min(self.max);
+                let start = at_most(self.max, START);
                 (start, Some(start))
             }
             // A path that got slower is followed down at once, queue or no queue.
             Capacity::Known(c) => {
                 let share = c.times(CAPACITY_SHARE);
-                (share.max(self.min), Some(share.min(self.max)))
+                (share.max(self.min), Some(at_most(self.max, share)))
             }
         };
         self.target = self.target.min(ceiling);
@@ -828,11 +836,7 @@ fn capture_loop(
     let mut last_capture = Instant::now() - interval;
     let paintover_delay = Duration::from_millis(cfg.paintover_delay_ms);
     let mut sharpening = Sharpening::new(cfg.paintover_burst, paintover_delay);
-    let mut rc = RateCtl::new(
-        Kbps::new(cfg.max_kbps as f64),
-        Kbps::new(cfg.min_kbps as f64),
-        hub.target(),
-    );
+    let mut rc = RateCtl::new(cfg.max_kbps, Kbps::new(cfg.min_kbps as f64), hub.target());
     hub.set_target(rc.target);
     let mut had_clients = false;
     let mut full_next = true;
@@ -1804,20 +1808,19 @@ mod tests {
     }
 
     /// Encodes frames the way a stripe worker does, under a bitrate cap of `max_kbps`
-    /// (0: none), with or without MotionQuality.
+    /// if there is one, with or without MotionQuality.
     struct Run {
         enc: Encoder,
         motion: MotionQuality,
         correct: bool,
         crf: f32,
-        max_kbps: u32,
         applied: f32,
         y: Vec<u8>,
         n: usize,
     }
 
     impl Run {
-        fn new(correct: bool, crf: f32, max_kbps: u32) -> Run {
+        fn new(correct: bool, crf: f32, max_kbps: Option<Kbps>) -> Run {
             Run {
                 enc: Encoder::new(&EncoderConfig {
                     pictures: Pictures {
@@ -1834,7 +1837,6 @@ mod tests {
                 motion: MotionQuality::default(),
                 correct,
                 crf,
-                max_kbps,
                 applied: crf,
                 y: vec![0; W * H],
                 n: 0,
@@ -1854,7 +1856,7 @@ mod tests {
                 None => self.crf,
             };
             if c != self.applied {
-                self.enc.set_rate(c, self.max_kbps);
+                self.enc.set_crf(c);
                 self.applied = c;
             }
             let (u, v) = (vec![128u8; W * H / 4], vec![128u8; W * H / 4]);
@@ -1911,8 +1913,13 @@ mod tests {
     #[test]
     fn dragged_window_stays_at_crf() {
         let crf = 24.0;
-        let plain = mean(Run::new(false, crf, 0).motion(Scene::Drag).iter().map(qp));
-        let corrected = mean(Run::new(true, crf, 0).motion(Scene::Drag).iter().map(qp));
+        let plain = mean(
+            Run::new(false, crf, None)
+                .motion(Scene::Drag)
+                .iter()
+                .map(qp),
+        );
+        let corrected = mean(Run::new(true, crf, None).motion(Scene::Drag).iter().map(qp));
         // The scene has to show the problem for the check below to mean anything.
         assert!(
             plain > crf + 3.0,
@@ -1931,9 +1938,9 @@ mod tests {
     fn capped_drag_keeps_its_estimate() {
         let crf = 24.0;
         // Without a cap the complexity is exactly what x264 added to the QP.
-        let plain = Run::new(false, crf, 0).motion(Scene::Drag);
+        let plain = Run::new(false, crf, None).motion(Scene::Drag);
         let complexity = mean(plain.iter().map(|f| qp(f) - f.crf));
-        let capped = Run::new(true, crf, 20_000).motion(Scene::Drag);
+        let capped = Run::new(true, crf, Some(Kbps::new(20_000.0))).motion(Scene::Drag);
         let start_qp_says = capped
             .iter()
             .map(|f| qp(f) - f.e.crf_avg)
@@ -1953,8 +1960,13 @@ mod tests {
     #[test]
     fn complex_content_is_left_alone() {
         let crf = 24.0;
-        let plain = mean(Run::new(false, crf, 0).motion(Scene::Noise).iter().map(qp));
-        let corrected = Run::new(true, crf, 0).motion(Scene::Noise);
+        let plain = mean(
+            Run::new(false, crf, None)
+                .motion(Scene::Noise)
+                .iter()
+                .map(qp),
+        );
+        let corrected = Run::new(true, crf, None).motion(Scene::Noise);
         assert!(
             plain > crf + 3.0,
             "x264 didn't raise the QP for noise ({plain:.1}, CRF {crf})"
@@ -2124,7 +2136,7 @@ mod tests {
     #[test]
     fn paintovers_wind_the_correction_down() {
         let crf = 24.0;
-        let mut run = Run::new(true, crf, 0);
+        let mut run = Run::new(true, crf, None);
         for _ in 0..40 {
             run.frame(Scene::Drag, None);
         }
@@ -2195,7 +2207,7 @@ mod rate_tests {
                 free: now,
                 flying: VecDeque::new(),
                 est: PathEst::new(now),
-                rc: RateCtl::new(Kbps::new(max_kbps), Kbps::new(2000.0), None),
+                rc: RateCtl::new(Some(Kbps::new(max_kbps)), Kbps::new(2000.0), None),
                 budget: FrameBudget::new(now),
                 worst_wait: Duration::ZERO,
                 worst_share: 1.0,
@@ -2356,7 +2368,7 @@ mod rate_tests {
         // And with nothing but the unknown path to go by, it reaches the start, not more.
         let now = Instant::now();
         let mut rc = RateCtl::new(
-            Kbps::new(30_000.0),
+            Some(Kbps::new(30_000.0)),
             Kbps::new(2000.0),
             Some(Kbps::new(2000.0)),
         );
@@ -2369,6 +2381,63 @@ mod rate_tests {
             rc.step(now + Duration::from_millis(100 * i), &[unknown]);
         }
         assert_eq!(rc.target, START);
+    }
+
+    /// Where a controller starts: the last pipeline's target, or the cautious start;
+    /// never under the floor, and never over a ceiling if there is one, which wins over
+    /// the floor.
+    #[test]
+    fn a_controller_starts_under_its_ceiling_if_it_has_one() {
+        let kbps = Kbps::new;
+        let floor = kbps(2000.0);
+        for (max, resume, start) in [
+            (None, None, START),
+            (None, Some(kbps(50_000.0)), kbps(50_000.0)),
+            (None, Some(kbps(500.0)), floor),
+            (Some(kbps(30_000.0)), None, START),
+            (Some(kbps(30_000.0)), Some(kbps(50_000.0)), kbps(30_000.0)),
+            (Some(kbps(5000.0)), None, kbps(5000.0)),
+            (Some(kbps(1000.0)), None, kbps(1000.0)),
+        ] {
+            let rc = RateCtl::new(max, floor, resume);
+            assert_eq!(rc.target, start, "ceiling {max:?}, resuming {resume:?}");
+        }
+    }
+
+    /// Ten seconds of decisions every 100 ms on one path. With a ceiling the target
+    /// stops at it. With none (`--max-kbps 0`) it goes where the path lets it: the
+    /// cautious start while the path is unknown, the path's share once it is known. Under
+    /// a queue it falls to the floor either way.
+    #[test]
+    fn the_target_is_held_by_the_ceiling_or_by_the_path() {
+        let (floor, fast) = (Kbps::new(2000.0), Kbps::new(100_000.0));
+        let path = |capacity, queue_ms| PathNow {
+            queue_ms,
+            capacity,
+            overdue: false,
+        };
+        let steer = |max, path| {
+            let mut rc = RateCtl::new(max, floor, None);
+            let t0 = Instant::now();
+            for i in 0..100 {
+                rc.step(t0 + Duration::from_millis(100 * i), &[path]);
+            }
+            rc.target
+        };
+        let ceiling = Some(Kbps::new(30_000.0));
+        assert_eq!(steer(ceiling, path(Some(fast), 0.0)), Kbps::new(30_000.0));
+        assert_eq!(
+            steer(None, path(Some(fast), 0.0)),
+            fast.times(CAPACITY_SHARE)
+        );
+        assert_eq!(steer(ceiling, path(None, 0.0)), START);
+        assert_eq!(
+            steer(Some(Kbps::new(5000.0)), path(None, 0.0)),
+            Kbps::new(5000.0)
+        );
+        assert_eq!(steer(None, path(None, 0.0)), START);
+        assert_eq!(steer(ceiling, path(Some(fast), 50.0)), floor);
+        assert_eq!(steer(None, path(Some(fast), 50.0)), floor);
     }
 
     #[test]
