@@ -463,36 +463,31 @@ mod tests {
 mod bench {
     use super::*;
 
-    /// A full-screen page of text-like lines scrolled `D` px a frame (default 132):
-    /// motion the search finds, plus `D` rows of new text every frame.
-    /// D=132 cargo test --release scroll_cost -- --ignored --nocapture
+    /// A full-screen page of text-like lines scrolled `STEP` px a frame: motion the search
+    /// finds, plus `STEP` rows of new text every frame.
+    /// cargo test --release scroll_cost -- --ignored --nocapture
     #[test]
     #[ignore]
     fn scroll_cost() {
+        /// Three of the page's 44 px lines a frame, near the fastest a trackpad flick moves
+        /// a terminal (see `ME_RANGE`). The bench's default since it was written; it was
+        /// also run at one line and at five.
+        const STEP: usize = 132;
         let (w, h) = (3024usize, 1898usize);
-        let step: usize = std::env::var("D")
-            .ok()
-            .and_then(|t| t.parse().ok())
-            .unwrap_or(132);
-        let range: u32 = std::env::var("R")
-            .ok()
-            .and_then(|t| t.parse().ok())
-            .unwrap_or(ME_RANGE);
-        let mut enc = Encoder::with_me_range(
-            &EncoderConfig {
-                pictures: Pictures {
-                    width: w as u32,
-                    height: h as u32,
-                    fps: 60,
-                    preset: "ultrafast".into(),
-                    threads: 4,
-                    debug: Debugging::read(|name| std::env::var_os(name)),
-                },
-                crf: 24.0,
-                max_kbps: None,
+        let step = STEP;
+        let range = ME_RANGE;
+        let mut enc = Encoder::new(&EncoderConfig {
+            pictures: Pictures {
+                width: w as u32,
+                height: h as u32,
+                fps: 60,
+                preset: "ultrafast".into(),
+                threads: 4,
+                debug: Debugging::read(|_| None),
             },
-            range,
-        )
+            crf: 24.0,
+            max_kbps: None,
+        })
         .unwrap();
         let mut y = vec![0u8; w * h];
         let (u, v) = (vec![128u8; w * h / 4], vec![128u8; w * h / 4]);
@@ -546,12 +541,13 @@ mod bench {
     #[test]
     #[ignore]
     fn encode_cost() {
+        /// One thread: what `--adaptive-threads` encodes on until a frame would miss its
+        /// budget. The bench's default since it was written; it was also run at four, the
+        /// default without that flag.
+        const THREADS: u32 = 1;
         let (w, h) = (2560usize, 1600usize);
         let mbs = (w / 16) * (h / 16);
-        let threads: u32 = std::env::var("T")
-            .ok()
-            .and_then(|t| t.parse().ok())
-            .unwrap_or(1);
+        let threads = THREADS;
         #[cfg(unix)]
         let cpu = || unsafe {
             let mut r: libc::rusage = std::mem::zeroed();
@@ -570,7 +566,7 @@ mod bench {
                     fps: 60,
                     preset: "ultrafast".into(),
                     threads,
-                    debug: Debugging::read(|name| std::env::var_os(name)),
+                    debug: Debugging::read(|_| None),
                 },
                 crf: 24.0,
                 max_kbps: Some(Kbps::new(30000.0)),
