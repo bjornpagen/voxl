@@ -149,15 +149,14 @@ pub(crate) fn truthy(v: Option<&String>, default: bool) -> bool {
 
 /// Runs the server with these command-line flags (without the program name) until it's
 /// told to stop. Takes over the calling thread, which on macOS has to be the main thread.
-/// An environment voxl cannot take (see `Env::read`) is returned before anything starts.
-pub fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
+pub fn run(args: impl IntoIterator<Item = String>) {
     let args: Vec<String> = args.into_iter().collect();
     // --help and --version print and return instead of starting the server.
     if help::print_if_asked(&args) {
-        return Ok(());
+        return;
     }
     let a = parse_args(args);
-    let env = env::Env::read(|name| std::env::var_os(name))?;
+    let env = env::Env::read(|name| std::env::var_os(name));
     // What env_logger::Builder::from_env does with RUST_LOG and RUST_LOG_STYLE, from Env.
     let mut log = env_logger::Builder::new();
     log.parse_filters(&env.log.filter);
@@ -165,6 +164,9 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
         log.parse_write_style(style);
     }
     let _ = log.try_init();
+    if let Some(refused) = &env.refused {
+        log::error!("{refused}");
+    }
     // A panic on any thread ends the process, as in voxl's own release build (panic = "abort"),
     // rather than leaving the server up without that thread when the embedder unwinds.
     #[cfg(panic = "unwind")]
@@ -185,13 +187,10 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         std::thread::spawn(move || rt.block_on(serve(a, env)));
-        dispatch2::dispatch_main()
+        dispatch2::dispatch_main();
     }
     #[cfg(not(target_os = "macos"))]
-    {
-        rt.block_on(serve(a, env));
-        Ok(())
-    }
+    rt.block_on(serve(a, env));
 }
 
 async fn serve(a: HashMap<String, String>, env: env::Env) {
@@ -573,7 +572,7 @@ mod tests {
                         fps: encoder::Fps::new(60).unwrap(),
                         preset,
                         threads: 1,
-                        debug: env::Debugging::read(|_| None).unwrap(),
+                        debug: env::Debugging::read(|_| None).0,
                     },
                     crf: 24.0,
                     max_kbps: None,
@@ -750,7 +749,7 @@ mod tests {
                     fps,
                     preset: encoder::Preset::parse("ultrafast").unwrap(),
                     threads: 1,
-                    debug: env::Debugging::read(|_| None).unwrap(),
+                    debug: env::Debugging::read(|_| None).0,
                 },
                 crf: 24.0,
                 max_kbps: Some(Kbps::new(2000.0)),

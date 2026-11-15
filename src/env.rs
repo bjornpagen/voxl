@@ -28,6 +28,9 @@ pub struct Env {
     pub tls_dir: PathBuf,
     /// `XDG_RUNTIME_DIR`: where the keyboard's scratch file is kept, on Linux.
     pub runtime_dir: Option<String>,
+    /// A value voxl could not take, as the line that says so (see [`Debugging::read`]).
+    /// It is read before logging is set up, so `run` logs it once logging is.
+    pub refused: Option<String>,
 }
 
 /// env_logger's two variables, as `env_logger::Builder::from_env` would read them.
@@ -93,16 +96,16 @@ impl Marker {
 
 impl Env {
     /// Reads every variable through `var`, which gives a variable's value if it is set:
-    /// `std::env::var_os` for voxl's own environment. A value voxl cannot take is refused,
-    /// with what it should be (see [`Debugging::read`]).
-    pub fn read(var: impl Fn(&str) -> Option<OsString>) -> Result<Env, String> {
+    /// `std::env::var_os` for voxl's own environment.
+    pub fn read(var: impl Fn(&str) -> Option<OsString>) -> Env {
         let text = |name: &str| var(name).and_then(|v| v.into_string().ok());
-        Ok(Env {
+        let (debug, refused) = Debugging::read(&var);
+        Env {
             log: Log {
                 filter: text("RUST_LOG").unwrap_or_else(|| "info".into()),
                 style: text("RUST_LOG_STYLE"),
             },
-            debug: Debugging::read(&var)?,
+            debug,
             #[cfg(target_os = "linux")]
             display: text("DISPLAY"),
             home: text("HOME").or_else(|| text("USERPROFILE")),
@@ -113,28 +116,33 @@ impl Env {
             password: text("VOXL_PASSWORD").or_else(|| text("SELKIES_BASIC_AUTH_PASSWORD")),
             tls_dir: crate::tls::tls_dir(&var),
             runtime_dir: text("XDG_RUNTIME_DIR"),
-        })
+            refused,
+        }
     }
 }
 
 impl Debugging {
     /// Reads the debugging variables through `var`, as [`Env::read`] does. A
-    /// `VOXL_DEBUG_MARKER` that is not `x,y` is refused: the marker would be looked for
-    /// where the loadgen did not draw it.
-    pub fn read(var: impl Fn(&str) -> Option<OsString>) -> Result<Debugging, String> {
-        let marker = var("VOXL_DEBUG_MARKER")
-            .map(|at| {
-                at.to_str().and_then(Marker::parse).ok_or_else(|| {
-                    format!(
+    /// `VOXL_DEBUG_MARKER` that is not `x,y` leaves the marker off, and comes back as the
+    /// line that says so: the marker would be looked for where the loadgen did not draw it.
+    pub fn read(var: impl Fn(&str) -> Option<OsString>) -> (Debugging, Option<String>) {
+        let (marker, refused) = match var("VOXL_DEBUG_MARKER") {
+            None => (None, None),
+            Some(at) => match at.to_str().and_then(Marker::parse) {
+                Some(marker) => (Some(marker), None),
+                None => (
+                    None,
+                    Some(format!(
                         "VOXL_DEBUG_MARKER={at:?}: not where the bench loadgen's marker is, \
-                         x,y in whole pixels (its clients look at 300,150 unless told)"
-                    )
-                })
-            })
-            .transpose()?;
+                         x,y in whole pixels (its clients look at 300,150 unless told); \
+                         the marker is off"
+                    )),
+                ),
+            },
+        };
         let var = |name: &str| var(name).and_then(|v| v.into_string().ok());
         let set = |name| var(name).is_some();
-        Ok(Debugging {
+        let debug = Debugging {
             x264_log: match var("VOXL_X264_INFO").as_deref() {
                 None => X264Log::Warning,
                 Some("debug") => X264Log::Debug,
@@ -146,7 +154,8 @@ impl Debugging {
             damage: set("VOXL_DEBUG_DAMAGE"),
             corners: set("VOXL_DEBUG_CORNERS"),
             stripes: set("VOXL_DEBUG_STRIPES"),
-        })
+        };
+        (debug, refused)
     }
 }
 
@@ -171,13 +180,22 @@ mod tests {
         }
     }
 
+    /// The marker an environment with `VOXL_DEBUG_MARKER=at` gives, or the line refusing
+    /// the value, with the marker then off.
     fn marker(at: Option<OsString>) -> Result<Option<Marker>, String> {
-        Debugging::read(|name| at.clone().filter(|_| name == "VOXL_DEBUG_MARKER")).map(|d| d.marker)
+        let env = Env::read(|name| at.clone().filter(|_| name == "VOXL_DEBUG_MARKER"));
+        match env.refused {
+            None => Ok(env.debug.marker),
+            Some(line) => {
+                assert_eq!(env.debug.marker, None, "{line}");
+                Err(line)
+            }
+        }
     }
 
     /// Every value of up to six characters from digits, signs, commas, a space and a
-    /// letter puts the marker where the model says, or is refused: none falls back to a
-    /// place nobody asked for.
+    /// letter puts the marker where the model says, or is refused and leaves it off: none
+    /// falls back to a place nobody asked for.
     #[test]
     fn a_marker_is_where_it_says_or_refused() {
         const CHARS: [char; 7] = ['0', '7', '+', '-', ',', ' ', 'x'];

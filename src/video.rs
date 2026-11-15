@@ -2396,7 +2396,7 @@ mod tests {
                 fps: Fps::new(60).unwrap(),
                 preset: Preset::parse("ultrafast").unwrap(),
                 threads: 1,
-                debug: Debugging::read(|_| None).unwrap(),
+                debug: Debugging::read(|_| None).0,
             },
             crf: 23.0,
             max_kbps: None,
@@ -2425,7 +2425,7 @@ mod tests {
                         configured: 23.0,
                         paintover: 18.0,
                     },
-                    Debugging::read(|_| None).unwrap(),
+                    Debugging::read(|_| None).0,
                 )
             }
         });
@@ -2536,7 +2536,7 @@ mod tests {
                         coalesce: Duration::ZERO,
                         // The stream codes the stripes the hub's hello names, not these.
                         stripes: 1,
-                        debug: Debugging::read(|_| None).unwrap(),
+                        debug: Debugging::read(|_| None).0,
                     };
                     *hub.stripes.lock() = stripe_layout(h, stripes);
                     let s = Stream::new(&cfg, &hub, w, h).unwrap();
@@ -2662,7 +2662,7 @@ mod tests {
                         fps: Fps::new(60).unwrap(),
                         preset: Preset::parse("ultrafast").unwrap(),
                         threads: 1,
-                        debug: Debugging::read(|_| None).unwrap(),
+                        debug: Debugging::read(|_| None).0,
                     },
                     crf,
                     max_kbps,
@@ -3550,7 +3550,7 @@ mod tests {
                             fps: Fps::new(60).unwrap(),
                             preset: Preset::parse("ultrafast").unwrap(),
                             threads: 1,
-                            debug: Debugging::read(|_| None).unwrap(),
+                            debug: Debugging::read(|_| None).0,
                         },
                         crf: 24.0,
                         max_kbps: cap,
@@ -3696,7 +3696,7 @@ mod tests {
                         fps: Fps::new(60).unwrap(),
                         preset: Preset::parse("ultrafast").unwrap(),
                         threads: (4 / layout.len() as u32).max(1),
-                        debug: Debugging::read(|_| None).unwrap(),
+                        debug: Debugging::read(|_| None).0,
                     },
                     crf: 24.0,
                     max_kbps: Some(Kbps::new(30_000.0)),
@@ -4541,7 +4541,7 @@ mod tests {
                 fps: Fps::new(60).unwrap(),
                 preset: Preset::parse("ultrafast").unwrap(),
                 threads: 1,
-                debug: Debugging::read(|_| None).unwrap(),
+                debug: Debugging::read(|_| None).0,
             },
             crf: 23.0,
             max_kbps: None,
@@ -4567,7 +4567,7 @@ mod tests {
                         configured: 23.0,
                         paintover: 18.0,
                     },
-                    Debugging::read(|_| None).unwrap(),
+                    Debugging::read(|_| None).0,
                 )
             }
         });
@@ -4784,7 +4784,7 @@ mod tests {
             paintover_delay_ms: 150,
             coalesce: Duration::ZERO,
             stripes: 1,
-            debug: Debugging::read(|_| None).unwrap(),
+            debug: Debugging::read(|_| None).0,
         };
         let hub = Hub::new();
         let (tx, mut socket) = tokio::sync::mpsc::unbounded_channel();
