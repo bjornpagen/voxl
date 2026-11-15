@@ -392,6 +392,7 @@ impl Client {
         Some(Backlog {
             frames: NonZeroUsize::new(q.len())?,
             oldest: now.saturating_duration_since(q.front()?.sent),
+            newest: now.saturating_duration_since(q.back()?.sent),
         })
     }
 }
@@ -402,6 +403,8 @@ pub struct Backlog {
     pub frames: NonZeroUsize,
     /// How long ago the oldest of them went.
     pub oldest: Duration,
+    /// How long ago the newest of them went: once it is acknowledged, they all are.
+    pub newest: Duration,
 }
 
 /// A non-blocking, close-on-exec pipe for waking a thread that polls file descriptors

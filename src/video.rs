@@ -560,13 +560,14 @@ const MOST_IN_FLIGHT: usize = 40;
 /// fps from Y = 61 to 77 ms; at double (240 ms) only below 10 fps.
 const MOST_QUEUED_MS: u128 = 120;
 /// A viewer whose oldest frame in flight is this old has stalled (a dead socket, a path
-/// queued for seconds): 4 s. Upstream's guess (051bb63), unmeasured. Until then its
-/// frames past `MOST_QUEUED_MS` hold every viewer's picture; from then it holds no other
-/// viewer's. Nothing is done to it: on TCP its frames are late, not lost, and a keyframe,
-/// the largest thing the stream sends, would reach it last. At half (2 s), a path whose
-/// round trip swings by 2 s (a slow link's reached 2.7 s) stops holding the others at
-/// every swing; at double (8 s), one stopped viewer freezes every other viewer's picture
-/// for 8 s.
+/// queued for seconds): 4 s. Upstream's guess (051bb63), unmeasured. Until then its frames
+/// past `MOST_QUEUED_MS` hold every viewer's picture; from then it holds no other viewer's.
+/// Nothing is done to it: on TCP its frames are late, not lost, and a keyframe, the largest
+/// thing the stream sends, would reach it last. At half (2 s), a path whose round trip
+/// swings by 2 s (a slow link's reached 2.7 s) stops holding the others at every swing; at
+/// double (8 s), one stopped viewer freezes every other viewer's picture for 8 s. It is
+/// also the longest a sharpening pass waits for one viewer's ack (`InFlight`): at double, a
+/// viewer that answers nothing slows every other viewer's sharpening to a pass per 8 s.
 pub const STALLED: Duration = Duration::from_millis(4000);
 
 /// What one viewer's frames in flight say about capturing another now.
@@ -828,7 +829,8 @@ enum Step {
 enum Wait {
     /// Damage or a wake: nothing is due.
     Change,
-    /// The sharpening pass due in this long, or damage or a wake.
+    /// The sharpening pass due in this long, or damage or a wake: an ack that empties the
+    /// viewers' paths sooner is one.
     Pass(Duration),
     /// The rest of the least interval since the capture that gates this one (`Captured`),
     /// or what the capture it holds back is woken by (`Next::interval_ends`).
@@ -953,6 +955,41 @@ enum Encoding {
     Busy,
 }
 
+/// What the viewers have yet to acknowledge, as a sharpening pass sees it. A pass goes out
+/// only once they have acknowledged everything: on a path slower than what the encoder
+/// makes of a page, passes sent one after another queue on it, and the keystroke after
+/// them waits behind them all (a 0.3 to 0.66 Mbit/s path stayed busy with 743 passes for
+/// 36 s after a 12 s scroll). Motion is not held: the first place on an empty path is
+/// the next keystroke's.
+///
+/// A viewer holds a pass until it acknowledges the newest frame it was sent, or until that
+/// frame has had `STALLED`. One that answers nothing (a dead socket) so slows the others'
+/// sharpening to a pass per `STALLED`, and cannot stop it. One that answers but is seconds
+/// behind (a slow path's queue) holds every pass until it has caught up: the age of its
+/// oldest frame, which the flow gate reads, would let passes pour into that queue.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum InFlight {
+    /// Every viewer has acknowledged all it was sent, or has had `STALLED` to acknowledge
+    /// the newest of it.
+    Nothing,
+    /// A viewer has yet to acknowledge a frame sent less than `STALLED` ago: in this long
+    /// the newest of them all will have had `STALLED`.
+    Frames(Duration),
+}
+
+impl InFlight {
+    /// From what each viewer has in flight.
+    fn of(backlogs: impl IntoIterator<Item = Option<Backlog>>) -> InFlight {
+        backlogs
+            .into_iter()
+            .flatten()
+            .filter(|b| b.newest < STALLED)
+            .map(|b| STALLED - b.newest)
+            .max()
+            .map_or(InFlight::Nothing, InFlight::Frames)
+    }
+}
+
 /// What the capture loop knows when it looks, while somebody watches.
 struct Look {
     key: Key,
@@ -966,6 +1003,7 @@ struct Look {
     coalesce: Duration,
     gate: Gated,
     encoding: Encoding,
+    in_flight: InFlight,
 }
 
 /// What the loop does next, from what it knows.
@@ -974,10 +1012,15 @@ fn step(look: &Look) -> Step {
         // Nothing moved and no keyframe is wanted. A pass goes only to an idle encoder,
         // as every capture does (below); until then a change may come, and with it the
         // capture is motion's.
-        (Damage::None, Key::NotWanted) => match (look.due, look.encoding) {
-            (Due::Now, Encoding::Idle) => Next::Pass,
-            (Due::Now, Encoding::Busy) | (Due::Never, _) => return Step::Wait(Wait::Change),
-            (Due::In(due), _) => return Step::Wait(Wait::Pass(due)),
+        (Damage::None, Key::NotWanted) => match (look.due, look.encoding, look.in_flight) {
+            (Due::Now, Encoding::Idle, InFlight::Nothing) => Next::Pass,
+            // Nor onto a path that has frames on it: behind them, it would hold the next
+            // keystroke back by all of them.
+            (Due::Now, Encoding::Idle, InFlight::Frames(last)) => {
+                return Step::Wait(Wait::Pass(last))
+            }
+            (Due::Now, Encoding::Busy, _) | (Due::Never, _, _) => return Step::Wait(Wait::Change),
+            (Due::In(due), _, _) => return Step::Wait(Wait::Pass(due)),
         },
         (Damage::Unreported | Damage::Rows { .. }, Key::Wanted | Key::NotWanted)
         | (Damage::None, Key::Wanted) => Next::Change,
@@ -1230,6 +1273,7 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
             coalesce: cfg.coalesce,
             gate: Gated::ask(&viewers, interval_ms, now),
             encoding: s.encoding(),
+            in_flight: InFlight::of(viewers.iter().map(|(c, _)| c.backlog(now))),
         };
         let step = step(&look);
         let next = match step {
@@ -3062,6 +3106,7 @@ mod tests {
                 coalesce: ms(2),
                 gate: Gated::Open,
                 encoding,
+                in_flight: InFlight::Nothing,
             };
             step(&look)
         };
@@ -5091,10 +5136,237 @@ mod tests {
         assert!(seen.iter().all(|&n| n > 100), "unreached: {seen:?}");
     }
 
+    /// A pass waits for every viewer to acknowledge all it was sent, each until the newest
+    /// frame it was sent has had `STALLED`: nothing holds it once every viewer has done one
+    /// or the other, and else it waits as long as the latest of them has left. Over none to
+    /// three viewers, each with none to two frames in flight, sent in order at ages either
+    /// side of nothing and of `STALLED`; read from the viewers as the capture loop reads
+    /// them, against the instants the frames were sent.
+    #[test]
+    fn a_pass_waits_for_the_viewers_to_acknowledge_what_they_were_sent() {
+        let ns = Duration::from_nanos;
+        let now = Instant::now() + Duration::from_secs(60);
+        let ages = [
+            ns(0),
+            ns(1),
+            Duration::from_millis(250),
+            STALLED - ns(1),
+            STALLED,
+            STALLED + ns(1),
+            Duration::from_secs(30),
+        ];
+        // What one viewer has in flight, oldest first: nothing, one frame, or two.
+        let queues: Vec<Vec<Duration>> = std::iter::once(vec![])
+            .chain(ages.map(|a| vec![a]))
+            .chain(ages.iter().flat_map(|&a| {
+                ages.iter()
+                    .filter(move |&&b| b <= a)
+                    .map(move |&b| vec![a, b])
+            }))
+            .collect();
+        let hub = Hub::new();
+        let viewers: Vec<Arc<Client>> = (0..3)
+            .map(|_| hub.add_client(tokio::sync::mpsc::unbounded_channel().0))
+            .collect();
+        let mut seen = [0; 2];
+        for n in 0..=viewers.len() as u32 {
+            for pick in 0..queues.len().pow(n) {
+                let picked: Vec<&[Duration]> = (0..n)
+                    .map(|i| &queues[pick / queues.len().pow(i) % queues.len()][..])
+                    .collect();
+                for (c, ages) in viewers.iter().zip(&picked) {
+                    let mut q = c.inflight();
+                    q.clear();
+                    q.extend(
+                        ages.iter()
+                            .enumerate()
+                            .map(|(id, &age)| crate::hub::Inflight {
+                                id: id as u32,
+                                sent: now - age,
+                                bytes: 1000,
+                                alone: id == 0,
+                            }),
+                    );
+                }
+                let got = InFlight::of(viewers[..n as usize].iter().map(|c| c.backlog(now)));
+                // Each viewer holds the pass until its newest frame has had `STALLED`.
+                let until = picked
+                    .iter()
+                    .filter_map(|ages| ages.last())
+                    .map(|&age| now - age + STALLED)
+                    .filter(|&until| until > now)
+                    .max();
+                let want = match until {
+                    None => InFlight::Nothing,
+                    Some(until) => InFlight::Frames(until - now),
+                };
+                assert_eq!(got, want, "in flight, by age: {picked:?}");
+                seen[until.is_some() as usize] += 1;
+            }
+        }
+        assert!(seen.iter().all(|&n| n > 1000), "unreached: {seen:?}");
+    }
+
+    /// On a path that carries less than the encoder makes, a keystroke waits behind one
+    /// pass at most, and sharpening goes on: a pass goes only once the path is empty, and
+    /// at most a frame's least interval after. The loop's own `step`, with a pass due at
+    /// every look (a page whose passes all come back squeezed, as on a slow path), drives a
+    /// modelled stream: an encoder that codes one capture at a time, a path of a rate and
+    /// a round trip that serves in order, and a viewer that acknowledges each frame as it
+    /// arrives; keystrokes come at generated instants. Over 300 generated paths from
+    /// 100 kbit/s to 40 Mbit/s and round trips to 600 ms, passes to 40 KB, keystrokes'
+    /// frames to 4 KB, encodes of 1 to 30 ms and coalesce windows to 4 ms, 30 s each.
+    #[test]
+    fn a_keystroke_waits_behind_one_pass_at_most() {
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let us = Duration::from_micros;
+        // A frame on its way: when it went, when its last byte left the path's queue,
+        // when its ack comes back, and whether it is a pass.
+        struct Sent {
+            at: Instant,
+            out: Instant,
+            acked: Instant,
+            pass: bool,
+        }
+        let (mut keys_behind_a_pass, mut passes) = (0, 0);
+        for _ in 0..300 {
+            let bps = 100_000 + next(40_000_000);
+            let rtt = us(1000 + next(600_000));
+            let pass_bytes = 200 + next(40_000);
+            let key_bytes = 200 + next(4000);
+            let encode = us(1000 + next(29_000));
+            let coalesce = us(next(4000));
+            let min_interval = Duration::from_secs_f64(1.0 / 60.0).mul_f64(MIN_INTERVAL_SHARE);
+            let crossing = |bytes: u64| us(bytes * 8_000_000 / bps);
+            let t0 = Instant::now() + Duration::from_secs(10);
+            let end = t0 + Duration::from_secs(30);
+            let mut keys = std::collections::VecDeque::new();
+            let mut k = t0;
+            while k < end {
+                k += us(50_000 + next(3_000_000));
+                keys.push_back(k);
+            }
+            let (mut now, mut captured) = (t0, Captured::new(t0 - Duration::from_secs(1)));
+            let mut damage = Damage::None;
+            // The capture the encoder holds: when it is coded, and whether it is a pass.
+            let mut encoder: Option<(Instant, bool)> = None;
+            let (mut sent, mut path_free) = (Vec::<Sent>::new(), t0);
+            // Since when the path has been empty, the encoder idle and nothing damaged.
+            let mut clear: Option<Instant> = None;
+            while now < end {
+                if let Some((done, pass)) = encoder.filter(|e| e.0 <= now) {
+                    encoder = None;
+                    let out =
+                        done.max(path_free) + crossing(if pass { pass_bytes } else { key_bytes });
+                    path_free = out;
+                    if !pass {
+                        let ahead = sent.iter().filter(|f| f.pass && f.out > done).count();
+                        assert!(ahead <= 1, "a keystroke's frame behind {ahead} passes");
+                        keys_behind_a_pass += ahead;
+                    }
+                    sent.push(Sent {
+                        at: done,
+                        out,
+                        acked: out + rtt,
+                        pass,
+                    });
+                }
+                while let Some(key) = keys.pop_front() {
+                    if key > now {
+                        keys.push_front(key);
+                        break;
+                    }
+                    if damage == Damage::None {
+                        damage = Damage::Rows {
+                            since: key,
+                            y0: 0,
+                            y1: 16,
+                        };
+                    }
+                }
+                let unacked: Vec<&Sent> = sent.iter().filter(|f| f.acked > now).collect();
+                let backlog = unacked.first().zip(unacked.last()).map(|(o, n)| Backlog {
+                    frames: std::num::NonZeroUsize::new(unacked.len()).unwrap(),
+                    oldest: now - o.at,
+                    newest: now - n.at,
+                });
+                clear = match (backlog, encoder, damage) {
+                    (None, None, Damage::None) => clear.or(Some(now)),
+                    _ => None,
+                };
+                let look = Look {
+                    key: Key::NotWanted,
+                    damage,
+                    due: Due::Now,
+                    now,
+                    captured,
+                    min_interval,
+                    coalesce,
+                    gate: Gated::Open,
+                    encoding: match encoder {
+                        None => Encoding::Idle,
+                        Some(_) => Encoding::Busy,
+                    },
+                    in_flight: InFlight::of([backlog]),
+                };
+                let wait = match step(&look) {
+                    Step::Capture(what) => {
+                        let pass = what == Next::Pass;
+                        if pass {
+                            let since = clear.expect("a pass went onto a path in use");
+                            assert!(
+                                now - since <= min_interval,
+                                "a pass {:?} after the path emptied",
+                                now - since
+                            );
+                            passes += 1;
+                        }
+                        damage = Damage::None;
+                        encoder = Some((now + encode, pass));
+                        captured.on_capture(what, now);
+                        continue;
+                    }
+                    Step::Wait(wait) => wait,
+                };
+                // Each wait ends as `Wait::through` makes it: on damage, on the hub's waker
+                // (a buffer home, an ack), on its time.
+                let woken = encoder
+                    .map(|e| e.0)
+                    .into_iter()
+                    .chain(sent.iter().map(|f| f.acked).filter(|&a| a > now));
+                let damaged = keys.front().copied();
+                now = match wait {
+                    Wait::Change => woken.chain(damaged).min(),
+                    Wait::Pass(due) | Wait::Gate(Some(due)) => {
+                        woken.chain(damaged).chain([now + due]).min()
+                    }
+                    Wait::Gate(None) => woken.chain(damaged).min(),
+                    Wait::Interval { rest, next } => match next.interval_ends() {
+                        On::Event => woken.chain(damaged).chain([now + rest]).min(),
+                        On::Wake => woken.chain([now + rest]).min(),
+                    },
+                    Wait::Settle(rest) => Some(now + rest),
+                    Wait::Buffer => woken.min(),
+                }
+                .unwrap_or(end);
+            }
+        }
+        assert!(
+            passes > 10_000 && keys_behind_a_pass > 100,
+            "unreached: {passes} passes, {keys_behind_a_pass} keystrokes behind one"
+        );
+    }
+
     /// One look, as the capture loop reads it: the capturer's damage, whether a viewer
     /// wants a keyframe, the pass due, the last capture, the pacing, the
-    /// gate, whether the buffer is home, the area the damage comes to when taken, and the
-    /// blocks pending.
+    /// gate, whether the buffer is home, what the viewers have in flight, the area the
+    /// damage comes to when taken, and the blocks pending.
     #[derive(Clone, Copy)]
     struct StepCase<'a> {
         damage: Damage,
@@ -5106,6 +5378,7 @@ mod tests {
         coalesce: Duration,
         gate: Gated,
         home: bool,
+        in_flight: InFlight,
         band: Option<Band>,
         refiner: &'a Refiner,
     }
@@ -5131,14 +5404,15 @@ mod tests {
                     true => Encoding::Idle,
                     false => Encoding::Busy,
                 },
+                in_flight: self.in_flight,
             }
         }
     }
 
     /// How many looks `each_case` makes: four frame rates, three coalesce windows, six
     /// damages, 28 pairs of times since the last change and the last capture, nine dues,
-    /// seven answers of the gate, and 16 ways for the rest.
-    const CASES: usize = 4 * 3 * 6 * 28 * 9 * 7 * 16;
+    /// seven answers of the gate, and 32 ways for the rest.
+    const CASES: usize = 4 * 3 * 6 * 28 * 9 * 7 * 32;
 
     /// Every look over a discretised domain: each state the capturer's damage takes, at
     /// four times since it came either side of three coalesce windows; four frame rates,
@@ -5147,8 +5421,9 @@ mod tests {
     /// milliseconds; seven waits for a pass, a pass due and none; a
     /// keyframe wanted or not; the gate open, holding until a viewer stalls now, either
     /// side of a millisecond or seconds away, or holding with no viewer to stall; the
-    /// buffer home or out; damage that came to
-    /// an area or to none; and blocks pending or none.
+    /// buffer home or out; nothing in flight, or frames whose newest will have had
+    /// `STALLED` in a nanosecond under it; damage that came to an area or to none; and
+    /// blocks pending or none.
     fn each_case(mut check: impl FnMut(StepCase)) -> usize {
         let ns = Duration::from_nanos;
         let us = Duration::from_micros;
@@ -5227,7 +5502,7 @@ mod tests {
                         .clone()
                         .flat_map(move |c| dues.clone().map(move |due| (d, c, due)))
                 }) {
-                    for (case, gate) in (0..16).flat_map(|case| gates.map(move |g| (case, g))) {
+                    for (case, gate) in (0..32).flat_map(|case| gates.map(move |g| (case, g))) {
                         let bit = |i: u32| case >> i & 1 == 1;
                         check(StepCase {
                             damage,
@@ -5239,6 +5514,10 @@ mod tests {
                             coalesce,
                             gate,
                             home: bit(1),
+                            in_flight: match bit(4) {
+                                false => InFlight::Nothing,
+                                true => InFlight::Frames(STALLED - ns(1)),
+                            },
                             band: bit(2).then_some(Band { y0: 16, y1: 48 }),
                             refiner: if bit(3) { &pending } else { &sharp },
                         });
@@ -5253,8 +5532,9 @@ mod tests {
     /// A look waits for the first of these that holds it, and only for that, else it
     /// captures if the encoder is idle, or waits for the buffer to come home: a still
     /// screen (nothing damaged, no keyframe wanted, and no pass due, or one due while the
-    /// encoder holds the buffer),
-    /// for the pass due or, with none due, for a change; the rest of the least interval
+    /// encoder holds the buffer or a viewer has frames to acknowledge), for the pass due,
+    /// or for the viewers' acks until the newest frame has had `STALLED`, or else for a
+    /// change; the rest of the least interval
     /// since the last capture; the rest of the coalesce window; the flow gate. The gate
     /// is asked only when nothing before it holds the capture and no keyframe is wanted.
     /// Checked over every look of `each_case`.
@@ -5262,8 +5542,8 @@ mod tests {
     fn a_capture_waits_only_for_what_holds_it() {
         let cases = each_case(|c| {
             let got = step(&c.look());
-            // A due pass goes only to an idle encoder.
-            let pass_goes = c.due == Due::Now && c.home;
+            // A due pass goes only to an idle encoder, and onto empty paths.
+            let pass_goes = c.due == Due::Now && c.home && c.in_flight == InFlight::Nothing;
             let still = !(c.damage != Damage::None || c.want_key || pass_goes);
             // A change waits a frame after the last change, a pass after any capture.
             let (next, after) = match c.damage != Damage::None || c.want_key {
@@ -5280,9 +5560,11 @@ mod tests {
             .map(|settled| c.coalesce - settled);
             let gate_asked = !still && early.is_none() && settling.is_none() && !c.want_key;
             let want = match (still, early, settling) {
-                (true, _, _) => Step::Wait(match c.due {
-                    Due::In(due) => Wait::Pass(due),
-                    Due::Now | Due::Never => Wait::Change,
+                (true, _, _) => Step::Wait(match (c.due, c.home, c.in_flight) {
+                    (Due::In(due), _, _) => Wait::Pass(due),
+                    (Due::Now, true, InFlight::Frames(last)) => Wait::Pass(last),
+                    (Due::Now, true, InFlight::Nothing) => unreachable!("a pass that goes"),
+                    (Due::Now, false, _) | (Due::Never, _, _) => Wait::Change,
                 }),
                 (false, Some(rest), _) => Step::Wait(Wait::Interval { rest, next }),
                 (false, None, Some(rest)) => Step::Wait(Wait::Settle(rest)),
