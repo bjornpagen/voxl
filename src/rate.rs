@@ -258,7 +258,7 @@ const DEPTH_FRAMES: f64 = 2.0;
 /// really passed, and pile up while the screen is still to what the path carries in
 /// `LATENCY_BUDGET`: so the first frames of a scroll after stillness go out sharp.
 /// Everything sent is taken off, into debt when a frame took more than there was (a
-/// keyframe's boost, several stripes moving at once), so over any stretch the stream
+/// keyframe, several stripes moving at once), so over any stretch the stream
 /// sends what the target carries in it, give or take one depth.
 pub struct FrameBudget {
     tokens: Bits,

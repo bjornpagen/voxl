@@ -121,13 +121,57 @@ pub struct Planes<'a> {
     pub stride_uv: usize,
 }
 
+/// The VBV an encoder opens with. x264 sets a buffer's fill only when it opens one, and
+/// picks the stream's level from the rate and the buffer it opens with.
+#[derive(Clone, Copy)]
+enum Vbv {
+    /// A stream's: ~1.25 frames at the cap (`vbv_buffer_kbit`), 90% full (x264's
+    /// default).
+    Steady(Kbps),
+    /// One keyframe's: `buffer_kbit`, full, at `rate`, the stream's ceiling.
+    Key { rate: Kbps, buffer_kbit: u32 },
+}
+
 impl Encoder {
     pub fn new(cfg: &EncoderConfig) -> Result<Self, String> {
-        let EncoderConfig {
-            ref pictures,
-            crf,
-            max_kbps,
-        } = *cfg;
+        Self::open(&cfg.pictures, cfg.crf, cfg.max_kbps.map(Vbv::Steady))
+    }
+
+    /// An encoder for one keyframe of at most one frame at `cap`, at `crf`, for a stream
+    /// whose encoders open capped at `ceiling`. Its first frame is an IDR, which is what a
+    /// keyframe is, and its buffer starts full. That is the one way to give a keyframe
+    /// its cap: x264 fills a VBV buffer only when it opens one (0.165,
+    /// ratecontrol.c:729-736), keeps the fill through a reconfiguration (encoder.c:1947)
+    /// and refills it only after a frame (ratecontrol.c:2165-2186), so a running encoder
+    /// has for a keyframe what its last frame left. It opens at `ceiling`, the rate the
+    /// stream's encoders opened at, because x264 picks the level from that rate and a
+    /// keyframe whose SPS names another level is a new decoder in the viewer; its buffer
+    /// is no smaller than theirs, since x264 raises a buffer under one frame at its rate
+    /// and logs it. Then it is given one frame of buffer at `cap` (a reconfiguration
+    /// checks no level): x264 clamps the fill to it when the keyframe starts, and only
+    /// with a single frame of buffer may its rows go finer than the first row to spend
+    /// it (ratecontrol.c:1693), which a new encoder's first guess needs.
+    pub fn for_keyframe(
+        pictures: &Pictures,
+        crf: f32,
+        ceiling: Kbps,
+        cap: Kbps,
+    ) -> Result<Self, String> {
+        let frame_kbit = (cap.get() / pictures.fps.get() as f64).ceil() as u32;
+        let vbv = Vbv::Key {
+            rate: ceiling,
+            buffer_kbit: frame_kbit.max(vbv_buffer_kbit(ceiling.get() as u32, pictures.fps)),
+        };
+        let mut enc = Self::open(pictures, crf, Some(vbv))?;
+        enc.param.rc.i_vbv_max_bitrate = cap.get() as i32;
+        enc.param.rc.i_vbv_buffer_size = frame_kbit as i32;
+        match unsafe { ffi::x264_encoder_reconfig(enc.h, &mut enc.param) } {
+            0.. => Ok(enc),
+            _ => Err(format!("x264 refused a keyframe's cap of {cap:?}")),
+        }
+    }
+
+    fn open(pictures: &Pictures, crf: f32, vbv: Option<Vbv>) -> Result<Self, String> {
         unsafe {
             let mut param: ffi::x264_param_t = std::mem::zeroed();
             let preset = &pictures.preset;
@@ -193,11 +237,19 @@ impl Encoder {
             param.analyse.b_mb_info = pictures.debug.mb_info as i32;
             param.i_sync_lookahead = 0;
             param.rc.b_mb_tree = 0;
-            if let Some(cap) = max_kbps {
-                let kbps = cap.get() as u32;
-                param.rc.i_vbv_max_bitrate = kbps as i32;
-                // ~1.25 frames of buffer keeps single-frame spikes bounded.
-                param.rc.i_vbv_buffer_size = vbv_buffer_kbit(kbps, pictures.fps) as i32;
+            match vbv {
+                Some(Vbv::Steady(cap)) => {
+                    let kbps = cap.get() as u32;
+                    param.rc.i_vbv_max_bitrate = kbps as i32;
+                    // ~1.25 frames of buffer keeps single-frame spikes bounded.
+                    param.rc.i_vbv_buffer_size = vbv_buffer_kbit(kbps, pictures.fps) as i32;
+                }
+                Some(Vbv::Key { rate, buffer_kbit }) => {
+                    param.rc.i_vbv_max_bitrate = rate.get() as i32;
+                    param.rc.i_vbv_buffer_size = buffer_kbit as i32;
+                    param.rc.f_vbv_buffer_init = 1.0;
+                }
+                None => {}
             }
             // sRGB content (BT.709 primaries, sRGB transfer) in BT.601 limited range,
             // matching libyuv ARGBToI420 and the macOS NV12 capture.
@@ -242,9 +294,17 @@ impl Encoder {
         }
     }
 
-    /// Reconfigure rate control on the fly (buffer of ~1.25 frames at `max_kbps`).
+    /// Reconfigure rate control on the fly (buffer of ~1.25 frames at `max_kbps`). The
+    /// buffer keeps the fill the last frame left (`for_keyframe`).
     pub fn set_rate(&mut self, crf: f32, max_kbps: u32) {
-        self.set_rate_buf(crf, max_kbps, vbv_buffer_kbit(max_kbps, self.fps));
+        unsafe {
+            self.param.rc.f_rf_constant = crf;
+            if max_kbps > 0 {
+                self.param.rc.i_vbv_max_bitrate = max_kbps as i32;
+                self.param.rc.i_vbv_buffer_size = vbv_buffer_kbit(max_kbps, self.fps) as i32;
+            }
+            ffi::x264_encoder_reconfig(self.h, &mut self.param);
+        }
     }
 
     /// Change the CRF alone; the cap stays what it was.
@@ -252,18 +312,6 @@ impl Encoder {
     pub fn set_crf(&mut self, crf: f32) {
         self.param.rc.f_rf_constant = crf;
         unsafe { ffi::x264_encoder_reconfig(self.h, &mut self.param) };
-    }
-
-    /// Reconfigure rate control with an explicit VBV buffer (kbit).
-    pub fn set_rate_buf(&mut self, crf: f32, max_kbps: u32, buf_kbit: u32) {
-        unsafe {
-            self.param.rc.f_rf_constant = crf;
-            if max_kbps > 0 {
-                self.param.rc.i_vbv_max_bitrate = max_kbps as i32;
-                self.param.rc.i_vbv_buffer_size = buf_kbit.max(1) as i32;
-            }
-            ffi::x264_encoder_reconfig(self.h, &mut self.param);
-        }
     }
 
     /// Encode one picture. `force_idr` requests a keyframe, `qp` (if set) forces the frame QP.
@@ -547,6 +595,65 @@ mod tests {
             (default as f64) < short as f64 * 0.8,
             "{default} bytes at the default search range, {short} at 64"
         );
+    }
+
+    /// x264 sets a VBV buffer's fill only when it opens an encoder (`for_keyframe`). So a
+    /// cap and buffer raised by `set_rate` give the next frame, a keyframe too, no more
+    /// than the last frame left in the old buffer; an encoder opened at the raised cap
+    /// gives the same keyframe more. Over generated caps and raises, after a page coded
+    /// under the cap.
+    #[test]
+    fn a_raised_cap_gives_a_keyframe_only_the_fill_the_last_frame_left() {
+        let (w, h) = (1280usize, 768usize);
+        let page = text_page(w, h + 10 * 30);
+        let (u, v) = (vec![128u8; w * h / 4], vec![128u8; w * h / 4]);
+        let open = |kbps: u32| {
+            Encoder::new(&EncoderConfig {
+                pictures: Pictures {
+                    width: w as u32,
+                    height: h as u32,
+                    fps: Fps::new(60).unwrap(),
+                    preset: Preset::parse("ultrafast").unwrap(),
+                    threads: 1,
+                    debug: Debugging::read(|_| None).0,
+                },
+                crf: 24.0,
+                max_kbps: Some(Kbps::new(kbps as f64)),
+            })
+            .unwrap()
+        };
+        let code = |enc: &mut Encoder, f: usize, key: bool| {
+            let planes = Planes {
+                y: &page[f * 30 * w..(f * 30 + h) * w],
+                u: &u,
+                v: &v,
+                stride_y: w,
+                stride_uv: w / 2,
+            };
+            let mut out = Vec::new();
+            enc.encode(&planes, f as i64 * 16, key, None, None, &mut out)
+                .unwrap();
+            out.len()
+        };
+        let mut g = crate::xorshift::Xorshift::new(0x2545_F491_4F6C_DD1D);
+        for _ in 0..8 {
+            let drawn = g.next();
+            let cap = 3000 + (drawn % 9000) as u32;
+            let raise = cap * (2 + (drawn >> 32) as u32 % 30);
+            let buffer = vbv_buffer_kbit(cap, Fps::new(60).unwrap()) as usize * 1000 / 8;
+            let mut running = open(cap);
+            for f in 0..10 {
+                code(&mut running, f, f == 0);
+            }
+            running.set_rate(24.0, raise);
+            let raised = code(&mut running, 10, true);
+            let opened = code(&mut open(raise), 10, true);
+            assert!(
+                raised <= buffer && opened > buffer,
+                "cap {cap} raised to {raise}: a keyframe of {raised} bytes, {opened} from an \
+                 encoder opened at {raise}, against a buffer of {buffer}"
+            );
+        }
     }
 
     /// Without a cap at open (`--max-kbps 0`), the caps `set_rate` gives each frame change

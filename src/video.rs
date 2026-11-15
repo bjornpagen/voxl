@@ -248,13 +248,37 @@ enum Dirty {
 /// What a stripe worker is asked to code. The worker turns the kind into a CRF.
 #[derive(Clone, Copy)]
 enum Coding {
-    /// An IDR, with a keyframe's allowance. `still`: in place of a sharpening pass, so at
-    /// paint-over quality.
+    /// An IDR, which may take `KEY_TIME` at the target. `still`: in place of a sharpening
+    /// pass, so at paint-over quality.
     Key { still: bool },
     /// Motion, at the configured CRF, which MotionQuality may lower.
     Motion,
     /// Sharpening, at the paint-over CRF.
     Sharpen,
+}
+
+/// How long a keyframe may take at the stream's target: what a viewer waits for its
+/// first picture on a path the target fills. Measured on a 3024x1898 terminal page (CRF
+/// 24, a viewer behind an emulated 6 Mbit/s, 80 ms link): a reload's first picture is
+/// 41-44 dB (246-284 KB, 369-419 ms after its encode), against 36 dB (154-170 KB, 246-268
+/// ms) at 250 ms and 27.5-27.7 dB (55-57 KB, 114-118 ms) from the frame budget alone; the
+/// page is sharp (59 dB) after 1.1-1.4 s, 0.9-1.0 s and 1.4-1.6 s. At 1 s the page's whole
+/// keyframe at its CRF (386 KB, 51 dB) would fit there, in about 0.6 s (its bytes at the
+/// target; not run), and anything that wants more (a photo) would wait twice as long. At
+/// 40 Mbit/s that keyframe fits in either.
+const KEY_TIME: Duration = Duration::from_millis(500);
+
+impl Coding {
+    /// The ceiling a frame's own encoder opens at, if it gets one: a keyframe under a cap.
+    /// The running encoder can give a keyframe only what its last frame left; with no
+    /// cap there is nothing to give, and an encoder opened capped would cap the stream
+    /// for good.
+    fn own_encoder(self, ceiling: Option<Kbps>) -> Option<Kbps> {
+        match self {
+            Coding::Key { .. } => ceiling,
+            Coding::Motion | Coding::Sharpen => None,
+        }
+    }
 }
 
 /// The two CRFs a pipeline codes at, for its whole life.
@@ -379,8 +403,8 @@ impl Stream {
             stripes.push(Stripe {
                 y: y as usize,
                 h: sh as usize,
-                enc: Encoder::new(&ecfg)?,
-                applied: None,
+                cfg: ecfg,
+                running: None,
             });
         }
         let hub = hub.clone();
@@ -1641,11 +1665,50 @@ impl Layout {
 struct Stripe {
     y: usize,
     h: usize,
+    /// What its encoders are opened with.
+    cfg: EncoderConfig,
+    /// None until the stripe's first frame opens it: on a new stream that is a viewer's
+    /// keyframe, so one open, for its budget. An open that fails ends the pipeline, so it
+    /// is None before that only.
+    running: Option<Running>,
+}
+
+/// A stripe's encoder, and the rate x264 was last told for it.
+struct Running {
     enc: Encoder,
-    /// The rate the encoder was last set to for a frame that isn't a keyframe, while it
-    /// holds: none before the first such frame, or after a keyframe's boost or a fresh
-    /// encoder, so the next one sets it.
-    applied: Option<Applied>,
+    rate: Applied,
+}
+
+impl Running {
+    /// The stream's encoder, as configured, told `rate`.
+    fn open(cfg: &EncoderConfig, rate: Applied) -> Result<Running, String> {
+        let mut enc = Encoder::new(cfg)?;
+        enc.set_rate(rate.crf, rate.kbps);
+        Ok(Running { enc, rate })
+    }
+
+    /// An encoder of a keyframe's own, at `crf` under `cap`, in a stream whose encoders
+    /// open at `ceiling` (`Encoder::for_keyframe`).
+    fn for_keyframe(
+        cfg: &EncoderConfig,
+        crf: f32,
+        ceiling: Kbps,
+        cap: u32,
+    ) -> Result<Running, String> {
+        let enc = Encoder::for_keyframe(&cfg.pictures, crf, ceiling, Kbps::new(cap as f64))?;
+        Ok(Running {
+            enc,
+            rate: Applied { crf, kbps: cap },
+        })
+    }
+
+    /// Before a frame at `crf` under `cap`: tells x264, unless what it was told holds.
+    fn set(&mut self, crf: f32, cap: u32) {
+        if let Some(rate) = self.rate.next(crf, cap) {
+            self.enc.set_rate(rate.crf, rate.kbps);
+            self.rate = rate;
+        }
+    }
 }
 
 /// The CRF and cap a stripe's encoder was set to.
@@ -1662,16 +1725,12 @@ struct Applied {
 const CAP_SLACK: f64 = 0.04;
 
 impl Applied {
-    /// The rate to set before a frame at `crf` under `cap`, unless the one set (`was`)
-    /// still holds: the same CRF, and a cap within CAP_SLACK of it.
-    fn next(was: Option<Applied>, crf: f32, cap: u32) -> Option<Applied> {
-        let holds = |a: Applied| {
-            a.crf == crf && (cap as f64 - a.kbps as f64).abs() <= a.kbps as f64 * CAP_SLACK
-        };
-        match was {
-            Some(a) if holds(a) => None,
-            Some(_) | None => Some(Applied { crf, kbps: cap }),
-        }
+    /// The rate to set before a frame at `crf` under `cap`, unless this one still holds:
+    /// the same CRF, and a cap within CAP_SLACK of it.
+    fn next(self, crf: f32, cap: u32) -> Option<Applied> {
+        let holds = self.crf == crf
+            && (cap as f64 - self.kbps as f64).abs() <= self.kbps as f64 * CAP_SLACK;
+        (!holds).then_some(Applied { crf, kbps: cap })
     }
 }
 
@@ -1702,7 +1761,8 @@ struct StripeResult {
 /// wait for its result ends at once. Each channel holds one message, since a worker has
 /// one job at a time.
 struct Crew {
-    own: Box<dyn FnMut(StripeJob) -> StripeResult + Send>,
+    /// Codes stripe 0, or finds it gone: its encoder could not be opened.
+    own: Box<dyn FnMut(StripeJob) -> Result<StripeResult, Gone> + Send>,
     /// Stripe 1's worker onwards.
     hands: Vec<Hand>,
     /// What came of the last frame: kept, so a frame allocates nothing for it.
@@ -1724,7 +1784,7 @@ impl Crew {
     /// `own` codes stripe 0; each of the others gets a thread, where `work` codes the jobs
     /// that arrive on its receiver and answers each on its sender.
     fn spawn<W>(
-        own: impl FnMut(StripeJob) -> StripeResult + Send + 'static,
+        own: impl FnMut(StripeJob) -> Result<StripeResult, Gone> + Send + 'static,
         workers: impl IntoIterator<Item = W>,
     ) -> Crew
     where
@@ -1773,7 +1833,7 @@ impl Crew {
         results.clear();
         results.extend((0..=self.hands.len()).map(|_| StripeOut::Skipped));
         if selected[0] {
-            results[0] = (self.own)(job.clone()).out;
+            results[0] = (self.own)(job.clone())?.out;
         }
         for (i, hand) in asked() {
             let StripeResult { out, buf } = hand.done.recv().map_err(|_| Gone(i))?;
@@ -1979,7 +2039,6 @@ struct MotionSize {
 /// frames it coded (how cheap their motion is, and where x264 started the last one).
 struct Coder {
     s: Stripe,
-    fps: Fps,
     crfs: Crfs,
     debug: bool,
     motion: MotionQuality,
@@ -2040,10 +2099,9 @@ impl Arenas {
 }
 
 impl Coder {
-    fn new(s: Stripe, fps: Fps, crfs: Crfs, debug: bool) -> Coder {
+    fn new(s: Stripe, crfs: Crfs, debug: bool) -> Coder {
         Coder {
             s,
-            fps,
             crfs,
             debug,
             motion: MotionQuality::default(),
@@ -2054,12 +2112,12 @@ impl Coder {
         }
     }
 
-    /// Codes the stripe's part of the job's frame, and hands the picture back with it.
-    fn code(&mut self, job: StripeJob) -> StripeResult {
+    /// Codes the stripe's part of the job's frame, and hands the picture back with it; or
+    /// says why the stripe has no encoder to code it with, now or after.
+    fn code(&mut self, job: StripeJob) -> Result<StripeResult, String> {
         let woke = Instant::now();
         let Coder {
             s,
-            fps,
             crfs,
             debug,
             motion,
@@ -2076,16 +2134,21 @@ impl Coder {
             Coding::Key { .. } | Coding::Sharpen => asked,
             Coding::Motion => motion.crf(asked),
         };
-        if let Coding::Key { .. } = job.coding {
-            // A keyframe is what a new viewer sees first; don't starve it to the
-            // steady-state frame budget (up to ~8 frames' worth at 4x the cap).
-            let boost = job.cap.saturating_mul(4).max(16_000);
-            s.enc.set_rate_buf(asked, boost, boost / fps.get() * 8);
-            s.applied = None;
-        } else if let Some(rate) = Applied::next(s.applied, crf, job.cap) {
-            s.enc.set_rate(rate.crf, rate.kbps);
-            s.applied = Some(rate);
-        }
+        // A keyframe under a cap gets an encoder of its own, opened for its budget `cap`
+        // (the running one is closed first: one encoder's memory at a time); any other
+        // frame the running one, told its rate; the stripe's first frame opens it.
+        let running = match (job.coding.own_encoder(s.cfg.max_kbps), s.running.take()) {
+            (Some(ceiling), was) => {
+                drop(was);
+                Running::for_keyframe(&s.cfg, asked, ceiling, job.cap)
+            }
+            (None, Some(mut running)) => {
+                running.set(crf, job.cap);
+                Ok(running)
+            }
+            (None, None) => Running::open(&s.cfg, Applied { crf, kbps: job.cap }),
+        };
+        let enc = &mut s.running.insert(running?).enc;
         let suv = buf.stride_uv();
         let planes = Planes {
             y: &buf.y[s.y * buf.width..],
@@ -2116,7 +2179,7 @@ impl Coder {
             .as_ref()
             .map_or(stripe_mbs, |m| m.iter().filter(|&&c| c == 0).count());
         let te = Instant::now();
-        let r = s.enc.encode(
+        let r = enc.encode(
             &planes,
             job.ts,
             matches!(job.coding, Coding::Key { .. }),
@@ -2163,10 +2226,10 @@ impl Coder {
                 StripeOut::Failed
             }
         };
-        StripeResult {
+        Ok(StripeResult {
             out: result,
             buf: job.buf,
-        }
+        })
     }
 }
 
@@ -2177,8 +2240,18 @@ fn stripe_worker(
     done: mpsc::SyncSender<StripeResult>,
 ) {
     while let Ok(job) = rx.recv() {
-        if done.send(coder.code(job)).is_err() {
-            return;
+        match coder.code(job) {
+            Ok(result) => {
+                if done.send(result).is_err() {
+                    return;
+                }
+            }
+            // Without an encoder the stripe can't code this frame or any after it: the
+            // worker is gone, and the pipeline ends.
+            Err(e) => {
+                log::error!("{e}");
+                return;
+            }
         }
     }
 }
@@ -2236,16 +2309,20 @@ fn encode_loop(
     debug: Debugging,
 ) {
     let debug_stripes = debug.stripes;
-    let fps = frames.fps;
     // Geometry stays here; encoders move to their workers.
     let stripes: Vec<(usize, usize)> = stripes_in.iter().map(|s| (s.y, s.h)).collect();
     // Persistent per-stripe workers keep each encoder's state warm in one core's cache.
     let mut coders = stripes_in
         .into_iter()
-        .map(|s| Coder::new(s, fps, crfs, debug_stripes));
+        .map(|s| Coder::new(s, crfs, debug_stripes));
     let mut own = coders.next().expect("a screen has a stripe");
     let mut crew = Crew::spawn(
-        move |job| own.code(job),
+        move |job| {
+            own.code(job).map_err(|e| {
+                log::error!("{e}");
+                Gone(0)
+            })
+        },
         coders.map(|c| move |rx, done| stripe_worker(c, rx, done)),
     );
     if let Err(Gone(i)) = encode_frames(&mut crew, &stripes, &frames, rx, ret, &hub) {
@@ -2295,11 +2372,14 @@ fn encode_frames(
         let mb_dirty = job.frame.mb_dirty();
         // Each stripe may use up to twice its area share of the frame's budget, and
         // never more than all of it: what was sent is taken off the budget afterwards,
-        // so several stripes moving at once is paid for by the frames that follow.
-        let frame = budget
-            .allow(t0, job.target, job.capacity, fps)
-            .a_frame_at(fps.get())
-            .get() as u32;
+        // so several stripes moving at once is paid for by the frames that follow. A
+        // keyframe's budget is the target's `KEY_TIME`, and it is paid for the same way.
+        let frame = match coding {
+            Coding::Key { .. } => job.target.over(KEY_TIME),
+            Coding::Motion | Coding::Sharpen => budget.allow(t0, job.target, job.capacity, fps),
+        }
+        .a_frame_at(fps.get())
+        .get() as u32;
         let share = (frame.saturating_mul(2) / n as u32).clamp(1, frame.max(1));
         let ts = job.captured.damage.duration_since(epoch).as_millis() as i64;
         let mb_cols = job.buf.width.div_ceil(16);
@@ -2624,8 +2704,8 @@ mod tests {
         let stripe = Stripe {
             y: 0,
             h,
-            enc: Encoder::new(&ecfg).unwrap(),
-            applied: None,
+            cfg: ecfg.clone(),
+            running: None,
         };
         let (job_tx, job_rx) = mpsc::sync_channel::<Job>(1);
         // The way home holds one picture: the capture loop's part, taking each home, is
@@ -3487,8 +3567,9 @@ mod tests {
                     StripeResult { out, buf: job.buf }
                 }
             };
+            let mut own = coder(layout[0]);
             let mut crew = Crew::spawn(
-                coder(layout[0]),
+                move |job| Ok(own(job)),
                 layout[1..].iter().map(|&rows| {
                     move |rx: mpsc::Receiver<StripeJob>, done: mpsc::SyncSender<StripeResult>| {
                         let mut code = coder(rows);
@@ -3669,37 +3750,38 @@ mod tests {
         );
     }
 
-    /// A stripe sets x264's rate when it moves: over generated runs of keyframes, frames
-    /// at a CRF (asked, or lowered for motion) under a cap of at least 1 kbit/s (the
-    /// share is never less), and reopened encoders, a frame sets its CRF and cap when
-    /// nothing set holds (at the start, after a keyframe or a reopen), when its CRF is
-    /// not the one set, or when its cap is more than CAP_SLACK of the one set away, and
-    /// otherwise sets nothing.
+    /// A stripe sets x264's rate when it moves: over generated runs of encoders opened
+    /// (the stripe's first frame, a keyframe's own encoder), each told the rate of the
+    /// frame it opened for, and frames at a CRF (asked, or lowered for motion) under a cap
+    /// of at least 1 kbit/s (the share is never less), a frame sets its CRF and cap when
+    /// its CRF is not the one set, or when its cap is more than CAP_SLACK of the one set
+    /// away, and otherwise sets nothing.
     #[test]
     fn a_stripe_sets_its_rate_when_it_moves() {
         let mut g = Gen(Xorshift::new(0x94D049BB133111EB));
         // Frames that kept a rate, that set one, and that moved the cap onto the slack's edge.
         let mut reached = [0; 3];
         for case in 0..2_000 {
-            // The rate set, if any holds.
-            let mut set: Option<(f32, u32)> = None;
-            let mut applied: Option<Applied> = None;
             let mut cap = 1 + g.below(40_000) as u32;
             let mut crf = 24.0;
+            // The rate set: the stripe's first frame opens its encoder, told its rate.
+            let mut set: (f32, u32) = (crf, cap);
+            let mut applied = Applied { crf, kbps: cap };
             for frame in 0..200 {
                 match g.below(20) {
-                    // A keyframe's boost, or a reopened encoder: nothing set holds.
+                    // A keyframe's own encoder, told the keyframe's CRF and its budget.
                     0 | 1 => {
-                        set = None;
-                        applied = None;
+                        (crf, cap) = (12.0 + g.below(20) as f32, 1 + g.below(400_000) as u32);
+                        set = (crf, cap);
+                        applied = Applied { crf, kbps: cap };
                     }
                     _ => {
                         // Caps wobble with the budget, and sometimes jump; CRFs step.
                         cap = match g.below(6) {
                             0 => 1 + g.below(40_000) as u32,
                             // Onto the edge of the slack, or one past it.
-                            1 if set.is_some_and(|(_, kbps)| kbps % 25 == 0) => {
-                                let kbps = set.map_or(cap, |(_, kbps)| kbps);
+                            1 if set.1.is_multiple_of(25) => {
+                                let kbps = set.1;
                                 let edge = kbps / 25 + g.below(2) as u32;
                                 match g.below(2) {
                                     0 => kbps + edge,
@@ -3717,18 +3799,15 @@ mod tests {
                         if g.below(8) == 0 {
                             crf = 12.0 + g.below(20) as f32;
                         }
-                        let holds = set.is_some_and(|(c, kbps)| {
-                            c == crf && cap.abs_diff(kbps) as f64 <= kbps as f64 * CAP_SLACK
-                        });
-                        let on_edge = set.is_some_and(|(_, kbps)| {
-                            cap.abs_diff(kbps) as f64 == kbps as f64 * CAP_SLACK
-                        });
+                        let holds =
+                            set.0 == crf && cap.abs_diff(set.1) as f64 <= set.1 as f64 * CAP_SLACK;
+                        let on_edge = cap.abs_diff(set.1) as f64 == set.1 as f64 * CAP_SLACK;
                         let want = (!holds).then_some((crf, cap));
                         if let Some(rate) = want {
-                            set = Some(rate);
+                            set = rate;
                         }
-                        let new = Applied::next(applied, crf, cap).map(|rate| {
-                            applied = Some(rate);
+                        let new = applied.next(crf, cap).map(|rate| {
+                            applied = rate;
                             (rate.crf, rate.kbps)
                         });
                         assert_eq!(new, want, "case {case} frame {frame}");
@@ -3777,10 +3856,10 @@ mod tests {
                     let s = Stripe {
                         y,
                         h,
-                        enc: Encoder::new(&cfg).unwrap(),
-                        applied: None,
+                        cfg: cfg.clone(),
+                        running: None,
                     };
-                    Coder::new(s, Fps::new(60).unwrap(), crfs, false)
+                    Coder::new(s, crfs, false)
                 })
                 .collect::<Vec<Coder>>()
         };
@@ -3799,7 +3878,7 @@ mod tests {
             let mut ours = coders(width, &layout, cap).into_iter();
             let mut own = ours.next().unwrap();
             let mut new = Crew::spawn(
-                move |job| own.code(job),
+                move |job| own.code(job).map_err(|_| Gone(0)),
                 ours.map(|c| move |rx, done| stripe_worker(c, rx, done)),
             );
             let mut buf = Arc::new(I420::new(width, height));
@@ -3848,7 +3927,7 @@ mod tests {
                     .iter_mut()
                     .zip(&selected)
                     .map(|(coder, &on)| match on {
-                        true => coder.code(job.clone()).out,
+                        true => coder.code(job.clone()).unwrap().out,
                         false => StripeOut::Skipped,
                     })
                     .collect();
@@ -3918,14 +3997,14 @@ mod tests {
                 let s = Stripe {
                     y: y as usize,
                     h: sh as usize,
-                    enc: Encoder::new(&cfg).unwrap(),
-                    applied: None,
+                    cfg: cfg.clone(),
+                    running: None,
                 };
-                Coder::new(s, Fps::new(60).unwrap(), crfs, false)
+                Coder::new(s, crfs, false)
             });
             let mut own = coders.next().unwrap();
             let crew = Crew::spawn(
-                move |job| own.code(job),
+                move |job| own.code(job).map_err(|_| Gone(0)),
                 coders.map(|c| move |rx, done| stripe_worker(c, rx, done)),
             );
             let geometry: Vec<(usize, usize)> = layout
@@ -4215,9 +4294,11 @@ mod tests {
                 .collect();
             let (ended_tx, ended) = mpsc::channel();
             let crew = Crew::spawn(
-                |job: StripeJob| StripeResult {
-                    out: StripeOut::Failed,
-                    buf: job.buf,
+                |job: StripeJob| {
+                    Ok(StripeResult {
+                        out: StripeOut::Failed,
+                        buf: job.buf,
+                    })
                 },
                 (0..n).map(|i| mortal(i, ends[i], ended_tx.clone())),
             );
@@ -4253,6 +4334,186 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A stripe of `height` rows of `width`, whose encoders open at `ceiling` with `preset`.
+    fn stripe(width: usize, height: usize, ceiling: Option<Kbps>) -> Stripe {
+        Stripe {
+            y: 0,
+            h: height,
+            cfg: EncoderConfig {
+                pictures: Pictures {
+                    width: width as u32,
+                    height: height as u32,
+                    fps: Fps::new(60).unwrap(),
+                    preset: Preset::parse("ultrafast").unwrap(),
+                    threads: 1,
+                    debug: Debugging::read(|_| None).0,
+                },
+                crf: 23.0,
+                max_kbps: ceiling,
+            },
+            running: None,
+        }
+    }
+
+    /// What a stripe's coder put out (x264's bytes, past the header's room) for `jobs` (a
+    /// kind and a cap each) of `buf`, coded one after another.
+    fn put_out(stripe: Stripe, buf: &Arc<I420>, jobs: &[(Coding, u32)]) -> Vec<Vec<u8>> {
+        let crfs = Crfs {
+            configured: 23.0,
+            paintover: 18.0,
+        };
+        let mut coder = Coder::new(stripe, crfs, false);
+        jobs.iter()
+            .enumerate()
+            .map(|(n, &(coding, cap))| {
+                let job = StripeJob {
+                    buf: buf.clone(),
+                    ts: n as i64 * 16,
+                    coding,
+                    cap,
+                    mb_dirty: Dirty::All,
+                    mb_cols: buf.width.div_ceil(16),
+                };
+                match coder.code(job).map(|r| r.out) {
+                    Ok(StripeOut::Sent { bytes, .. }) => bytes[Header::LEN..].to_vec(),
+                    Ok(StripeOut::Skipped | StripeOut::Failed | StripeOut::Empty) | Err(_) => {
+                        panic!("frame {n} came out with nothing")
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// The SPS of a keyframe: from its NAL header to the next start code.
+    fn sps(keyframe: &[u8]) -> &[u8] {
+        let at = keyframe
+            .windows(4)
+            .position(|w| w == [0, 0, 1, 0x67])
+            .expect("a keyframe carries its SPS")
+            + 3;
+        let len = keyframe[at..]
+            .windows(3)
+            .position(|w| w == [0, 0, 1])
+            .unwrap_or(keyframe.len() - at);
+        &keyframe[at..at + len]
+    }
+
+    /// `--max-kbps 0` is no ceiling: encoders open without a rate cap, so nothing applies
+    /// the target, and a viewer on a slow path gets every frame at its CRF. So with no
+    /// ceiling, what a stripe sends cannot depend on the cap its jobs carry, keyframes
+    /// included: over generated runs of keyframes, motion and passes of new noise, the
+    /// same bytes under caps of 100 kbit/s and of 20 Mbit/s. (RED's, for this commit's
+    /// coder.) One thread, no VBV: x264's output is byte-identical run to run.
+    #[test]
+    fn with_no_ceiling_a_stripe_sends_the_same_whatever_the_cap() {
+        let mut g = Gen(Xorshift::new(0xD1B5_4A32_D192_ED03));
+        for case in 0..6 {
+            let mut buf = Arc::new(I420::new(256, 64));
+            Arc::get_mut(&mut buf).unwrap().y = g.bytes(256 * 64);
+            let codings: Vec<Coding> = (0..2 + g.below(8))
+                .map(|_| match g.below(3) {
+                    0 => Coding::Key { still: false },
+                    1 => Coding::Motion,
+                    _ => Coding::Sharpen,
+                })
+                .collect();
+            let at = |cap: u32| codings.iter().map(|&c| (c, cap)).collect::<Vec<_>>();
+            let slow = put_out(stripe(256, 64, None), &buf, &at(100));
+            let fast = put_out(stripe(256, 64, None), &buf, &at(20_000));
+            assert!(
+                slow == fast,
+                "case {case}: with no ceiling, frames came out apart under 100 and 20000 kbit/s"
+            );
+        }
+    }
+
+    /// A keyframe gets its cap, one frame at it, whatever came before it. A stripe whose
+    /// stream is capped at a ceiling codes a picture at a low cap, then a keyframe of it
+    /// under a generated cap, from under the ceiling to past five frames of it in one. The
+    /// picture (noise) wants more than any of them. The keyframe takes most of one frame
+    /// at its cap and no more, where the running encoder had only the low cap's buffer
+    /// for it; and it carries the stream's own SPS, so the viewer keeps its decoder, even
+    /// under a cap past what the stream's level allows.
+    #[test]
+    fn a_keyframe_gets_its_cap() {
+        let mut buf = Arc::new(I420::new(W, H));
+        draw(&mut Arc::get_mut(&mut buf).unwrap().y, Scene::Noise, 0);
+        let key = Coding::Key { still: false };
+        // The level x264 picks for 1280x768 at 60 fps and this ceiling allows 20 Mbit/s.
+        let ceiling = Some(Kbps::new(20_000.0));
+        let low = 1200;
+        let frame = |cap: u32| cap as usize * 1000 / 60 / 8;
+        let mut g = Gen(Xorshift::new(0x9E37_79B9_7F4A_7C15));
+        for _ in 0..10 {
+            let cap = 2_000 + g.below(150_000) as u32;
+            let mut jobs = vec![(key, low)];
+            jobs.extend([(Coding::Sharpen, low); 6]);
+            jobs.push((key, cap));
+            let sent = put_out(stripe(W, H, ceiling), &buf, &jobs);
+            let keyframe = sent.last().unwrap();
+            assert!(
+                keyframe.len() * 4 >= frame(cap) * 3 && keyframe.len() <= frame(cap),
+                "a keyframe of {} bytes under a cap of {cap} kbit/s, a frame of {}",
+                keyframe.len(),
+                frame(cap)
+            );
+            assert!(
+                sps(keyframe) == sps(&sent[0]),
+                "a keyframe under a cap of {cap} kbit/s names another SPS"
+            );
+        }
+    }
+
+    /// A stripe whose encoder cannot be opened has nothing to code with, now or after: it
+    /// is gone, and the pipeline ends, as when a worker dies. Over generated screens of
+    /// 1-4 stripes, one of them (stripe 0 on the encode loop's thread, or a worker's)
+    /// opening at a size x264 refuses, with a cap and without, and first frames of every
+    /// kind: the crew finds that stripe gone on the first frame.
+    #[test]
+    fn a_stripe_that_cannot_open_its_encoder_is_gone() {
+        let crfs = Crfs {
+            configured: 23.0,
+            paintover: 18.0,
+        };
+        let mut g = Gen(Xorshift::new(0xA076_1D64_78BD_642F));
+        let mut reached = [0; 2];
+        for case in 0..24 {
+            let n = 1 + g.below(4) as usize;
+            let dead = g.below(n as u64) as usize;
+            let ceiling = (g.below(2) == 0).then_some(Kbps::new(8000.0));
+            let coding = match g.below(3) {
+                0 => Coding::Key { still: false },
+                1 => Coding::Motion,
+                _ => Coding::Sharpen,
+            };
+            // x264 refuses a picture of odd height in 4:2:0.
+            let mut coders = (0..n).map(|i| {
+                Coder::new(
+                    stripe(64, if i == dead { 15 } else { 16 }, ceiling),
+                    crfs,
+                    false,
+                )
+            });
+            let mut own = coders.next().unwrap();
+            let mut crew = Crew::spawn(
+                move |job| own.code(job).map_err(|_| Gone(0)),
+                coders.map(|c| move |rx, done| stripe_worker(c, rx, done)),
+            );
+            let job = StripeJob {
+                buf: Arc::new(I420::new(64, 16)),
+                ts: 0,
+                coding,
+                cap: 4000,
+                mb_dirty: Dirty::All,
+                mb_cols: 4,
+            };
+            let gone = crew.run(&vec![true; n], job).err().map(|Gone(i)| i);
+            assert_eq!(gone, Some(dead), "case {case}: {n} stripes");
+            reached[usize::from(dead > 0)] += 1;
+        }
+        assert!(reached.iter().all(|&r| r > 0), "{reached:?}");
     }
 
     /// Any stripe worker may die at any point, and the pipeline then ends with it gone
@@ -4318,7 +4579,7 @@ mod tests {
                             encoded: at,
                         },
                     };
-                    StripeResult { out, buf: job.buf }
+                    Ok(StripeResult { out, buf: job.buf })
                 },
                 (1..n).map(|i| mortal(i, ends[i], ended_tx.clone())),
             );
@@ -4511,8 +4772,9 @@ mod tests {
                     StripeResult { out, buf: job.buf }
                 }
             };
+            let mut own = coder(0);
             let crew = Crew::spawn(
-                coder(0),
+                move |job| Ok(own(job)),
                 (1..n).map(|i| {
                     let mut code = coder(i);
                     move |rx: mpsc::Receiver<StripeJob>, done: mpsc::SyncSender<StripeResult>| {
@@ -4825,8 +5087,8 @@ mod tests {
         let stripe = Stripe {
             y: 0,
             h,
-            enc: Encoder::new(&ecfg).unwrap(),
-            applied: None,
+            cfg: ecfg.clone(),
+            running: None,
         };
         let (job_tx, job_rx) = mpsc::sync_channel::<Job>(1);
         let (ret_tx, _ret_rx) = mpsc::sync_channel::<Returned>(1);
