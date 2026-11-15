@@ -31,7 +31,7 @@ Video:
   --framerate                   max frames per second (default 60)
   --crf                         base quality (default 24)
   --max-kbps, --min-kbps        adaptive bitrate ceiling and floor
-                                (default 30000, 2000; ceiling 0: none;
+                                (default 30000, 0; ceiling 0: none;
                                 a ceiling under the floor wins)
   --preset                      x264 preset (default ultrafast)
   --encoder-threads             x264 sliced threads (default min(4, cores/4))

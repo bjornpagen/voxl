@@ -1,9 +1,7 @@
 //! Rate control: the bitrate the stream is steered to, and the bits each frame may spend.
 
 use crate::encoder::Fps;
-use crate::hub::{Client, Hub, Viewer};
 use crate::path::{Bits, Capacity, Kbps};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// What one client's acks say about its path now.
@@ -148,6 +146,19 @@ impl Bounds {
         self.ceiling
     }
 
+    /// What a viewer's path is taken to carry in `LATENESS` (window.rs): at least what the
+    /// floor carries in it, and at most what the ceiling does, or with none as much as
+    /// there is.
+    pub fn paths(self) -> crate::hub::Paths {
+        // kbit/s times ms is bits, exactly for whole numbers of each.
+        let ms = crate::window::LATENESS.as_millis() as f64;
+        let bytes = |rate: Kbps| (rate.get() * ms / 8.0) as usize;
+        crate::hub::Paths {
+            least: bytes(self.floor),
+            most: self.ceiling.map_or(usize::MAX, bytes),
+        }
+    }
+
     /// `rate`, or the bound it is past.
     fn hold(self, rate: Kbps) -> Kbps {
         self.ceiling
@@ -166,27 +177,6 @@ impl RateCtl {
             decided: None,
             moved: Moved::Never,
         }
-    }
-
-    /// Steers by what the clients' paths say now; what they are known to carry together.
-    pub fn update(&mut self, hub: &Hub, viewers: &[(Arc<Client>, Viewer)]) -> Option<Kbps> {
-        let paths: Vec<PathNow> = viewers
-            .iter()
-            .filter(|(_, viewer)| *viewer == Viewer::Started)
-            .map(|(c, _)| {
-                let rtt = c.rtt_ms().unwrap_or(RTT_GUESS_MS) as f64;
-                PathNow {
-                    queue_ms: c.queue_ms(),
-                    capacity: c.capacity(),
-                    overdue: c
-                        .backlog(Instant::now())
-                        .is_some_and(|b| b.oldest.as_millis() as f64 > rtt + OVERDUE_MS),
-                }
-            })
-            .collect();
-        let capacity = self.step(Instant::now(), &paths);
-        hub.set_target(self.target);
-        known(capacity)
     }
 
     /// One decision, at most every `DECIDE_EVERY`, from what every watched path says now;

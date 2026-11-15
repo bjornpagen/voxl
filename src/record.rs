@@ -146,8 +146,8 @@ fn begin(
         ));
     }
     let (tx, rx) = mpsc::unbounded_channel();
-    let client = r.hub.add_client(tx);
-    client.watch();
+    let client = r.hub.add_client(tx, Instant::now());
+    client.watch(Instant::now());
     r.hub.wake();
     let hub = r.hub.clone();
     Ok(tokio::spawn(async move {
@@ -324,9 +324,9 @@ mod tests {
             "",
             "x",
         ];
-        let hub = Hub::new();
+        let hub = Hub::new(crate::hub::Paths::ANY);
         let (tx, _) = mpsc::unbounded_channel();
-        let client = hub.add_client(tx);
+        let client = hub.add_client(tx, Instant::now());
         let mut rng = crate::xorshift::Xorshift::new(0x9e37_79b9_7f4a_7c15);
         for _ in 0..2_000 {
             let (tx, rx) = mpsc::unbounded_channel();

@@ -170,19 +170,27 @@ pub fn router(state: AppState) -> Router {
 
 async fn stats(State(s): State<AppState>) -> Response {
     let st = &s.hub.stats;
-    let clients: Vec<_> = s
-        .hub
-        .clients
-        .lock()
+    let now = Instant::now();
+    let viewers = s.hub.clients.lock().clone();
+    let clients: Vec<_> = viewers
         .iter()
         .map(|c| {
-            let backlog = c.backlog(Instant::now());
+            let backlog = c.backlog(now);
             let (n, age) = backlog.map_or((0, 0), |b| (b.frames.get(), b.oldest.as_millis()));
+            let (carries, flying, fastest) = c.window(|w| (w.carries(), w.flying(), w.fastest()));
             serde_json::json!({"id": c.id, "video": c.viewer() != crate::hub::Viewer::NotWatching, "inflight": n, "oldest_ms": age,
-                "min_rtt_ms": c.min_rtt_ms.load(Ordering::Relaxed), "queue_ms": c.queue_ms() as u64, "capacity_kbps": c.capacity().map(|k| k.get() as u64),
+                "min_rtt_ms": c.min_rtt_ms.load(Ordering::Relaxed), "carries_bytes": carries, "flying_bytes": flying,
+                "fastest_ms": fastest.map(|t| t.as_secs_f64() * 1000.0),
                 "client_ms": (*c.client_ms.lock() * 10.0).round() / 10.0})
         })
         .collect();
+    // What the slowest watching viewer's path carries, as a rate.
+    let target = viewers
+        .iter()
+        .filter(|c| c.viewer() != crate::hub::Viewer::NotWatching)
+        .map(|c| c.window(|w| w.carries()))
+        .min()
+        .map(|bytes| bytes as f64 * 8.0 / crate::window::LATENESS.as_secs_f64() / 1000.0);
     let body = serde_json::json!({
         "now_us": s.hub.timeline.us(Instant::now()),
         "captured": st.captured.load(Ordering::Relaxed),
@@ -195,7 +203,7 @@ async fn stats(State(s): State<AppState>) -> Response {
         "paintovers": st.paintovers.load(Ordering::Relaxed),
         "keyframes": st.keyframes.load(Ordering::Relaxed),
         "refines": st.refines.load(Ordering::Relaxed),
-        "target_kbps": s.hub.target().map(|k| k.get() as u64),
+        "target_kbps": target.map(|kbps| kbps as u64),
         "damage_events": crate::capture::DAMAGE_EVENTS.load(Ordering::Relaxed),
         "damage_wait_us_total": st.damage_wait_us.load(Ordering::Relaxed),
         "send_lat_us_total": st.send_lat_us.load(Ordering::Relaxed),
@@ -279,7 +287,7 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
         if input.is_none() && s.hub.input_floor.load(Ordering::Relaxed) != 0 {
             return;
         }
-        s.hub.add_client(tx)
+        s.hub.add_client(tx, Instant::now())
     };
     log::info!("client {} connected", client.id);
     client.send(Out::Text(s.hub.hello()));
@@ -622,7 +630,7 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
         )),
         Command::Video(on) => {
             if on {
-                c.watch();
+                c.watch(Instant::now());
             } else {
                 c.stop_watching();
             }
@@ -665,9 +673,11 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
             s.hub.wake();
         }
         Command::Pong { token } => {
-            let Some(rtt) = c.pings.lock().answer(Instant::now(), token) else {
+            let now = Instant::now();
+            let Some(rtt) = c.pings.lock().answer(now, token) else {
                 return;
             };
+            c.pinged(now, rtt);
             // Whole ms, and at least 1: a client's min_rtt_ms is 0 until it has one. A
             // ping in the record went out at most a few seconds ago, so a u32 holds it.
             rtts.push_back((rtt.as_millis() as u32).max(1));
@@ -711,7 +721,7 @@ mod tests {
     /// Sends every command to a server that has input, a microphone and resizing wired
     /// up, and returns (input events, microphone messages, a resize was asked for).
     fn drive(read_only: bool) -> (usize, usize, bool) {
-        let hub = Hub::new();
+        let hub = Hub::new(crate::hub::Paths::ANY);
         hub.width.store(1280, Ordering::Relaxed);
         hub.height.store(800, Ordering::Relaxed);
         *hub.resize_max.lock() = Some((2560, 1600));
@@ -738,7 +748,7 @@ mod tests {
             debug: crate::env::Debugging::read(|_| None).0,
         };
         let (tx, _rx) = mpsc::unbounded_channel();
-        let client = hub.add_client(tx);
+        let client = hub.add_client(tx, Instant::now());
         let mut rtts = Default::default();
         for c in ALL {
             handle_text(&s, &client, c, &mut rtts);
@@ -776,7 +786,7 @@ mod tests {
     /// viewer may send it.
     #[test]
     fn a_reply_to_no_ping_is_no_round_trip() {
-        let hub = Hub::new();
+        let hub = Hub::new(crate::hub::Paths::ANY);
         let s = AppState {
             hub: hub.clone(),
             audio: true,
@@ -797,7 +807,7 @@ mod tests {
             debug: crate::env::Debugging::read(|_| None).0,
         };
         let (tx, _rx) = mpsc::unbounded_channel();
-        let client = hub.add_client(tx);
+        let client = hub.add_client(tx, Instant::now());
         let mut rtts = Default::default();
         // No ping was sent to this viewer. It names a moment just past, as replies did when
         // pings were named by the microsecond they went out, then a token.
@@ -805,8 +815,11 @@ mod tests {
             handle_text(&s, &client, reply, &mut rtts);
         }
         assert_eq!(
-            client.rtt_ms(),
-            None,
+            (
+                client.min_rtt_ms.load(Ordering::Relaxed),
+                client.window(|w| w.fastest())
+            ),
+            (0, None),
             "a reply to no ping read as a round trip"
         );
     }
@@ -815,7 +828,7 @@ mod tests {
     /// ignores every reply: the reply to a ping the pinger recorded is a round trip.
     #[test]
     fn a_reply_to_the_ping_sent_is_a_round_trip() {
-        let hub = Hub::new();
+        let hub = Hub::new(crate::hub::Paths::ANY);
         let s = AppState {
             hub: hub.clone(),
             audio: true,
@@ -836,13 +849,14 @@ mod tests {
             debug: crate::env::Debugging::read(|_| None).0,
         };
         let (tx, _rx) = mpsc::unbounded_channel();
-        let client = hub.add_client(tx);
+        let client = hub.add_client(tx, Instant::now());
         let mut rtts = Default::default();
         let token = crate::hub::Token::random();
         client.pings.lock().send(Instant::now(), token);
         handle_text(&s, &client, &format!("po,{token}"), &mut rtts);
         assert!(
-            client.rtt_ms().is_some(),
+            client.min_rtt_ms.load(Ordering::Relaxed) > 0
+                && client.window(|w| w.fastest()).is_some(),
             "the reply to a ping was no round trip"
         );
     }
@@ -1210,11 +1224,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn display_switch_drains_input_and_retires_old_connections() {
-        let hub = Hub::new();
+        let hub = Hub::new(crate::hub::Paths::ANY);
         let (sender, events) = std::sync::mpsc::channel();
         *hub.input.lock() = Some(sender);
         let (out, _messages) = mpsc::unbounded_channel();
-        let old = hub.add_client(out);
+        let old = hub.add_client(out, Instant::now());
         send_input(&hub, &old, InputEvent::Move { x: 1, y: 2 });
         let request = hub.pause_display_input(20, old.id).unwrap();
         assert!(
@@ -1250,7 +1264,7 @@ mod tests {
         );
         assert!(hub.pause_display_input(30, old.id).is_none());
         let (out, _messages) = mpsc::unbounded_channel();
-        let fresh = hub.add_client(out);
+        let fresh = hub.add_client(out, Instant::now());
         send_input(&hub, &fresh, InputEvent::Move { x: 3, y: 4 });
         assert!(matches!(
             events.try_recv(),

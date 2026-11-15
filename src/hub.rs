@@ -1,5 +1,6 @@
 //! Shared state between media producers (video/audio/cursor/clipboard) and websocket clients.
 
+use crate::window::{self, Window};
 use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -139,11 +140,10 @@ pub struct Display {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Inflight {
     pub id: u32,
-    pub sent: Instant,
     pub bytes: usize,
-    /// Nothing sent before it was still unacknowledged when it went: whatever its
-    /// delay, it did not queue behind this client's own frames.
-    pub alone: bool,
+    /// When it left, and what its viewer's path was asked to carry with it, as its window
+    /// took it in.
+    pub left: window::Left,
 }
 
 /// How long a client says it kept a frame between its arrival and the ack (decode,
@@ -291,11 +291,39 @@ fn asked(viewer: Viewer) -> Viewer {
     }
 }
 
-/// What a client is to the stream, and the frames sent to it and not yet acked: under one
-/// lock, so that every change to the two is one step.
+/// What a client is to the stream, the frames sent to it and not yet acked, and what its
+/// path carries, read from those frames: under one lock, so that every change to the three
+/// is one step.
 struct Viewing {
     viewer: Viewer,
     inflight: VecDeque<Inflight>,
+    window: Window,
+}
+
+impl Viewing {
+    /// What it has in flight is not coming back: acks for it no longer apply, and its
+    /// window forgets it.
+    fn forget(&mut self, now: Instant) {
+        self.inflight.clear();
+        self.window.forget(now);
+    }
+}
+
+/// What a viewer's path is taken to carry in `window::LATENESS`, in bytes: what
+/// `--min-kbps` and `--max-kbps` carry in it. Each viewer's window starts within them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Paths {
+    pub least: usize,
+    pub most: usize,
+}
+
+#[cfg(test)]
+impl Paths {
+    /// Any path: from a packet to as much as there is.
+    pub const ANY: Paths = Paths {
+        least: 0,
+        most: usize::MAX,
+    };
 }
 
 pub struct Client {
@@ -307,8 +335,6 @@ pub struct Client {
     pub min_rtt_ms: AtomicU32,
     /// The pings sent to it that it has not answered.
     pub pings: Mutex<Pings>,
-    /// What the acks say about the path: its baseline delay, its capacity, its queue.
-    pub path: Mutex<crate::path::PathEst>,
     /// How long the client keeps a frame between its arrival and the ack (decode, draw,
     /// frames ahead of it), as it reports it: smoothed ms, 0 for a client that doesn't.
     pub client_ms: Mutex<f64>,
@@ -322,10 +348,9 @@ impl Client {
         let _ = self.tx.send(m);
     }
 
-    /// The frames sent to it and not yet acked, under the lock that also holds what it is
-    /// to the stream.
-    pub fn inflight(&self) -> parking_lot::MappedMutexGuard<'_, VecDeque<Inflight>> {
-        parking_lot::MutexGuard::map(self.viewing.lock(), |v| &mut v.inflight)
+    /// What its window says, as one read sees it.
+    pub fn window<R>(&self, read: impl FnOnce(&Window) -> R) -> R {
+        read(&self.viewing.lock().window)
     }
 
     /// What it is to the stream, as one read sees it.
@@ -333,12 +358,12 @@ impl Client {
         self.viewing.lock().viewer
     }
 
-    /// It starts watching (`v,1`, or a recording begins): it waits for a keyframe, and acks
-    /// for frames sent before no longer apply.
-    pub fn watch(&self) {
+    /// It starts watching at `now` (`v,1`, or a recording begins): it waits for a keyframe,
+    /// and acks for frames sent before no longer apply.
+    pub fn watch(&self, now: Instant) {
         let mut v = self.viewing.lock();
         v.viewer = Viewer::Waiting;
-        v.inflight.clear();
+        v.forget(now);
     }
 
     /// It stops watching (`v,0`).
@@ -353,12 +378,12 @@ impl Client {
         v.viewer = asked(v.viewer);
     }
 
-    /// The stream starts over for it (it is rebuilt, or the client stalled): if it watches,
-    /// it waits for a keyframe; acks for frames sent before no longer apply.
-    pub fn start_over(&self) {
+    /// The stream starts over for it at `now` (it is rebuilt): if it watches, it waits for a
+    /// keyframe; acks for frames sent before no longer apply.
+    pub fn start_over(&self, now: Instant) {
         let mut v = self.viewing.lock();
         v.viewer = asked(v.viewer);
-        v.inflight.clear();
+        v.forget(now);
     }
 
     /// The capture loop planned a keyframe: one waiting for one is promised it. Whether it
@@ -374,16 +399,16 @@ impl Client {
         }
     }
 
-    /// The encode loop sent a keyframe this client was promised, `whole` when every stripe
-    /// of it is a keyframe. A whole one starts it, and acks for frames sent before it no
-    /// longer apply; one that is not leaves it waiting for another. A client that has since
-    /// stopped watching, asked again or started over is what that made it.
-    pub fn keyframe_sent(&self, whole: bool) {
+    /// At `now` the encode loop sent a keyframe this client was promised, `whole` when every
+    /// stripe of it is a keyframe. A whole one starts it, and acks for frames sent before it
+    /// no longer apply; one that is not leaves it waiting for another. A client that has
+    /// since stopped watching, asked again or started over is what that made it.
+    pub fn keyframe_sent(&self, whole: bool, now: Instant) {
         let mut v = self.viewing.lock();
         match (v.viewer, whole) {
             (Viewer::Promised, true) => {
                 v.viewer = Viewer::Started;
-                v.inflight.clear();
+                v.forget(now);
             }
             (Viewer::Promised, false) => v.viewer = Viewer::Waiting,
             (Viewer::NotWatching | Viewer::Waiting | Viewer::Started, _) => {}
@@ -402,12 +427,8 @@ impl Client {
                 Takes::Close
             }
             Viewer::Started => {
-                let frame = Inflight {
-                    id,
-                    sent: now,
-                    bytes,
-                    alone: v.inflight.is_empty(),
-                };
+                let left = v.window.leave(now, bytes);
+                let frame = Inflight { id, bytes, left };
                 v.inflight.push_back(frame);
                 self.trace.lock().sent(frame, key);
                 Takes::Frame
@@ -416,67 +437,62 @@ impl Client {
         }
     }
 
-    /// At `now`, the ack for frame `id` (and every one before it) arrived. What the
-    /// client held of the delay is its own time, not the path's, so the delay sample
-    /// ends that much earlier.
+    /// At `now`, the ack for frame `id` (and every one before it) arrived. Each frame it
+    /// covers comes back to the window, oldest first. The one it names came back when the
+    /// client had it: what the client says it held of the trip is its own time, not the
+    /// path's. Any it covers without an ack of its own, and one whose hold cannot be true
+    /// (unreadable, or longer than the trip it is part of), came back at `now`: later, so
+    /// what the window reads of the path can only be lower.
     pub fn on_ack(&self, now: Instant, id: u32, hold: Hold) {
         self.trace.lock().acked(now, id, hold);
-        let mut q = self.inflight();
-        let mut sample = None;
-        while let Some(f) = q.front() {
-            if wrapping_le(f.id, id) {
-                if f.id == id {
-                    sample = Some((f.sent, f.bytes, f.alone));
+        let mut v = self.viewing.lock();
+        let Viewing {
+            inflight, window, ..
+        } = &mut *v;
+        let mut said = None;
+        while let Some(&f) = inflight.front().filter(|f| wrapping_le(f.id, id)) {
+            inflight.pop_front();
+            let back = match hold {
+                Hold::Said(held)
+                    if f.id == id && held <= now.saturating_duration_since(f.left.at) =>
+                {
+                    said = Some(held);
+                    now - held
                 }
-                q.pop_front();
-            } else {
-                break;
-            }
+                Hold::Unsaid | Hold::Said(_) | Hold::Unreadable => now,
+            };
+            window.came_back(f.left, back, f.bytes);
         }
-        drop(q);
-        let Some((sent, bytes, alone)) = sample else {
-            return;
-        };
-        let arrived = match hold {
-            Hold::Unsaid => now,
-            // A hold is part of the delay it was measured in.
-            Hold::Said(held) if held <= now.saturating_duration_since(sent) => {
-                let mut m = self.client_ms.lock();
-                *m = *m * 0.9 + held.as_secs_f64() * 100.0;
-                now - held
-            }
-            Hold::Said(_) | Hold::Unreadable => return,
-        };
-        self.path.lock().on_ack(arrived, sent, bytes, alone);
-    }
-
-    /// Delay queued on the path to this client now (ms).
-    pub fn queue_ms(&self) -> f64 {
-        let idle = self.inflight().is_empty();
-        self.path.lock().queue_ms(Instant::now(), idle)
-    }
-
-    /// What the path to this client can carry, once its frames have told.
-    pub fn capacity(&self) -> Option<crate::path::Kbps> {
-        self.path.lock().capacity()
-    }
-
-    /// The smallest round trip its pings have shown, once one has been answered.
-    pub fn rtt_ms(&self) -> Option<u32> {
-        match self.min_rtt_ms.load(Ordering::Relaxed) {
-            0 => None,
-            ms => Some(ms),
+        drop(v);
+        if let Some(held) = said {
+            let mut m = self.client_ms.lock();
+            *m = *m * 0.9 + held.as_secs_f64() * 100.0;
         }
+    }
+
+    /// At `now` a ping came back, `trip` after it went: a round trip that carried nothing.
+    pub fn pinged(&self, now: Instant, trip: Duration) {
+        self.viewing.lock().window.pinged(now, trip);
     }
 
     /// What it has in flight at `now`, if anything.
     pub fn backlog(&self, now: Instant) -> Option<Backlog> {
-        let q = self.inflight();
+        let q = &self.viewing.lock().inflight;
         Some(Backlog {
             frames: NonZeroUsize::new(q.len())?,
-            oldest: now.saturating_duration_since(q.front()?.sent),
-            newest: now.saturating_duration_since(q.back()?.sent),
+            oldest: now.saturating_duration_since(q.front()?.left.at),
         })
+    }
+}
+
+#[cfg(test)]
+impl Client {
+    /// Frame `id` of `bytes` leaves for it at `at`, whatever it is to the stream: in
+    /// flight, and on its way in its window.
+    pub fn fly(&self, id: u32, at: Instant, bytes: usize) {
+        let mut v = self.viewing.lock();
+        let left = v.window.leave(at, bytes);
+        v.inflight.push_back(Inflight { id, bytes, left });
     }
 }
 
@@ -486,8 +502,6 @@ pub struct Backlog {
     pub frames: NonZeroUsize,
     /// How long ago the oldest of them went.
     pub oldest: Duration,
-    /// How long ago the newest of them went: once it is acknowledged, they all are.
-    pub newest: Duration,
 }
 
 /// A non-blocking, close-on-exec pipe for waking a thread that polls file descriptors
@@ -641,9 +655,8 @@ pub struct Hub {
     pub height: AtomicU32,
     /// Encoded stripes as (y, height).
     pub stripes: Mutex<Vec<(u32, u32)>>,
-    /// The bitrate the stream is steered to (kbit/s; 0 until a pipeline has set one).
-    /// Kept across pipelines; read through `target`.
-    target_kbps: AtomicU32,
+    /// What each viewer's path is taken to carry, at least and at most.
+    paths: Paths,
     /// Last cursor message, replayed to new clients.
     pub cursor: Mutex<Option<Bytes>>,
     /// Wakes the capture thread (acks, joins, keyframe requests).
@@ -667,7 +680,7 @@ pub struct Hub {
 }
 
 impl Hub {
-    pub fn new() -> Arc<Self> {
+    pub fn new(paths: Paths) -> Arc<Self> {
         Arc::new(Hub {
             #[cfg(target_os = "macos")]
             display_req: Mutex::new(None),
@@ -678,7 +691,7 @@ impl Hub {
             stats: Stats::default(),
             width: AtomicU32::new(0),
             height: AtomicU32::new(0),
-            target_kbps: AtomicU32::new(0),
+            paths,
             stripes: Mutex::new(Vec::new()),
             cursor: Mutex::new(None),
             waker: Wake::new().expect("wake"),
@@ -702,18 +715,19 @@ impl Hub {
         self.waker.drain();
     }
 
-    pub fn add_client(&self, tx: mpsc::UnboundedSender<Out>) -> Arc<Client> {
+    /// A client joins at `now`, with a window of its own from then.
+    pub fn add_client(&self, tx: mpsc::UnboundedSender<Out>, now: Instant) -> Arc<Client> {
         let c = Arc::new(Client {
             id: self.next_id.fetch_add(1, Ordering::Relaxed),
             tx,
             viewing: Mutex::new(Viewing {
                 viewer: Viewer::NotWatching,
                 inflight: VecDeque::new(),
+                window: Window::new(now, self.paths.least, self.paths.most),
             }),
             audio: AtomicBool::new(false),
             min_rtt_ms: AtomicU32::new(0),
             pings: Mutex::new(Pings::default()),
-            path: Mutex::new(crate::path::PathEst::new(Instant::now())),
             client_ms: Mutex::new(0.0),
             trace: Arc::new(Mutex::new(crate::timeline::Trace::with_room())),
         });
@@ -780,19 +794,6 @@ impl Hub {
         );
     }
 
-    /// The bitrate the stream is steered to, once a pipeline has set one.
-    pub fn target(&self) -> Option<crate::path::Kbps> {
-        match self.target_kbps.load(Ordering::Relaxed) {
-            0 => None,
-            kbps => Some(crate::path::Kbps::new(kbps as f64)),
-        }
-    }
-
-    pub fn set_target(&self, target: crate::path::Kbps) {
-        self.target_kbps
-            .store(target.get().max(1.0) as u32, Ordering::Relaxed);
-    }
-
     /// The `hello` message: current geometry plus the server's settings.
     pub fn hello(&self) -> ServerMessage {
         let settings = self.settings.lock().clone();
@@ -809,8 +810,9 @@ impl Hub {
     /// a keyframe, and acks for the old stream's frames no longer apply.
     pub fn restart_clients(&self) {
         let hello = self.hello();
+        let now = Instant::now();
         for c in self.clients.lock().iter() {
-            c.start_over();
+            c.start_over(now);
             c.send(Out::Text(hello.clone()));
         }
     }
@@ -1017,15 +1019,10 @@ mod tests {
         let c: Vec<Arc<Client>> =
             m.c.iter()
                 .map(|&(viewer, inflight)| {
-                    let c = hub.add_client(mpsc::unbounded_channel().0);
+                    let c = hub.add_client(mpsc::unbounded_channel().0, t0);
                     c.viewing.lock().viewer = viewer;
                     for id in 1..=inflight as u32 {
-                        c.inflight().push_back(Inflight {
-                            id,
-                            sent: t0,
-                            bytes: 1000,
-                            alone: true,
-                        });
+                        c.fly(id, t0, 1000);
                     }
                     c
                 })
@@ -1033,7 +1030,7 @@ mod tests {
         let mut after = m.clone();
         let (mut planned, mut sent) = (false, vec![]);
         match step {
-            Step::Watch(i) | Step::Record(i) => c[i].watch(),
+            Step::Watch(i) | Step::Record(i) => c[i].watch(t0),
             Step::StopWatching(i) => c[i].stop_watching(),
             Step::AskKeyframe(i) => c[i].ask_keyframe(),
             Step::Stall(i) => {
@@ -1041,7 +1038,7 @@ mod tests {
                     c[i].viewer() != Viewer::NotWatching && c[i].backlog(t0).is_some(),
                     "stalls only a watcher"
                 );
-                c[i].start_over();
+                c[i].start_over(t0);
             }
             Step::Restart => hub.restart_clients(),
             Step::Capture => {
@@ -1062,19 +1059,19 @@ mod tests {
                 if let Some(starts) = after.held.remove(0) {
                     for (i, c) in c.iter().enumerate() {
                         if starts[i] {
-                            c.keyframe_sent(whole);
+                            c.keyframe_sent(whole, t0);
                         }
                     }
                 }
                 for (v, _) in hub.viewers() {
-                    let id = v.inflight().back().map_or(1, |f| f.id + 1);
+                    let id = v.viewing.lock().inflight.back().map_or(1, |f| f.id + 1);
                     if v.takes(id, t0, 1000, whole, BEHIND) == Takes::Frame {
                         sent.push(c.iter().position(|c| c.id == v.id).unwrap());
                     }
                 }
             }
             Step::Ack(i) => {
-                let last = c[i].inflight().back().map(|f| f.id);
+                let last = c[i].viewing.lock().inflight.back().map(|f| f.id);
                 if let Some(id) = last {
                     c[i].on_ack(t0 + Duration::from_millis(50), id, Hold::Unsaid);
                 }
@@ -1082,6 +1079,9 @@ mod tests {
         }
         after.c = [0, 1].map(|i| {
             let v = c[i].viewing.lock();
+            // The window has on its way what is in flight, whatever the step did.
+            let bytes: usize = v.inflight.iter().map(|f| f.bytes).sum();
+            assert_eq!(v.window.flying(), bytes, "client {i}'s window, {step:?}");
             (v.viewer, v.inflight.len())
         });
         after.fresh = rule(m, step).2.fresh;
@@ -1112,7 +1112,7 @@ mod tests {
     /// start every viewer watching.
     #[test]
     fn a_viewer_starts_only_on_a_whole_keyframe_promised_it() {
-        let hub = Hub::new();
+        let hub = Hub::new(Paths::ANY);
         let start = Model {
             c: [(Viewer::NotWatching, 0); 2],
             fresh: [true; 2],
@@ -1188,61 +1188,154 @@ mod tests {
         assert!(steps > 0);
     }
 
-    /// Frame `id` of `bytes`, sent `id` x 100 ms after `t0`, which spent `path_ms` on
-    /// the path and `held_ms` in the client and is acknowledged with `hold`.
-    fn ack(
-        c: &Client,
-        t0: Instant,
-        id: u32,
-        bytes: usize,
-        (path_ms, held_ms): (u64, u64),
-        hold: Hold,
-    ) {
-        let sent = t0 + Duration::from_millis(id as u64 * 100);
-        c.inflight().push_back(Inflight {
-            id,
-            sent,
-            bytes,
-            alone: true,
-        });
-        c.on_ack(sent + Duration::from_millis(path_ms + held_ms), id, hold);
+    /// What a client's window says at `at`: what its path carries, what is on its way,
+    /// the fastest round trip, and the room it leaves a frame.
+    type Said = (usize, usize, Option<Duration>, Option<usize>);
+
+    fn said(c: &Client, at: Instant) -> Said {
+        c.window(|w| (w.carries(), w.flying(), w.fastest(), w.room(at)))
     }
 
-    /// The time a client keeps a frame (decoding, drawing) is its own, not the path's:
-    /// frames it was slow to show don't read as a queue once it says how long it took.
-    #[test]
-    fn the_clients_own_time_is_not_queueing() {
-        let hub = Hub::new();
+    /// A frame of a generated run: when it leaves, its number and bytes, when it arrives
+    /// at the viewer and when the viewer acks it, and whether it is acked itself or
+    /// covered by the ack of a later one.
+    #[derive(Clone, Copy)]
+    struct Sent {
+        at: Instant,
+        id: u32,
+        bytes: usize,
+        arrives: Instant,
+        acks: Instant,
+        acked: bool,
+    }
+
+    impl Sent {
+        /// How long the viewer held it between its arrival and its ack.
+        fn held(&self) -> Duration {
+            self.acks - self.arrives
+        }
+    }
+
+    /// A run of 200 frames one viewer is sent, generated from `seed`: each leaves 1 to
+    /// 40 ms after the one before, of 200 B to 60 KB, arrives 0 to 120 ms later, and is
+    /// acked 0 to 50 ms after that, each no sooner than the one before (TCP keeps them in
+    /// order); with `covering`, about one in four is covered by a later frame's ack. The
+    /// last is acked.
+    fn run(seed: u64, covering: bool) -> Vec<Sent> {
+        let mut rng = Rng(crate::xorshift::Xorshift::new(seed));
         let t0 = Instant::now();
-        for says in [true, false] {
-            let c = hub.add_client(mpsc::unbounded_channel().0);
-            for (id, held) in (1..=20)
-                .map(|id| (id, 2))
-                .chain((21..=40).map(|id| (id, 40)))
-            {
-                let hold = if says {
-                    Hold::Said(Duration::from_millis(held))
-                } else {
-                    Hold::Unsaid
-                };
-                ack(&c, t0, id, 2000, (50, held), hold);
+        let (mut at, mut arrives, mut acks) = (t0, t0, t0);
+        let mut frames: Vec<Sent> = (1..=200)
+            .map(|id| {
+                at += Duration::from_millis(1 + rng.below(40));
+                arrives = arrives.max(at + Duration::from_millis(rng.below(121)));
+                acks = acks.max(arrives + Duration::from_millis(rng.below(51)));
+                Sent {
+                    at,
+                    id,
+                    bytes: 200 + rng.below(60_000) as usize,
+                    arrives,
+                    acks,
+                    acked: !covering || rng.below(4) > 0,
+                }
+            })
+            .collect();
+        frames.last_mut().unwrap().acked = true;
+        frames
+    }
+
+    /// `frames` on a new client of `hub` that has started: each is sent when it leaves,
+    /// and each acked is acked at what `when` says with what `hold` says, in the order the
+    /// acks arrive.
+    fn acked(
+        hub: &Hub,
+        frames: &[Sent],
+        when: impl Fn(&Sent) -> Instant,
+        hold: impl Fn(&Sent) -> Hold,
+    ) -> Arc<Client> {
+        // It joins as the run starts: before the first frame, by the run's own clock.
+        let c = hub.add_client(mpsc::unbounded_channel().0, frames[0].at);
+        c.viewing.lock().viewer = Viewer::Started;
+        let mut acks = frames.iter().filter(|f| f.acked).peekable();
+        for f in frames {
+            // The acks that arrive before it leaves, of frames already sent.
+            while let Some(a) = acks.next_if(|a| a.id < f.id && when(a) <= f.at) {
+                c.on_ack(when(a), a.id, hold(a));
             }
-            let q = c.path.lock().queue_ms(t0, false);
-            if says {
-                assert!(q < 5.0, "{q:.1} ms of queue from a client that said");
-            } else {
-                assert!(
-                    q > 15.0,
-                    "{q:.1} ms: the old ack should still read the queue"
-                );
+            let took = c.takes(f.id, f.at, f.bytes, false, usize::MAX);
+            assert_eq!(took, Takes::Frame);
+        }
+        for a in acks {
+            c.on_ack(when(a), a.id, hold(a));
+        }
+        c
+    }
+
+    /// The time a client keeps a frame (decoding, drawing) is its own, not the path's: a
+    /// client that says how long it held each frame reads, in its window, as a twin that
+    /// acked each the moment it arrived and said nothing. One that does not say reads
+    /// otherwise, in nearly every run. Over 50 generated runs, every frame acked.
+    #[test]
+    fn the_clients_own_time_is_not_the_paths() {
+        let mut otherwise = 0;
+        for seed in 1..=50u64 {
+            let hub = Hub::new(Paths::ANY);
+            let frames = run(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15), false);
+            let end = frames.last().unwrap().acks + Duration::from_secs(1);
+            let says = acked(&hub, &frames, |f| f.acks, |f| Hold::Said(f.held()));
+            let twin = acked(&hub, &frames, |f| f.arrives, |_| Hold::Unsaid);
+            let silent = acked(&hub, &frames, |f| f.acks, |_| Hold::Unsaid);
+            assert_eq!(said(&says, end), said(&twin, end), "seed {seed}");
+            otherwise += u32::from(said(&silent, end) != said(&twin, end));
+        }
+        assert!(otherwise > 40, "{otherwise} of 50");
+    }
+
+    /// A frame an ack covers without one of its own comes back to the window when the ack
+    /// arrives, before the frame it names: as for a twin that acked it then itself, saying
+    /// no hold. Over 50 generated runs, about one frame in four covered.
+    #[test]
+    fn a_frame_an_ack_covers_comes_back_when_the_ack_arrives() {
+        for seed in 1..=50u64 {
+            let hub = Hub::new(Paths::ANY);
+            let frames = run(seed.wrapping_mul(0x2545_F491_4F6C_DD1D), true);
+            let end = frames.last().unwrap().acks + Duration::from_secs(1);
+            // Each frame acked, a covered one when the ack that covers it arrives.
+            let mut each = frames.clone();
+            for i in (0..each.len()).rev() {
+                if !each[i].acked {
+                    each[i].acks = each[i + 1].acks;
+                }
             }
+            let says = |f: &Sent| match f.acked {
+                true => Hold::Said(f.held()),
+                false => Hold::Unsaid,
+            };
+            let c = acked(&hub, &frames, |f| f.acks, says);
+            for f in &mut each {
+                f.acked = true;
+            }
+            let covered: std::collections::HashSet<u32> =
+                frames.iter().filter(|f| !f.acked).map(|f| f.id).collect();
+            let twin = acked(
+                &hub,
+                &each,
+                |f| f.acks,
+                |f| match covered.contains(&f.id) {
+                    true => Hold::Unsaid,
+                    false => Hold::Said(f.held()),
+                },
+            );
+            assert!(!covered.is_empty());
+            assert_eq!(said(&c, end), said(&twin, end), "seed {seed}");
         }
     }
 
     /// The hold is whatever a client sends. A field that isn't a time parses to
-    /// `Unreadable`, whatever it is; and an ack whose hold is unreadable, or longer
-    /// than the delay it is part of, leaves the path estimate as it is for a twin that
-    /// was never sent that frame.
+    /// `Unreadable`, whatever it is; and an ack whose hold is unreadable, or longer than
+    /// the trip it is part of, is read as one that says none: the window reads it as a
+    /// twin's that says nothing, and the client's hold is the twin's. Over 50 generated
+    /// runs, each lie in place of every other frame's hold.
     #[test]
     fn a_hold_that_cannot_be_true_says_nothing() {
         let unreadable = [
@@ -1253,31 +1346,38 @@ mod tests {
         }
         assert_eq!(Hold::parse(" 3.5"), Hold::Said(Duration::from_micros(3500)));
 
-        let hub = Hub::new();
-        let (c, twin) = (
-            hub.add_client(mpsc::unbounded_channel().0),
-            hub.add_client(mpsc::unbounded_channel().0),
-        );
-        let t0 = Instant::now();
-        let good = Hold::Said(Duration::from_millis(1));
-        for (i, lie) in [Hold::Unreadable, Hold::Said(Duration::from_secs(3600))]
-            .into_iter()
-            .cycle()
-            .take(20)
-            .enumerate()
-        {
-            let id = i as u32 * 2 + 1;
-            ack(&c, t0, id, 90_000, (50, 1), lie);
-            ack(&c, t0, id + 1, 2000 + i * 3000, (50 + i as u64, 1), good);
-            ack(&twin, t0, id + 1, 2000 + i * 3000, (50 + i as u64, 1), good);
+        let lies: [fn(&Sent) -> Hold; 2] = [
+            |_| Hold::Unreadable,
+            |f| Hold::Said(f.acks - f.at + Duration::from_nanos(1)),
+        ];
+        for seed in 1..=50u64 {
+            let frames = run(seed.wrapping_mul(0xD1B5_4A32_D192_ED03), true);
+            let end = frames.last().unwrap().acks + Duration::from_secs(1);
+            for lie in lies {
+                let hub = Hub::new(Paths::ANY);
+                let truth = |f: &Sent| Hold::Said(f.held());
+                let c = acked(
+                    &hub,
+                    &frames,
+                    |f| f.acks,
+                    |f| match f.id % 2 {
+                        0 => lie(f),
+                        _ => truth(f),
+                    },
+                );
+                let twin = acked(
+                    &hub,
+                    &frames,
+                    |f| f.acks,
+                    |f| match f.id % 2 {
+                        0 => Hold::Unsaid,
+                        _ => truth(f),
+                    },
+                );
+                assert_eq!(said(&c, end), said(&twin, end), "seed {seed}");
+                assert_eq!(*c.client_ms.lock(), *twin.client_ms.lock(), "seed {seed}");
+            }
         }
-        assert!(twin.capacity().is_some());
-        assert_eq!(c.capacity(), twin.capacity());
-        assert_eq!(
-            c.path.lock().queue_ms(t0, false),
-            twin.path.lock().queue_ms(t0, false)
-        );
-        assert_eq!(*c.client_ms.lock(), *twin.client_ms.lock());
     }
 
     /// A reply is a round trip only if it echoes the token of a ping that was sent and not
@@ -1494,7 +1594,7 @@ mod tests {
     #[test]
     fn a_message_is_its_fields_after_its_kind() {
         let mut rng = Rng(crate::xorshift::Xorshift::new(0x2545_f491_4f6c_dd1d));
-        let hub = Hub::new();
+        let hub = Hub::new(Paths::ANY);
         for _ in 0..100_000 {
             let m = rng.message();
             say(&hub, &m);

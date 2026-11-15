@@ -40,6 +40,15 @@ pub const PACKET: usize = 1460;
 /// with (RFC 6928), and for the same reason: nothing is known about the path yet.
 pub const START: usize = 10 * PACKET;
 
+/// The frames a window keeps room for, of those that left in the last `LATENESS`: the capture
+/// loop captures at most twice in its least interval (a change and a pass), 3.5 ms at 240
+/// frames a second, so at most 35 frames leave in `LATENESS`. Room for 64 is made when a
+/// viewer joins, so that no frame grows it: one frame leaving allocates nothing. A bench that
+/// sends frames faster than any capture loop still fits: the allocation test, a frame every
+/// 2 ms, measured 31 of them in `LATENESS`. At half (32) that is all the margin there is;
+/// at double, 1.5 KB a viewer more for nothing.
+const LATELY: usize = 64;
+
 /// How long the fastest round trip is remembered. A path whose own delay rises reads as
 /// late for this long, and then is the new fastest.
 const FASTEST_FOR: Duration = Duration::from_secs(30);
@@ -125,6 +134,19 @@ pub struct Window {
     lately: VecDeque<(Instant, usize)>,
 }
 
+/// What a frame leaving finds on its way to the viewer, a viewer being taken to have
+/// stalled once its oldest frame on its way has been on its way for some time.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Way {
+    /// Room for this many bytes (`room`).
+    Room(usize),
+    /// No room for a packet until an ack makes some, or until `stalls`, when the oldest
+    /// frame on its way will have been on its way for that time.
+    Full { stalls: Instant },
+    /// The oldest frame on its way has been on its way for that time.
+    Stalled,
+}
+
 /// What a frame was part of as it left: when it left, and the bytes the path was asked to
 /// carry in the `LATENESS` up to then (itself included).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -134,7 +156,7 @@ pub struct Left {
 }
 
 /// `bytes * a / b`, for durations.
-fn scale(bytes: usize, a: Duration, b: Duration) -> usize {
+pub fn scale(bytes: usize, a: Duration, b: Duration) -> usize {
     (bytes as u128 * a.as_nanos() / b.as_nanos().max(1)).min(usize::MAX as u128) as usize
 }
 
@@ -157,13 +179,18 @@ impl Window {
             flying: VecDeque::new(),
             queued: 0,
             as_of: now,
-            lately: VecDeque::new(),
+            lately: VecDeque::with_capacity(LATELY),
         }
     }
 
     /// The bytes the path carries in `LATENESS`.
     pub fn carries(&self) -> usize {
         self.carries
+    }
+
+    /// The fastest round trip of the last `FASTEST_FOR`, once something has come back.
+    pub fn fastest(&self) -> Option<Duration> {
+        self.fastest.get().map(|(trip, _)| trip)
     }
 
     /// The bytes that have left and not come back.
@@ -185,15 +212,29 @@ impl Window {
             LATENESS,
         );
         let sent = self.queued.saturating_sub(through);
+        sent.max(self.overdue(now))
+    }
+
+    /// The bytes of the frames on their way at `now` that would be back even behind the
+    /// fullest queue the path is allowed, but for the oldest.
+    fn overdue(&self, now: Instant) -> usize {
         let there_and_back = self.fastest.get().map_or(Duration::ZERO, |(trip, _)| trip);
-        let overdue: usize = self
-            .flying
+        self.flying
             .iter()
             .skip(1)
             .filter(|&&(left, _)| now.saturating_duration_since(left) > there_and_back + LATENESS)
             .map(|&(_, b)| b)
-            .sum();
-        sent.max(overdue)
+            .sum()
+    }
+
+    /// When the queue the path is taken to hold at `now` is empty, so that a frame leaving
+    /// then finds all of `carries`: the moment what has left since it was last empty is
+    /// through at what the path carries (at or before `now` if it is), or None while frames
+    /// on their way are overdue, which only their acks clear.
+    pub fn empties(&self, now: Instant) -> Option<Instant> {
+        let ns = (LATENESS.as_nanos() * self.queued as u128).div_ceil(self.carries as u128);
+        let drained = Duration::from_nanos(ns.min(u64::MAX as u128) as u64);
+        (self.overdue(now) == 0).then_some(self.as_of + drained)
     }
 
     /// What a frame leaving at `now` may spend: what the path carries in `LATENESS`, less
@@ -206,6 +247,25 @@ impl Window {
         }
         let room = self.carries.saturating_sub(self.queued(now));
         (room >= PACKET).then_some(room)
+    }
+
+    /// What a frame leaving at `now` finds on its way to the viewer, once one whose oldest
+    /// frame on its way has been on its way for `stall` is taken to have stalled.
+    pub fn way(&self, now: Instant, stall: Duration) -> Way {
+        let Some(&(oldest, _)) = self.flying.front() else {
+            return Way::Room(self.carries);
+        };
+        let stalls = oldest + stall;
+        match self.room(now) {
+            _ if now >= stalls => Way::Stalled,
+            Some(room) => Way::Room(room),
+            None => Way::Full { stalls },
+        }
+    }
+
+    /// When the newest frame on its way left, while one is on its way.
+    pub fn newest(&self) -> Option<Instant> {
+        self.flying.back().map(|&(at, _)| at)
     }
 
     /// A frame of `bytes` leaves at `now`.

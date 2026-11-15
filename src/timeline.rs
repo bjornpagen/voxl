@@ -295,9 +295,9 @@ impl Timeline {
 /// A frame as the encode loop sent it to one viewer, and the ack that covered it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sent {
-    /// What the hub keeps of it while it is in flight: its number, when the encode loop
-    /// handed it to the viewer's socket task, its bytes, and whether it went `alone`
-    /// (path.rs).
+    /// What the hub keeps of it while it is in flight: its number, its bytes, and when the
+    /// encode loop handed it to the viewer's socket task, with what the viewer's path was
+    /// asked to carry in `LATENESS` up to then, itself included (window.rs).
     pub frame: Inflight,
     /// Every stripe of it is a keyframe, as `/stats` counts keyframes.
     pub key: bool,
@@ -427,7 +427,7 @@ pub struct SentRow {
     frame: u32,
     sent_us: u64,
     bytes: usize,
-    alone: bool,
+    asked: usize,
     key: bool,
     ack: Option<AckRow>,
 }
@@ -457,9 +457,9 @@ impl Timeline {
     pub fn rows(&self, trace: &Trace) -> Vec<SentRow> {
         let row = |s: &Sent| SentRow {
             frame: s.frame.id,
-            sent_us: self.us(s.frame.sent),
+            sent_us: self.us(s.frame.left.at),
             bytes: s.frame.bytes,
-            alone: s.frame.alone,
+            asked: s.frame.left.asked,
             key: s.key,
             ack: s.ack.map(|a| AckRow {
                 at_us: self.us(a.at),
@@ -721,9 +721,9 @@ mod tests {
                 });
                 serde_json::json!({
                     "frame": s.frame.id,
-                    "sent_us": us(s.frame.sent),
+                    "sent_us": us(s.frame.left.at),
                     "bytes": s.frame.bytes,
-                    "alone": s.frame.alone,
+                    "asked": s.frame.left.asked,
                     "key": s.key,
                     "ack": ack,
                 })
@@ -747,7 +747,7 @@ mod tests {
     #[test]
     fn each_viewer_keeps_its_last_frames_and_their_acks() {
         const STEPS: u32 = 64_000;
-        let hub = crate::hub::Hub::new();
+        let hub = crate::hub::Hub::new(crate::hub::Paths::ANY);
         let mut rng = Xorshift::new(0x9E37_79B9_7F4A_7C15);
         let mut at = Instant::now();
         let mut watchers: Vec<Watcher> = vec![];
@@ -767,7 +767,7 @@ mod tests {
             at += Duration::from_micros(rng.below(30_000));
             match rng.below(10_000) {
                 0..=29 if watchers.len() < 4 => watchers.push(Watcher {
-                    client: hub.add_client(tokio::sync::mpsc::unbounded_channel().0),
+                    client: hub.add_client(tokio::sync::mpsc::unbounded_channel().0, at),
                     sent: vec![],
                     heard_from: step,
                 }),
@@ -815,9 +815,11 @@ mod tests {
                         }
                         let frame = Inflight {
                             id: number,
-                            sent: at,
                             bytes,
-                            alone: rng.below(2) == 0,
+                            left: crate::window::Left {
+                                at,
+                                asked: bytes + rng.below(1 << 20) as usize,
+                            },
                         };
                         w.client.trace.lock().sent(frame, key);
                         w.sent.push(Sent {
@@ -830,9 +832,8 @@ mod tests {
                     if let Some((w, _, _)) = leavers.back_mut().filter(|l| l.2 + 2 >= step) {
                         let frame = Inflight {
                             id: number,
-                            sent: at,
                             bytes,
-                            alone: false,
+                            left: crate::window::Left { at, asked: bytes },
                         };
                         w.client.trace.lock().sent(frame, key);
                         w.sent.push(Sent {

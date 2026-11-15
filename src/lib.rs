@@ -29,7 +29,9 @@ mod login;
 mod mac;
 mod mic;
 mod mp4;
+#[allow(dead_code)]
 mod path;
+#[allow(dead_code)]
 mod rate;
 mod record;
 #[cfg(target_os = "linux")]
@@ -41,7 +43,6 @@ mod video;
 mod wait;
 #[cfg(windows)]
 mod win;
-#[allow(dead_code)]
 mod window;
 #[cfg(test)]
 mod xorshift;
@@ -133,12 +134,14 @@ fn framerate(v: Option<&String>) -> Result<encoder::Fps, String> {
     })
 }
 
-/// `--min-kbps` and `--max-kbps` (or Selkies' `--video-bitrate`), read together: what the
-/// stream is steered between; 2000 and 30000 kbit/s when not given. A ceiling of 0 is
-/// none: the target goes as high as the viewers' paths carry, and encoders open without
-/// a rate cap.
+/// `--min-kbps` and `--max-kbps` (or Selkies' `--video-bitrate`), read together: what a
+/// viewer's path is taken to carry, at least and at most; 0 and 30000 kbit/s when not
+/// given. A floor of 0 is a packet in the window's `LATENESS`: 2000 kbit/s, the floor
+/// before, is 15 KB in it, three times what a slow link was measured to carry. A ceiling
+/// of 0 is none: a path is taken to carry as much as its frames show, and encoders open
+/// without a rate cap.
 fn bounds(min: Option<&String>, max: Option<&String>) -> Result<rate::Bounds, String> {
-    let floor = rate_flag("min-kbps", min, 2000)?;
+    let floor = rate_flag("min-kbps", min, 0)?;
     let ceiling = rate_flag("max-kbps", max, 30000)?;
     let kbps = |kbps: u32| path::Kbps::new(kbps as f64);
     Ok(rate::Bounds::new(
@@ -277,7 +280,7 @@ async fn serve(a: HashMap<String, String>, env: env::Env) {
         false
     };
 
-    let hub = hub::Hub::new();
+    let hub = hub::Hub::new(bounds.paths());
     // --read-only: the viewer watches the desktop, it does not drive it. Only the
     // commands watching needs are accepted (see server::READ_ONLY_COMMANDS), uploads
     // are refused, and the page hides the controls that would send anything else.
@@ -644,21 +647,21 @@ mod tests {
         }
     }
 
-    /// `--min-kbps` is read the same way, 2000 when not given, and with the ceiling into
+    /// `--min-kbps` is read the same way, 0 when not given, and with the ceiling into
     /// one value: a ceiling under the floor brings the floor down to it.
     #[test]
     fn the_floor_is_read_with_the_ceiling() {
         let kbps = Kbps::new;
         let default = Some(kbps(30000.0));
         for (min, max, want) in [
-            (None, None, Bounds::new(kbps(2000.0), default)),
+            (None, None, Bounds::new(kbps(0.0), default)),
             (Some("0"), None, Bounds::new(kbps(0.0), default)),
             (Some("1000-3000"), None, Bounds::new(kbps(3000.0), default)),
             (Some("5000"), Some("0"), Bounds::new(kbps(5000.0), None)),
             (
                 None,
                 Some("1000"),
-                Bounds::new(kbps(1000.0), Some(kbps(1000.0))),
+                Bounds::new(kbps(0.0), Some(kbps(1000.0))),
             ),
             (
                 Some("9000"),
@@ -674,6 +677,41 @@ mod tests {
         }
         for min in ["", "fast", "1.5", "-5", "3000-1000"] {
             assert!(read(Some(min), None).is_err(), "--min-kbps {min:?} parsed");
+        }
+    }
+
+    /// A viewer's path is taken to carry, in the window's `LATENESS` (60 ms), what the
+    /// flags carry in it: 7.5 bytes a kbit/s, whole bytes, rounded down; and with no
+    /// ceiling, as much as there is. The floor is never over the ceiling. Over whole rates
+    /// from 0 to past what a 32-bit kbit/s holds, either way round.
+    #[test]
+    fn a_path_is_taken_to_carry_what_the_flags_carry_in_the_lateness() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut draw = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let bytes = |kbps: u64| (kbps * 15 / 2) as usize;
+        for _ in 0..10_000 {
+            let (floor, ceiling) = (draw(1 << 33), draw(1 << 33));
+            let none = draw(4) == 0;
+            let bounds = Bounds::new(
+                Kbps::new(floor as f64),
+                (!none).then(|| Kbps::new(ceiling as f64)),
+            );
+            let want = match none {
+                true => crate::hub::Paths {
+                    least: bytes(floor),
+                    most: usize::MAX,
+                },
+                false => crate::hub::Paths {
+                    least: bytes(floor.min(ceiling)),
+                    most: bytes(ceiling),
+                },
+            };
+            assert_eq!(bounds.paths(), want, "{bounds:?}");
         }
     }
 
