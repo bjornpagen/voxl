@@ -135,11 +135,8 @@ enum Frame {
     /// `blocks`: it went out in place of a sharpening pass, so it is coded at paint-over
     /// quality and sharpens every block, as that pass would have.
     Key { blocks: Option<Sharpen> },
-    /// What changed on screen, and which blocks (None: analyse every block in the band).
-    Motion {
-        band: Band,
-        dirty: Option<Arc<Vec<u8>>>,
-    },
+    /// What changed on screen, and which blocks.
+    Motion { band: Band, dirty: Arc<Vec<u8>> },
     /// The screen is still: re-encode `blocks` at paint-over quality.
     Sharpen { band: Band, blocks: Sharpen },
     /// Motion, plus blocks elsewhere that have gone still, at paint-over quality.
@@ -187,9 +184,10 @@ impl Frame {
     fn mb_dirty(&self) -> Option<Arc<Vec<u8>>> {
         match self {
             Frame::Key { .. } => None,
-            Frame::Motion { dirty, .. } => dirty.clone(),
+            Frame::Motion { dirty, .. } | Frame::MotionAndSharpen { dirty, .. } => {
+                Some(dirty.clone())
+            }
             Frame::Sharpen { blocks, .. } => Some(blocks.map.clone()),
-            Frame::MotionAndSharpen { dirty, .. } => Some(dirty.clone()),
         }
     }
 
@@ -266,12 +264,98 @@ fn union(a: Option<Band>, b: Band) -> Band {
     }
 }
 
-/// One capture/encode setup for the current screen size.
-struct Pipeline {
-    cap: Capturer,
+/// What the viewers watching are sent: the encoders, and the two buffers captures are
+/// converted into for them. There is one only while somebody watches.
+struct Stream {
     job_tx: mpsc::SyncSender<Job>,
     ret_rx: mpsc::Receiver<Returned>,
     encode: std::thread::JoinHandle<()>,
+    slots: [Slot; 2],
+    /// The slot the next capture is converted into.
+    next: usize,
+}
+
+/// One of the two buffers a capture is converted into: the encoder reads one while the
+/// next capture is converted into the other.
+struct Slot {
+    /// None while the encoder holds it.
+    buf: Option<Box<I420>>,
+    /// The rows that changed on screen since it was last converted into.
+    pending: Option<Band>,
+}
+
+impl Stream {
+    /// The encoders for a screen of `w` x `h`, on their thread, and two buffers that hold
+    /// nothing of it yet.
+    fn new(cfg: &VideoConfig, hub: &Arc<Hub>, w: u32, h: u32) -> Result<Self, String> {
+        log::info!("streaming");
+        let (job_tx, job_rx) = mpsc::sync_channel::<Job>(1);
+        let (ret_tx, ret_rx) = mpsc::channel::<Returned>();
+        let layout = stripe_layout(h, cfg.stripes);
+        let mut stripes = Vec::new();
+        for &(y, sh) in &layout {
+            let ecfg = EncoderConfig {
+                pictures: Pictures {
+                    width: w,
+                    height: sh,
+                    fps: cfg.fps,
+                    preset: cfg.preset.clone(),
+                    threads: (cfg.threads / layout.len() as u32).max(1),
+                    debug: cfg.debug,
+                },
+                crf: cfg.crf,
+                max_kbps: cfg.bounds.ceiling(),
+            };
+            stripes.push(Stripe {
+                y: y as usize,
+                h: sh as usize,
+                enc: Encoder::new(&ecfg)?,
+                applied_kbps: 0,
+                applied_crf: -1.0,
+            });
+        }
+        let hub = hub.clone();
+        let crfs = Crfs {
+            configured: cfg.crf,
+            paintover: cfg.paintover_crf,
+        };
+        let (fps, debug) = (cfg.fps, cfg.debug);
+        let encode = std::thread::Builder::new()
+            .name("encode".into())
+            .spawn(move || encode_loop(stripes, job_rx, ret_tx, hub, fps, crfs, debug))
+            .unwrap();
+        let slot = || Slot {
+            buf: Some(Box::new(I420::new(w as usize, h as usize))),
+            pending: Some(Band { y0: 0, y1: h }),
+        };
+        Ok(Stream {
+            job_tx,
+            ret_rx,
+            encode,
+            slots: [slot(), slot()],
+            next: 0,
+        })
+    }
+
+    /// A buffer the encoder is done with; the blocks it sharpened, if it did.
+    fn returned(&mut self, r: Returned) -> Option<Sharpen> {
+        self.slots[r.idx].buf = Some(r.buf);
+        r.sharpened
+    }
+
+    /// Whether the encoder holds a buffer.
+    fn encoding(&self) -> Encoding {
+        match self.slots.iter().all(|slot| slot.buf.is_some()) {
+            true => Encoding::Idle,
+            false => Encoding::Busy,
+        }
+    }
+
+    /// The encoder drains what it was sent, and stops.
+    fn close(self) {
+        drop(self.job_tx);
+        let _ = self.encode.join();
+    }
 }
 
 /// Runs the pipeline. With a `Screen` (dynamic resolution), a client's size request
@@ -285,17 +369,12 @@ pub fn spawn(
     if let Some(s) = &screen {
         *hub.resize_max.lock() = Some(s.max());
     }
-    let mut p = build(&cfg, &hub)?;
+    let mut cap = build(&cfg, &hub)?;
     std::thread::Builder::new()
         .name("capture".into())
         .spawn(move || loop {
-            let Pipeline {
-                mut cap,
-                job_tx,
-                ret_rx,
-                encode,
-            } = p;
-            if let Err(e) = capture_loop(&mut cap, cfg.clone(), hub.clone(), job_tx, ret_rx) {
+            let mut stream = None;
+            if let Err(e) = capture_loop(&mut cap, &mut stream, cfg.clone(), hub.clone()) {
                 #[cfg(target_os = "linux")]
                 let resized = cap.geometry_changed();
                 #[cfg(not(target_os = "linux"))]
@@ -308,14 +387,16 @@ pub fn spawn(
                 }
             }
             drop(cap);
-            let _ = encode.join();
+            if let Some(s) = stream {
+                s.close();
+            }
             #[cfg(target_os = "macos")]
             let display_request = hub.display_req.lock().take();
             #[cfg(target_os = "macos")]
             if let Some(request) = display_request {
                 // A resize for the old monitor must not be applied to the new one.
                 hub.resize_req.lock().take();
-                p = switch_display(request, &cfg, &hub, &mut screen).unwrap_or_else(|e| {
+                cap = switch_display(request, &cfg, &hub, &mut screen).unwrap_or_else(|e| {
                     log::error!("display switch failed: {e}");
                     std::process::exit(1);
                 });
@@ -327,8 +408,8 @@ pub fn spawn(
                     log::warn!("resize to {w}x{h} failed: {e}");
                 }
             }
-            p = match build(&cfg, &hub) {
-                Ok(p) => p,
+            cap = match build(&cfg, &hub) {
+                Ok(cap) => cap,
                 Err(e) => {
                     log::error!("video restart failed: {e}");
                     std::process::exit(1);
@@ -345,7 +426,7 @@ fn switch_display(
     cfg: &VideoConfig,
     hub: &Arc<Hub>,
     screen: &mut Option<crate::screen::Screen>,
-) -> Result<Pipeline, String> {
+) -> Result<Capturer, String> {
     let previous = crate::mac::display();
     let mut open = |id| {
         // Best effort: an app-only mode change is undone by macOS when voxl exits.
@@ -372,15 +453,16 @@ fn switch_display(
         .recv_timeout(Duration::from_secs(2))
         .map_err(|e| e.to_string())
         .and_then(|_| open(request.id));
-    let pipeline = attempt.or_else(|e| {
+    let cap = attempt.or_else(|e| {
         log::warn!("display switch: {e}; restoring the previous display");
         open(previous)
     })?;
     *hub.input.lock() = Some(request.sender);
-    Ok(pipeline)
+    Ok(cap)
 }
 
-fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
+/// The capture of the screen as it is now, and its geometry for the viewers.
+fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Capturer, String> {
     let cap = Capturer::new(cfg.display.as_deref(), cfg.debug)?;
     let (w, h) = (cap.width, cap.height);
     hub.width.store(w, Ordering::Relaxed);
@@ -394,43 +476,7 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
         cfg.preset,
         cfg.threads
     );
-
-    let (job_tx, job_rx) = mpsc::sync_channel::<Job>(1);
-    let (ret_tx, ret_rx) = mpsc::channel::<Returned>();
-    let layout = stripe_layout(h, cfg.stripes);
-    let mut stripes = Vec::new();
-    for &(y, sh) in &layout {
-        let ecfg = EncoderConfig {
-            pictures: Pictures {
-                width: w,
-                height: sh,
-                fps: cfg.fps,
-                preset: cfg.preset.clone(),
-                threads: (cfg.threads / layout.len() as u32).max(1),
-                debug: cfg.debug,
-            },
-            crf: cfg.crf,
-            max_kbps: cfg.bounds.ceiling(),
-        };
-        stripes.push(Stripe {
-            y: y as usize,
-            h: sh as usize,
-            enc: Encoder::new(&ecfg)?,
-            applied_kbps: 0,
-            applied_crf: -1.0,
-        });
-    }
-    *hub.stripes.lock() = layout;
-    let hub2 = hub.clone();
-    let crfs = Crfs {
-        configured: cfg.crf,
-        paintover: cfg.paintover_crf,
-    };
-    let (fps, debug) = (cfg.fps, cfg.debug);
-    let encode = std::thread::Builder::new()
-        .name("encode".into())
-        .spawn(move || encode_loop(stripes, job_rx, ret_tx, hub2, fps, crfs, debug))
-        .unwrap();
+    *hub.stripes.lock() = stripe_layout(h, cfg.stripes);
     #[cfg(target_os = "macos")]
     {
         let resizing = hub.resize_max.lock().is_some();
@@ -447,12 +493,7 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
     }
     // New geometry (and a keyframe) for clients already connected; no-op at startup.
     hub.restart_clients();
-    Ok(Pipeline {
-        cap,
-        job_tx,
-        ret_rx,
-        encode,
-    })
+    Ok(cap)
 }
 
 fn flow_ok(hub: &Hub, interval_ms: f64) -> bool {
@@ -707,18 +748,11 @@ fn note_changes(cap: &mut Capturer, hub: &Hub) {
 
 fn capture_loop(
     cap: &mut Capturer,
+    stream: &mut Option<Stream>,
     cfg: VideoConfig,
     hub: Arc<Hub>,
-    job_tx: mpsc::SyncSender<Job>,
-    ret_rx: mpsc::Receiver<Returned>,
 ) -> Result<(), String> {
     let (w, h) = (cap.width as usize, cap.height as usize);
-    let mut pool: Vec<Option<Box<I420>>> = vec![
-        Some(Box::new(I420::new(w, h))),
-        Some(Box::new(I420::new(w, h))),
-    ];
-    let mut pending: [Option<Band>; 2] = [Some(cap.full()), Some(cap.full())];
-    let mut next_idx = 0usize;
     let interval = Duration::from_secs_f64(1.0 / cfg.fps as f64);
     // Allow slight early capture so source jitter doesn't alias into dropped frames.
     let min_interval = interval.mul_f64(0.85);
@@ -728,8 +762,6 @@ fn capture_loop(
     let mut sharpening = Sharpening::new(paintover_delay);
     let mut rc = RateCtl::new(cfg.bounds, hub.target());
     hub.set_target(rc.target);
-    let mut had_clients = false;
-    let mut full_next = true;
     let mut refiner = Refiner::new(
         w.div_ceil(16) * h.div_ceil(16),
         w.div_ceil(16),
@@ -788,42 +820,47 @@ fn capture_loop(
                 let _ = tx.send(shot.clone());
             }
         }
-        while let Ok(r) = ret_rx.try_recv() {
-            pool[r.idx] = Some(r.buf);
-            if let Some(s) = r.sharpened {
-                refiner.sharpened(&s.map, s.at);
+        if let Some(s) = stream.as_mut() {
+            while let Ok(r) = s.ret_rx.try_recv() {
+                if let Some(sharp) = s.returned(r) {
+                    refiner.sharpened(&sharp.map, sharp.at);
+                }
             }
         }
         let clients = hub.video_clients();
-        if clients.is_empty() {
+        *stream = match (stream.take(), clients.is_empty()) {
+            (None, true) => None,
+            (Some(s), true) => {
+                s.close();
+                None
+            }
+            (Some(s), false) => Some(s),
+            // A new stream starts from the whole screen: our shm copy may be stale, and
+            // none of it has been sent, so every block is pending.
+            (None, false) => {
+                let s = Stream::new(&cfg, &hub, cap.width, cap.height)?;
+                cap.grab(cap.full())?;
+                cap.damaged = true;
+                refiner.mark_all(Instant::now());
+                Some(s)
+            }
+        };
+        let Some(s) = stream.as_mut() else {
             // The target stands: a viewer that hid its tab comes back over the same
             // path, and one on a new path starts from what its own acks say.
-            had_clients = false;
             wait_event(&[cap.fd(), hub.waker.waitable()]);
             continue;
-        }
+        };
         let capacity = rc.update(&hub, &clients);
         let want_key = clients
             .iter()
             .any(|c| c.needs_keyframe.load(Ordering::Relaxed));
-        if !had_clients {
-            had_clients = true;
-            // Our shm copy may be stale: re-grab everything once.
-            cap.grab(cap.full())?;
-            pending = [Some(cap.full()), Some(cap.full())];
-            cap.damaged = true;
-            full_next = true;
-        }
         // One reading of the clock for every decision before the capture; the capture
         // itself is stamped `t0` below, after any wait for a buffer.
         let now = Instant::now();
         let due = sharpening.due(now);
         if !cap.damaged && !want_key {
-            let encoding = match pool.iter().all(Option::is_some) {
-                true => Encoding::Idle,
-                false => Encoding::Busy,
-            };
-            match still_wait(&due, encoding) {
+            match still_wait(&due, s.encoding()) {
                 Look::Now => {}
                 Look::In(wait) => {
                     let ms = wait.as_micros().div_ceil(1000) as i32;
@@ -861,17 +898,16 @@ fn capture_loop(
             continue;
         }
         // Need a free buffer (the encoder may still hold the other).
-        if pool[next_idx].is_none() {
-            match ret_rx.recv_timeout(Duration::from_millis(50)) {
+        if s.slots[s.next].buf.is_none() {
+            match s.ret_rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(r) => {
-                    pool[r.idx] = Some(r.buf);
-                    if let Some(s) = r.sharpened {
-                        refiner.sharpened(&s.map, s.at);
+                    if let Some(sharp) = s.returned(r) {
+                        refiner.sharpened(&sharp.map, sharp.at);
                     }
                 }
                 Err(_) => continue,
             }
-            if pool[next_idx].is_none() {
+            if s.slots[s.next].buf.is_none() {
                 continue;
             }
         }
@@ -882,15 +918,8 @@ fn capture_loop(
             .damage_wait_us
             .fetch_add((t0 - origin).as_micros() as u64, Ordering::Relaxed);
         let mut band = None;
-        let mut mb_dirty = (!full_next).then(|| cap.take_mb_map());
-        if full_next {
-            cap.take_mb_map();
-            full_next = false;
-        }
-        match &mb_dirty {
-            Some(m) => refiner.mark(m, t0),
-            None => refiner.mark_all(t0),
-        }
+        let mb_dirty = cap.take_mb_map();
+        refiner.mark(&mb_dirty, t0);
         if cap.damaged {
             band = cap.take_damage()?;
             if let Some(b) = band {
@@ -924,16 +953,17 @@ fn capture_loop(
             // The damage was empty after all, and no pass is due: nothing to send.
             (false, None, Due::In(_) | Due::Never) => continue,
         };
-        let idx = next_idx;
-        let mut buf = pool[idx].take().unwrap();
-        let todo = match (pending[idx], band) {
+        let idx = s.next;
+        let slot = &mut s.slots[idx];
+        let mut buf = slot.buf.take().unwrap();
+        let todo = match (slot.pending.take(), band) {
             (p, Some(b)) => Some(union(p, b)),
             (p, None) => p,
         };
         if let Some(b) = band {
-            pending[1 - idx] = Some(union(pending[1 - idx], b));
+            let other = &mut s.slots[1 - idx].pending;
+            *other = Some(union(*other, b));
         }
-        pending[idx] = None;
         if let Some(t) = todo {
             cap.convert(&mut buf, t.y0 as usize, t.y1 as usize, cfg.convert_threads);
         }
@@ -982,7 +1012,7 @@ fn capture_loop(
                 match refiner.due(t0) {
                     // What moved plus what is due; everything else stays skipped.
                     Some((rmap, rband)) => {
-                        let mut m = mb_dirty.take().unwrap_or_else(|| vec![1; rmap.len()]);
+                        let mut m = mb_dirty;
                         for (d, r) in m.iter_mut().zip(&rmap) {
                             *d |= r;
                         }
@@ -998,14 +1028,14 @@ fn capture_loop(
                     }
                     None => Frame::Motion {
                         band: moved,
-                        dirty: mb_dirty.take().map(Arc::new),
+                        dirty: Arc::new(mb_dirty),
                     },
                 }
             }
         };
         last_capture = t0;
-        next_idx = 1 - idx;
-        if job_tx
+        s.next = 1 - idx;
+        if s.job_tx
             .send(Job {
                 buf,
                 idx,
@@ -1639,6 +1669,113 @@ mod tests {
             fits > 300 && not > 300 && edge > 300,
             "{fits} fit, {not} do not, {edge} at an edge"
         );
+    }
+
+    /// A stream is made when somebody starts watching, so its encoders are new: whatever
+    /// its first frame was planned as, and whatever blocks it was told are unchanged, each
+    /// stripe codes the first part it sends from nothing, and a viewer is sent nothing that
+    /// depends on a frame from before the stream. For every kind of frame, with every block
+    /// marked unchanged, over the whole screen and over its first rows, at 1 to 4 stripes,
+    /// then a motion frame with every block changed: each stripe's first part is coded
+    /// from nothing and its second is not.
+    #[test]
+    fn a_new_streams_first_frame_is_coded_from_nothing() {
+        let (w, h) = (64u32, 128u32);
+        let blocks = (w.div_ceil(16) * h.div_ceil(16)) as usize;
+        let unchanged = || Arc::new(vec![0u8; blocks]);
+        let sharpen = || Sharpen {
+            map: Arc::new(vec![1u8; blocks]),
+            at: Instant::now(),
+        };
+        let bands = [Band { y0: 0, y1: h }, Band { y0: 0, y1: 16 }];
+        for stripes in 1..=4 {
+            for band in bands {
+                let frames = [
+                    super::Frame::Key { blocks: None },
+                    super::Frame::Key {
+                        blocks: Some(sharpen()),
+                    },
+                    super::Frame::Motion {
+                        band,
+                        dirty: unchanged(),
+                    },
+                    super::Frame::Sharpen {
+                        band,
+                        blocks: sharpen(),
+                    },
+                    super::Frame::MotionAndSharpen {
+                        band,
+                        dirty: unchanged(),
+                        blocks: sharpen(),
+                    },
+                ];
+                for frame in frames {
+                    let what = format!("{stripes} stripes, {:?}, {}", band, frame_kind(&frame));
+                    let hub = Hub::new();
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                    let viewer = hub.add_client(tx);
+                    viewer.video.store(true, Ordering::Relaxed);
+                    viewer.needs_keyframe.store(false, Ordering::Relaxed);
+                    viewer.started.store(true, Ordering::Relaxed);
+                    let cfg = VideoConfig {
+                        display: None,
+                        #[cfg(target_os = "macos")]
+                        enable_resize: false,
+                        fps: 60,
+                        preset: "ultrafast".into(),
+                        threads: 1,
+                        convert_threads: 1,
+                        crf: 23.0,
+                        bounds: Bounds::new(Kbps::new(500.0), None),
+                        paintover_crf: 18.0,
+                        paintover_delay_ms: 0,
+                        coalesce: Duration::ZERO,
+                        stripes,
+                        debug: Debugging::read(|_| None).unwrap(),
+                    };
+                    let s = Stream::new(&cfg, &hub, w, h).unwrap();
+                    let next = super::Frame::Motion {
+                        band: bands[0],
+                        dirty: Arc::new(vec![1u8; blocks]),
+                    };
+                    for (idx, frame) in [frame, next].into_iter().enumerate() {
+                        s.job_tx
+                            .send(Job {
+                                buf: Box::new(I420::new(w as usize, h as usize)),
+                                idx,
+                                frame,
+                                target: Kbps::new(8000.0),
+                                capacity: Capacity::Unknown,
+                                captured_at: Instant::now(),
+                                marker_ms: None,
+                            })
+                            .unwrap();
+                    }
+                    s.close();
+                    // Whether each part a stripe sent was coded from nothing, in order.
+                    let mut sent = vec![vec![]; stripe_layout(h, stripes).len()];
+                    while let Ok(m) = rx.try_recv() {
+                        if let Out::Bin(b) = m {
+                            sent[b[10] as usize].push(b[1] & 1 == 1);
+                        }
+                    }
+                    for (i, parts) in sent.iter().enumerate() {
+                        assert_eq!(parts.first(), Some(&true), "stripe {i}: {what}");
+                        assert!(parts[1..].iter().all(|&key| !key), "stripe {i}: {what}");
+                    }
+                }
+            }
+        }
+    }
+
+    fn frame_kind(f: &super::Frame) -> &'static str {
+        match f {
+            super::Frame::Key { blocks: None } => "key",
+            super::Frame::Key { blocks: Some(_) } => "key in place of a pass",
+            super::Frame::Motion { .. } => "motion",
+            super::Frame::Sharpen { .. } => "sharpen",
+            super::Frame::MotionAndSharpen { .. } => "motion and sharpen",
+        }
     }
 
     const W: usize = 1280;
