@@ -492,8 +492,13 @@ impl RateCtl {
         // The most the target may be, and what it may rise to.
         let (ceiling, goal) = match Capacity::of(paths.iter().map(|p| p.capacity)) {
             Capacity::NoViewers => return,
-            // An unknown path gets the cautious start, whatever was reached before it.
-            Capacity::Unknown => (START.min(self.max), None),
+            // An unknown path gets the cautious start, whatever was reached before it:
+            // no more than it, and up to it, since frames at a target far under it
+            // are too small to show the path's rate, and the target would stay there.
+            Capacity::Unknown => {
+                let start = START.min(self.max);
+                (start, Some(start))
+            }
             // A path that got slower is followed down at once, queue or no queue.
             Capacity::Known(c) => {
                 let share = c.times(CAPACITY_SHARE);
@@ -2264,6 +2269,44 @@ mod rate_tests {
                 sim.worst_wait
             );
         }
+    }
+
+    #[test]
+    fn a_new_viewer_is_not_left_at_the_floor() {
+        // The target is kept across viewers. One slow viewer drives it to the floor
+        // and leaves; the next one's path is unknown, and frames at the floor are too
+        // small to show its rate. The target has to come back to the cautious start by
+        // itself, and from there the path shows what it carries: here after half a
+        // second of a desktop at rest, which gives the estimate its baseline.
+        let mut rng = Rng(0xA0761D6478BD642F);
+        for _ in 0..40 {
+            let rate = rng.range(20_000_000, 80_000_000) as f64;
+            let mut sim = Sim::new(rate, rng.range(20, 100), 30_000.0);
+            sim.rc.target = sim.rc.min;
+            sim.run(30, rest);
+            sim.run(60 * 3, |_| 60_000);
+            assert!(
+                sim.rc.target.get() >= 0.5 * rate / 1000.0 || sim.rc.target.get() >= 25_000.0,
+                "rate {rate}: target {} three seconds into a scroll",
+                sim.rc.target.get()
+            );
+        }
+        // And with nothing but the unknown path to go by, it reaches the start, not more.
+        let now = Instant::now();
+        let mut rc = RateCtl::new(
+            Kbps::new(30_000.0),
+            Kbps::new(2000.0),
+            Some(Kbps::new(2000.0)),
+        );
+        let unknown = PathNow {
+            queue_ms: 0.0,
+            capacity: None,
+            overdue: false,
+        };
+        for i in 0..100 {
+            rc.step(now + Duration::from_millis(100 * i), &[unknown]);
+        }
+        assert_eq!(rc.target, START);
     }
 
     #[test]
