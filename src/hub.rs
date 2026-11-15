@@ -49,6 +49,51 @@ impl Hold {
     }
 }
 
+/// How often a client is pinged: every 500 ms, as 93ad2d4 does. Its round trip is the
+/// shortest of its last 20 replies, so a path that changes shows within 10 s.
+pub const PING_EVERY: Duration = Duration::from_millis(500);
+
+/// The longest round trip a client's replies can show: 4 s. A client whose oldest
+/// unacknowledged frame is that old is stalled, and the flow check resyncs it (video.rs),
+/// so a longer round trip steers nothing; the bench's links have 80 to 140 ms. At half, a
+/// path of 2 to 4 s would show no round trip and be judged by the 40 ms guess; at double,
+/// a client's record would keep twice the pings for nothing.
+const LONGEST_ROUND_TRIP: Duration = Duration::from_secs(4);
+
+/// The pings a client's record keeps: one goes out every `PING_EVERY`, so this many are
+/// out at once on the longest round trip, 8.
+const PINGS_KEPT: usize = (LONGEST_ROUND_TRIP.as_millis() / PING_EVERY.as_millis()) as usize;
+
+/// The pings sent to a client and not yet answered, oldest first, by when each was sent
+/// (since the server's epoch, to the microsecond a ping carries), at most `PINGS_KEPT`. A
+/// reply is a round trip only if it names one of them: what it says was sent, the record
+/// shows was.
+#[derive(Default)]
+pub struct Pings(VecDeque<Duration>);
+
+impl Pings {
+    /// A ping sent at `now`: the time it carries, which the record keeps. The oldest
+    /// unanswered ping leaves once the record holds `PINGS_KEPT`.
+    pub fn send(&mut self, now: Duration) -> Duration {
+        let sent = Duration::from_micros(now.as_micros() as u64);
+        if self.0.len() == PINGS_KEPT {
+            self.0.pop_front();
+        }
+        self.0.push_back(sent);
+        sent
+    }
+
+    /// At `now`, a reply naming the ping sent at `sent`: its round trip, if that ping is in
+    /// the record, which it then leaves. A reply naming anything else (a ping already
+    /// answered, one older than the record keeps, or a time no ping went out at, past or
+    /// still to come) is no round trip.
+    pub fn answer(&mut self, now: Duration, sent: Duration) -> Option<Duration> {
+        let i = self.0.iter().position(|&p| p == sent)?;
+        self.0.remove(i);
+        now.checked_sub(sent)
+    }
+}
+
 pub struct Client {
     pub id: u64,
     pub tx: mpsc::UnboundedSender<Out>,
@@ -57,6 +102,8 @@ pub struct Client {
     pub inflight: Mutex<VecDeque<Inflight>>,
     /// Smoothed min RTT (ms), from pings.
     pub min_rtt_ms: AtomicU32,
+    /// The pings sent to it that it has not answered.
+    pub pings: Mutex<Pings>,
     pub needs_keyframe: AtomicBool,
     /// Has received a keyframe since (re)starting video.
     pub started: AtomicBool,
@@ -340,6 +387,7 @@ impl Hub {
             audio: AtomicBool::new(false),
             inflight: Mutex::new(VecDeque::new()),
             min_rtt_ms: AtomicU32::new(0),
+            pings: Mutex::new(Pings::default()),
             needs_keyframe: AtomicBool::new(true),
             started: AtomicBool::new(false),
             path: Mutex::new(crate::path::PathEst::new(Instant::now())),
@@ -529,5 +577,41 @@ mod tests {
             twin.path.lock().queue_ms(t0, false)
         );
         assert_eq!(*c.client_ms.lock(), *twin.client_ms.lock());
+    }
+
+    /// A reply is a round trip only if it names a ping that was sent and not yet
+    /// answered: the latest, or an older one still out. One already answered, one never
+    /// sent (a moment between pings, or one still to come) and one older than the record
+    /// keeps are none, whatever time they name.
+    #[test]
+    fn a_reply_is_a_round_trip_only_to_a_ping_still_out() {
+        let ms = Duration::from_millis;
+        let mut pings = Pings::default();
+        // A ping carries the microsecond it went out at.
+        for at in [ms(0), ms(500), Duration::from_nanos(1_000_000_999)] {
+            pings.send(at);
+        }
+        for (now, names, round_trip) in [
+            // The latest ping.
+            (ms(1040), ms(1000), Some(ms(40))),
+            // An older one, still out.
+            (ms(1060), ms(500), Some(ms(560))),
+            // One already answered.
+            (ms(1080), ms(1000), None),
+            // None went out then: a moment between pings, and one still to come.
+            (ms(1100), ms(999), None),
+            (ms(1120), ms(1500), None),
+        ] {
+            assert_eq!(pings.answer(now, names), round_trip, "{names:?} at {now:?}");
+        }
+        // One older than the record keeps: the first of PINGS_KEPT + 1, a ping apart.
+        let mut pings = Pings::default();
+        let sent: Vec<Duration> = (0..=PINGS_KEPT as u32)
+            .map(|i| pings.send(PING_EVERY * i))
+            .collect();
+        let now = PING_EVERY * (PINGS_KEPT as u32 + 1);
+        assert_eq!(pings.answer(now, sent[0]), None);
+        assert_eq!(pings.answer(now, sent[1]), Some(now - sent[1]));
+        assert_eq!(PINGS_KEPT, 8);
     }
 }

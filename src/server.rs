@@ -253,10 +253,10 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
         let c = client.clone();
         let epoch = s.epoch;
         tokio::spawn(async move {
-            let mut iv = tokio::time::interval(Duration::from_millis(500));
+            let mut iv = tokio::time::interval(crate::hub::PING_EVERY);
             loop {
                 iv.tick().await;
-                let t = epoch.elapsed().as_micros() as u64;
+                let t = c.pings.lock().send(epoch.elapsed()).as_micros();
                 c.send(Out::Text(format!("{{\"t\":\"ping\",\"s\":{t}}}")));
             }
         })
@@ -549,15 +549,6 @@ impl Command {
     }
 }
 
-/// The round trip a ping's reply shows, in whole ms and at least 1 (a client's
-/// `min_rtt_ms` is 0 until it has one), with `now` and `sent` both since the epoch. A
-/// reply naming a ping sent after `now` answers no ping, and is no round trip; nor is one
-/// longer than a u32 of ms holds (49.7 days), which `as u32` wrapped into any value.
-fn round_trip(now: Duration, sent: Duration) -> Option<u32> {
-    let ms = u32::try_from(now.checked_sub(sent)?.as_millis()).ok()?;
-    Some(ms.max(1))
-}
-
 fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collections::VecDeque<u32>) {
     let Some(command) = Command::parse(t) else {
         return;
@@ -639,10 +630,12 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
             s.hub.wake();
         }
         Command::Pong { sent } => {
-            let Some(rtt) = round_trip(s.epoch.elapsed(), sent) else {
+            let Some(rtt) = c.pings.lock().answer(s.epoch.elapsed(), sent) else {
                 return;
             };
-            rtts.push_back(rtt);
+            // Whole ms, and at least 1: a client's min_rtt_ms is 0 until it has one. A
+            // ping in the record went out at most a few seconds ago, so a u32 holds it.
+            rtts.push_back((rtt.as_millis() as u32).max(1));
             if rtts.len() > 20 {
                 rtts.pop_front();
             }
@@ -740,19 +733,86 @@ mod tests {
         assert!(resized);
     }
 
-    /// A ping's reply names its ping by when it was sent. One naming a time still to come
-    /// answers no ping, so it is no round trip: it read as 1 ms, the shortest there is,
-    /// and held the client's shortest round trip there for its next 20 replies.
+    /// A reply names its ping by when it was sent, and one naming a time no ping went out
+    /// at answers no ping, as one from the future does not
+    /// (a_reply_is_a_round_trip_only_to_a_ping_still_out). The server keeps no record of the
+    /// pings it sent, so a reply naming a moment just past reads as a 1 ms round trip on
+    /// a viewer that was never pinged: its frames are then overdue at 81 ms, and the flow
+    /// check holds every viewer's frames once one of its own is 121 ms old. A read-only
+    /// viewer may send it.
     #[test]
-    fn a_reply_to_a_ping_not_yet_sent_is_no_round_trip() {
-        let ms = Duration::from_millis;
-        assert_eq!(round_trip(ms(1000), ms(960)), Some(40));
-        assert_eq!(round_trip(ms(1000), ms(1000)), Some(1));
-        for sent in [ms(1001), Duration::from_micros(u64::MAX)] {
-            assert_eq!(round_trip(ms(1000), sent), None, "{sent:?}");
-        }
-        let days = |d: u64| Duration::from_secs(d * 86_400);
-        assert_eq!(round_trip(days(50), Duration::ZERO), None);
+    fn a_reply_to_no_ping_is_no_round_trip() {
+        let hub = Hub::new();
+        let s = AppState {
+            hub: hub.clone(),
+            audio: true,
+            epoch: Instant::now() - Duration::from_secs(10),
+            files: Arc::new(crate::files::Files {
+                root: std::env::temp_dir(),
+                upload: false,
+                download: false,
+                default_dir: String::new(),
+                max_upload_bytes: 0,
+            }),
+            mic: None,
+            resize: false,
+            read_only: true,
+            recorder: crate::record::Recorder::new(hub.clone(), Duration::from_secs(1)),
+            index: Bytes::new(),
+            favicon: Bytes::new(),
+            favicon_type: "image/x-icon",
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let client = hub.add_client(tx);
+        let mut rtts = Default::default();
+        // No ping was sent to this viewer. It names a moment a millisecond ago.
+        let just_past = s.epoch.elapsed() - Duration::from_millis(1);
+        handle_text(
+            &s,
+            &client,
+            &format!("po,{}", just_past.as_micros()),
+            &mut rtts,
+        );
+        assert_eq!(
+            client.rtt_ms(),
+            None,
+            "a reply to no ping read as a round trip"
+        );
+    }
+
+    /// The other half of the one above, so it checks the record rather than a server that
+    /// ignores every reply: the reply to a ping the pinger recorded is a round trip.
+    #[test]
+    fn a_reply_to_the_ping_sent_is_a_round_trip() {
+        let hub = Hub::new();
+        let s = AppState {
+            hub: hub.clone(),
+            audio: true,
+            epoch: Instant::now() - Duration::from_secs(10),
+            files: Arc::new(crate::files::Files {
+                root: std::env::temp_dir(),
+                upload: false,
+                download: false,
+                default_dir: String::new(),
+                max_upload_bytes: 0,
+            }),
+            mic: None,
+            resize: false,
+            read_only: true,
+            recorder: crate::record::Recorder::new(hub.clone(), Duration::from_secs(1)),
+            index: Bytes::new(),
+            favicon: Bytes::new(),
+            favicon_type: "image/x-icon",
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let client = hub.add_client(tx);
+        let mut rtts = Default::default();
+        let sent = client.pings.lock().send(s.epoch.elapsed());
+        handle_text(&s, &client, &format!("po,{}", sent.as_micros()), &mut rtts);
+        assert!(
+            client.rtt_ms().is_some(),
+            "the reply to a ping was no round trip"
+        );
     }
 
     /// Every command the web client sends parses here (a display switch only on
