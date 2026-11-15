@@ -2048,6 +2048,10 @@ struct Coder {
     /// x264's hint for each macroblock of the stripe (1: unchanged), kept likewise.
     hints: Vec<u8>,
     arenas: Arenas,
+    /// Takes the encoders a keyframe replaces, to close them on a thread of their own:
+    /// closing one joins x264's threads and frees its memory, which took 1.8-15.4 ms on
+    /// the stripe's thread, before the keyframe.
+    close: mpsc::SyncSender<Running>,
 }
 
 /// The bytes a stripe's messages are cut from, in two arenas taken in turn. A message
@@ -2099,7 +2103,7 @@ impl Arenas {
 }
 
 impl Coder {
-    fn new(s: Stripe, crfs: Crfs, debug: bool) -> Coder {
+    fn new(s: Stripe, crfs: Crfs, debug: bool, close: mpsc::SyncSender<Running>) -> Coder {
         Coder {
             s,
             crfs,
@@ -2109,6 +2113,7 @@ impl Coder {
             out: Vec::new(),
             hints: Vec::new(),
             arenas: Arenas::new(),
+            close,
         }
     }
 
@@ -2125,6 +2130,7 @@ impl Coder {
             out,
             hints,
             arenas,
+            close,
         } = self;
         let buf = &*job.buf;
         // The CRF the job asks for, and the one x264 is given: MotionQuality may lower
@@ -2135,11 +2141,13 @@ impl Coder {
             Coding::Motion => motion.crf(asked),
         };
         // A keyframe under a cap gets an encoder of its own, opened for its budget `cap`
-        // (the running one is closed first: one encoder's memory at a time); any other
-        // frame the running one, told its rate; the stripe's first frame opens it.
+        // while the running one is closed elsewhere; any other frame the running one,
+        // told its rate; the stripe's first frame opens it.
         let running = match (job.coding.own_encoder(s.cfg.max_kbps), s.running.take()) {
             (Some(ceiling), was) => {
-                drop(was);
+                if let Some(old) = was {
+                    let _ = close.send(old);
+                }
                 Running::for_keyframe(&s.cfg, asked, ceiling, job.cap)
             }
             (None, Some(mut running)) => {
@@ -2311,10 +2319,18 @@ fn encode_loop(
     let debug_stripes = debug.stripes;
     // Geometry stays here; encoders move to their workers.
     let stripes: Vec<(usize, usize)> = stripes_in.iter().map(|s| (s.y, s.h)).collect();
+    // The encoders the stripes' keyframes replace are closed here, off the stripes'
+    // threads. A keyframe hands over one a stripe, so the queue holds them all and no
+    // stripe waits; the thread ends with the last coder.
+    let (close, closing) = mpsc::sync_channel::<Running>(stripes.len());
+    std::thread::Builder::new()
+        .name("enc-close".into())
+        .spawn(move || closing.into_iter().for_each(drop))
+        .unwrap();
     // Persistent per-stripe workers keep each encoder's state warm in one core's cache.
     let mut coders = stripes_in
         .into_iter()
-        .map(|s| Coder::new(s, crfs, debug_stripes));
+        .map(|s| Coder::new(s, crfs, debug_stripes, close.clone()));
     let mut own = coders.next().expect("a screen has a stripe");
     let mut crew = Crew::spawn(
         move |job| {
@@ -3859,7 +3875,7 @@ mod tests {
                         cfg: cfg.clone(),
                         running: None,
                     };
-                    Coder::new(s, crfs, false)
+                    Coder::new(s, crfs, false, mpsc::sync_channel(1).0)
                 })
                 .collect::<Vec<Coder>>()
         };
@@ -4000,7 +4016,7 @@ mod tests {
                     cfg: cfg.clone(),
                     running: None,
                 };
-                Coder::new(s, crfs, false)
+                Coder::new(s, crfs, false, mpsc::sync_channel(1).0)
             });
             let mut own = coders.next().unwrap();
             let crew = Crew::spawn(
@@ -4357,15 +4373,26 @@ mod tests {
         }
     }
 
-    /// What a stripe's coder put out (x264's bytes, past the header's room) for `jobs` (a
-    /// kind and a cap each) of `buf`, coded one after another.
-    fn put_out(stripe: Stripe, buf: &Arc<I420>, jobs: &[(Coding, u32)]) -> Vec<Vec<u8>> {
+    /// What a stripe's coder did with `jobs` (a kind and a cap each) of one picture, coded
+    /// one after another: what it put out for each, and how many encoders it handed over
+    /// to be closed.
+    struct PutOut {
+        sent: Vec<Vec<u8>>,
+        closed: usize,
+    }
+
+    /// What a stripe's coder put out (x264's bytes, past the header's room) for `jobs` of
+    /// `buf`.
+    fn put_out(stripe: Stripe, buf: &Arc<I420>, jobs: &[(Coding, u32)]) -> PutOut {
         let crfs = Crfs {
             configured: 23.0,
             paintover: 18.0,
         };
-        let mut coder = Coder::new(stripe, crfs, false);
-        jobs.iter()
+        // Room for every encoder the jobs could replace, so the coder never waits.
+        let (close, closing) = mpsc::sync_channel(jobs.len());
+        let mut coder = Coder::new(stripe, crfs, false, close);
+        let sent = jobs
+            .iter()
             .enumerate()
             .map(|(n, &(coding, cap))| {
                 let job = StripeJob {
@@ -4383,7 +4410,12 @@ mod tests {
                     }
                 }
             })
-            .collect()
+            .collect();
+        drop(coder);
+        PutOut {
+            sent,
+            closed: closing.into_iter().count(),
+        }
     }
 
     /// The SPS of a keyframe: from its NAL header to the next start code.
@@ -4420,8 +4452,8 @@ mod tests {
                 })
                 .collect();
             let at = |cap: u32| codings.iter().map(|&c| (c, cap)).collect::<Vec<_>>();
-            let slow = put_out(stripe(256, 64, None), &buf, &at(100));
-            let fast = put_out(stripe(256, 64, None), &buf, &at(20_000));
+            let slow = put_out(stripe(256, 64, None), &buf, &at(100)).sent;
+            let fast = put_out(stripe(256, 64, None), &buf, &at(20_000)).sent;
             assert!(
                 slow == fast,
                 "case {case}: with no ceiling, frames came out apart under 100 and 20000 kbit/s"
@@ -4451,7 +4483,7 @@ mod tests {
             let mut jobs = vec![(key, low)];
             jobs.extend([(Coding::Sharpen, low); 6]);
             jobs.push((key, cap));
-            let sent = put_out(stripe(W, H, ceiling), &buf, &jobs);
+            let sent = put_out(stripe(W, H, ceiling), &buf, &jobs).sent;
             let keyframe = sent.last().unwrap();
             assert!(
                 keyframe.len() * 4 >= frame(cap) * 3 && keyframe.len() <= frame(cap),
@@ -4462,6 +4494,38 @@ mod tests {
             assert!(
                 sps(keyframe) == sps(&sent[0]),
                 "a keyframe under a cap of {cap} kbit/s names another SPS"
+            );
+        }
+    }
+
+    /// An encoder a keyframe replaces is handed over to be closed, not closed on the
+    /// stripe's thread before the keyframe. Over generated runs of keyframes, motion and
+    /// passes: under a cap, every keyframe after the stripe's first frame hands over the
+    /// encoder it replaces, and nothing else does; with no cap a keyframe keeps the
+    /// stream's encoder, and none is.
+    #[test]
+    fn a_replaced_encoder_is_closed_off_the_stripe() {
+        let mut g = Gen(Xorshift::new(0x51_7CC1_B727_220A));
+        for case in 0..12 {
+            let mut buf = Arc::new(I420::new(64, 64));
+            Arc::get_mut(&mut buf).unwrap().y = g.bytes(64 * 64);
+            let jobs: Vec<(Coding, u32)> = (0..4 + g.below(10))
+                .map(|_| match g.below(3) {
+                    0 => (Coding::Key { still: false }, 2000),
+                    1 => (Coding::Motion, 300),
+                    _ => (Coding::Sharpen, 300),
+                })
+                .collect();
+            let replaced = jobs[1..]
+                .iter()
+                .filter(|(coding, _)| matches!(coding, Coding::Key { .. }))
+                .count();
+            let capped = put_out(stripe(64, 64, Some(Kbps::new(8000.0))), &buf, &jobs).closed;
+            let uncapped = put_out(stripe(64, 64, None), &buf, &jobs).closed;
+            assert!(
+                capped == replaced && uncapped == 0,
+                "case {case}: {capped} encoders handed over under a cap and {uncapped} \
+                 without, for {replaced} keyframes after the first frame"
             );
         }
     }
@@ -4494,6 +4558,7 @@ mod tests {
                     stripe(64, if i == dead { 15 } else { 16 }, ceiling),
                     crfs,
                     false,
+                    mpsc::sync_channel(1).0,
                 )
             });
             let mut own = coders.next().unwrap();
