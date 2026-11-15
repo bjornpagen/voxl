@@ -6,7 +6,7 @@ use crate::encoder::{Encoded, Encoder, EncoderConfig, Pictures, Planes, Preset, 
 use crate::env::{Debugging, Marker};
 use crate::hub::{wait_any, wait_event};
 use crate::hub::{Client, Hub, Out, ServerMessage, Takes, Viewer};
-use crate::path::{Capacity, Kbps};
+use crate::path::Kbps;
 use crate::rate::{Bounds, FrameBudget, RateCtl, RTT_GUESS_MS};
 use crate::timeline::{CaptureMarks, Coded};
 use bytes::Bytes;
@@ -120,10 +120,10 @@ struct Job {
     buf: Box<I420>,
     idx: usize,
     frame: Frame,
-    /// The bitrate the stream is steered to, and what the viewers' paths can carry,
-    /// as the rate controller had them when the frame was captured.
+    /// The bitrate the stream is steered to, and what the viewers' paths are known to
+    /// carry (None: not yet), as the rate controller had them when the frame was captured.
     target: Kbps,
-    capacity: Capacity,
+    capacity: Option<Kbps>,
     /// When the capture loop's part of it happened.
     captured: CaptureMarks,
     /// What the bench loadgen's marker said when the frame was captured, while
@@ -1823,7 +1823,7 @@ mod tests {
                     idx: 0,
                     frame,
                     target: Kbps::new(8000.0),
-                    capacity: Capacity::Unknown,
+                    capacity: None,
                     captured: CaptureMarks::at(Instant::now()),
                     marker_ms: None,
                 })
@@ -1925,7 +1925,7 @@ mod tests {
                                 idx,
                                 frame,
                                 target: Kbps::new(8000.0),
-                                capacity: Capacity::Unknown,
+                                capacity: None,
                                 captured: CaptureMarks::at(Instant::now()),
                                 marker_ms: None,
                             })
@@ -2683,7 +2683,7 @@ mod tests {
                 starts,
             },
             target: Kbps::new(8000.0),
-            capacity: Capacity::Unknown,
+            capacity: None,
             captured: CaptureMarks::at(Instant::now()),
             marker_ms: None,
         };
@@ -2978,7 +2978,7 @@ mod tests {
                     idx,
                     frame,
                     target: Kbps::new(6000.0),
-                    capacity: Capacity::Unknown,
+                    capacity: None,
                     captured: CaptureMarks::at(Instant::now()),
                     marker_ms: None,
                 })

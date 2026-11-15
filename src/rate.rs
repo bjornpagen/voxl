@@ -167,8 +167,8 @@ impl RateCtl {
         }
     }
 
-    /// Steers by what the clients' paths say now; what they can carry together.
-    pub fn update(&mut self, hub: &Hub, viewers: &[(Arc<Client>, Viewer)]) -> Capacity {
+    /// Steers by what the clients' paths say now; what they are known to carry together.
+    pub fn update(&mut self, hub: &Hub, viewers: &[(Arc<Client>, Viewer)]) -> Option<Kbps> {
         let paths: Vec<PathNow> = viewers
             .iter()
             .filter(|(_, viewer)| *viewer == Viewer::Started)
@@ -184,7 +184,7 @@ impl RateCtl {
             .collect();
         let capacity = self.step(Instant::now(), &paths);
         hub.set_target(self.target);
-        capacity
+        known(capacity)
     }
 
     /// One decision, at most every `DECIDE_EVERY`, from what every watched path says now;
@@ -228,6 +228,16 @@ impl RateCtl {
     }
 }
 
+/// What the paths a frame goes to are known to carry. A frame no viewer has started on
+/// is a keyframe for viewers that are only starting (a new one, or every one after a
+/// stall or a restart), and their paths have shown no rate to this stream yet.
+fn known(capacity: Capacity) -> Option<Kbps> {
+    match capacity {
+        Capacity::Known(c) => Some(c),
+        Capacity::Unknown | Capacity::NoViewers => None,
+    }
+}
+
 /// How long a frame may take to cross the path: what a burst after stillness may cost
 /// in delay, once.
 const LATENCY_BUDGET: Duration = Duration::from_millis(60);
@@ -265,12 +275,12 @@ impl FrameBudget {
     }
 
     /// What a frame encoded at `now` may spend.
-    pub fn allow(&mut self, now: Instant, target: Kbps, capacity: Capacity, fps: u32) -> Bits {
+    pub fn allow(&mut self, now: Instant, target: Kbps, capacity: Option<Kbps>, fps: u32) -> Bits {
         let steady = target.over(Duration::from_secs_f64(1.0 / fps.max(1) as f64));
         let depth = match capacity {
-            Capacity::Known(c) => c.over(LATENCY_BUDGET).max(steady.times(DEPTH_FRAMES)),
+            Some(c) => c.over(LATENCY_BUDGET).max(steady.times(DEPTH_FRAMES)),
             // A path nothing is known about gets `DEPTH_FRAMES` of the target at most.
-            Capacity::Unknown | Capacity::NoViewers => steady.times(DEPTH_FRAMES),
+            None => steady.times(DEPTH_FRAMES),
         };
         let passed = now.saturating_duration_since(self.at);
         self.at = now;
@@ -390,7 +400,7 @@ mod rate_tests {
             // x264 under the rate cap: a frame holds at most what the budget allows.
             let room = self
                 .budget
-                .allow(self.now, self.rc.target, Capacity::of([path.capacity]), FPS)
+                .allow(self.now, self.rc.target, path.capacity, FPS)
                 .bytes() as usize;
             let bytes = want.min(room).max(200);
             self.budget.spend(bytes);
@@ -746,10 +756,7 @@ mod rate_tests {
         for _ in 0..500 {
             let mut b = FrameBudget::new(t0);
             let target = Kbps::new(rng.range(500, 30_000) as f64);
-            let capacity = match rng.range(0, 3) {
-                0 => Capacity::Unknown,
-                _ => Capacity::Known(Kbps::new(rng.range(500, 100_000) as f64)),
-            };
+            let capacity = (rng.range(0, 3) > 0).then(|| Kbps::new(rng.range(500, 100_000) as f64));
             let mut now = t0;
             for _ in 0..200 {
                 now += Duration::from_micros(rng.range(100, 3_000_000));
@@ -758,8 +765,8 @@ mod rate_tests {
                 let least = steady.times(DEBT_SHARE);
                 assert!(may >= least, "{may:?} under the share in debt {least:?}");
                 let most = match capacity {
-                    Capacity::Known(c) => c.over(LATENCY_BUDGET).max(steady.times(2.0)),
-                    Capacity::Unknown | Capacity::NoViewers => steady.times(2.0),
+                    Some(c) => c.over(LATENCY_BUDGET).max(steady.times(2.0)),
+                    None => steady.times(2.0),
                 };
                 assert!(may <= most, "{may:?} over the latency budget {most:?}");
                 b.spend(rng.range(0, 400_000) as usize);
@@ -776,7 +783,7 @@ mod rate_tests {
     fn a_long_run_of_frames_averages_the_target() {
         let t0 = Instant::now();
         let target = Kbps::new(9_000.0);
-        let capacity = Capacity::Known(Kbps::new(10_000.0));
+        let capacity = Some(Kbps::new(10_000.0));
         let frame_time = Duration::from_secs_f64(1.0 / FPS as f64);
         let steady = target.over(frame_time);
         let depth = Kbps::new(10_000.0)
@@ -816,7 +823,7 @@ mod rate_tests {
         let t0 = Instant::now();
         let target = Kbps::new(2_000.0);
         let capacity = Kbps::new(3_000.0);
-        let known = Capacity::Known(capacity);
+        let known = Some(capacity);
         let frame_time = Duration::from_secs_f64(1.0 / FPS as f64);
         let steady = target.over(frame_time);
         let depth = capacity.over(LATENCY_BUDGET).max(steady.times(2.0));
@@ -835,5 +842,61 @@ mod rate_tests {
             depth.bytes() / 1000.0,
             -b.tokens.bytes() * 8.0 / target.bps()
         );
+    }
+
+    /// FrameBudget::allow as it was when it took the whole Capacity: the oracle for
+    /// narrowing it to what is known.
+    fn old_allow(
+        b: &mut FrameBudget,
+        now: Instant,
+        target: Kbps,
+        capacity: Capacity,
+        fps: u32,
+    ) -> Bits {
+        let steady = target.over(Duration::from_secs_f64(1.0 / fps.max(1) as f64));
+        let depth = match capacity {
+            Capacity::Known(c) => c.over(LATENCY_BUDGET).max(steady.times(DEPTH_FRAMES)),
+            Capacity::Unknown | Capacity::NoViewers => steady.times(DEPTH_FRAMES),
+        };
+        let passed = now.saturating_duration_since(b.at);
+        b.at = now;
+        b.depth = depth;
+        b.tokens = (b.tokens + target.over(passed)).min(depth);
+        b.tokens.max(steady.times(DEBT_SHARE))
+    }
+
+    /// What update now hands a frame allows what the whole Capacity did: over every
+    /// capacity (no viewers, unknown, any known), any target, 0 to 240 fps, gaps that
+    /// are whole 50 ms or anything up to half a second, and any spend, every allowance,
+    /// the tokens and the depth are equal.
+    #[test]
+    fn what_is_known_allows_what_the_capacity_did() {
+        let mut rng = Rng(0xD1B54A32D192ED03);
+        let t0 = Instant::now();
+        for _ in 0..2000 {
+            let (mut new, mut old) = (FrameBudget::new(t0), FrameBudget::new(t0));
+            let mut now = t0;
+            for _ in 0..200 {
+                now += match rng.range(0, 2) {
+                    0 => Duration::from_millis(50 * rng.range(0, 25)),
+                    _ => Duration::from_micros(rng.range(0, 500_000)),
+                };
+                let target = Kbps::new(rng.range(0, 40_000) as f64);
+                let capacity = match rng.range(0, 3) {
+                    0 => Capacity::NoViewers,
+                    1 => Capacity::Unknown,
+                    _ => Capacity::Known(Kbps::new(rng.range(1, 100_000) as f64)),
+                };
+                let fps = rng.range(0, 241) as u32;
+                assert_eq!(
+                    new.allow(now, target, known(capacity), fps),
+                    old_allow(&mut old, now, target, capacity, fps)
+                );
+                let bytes = rng.range(0, 400_000) as usize;
+                new.spend(bytes);
+                old.spend(bytes);
+                assert_eq!((new.tokens, new.depth), (old.tokens, old.depth));
+            }
+        }
     }
 }
