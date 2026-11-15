@@ -267,12 +267,40 @@ fn union(a: Option<Band>, b: Band) -> Band {
 /// What the viewers watching are sent: the encoders, and the two buffers captures are
 /// converted into for them. There is one only while somebody watches.
 struct Stream {
+    /// Dropped first (fields drop in order), which ends the encode loop once it has sent
+    /// what it was given.
     job_tx: mpsc::SyncSender<Job>,
     ret_rx: mpsc::Receiver<Returned>,
-    encode: std::thread::JoinHandle<()>,
     slots: [Slot; 2],
     /// The slot the next capture is converted into.
     next: usize,
+    /// Dropped last: waits until the encode loop has stopped.
+    _encode: Stopped,
+}
+
+/// A thread that is waited for when this is dropped. The thread holds the sending side
+/// of a channel nothing is sent on, which closes when the thread's work returns.
+struct Stopped(mpsc::Receiver<std::convert::Infallible>);
+
+impl Stopped {
+    /// `work` on a thread named `name`.
+    fn spawn(name: &str, work: impl FnOnce() + Send + 'static) -> Stopped {
+        let (running, stopped) = mpsc::channel();
+        std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || {
+                let _running = running;
+                work()
+            })
+            .unwrap();
+        Stopped(stopped)
+    }
+}
+
+impl Drop for Stopped {
+    fn drop(&mut self) {
+        let _ = self.0.recv();
+    }
 }
 
 /// One of the two buffers a capture is converted into: the encoder reads one while the
@@ -320,10 +348,9 @@ impl Stream {
             paintover: cfg.paintover_crf,
         };
         let (fps, debug) = (cfg.fps, cfg.debug);
-        let encode = std::thread::Builder::new()
-            .name("encode".into())
-            .spawn(move || encode_loop(stripes, job_rx, ret_tx, hub, fps, crfs, debug))
-            .unwrap();
+        let encode = Stopped::spawn("encode", move || {
+            encode_loop(stripes, job_rx, ret_tx, hub, fps, crfs, debug)
+        });
         let slot = || Slot {
             buf: Some(Box::new(I420::new(w as usize, h as usize))),
             pending: Some(Band { y0: 0, y1: h }),
@@ -331,9 +358,9 @@ impl Stream {
         Ok(Stream {
             job_tx,
             ret_rx,
-            encode,
             slots: [slot(), slot()],
             next: 0,
+            _encode: encode,
         })
     }
 
@@ -349,12 +376,6 @@ impl Stream {
             true => Encoding::Idle,
             false => Encoding::Busy,
         }
-    }
-
-    /// The encoder drains what it was sent, and stops.
-    fn close(self) {
-        drop(self.job_tx);
-        let _ = self.encode.join();
     }
 }
 
@@ -373,8 +394,7 @@ pub fn spawn(
     std::thread::Builder::new()
         .name("capture".into())
         .spawn(move || loop {
-            let mut stream = None;
-            if let Err(e) = capture_loop(&mut cap, &mut stream, cfg.clone(), hub.clone()) {
+            if let Err(e) = capture_loop(&mut cap, cfg.clone(), hub.clone()) {
                 #[cfg(target_os = "linux")]
                 let resized = cap.geometry_changed();
                 #[cfg(not(target_os = "linux"))]
@@ -387,9 +407,6 @@ pub fn spawn(
                 }
             }
             drop(cap);
-            if let Some(s) = stream {
-                s.close();
-            }
             #[cfg(target_os = "macos")]
             let display_request = hub.display_req.lock().take();
             #[cfg(target_os = "macos")]
@@ -746,12 +763,7 @@ fn note_changes(cap: &mut Capturer, hub: &Hub) {
     }
 }
 
-fn capture_loop(
-    cap: &mut Capturer,
-    stream: &mut Option<Stream>,
-    cfg: VideoConfig,
-    hub: Arc<Hub>,
-) -> Result<(), String> {
+fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(), String> {
     let (w, h) = (cap.width as usize, cap.height as usize);
     let interval = Duration::from_secs_f64(1.0 / cfg.fps as f64);
     // Allow slight early capture so source jitter doesn't alias into dropped frames.
@@ -782,6 +794,9 @@ fn capture_loop(
         }
         probe
     });
+    // The encoders, while somebody watches. Every way out of the loop drops it, and with it
+    // waits for the encoder to send what it holds.
+    let mut stream: Option<Stream> = None;
 
     loop {
         // The wake is taken before anything it may stand for is read: a request that
@@ -828,12 +843,10 @@ fn capture_loop(
             }
         }
         let clients = hub.video_clients();
-        *stream = match (stream.take(), clients.is_empty()) {
-            (None, true) => None,
-            (Some(s), true) => {
-                s.close();
-                None
-            }
+        stream = match (stream.take(), clients.is_empty()) {
+            // Nobody watches: a stream is dropped here, once its encoder has sent what it
+            // holds.
+            (None | Some(_), true) => None,
             (Some(s), false) => Some(s),
             // A new stream starts from the whole screen: our shm copy may be stale, and
             // none of it has been sent, so every block is pending.
@@ -1671,6 +1684,21 @@ mod tests {
         );
     }
 
+    /// Dropping a `Stopped` waits for its work: whatever the work did before it returned
+    /// is done once the drop returns, for work of every length up to 64 steps.
+    #[test]
+    fn a_stopped_thread_has_done_its_work_once_dropped() {
+        for steps in 0..64u32 {
+            let (tx, rx) = mpsc::channel();
+            drop(Stopped::spawn("work", move || {
+                for i in 0..steps {
+                    tx.send(i).unwrap();
+                }
+            }));
+            assert_eq!(rx.try_iter().count(), steps as usize, "{steps} steps");
+        }
+    }
+
     /// A stream is made when somebody starts watching, so its encoders are new: whatever
     /// its first frame was planned as, and whatever blocks it was told are unchanged, each
     /// stripe codes the first part it sends from nothing, and a viewer is sent nothing that
@@ -1751,7 +1779,7 @@ mod tests {
                             })
                             .unwrap();
                     }
-                    s.close();
+                    drop(s);
                     // Whether each part a stripe sent was coded from nothing, in order.
                     let mut sent = vec![vec![]; stripe_layout(h, stripes).len()];
                     while let Ok(m) = rx.try_recv() {
