@@ -601,6 +601,28 @@ impl Sharpening {
     }
 }
 
+/// Whether the encoder holds a frame: one of the capture loop's two buffers is out.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Encoding {
+    Idle,
+    Busy,
+}
+
+/// Nothing moved and no keyframe is wanted: how long to wait for damage or a wake before
+/// looking again, or None to capture a pass now. A pass goes only to an idle encoder.
+/// Queued behind a frame being encoded it would hold the next keystroke back by two
+/// encodes; this way motion that comes meanwhile takes the free buffer and waits for one
+/// at most. A buffer coming home wakes the wait.
+fn still_wait(due: &Due, encoding: Encoding) -> Option<Duration> {
+    match (due, encoding) {
+        (Due::Now, Encoding::Idle) => None,
+        (Due::Now, Encoding::Busy) | (Due::Never, Encoding::Idle | Encoding::Busy) => {
+            Some(Duration::from_millis(100))
+        }
+        (Due::In(wait), Encoding::Idle | Encoding::Busy) => Some(*wait + Duration::from_millis(1)),
+    }
+}
+
 /// Notes the damage the capturer has taken for /wait, whether or not anyone is watching.
 fn note_changes(cap: &mut Capturer, hub: &Hub) {
     if !cap.changes.is_empty() {
@@ -705,19 +727,13 @@ fn capture_loop(
         let now = Instant::now();
         let due = sharpening.due(now);
         if !cap.damaged && !want_key {
-            match &due {
-                Due::Now => {}
-                Due::In(wait) => {
-                    wait_any(
-                        &[cap.fd(), hub.waker.waitable()],
-                        wait.as_millis() as i32 + 1,
-                    );
-                    continue;
-                }
-                Due::Never => {
-                    wait_any(&[cap.fd(), hub.waker.waitable()], 100);
-                    continue;
-                }
+            let encoding = match pool.iter().all(Option::is_some) {
+                true => Encoding::Idle,
+                false => Encoding::Busy,
+            };
+            if let Some(wait) = still_wait(&due, encoding) {
+                wait_any(&[cap.fd(), hub.waker.waitable()], wait.as_millis() as i32);
+                continue;
             }
         }
         let since = now.saturating_duration_since(last_capture);
@@ -1343,6 +1359,7 @@ fn encode_loop(
                 buf: job.buf,
                 sharpened: None,
             });
+            hub.wake();
             continue;
         }
         let coding = job.frame.coding();
@@ -1396,6 +1413,7 @@ fn encode_loop(
             buf: job.buf,
             sharpened: job.frame.into_sharpened().filter(|_| sharp),
         });
+        hub.wake();
         let parts: Vec<(usize, bool, Vec<u8>)> = results
             .into_iter()
             .enumerate()
@@ -1914,6 +1932,18 @@ mod tests {
         // A keyframe goes out in place of that pass: passes go on at once.
         s.on_key(Keyframe::Pass, ms(1160));
         assert_eq!(s.due(ms(1160)), Due::Now);
+    }
+
+    /// With nothing moved, a due pass is captured only while the encoder holds nothing, so
+    /// a keystroke that comes during it never waits behind a queued pass; otherwise the
+    /// loop waits, as for the wait before a burst.
+    #[test]
+    fn a_pass_goes_only_to_an_idle_encoder() {
+        let ms = Duration::from_millis;
+        assert_eq!(still_wait(&Due::Now, Encoding::Idle), None);
+        assert_eq!(still_wait(&Due::Now, Encoding::Busy), Some(ms(100)));
+        assert_eq!(still_wait(&Due::Never, Encoding::Idle), Some(ms(100)));
+        assert_eq!(still_wait(&Due::In(ms(40)), Encoding::Busy), Some(ms(41)));
     }
 
     /// Once the screen goes still the paint-overs show x264 forgetting the drag, so the
