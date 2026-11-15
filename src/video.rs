@@ -4,7 +4,7 @@ use crate::capture::{Band, Capturer};
 use crate::convert::I420;
 use crate::encoder::{Encoded, Encoder, EncoderConfig, Fps, Pictures, Planes, Preset, Quality};
 use crate::env::{Debugging, Marker};
-use crate::hub::wait_any;
+use crate::hub::{wait_any, Waitable};
 use crate::hub::{Backlog, Client, Hub, Out, ServerMessage, Takes, Viewer};
 use crate::path::Kbps;
 use crate::rate::{Bounds, FrameBudget, RateCtl, RTT_GUESS_MS};
@@ -874,7 +874,7 @@ enum On {
 }
 
 impl Wait {
-    fn wait(self, cap: &Capturer, hub: &Hub) {
+    fn wait(self, cap: &impl Capture, hub: &Hub) {
         let poll = |on, timeout| match on {
             On::Event => wait_any([cap.fd(), hub.waker.waitable()], timeout),
             On::Wake => wait_any([hub.waker.waitable()], timeout),
@@ -1172,15 +1172,90 @@ impl Captured {
 }
 
 /// Notes the damage the capturer has taken for /wait, whether or not anyone is watching.
-fn note_changes(cap: &mut Capturer, hub: &Hub) {
-    if !cap.changes.is_empty() {
-        hub.activity.note(&cap.changes);
-        cap.changes.clear();
+fn note_changes(cap: &mut impl Capture, hub: &Hub) {
+    let changes = cap.changes();
+    if !changes.is_empty() {
+        hub.activity.note(changes);
+        changes.clear();
     }
 }
 
-fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(), String> {
-    let (w, h) = (cap.width as usize, cap.height as usize);
+/// What the capture loop asks of the screen it captures: the platform's `Capturer`, or a
+/// screen a test draws on.
+trait Capture {
+    /// Width and height, in pixels.
+    fn size(&self) -> (u32, u32);
+    /// Readable when the screen has something to report.
+    fn fd(&self) -> Waitable<'_>;
+    /// Takes in what the screen reported.
+    fn pump(&mut self) -> Result<(), String>;
+    /// The screen changed size.
+    fn needs_rebuild(&self) -> bool;
+    /// The areas changed since `/wait` last took them.
+    fn changes(&mut self) -> &mut Vec<(u32, u32, u32, u32)>;
+    /// What changed since the last capture.
+    fn damage(&mut self) -> &mut Damage;
+    /// The rows damaged since the last take, if any were.
+    fn take_damage(&mut self) -> Result<Option<Band>, String>;
+    /// The macroblocks damaged since the last take, one byte each, row-major.
+    fn take_mb_map(&mut self) -> Vec<u8>;
+    /// Every row.
+    fn full(&self) -> Band;
+    /// Reads `band` of the screen into the frame `convert` reads.
+    fn grab(&mut self, band: Band) -> Result<(), String>;
+    /// Converts rows [y0, y1) of the grabbed frame into `dst`, on `threads` threads.
+    fn convert(&self, dst: &mut I420, y0: usize, y1: usize, threads: usize);
+    /// The whole screen as BGRX, for a screenshot.
+    fn snapshot(&mut self) -> Result<Vec<u8>, String>;
+    /// The grabbed frame as BGRX and its stride (the debug marker's probe).
+    fn bgrx(&self) -> Option<(&[u8], usize)>;
+}
+
+impl Capture for Capturer {
+    fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+    fn fd(&self) -> Waitable<'_> {
+        Capturer::fd(self)
+    }
+    fn pump(&mut self) -> Result<(), String> {
+        Capturer::pump(self)
+    }
+    fn needs_rebuild(&self) -> bool {
+        Capturer::needs_rebuild(self)
+    }
+    fn changes(&mut self) -> &mut Vec<(u32, u32, u32, u32)> {
+        &mut self.changes
+    }
+    fn damage(&mut self) -> &mut Damage {
+        &mut self.damage
+    }
+    fn take_damage(&mut self) -> Result<Option<Band>, String> {
+        Capturer::take_damage(self)
+    }
+    fn take_mb_map(&mut self) -> Vec<u8> {
+        Capturer::take_mb_map(self)
+    }
+    fn full(&self) -> Band {
+        Capturer::full(self)
+    }
+    fn grab(&mut self, band: Band) -> Result<(), String> {
+        Capturer::grab(self, band)
+    }
+    fn convert(&self, dst: &mut I420, y0: usize, y1: usize, threads: usize) {
+        Capturer::convert(self, dst, y0, y1, threads)
+    }
+    fn snapshot(&mut self) -> Result<Vec<u8>, String> {
+        Capturer::snapshot(self)
+    }
+    fn bgrx(&self) -> Option<(&[u8], usize)> {
+        Capturer::bgrx(self)
+    }
+}
+
+fn capture_loop(cap: &mut impl Capture, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(), String> {
+    let (w, h) = cap.size();
+    let (w, h) = (w as usize, h as usize);
     let interval = Duration::from_secs_f64(1.0 / cfg.fps.get() as f64);
     let min_interval = interval.mul_f64(MIN_INTERVAL_SHARE);
     let interval_ms = interval.as_secs_f64() * 1000.0;
@@ -1272,13 +1347,14 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
             // A new stream starts from the whole screen: our shm copy may be stale, and
             // none of it has been sent, so every block is pending.
             (None, false) => {
-                let s = Stream::new(&cfg, &hub, cap.width, cap.height)?;
+                let (cw, ch) = cap.size();
+                let s = Stream::new(&cfg, &hub, cw, ch)?;
                 cap.grab(cap.full())?;
                 // The whole screen is grabbed and pending: it holds what was drawn while
                 // nobody watched, so that damage is taken with it, and the stream's first
                 // frame counts from its capture, not from damage no frame took.
-                let _ = cap.damage.take(cap.height);
-                cap.damage.mark();
+                let _ = cap.damage().take(ch);
+                cap.damage().mark();
                 refiner.mark_all(Instant::now());
                 Some(s)
             }
@@ -1300,7 +1376,7 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
         let due = sharpening.due(now);
         let look = Look {
             key,
-            damage: cap.damage,
+            damage: *cap.damage(),
             due,
             now,
             captured,
@@ -1324,7 +1400,7 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
         };
 
         let t0 = Instant::now();
-        let origin = match cap.damage {
+        let origin = match *cap.damage() {
             Damage::Rows { since, .. } => since,
             Damage::None | Damage::Unreported => t0,
         };
