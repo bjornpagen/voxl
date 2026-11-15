@@ -309,7 +309,7 @@ fn num<T: std::str::FromStr>(field: &str) -> Option<T> {
 /// A button the viewer's pointer has, which a command names by X's number for it.
 /// pointer.ts sends the browser's five (main, middle, secondary, back, forward) as 1, 2,
 /// 3, 8 and 9, and those five are all macOS and Windows press. X has more (4 to 7 are its
-/// wheel, which `s` and `sp` turn) and no button 0.
+/// wheel, which `sp` turns) and no button 0.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Button {
     Left,
@@ -342,38 +342,6 @@ impl Button {
     fn parse(field: &str) -> Option<Button> {
         let number: u8 = field.trim().parse().ok()?;
         Button::ALL.into_iter().find(|b| b.number() == number)
-    }
-}
-
-/// The most notches one wheel message turns, either way.
-///
-/// Who needs it: X turns its wheel by a press and a release of a button per notch, so
-/// this bounds what one message makes the input thread send X at 40 events, here and in
-/// its pixel-scroll fallback on a server without smooth scrolling. macOS and Windows
-/// negate a count, and Windows scales it by its 120 units a notch, which a count this
-/// size cannot overflow.
-///
-/// What sets it: 93ad2d4 clamps every wheel message to 20 notches on X, macOS and
-/// Windows, so each count that turned a wheel before turns it as it did. The web client
-/// sends no `s` (pointer.ts sends pixels), and bench/macos/input.js sends 3; half or
-/// double this changes nothing either sends.
-pub const MAX_NOTCHES: i8 = 20;
-
-/// A wheel turned by whole notches, at most `MAX_NOTCHES` either way: positive turns it
-/// down, or right.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Notches(i8);
-
-impl Notches {
-    fn parse(field: &str) -> Option<Notches> {
-        let n: i8 = field.trim().parse().ok()?;
-        (-MAX_NOTCHES..=MAX_NOTCHES)
-            .contains(&n)
-            .then_some(Notches(n))
-    }
-
-    pub fn get(self) -> i8 {
-        self.0
     }
 }
 
@@ -432,8 +400,6 @@ enum Command {
     Move { x: i16, y: i16 },
     /// `b,<button>,<1|0>`
     Button { button: Button, down: bool },
-    /// `s,<dx>,<dy>`: wheel notches.
-    Scroll { dx: Notches, dy: Notches },
     /// `sp,<dx>,<dy>`: desktop pixels.
     ScrollPx { dx: Pixels, dy: Pixels },
     /// `k,<keysym>,<1|2|0>`: down, repeat, up.
@@ -499,10 +465,6 @@ impl Command {
                 button: Button::parse(button)?,
                 down: flag(down)?,
             },
-            ("s", [dx, dy]) => Command::Scroll {
-                dx: Notches::parse(dx)?,
-                dy: Notches::parse(dy)?,
-            },
             ("sp", [dx, dy]) => Command::ScrollPx {
                 dx: Pixels::parse(dx)?,
                 dy: Pixels::parse(dy)?,
@@ -543,7 +505,6 @@ impl Command {
             | Command::Pong { .. } => true,
             Command::Move { .. }
             | Command::Button { .. }
-            | Command::Scroll { .. }
             | Command::ScrollPx { .. }
             | Command::Key { .. }
             | Command::ReleaseAll
@@ -583,7 +544,6 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
         }
         Command::Move { x, y } => input(InputEvent::Move { x, y }),
         Command::Button { button, down } => input(InputEvent::Button { button, down }),
-        Command::Scroll { dx, dy } => input(InputEvent::Scroll { dx, dy }),
         Command::ScrollPx { dx, dy } => input(InputEvent::ScrollPx { dx: dx.0, dy: dy.0 }),
         Command::Key { keysym, act } => input(InputEvent::Key { keysym, act }),
         Command::ReleaseAll => input(InputEvent::ReleaseAll),
@@ -665,7 +625,6 @@ mod tests {
         "m,10,20",
         "b,1,1",
         "b,1,0",
-        "s,0,1",
         "sp,0.0,12.0",
         "k,65,1",
         "k,65,2",
@@ -844,7 +803,7 @@ mod tests {
     fn fields_of(name: &str) -> &'static [usize] {
         match name {
             "a" => &[1, 2],
-            "m" | "b" | "s" | "sp" | "k" | "sz" => &[2],
+            "m" | "b" | "sp" | "k" | "sz" => &[2],
             "v" | "au" | "mi" | "po" | "ds" => &[1],
             "r" | "kf" => &[0],
             _ => &[],
@@ -861,16 +820,14 @@ mod tests {
         (9, Button::Forward),
     ];
 
-    /// Whether a position, a button, a wheel, a pixel scroll or a clipboard with its own
-    /// count of fields is a command, written apart from `parse` from what each number must
-    /// be where it is used: a position in X's 16 bits, a button one of `BUTTONS` and a flag,
-    /// a wheel's notches within `MAX_NOTCHES`, a pixel scroll finite and within
-    /// `MAX_SCROLL_PX`, and a clipboard any text. `None` for any other line.
+    /// Whether a position, a button, a pixel scroll or a clipboard with its own count of
+    /// fields is a command, written apart from `parse` from what each number must be where
+    /// it is used: a position in X's 16 bits, a button one of `BUTTONS` and a flag, a pixel
+    /// scroll finite and within `MAX_SCROLL_PX`, and a clipboard any text. A line naming
+    /// the wheel (`s`) never is. `None` for any other line.
     fn takes(name: &str, fields: &[&str]) -> Option<bool> {
         let int = |f: &str| f.trim().parse::<i128>().ok();
         let position = |f: &str| int(f).is_some_and(|n| i16::try_from(n).is_ok());
-        let most = i128::from(MAX_NOTCHES);
-        let notches = |f: &str| int(f).is_some_and(|n| (-most..=most).contains(&n));
         let pixels = |f: &str| {
             f.trim()
                 .parse::<f64>()
@@ -881,7 +838,7 @@ mod tests {
             ("b", [button, down]) => {
                 BUTTONS.iter().any(|&(n, _)| int(button) == Some(n)) && matches!(*down, "0" | "1")
             }
-            ("s", [dx, dy]) => notches(dx) && notches(dy),
+            ("s", _) => false,
             ("sp", [dx, dy]) => pixels(dx) && pixels(dy),
             ("c", [_, ..]) => true,
             _ => return None,
@@ -970,22 +927,17 @@ mod tests {
     }
 
     /// A command is parsed once, into what it is (02b9dd0), so what parses is in range
-    /// where it is used. X takes a pointer position as 16 bits, a wheel count is negated
-    /// to scroll up, and X has no button 0. These are no command: a position that only
-    /// fits by wrapping, a wheel count that cannot be negated, and a button that isn't.
+    /// where it is used. X takes a pointer position as 16 bits, and X has no button 0.
+    /// These are no command: a position that only fits by wrapping, and a button that
+    /// isn't.
     #[test]
     fn what_parses_is_in_range_where_it_is_used() {
         let mut out = vec![];
-        for line in ["m,65636,100", "m,-32769,0", "s,0,-2147483648", "b,0,1"] {
+        for line in ["m,65636,100", "m,-32769,0", "b,0,1"] {
             match Command::parse(line) {
                 // A position is X's 16 bits, so these would have wrapped to fit.
                 Some(Command::Move { x, y }) => {
                     out.push(format!("{line}: the pointer goes to ({x}, {y})"))
-                }
-                Some(Command::Scroll { dx, dy })
-                    if dx.get().checked_neg().is_none() || dy.get().checked_neg().is_none() =>
-                {
-                    out.push(format!("{line}: a wheel count that cannot be negated"))
                 }
                 // No button is 0, so any button this is was not the one asked for.
                 Some(Command::Button { button, .. }) => {
@@ -1028,42 +980,27 @@ mod tests {
     /// anything smaller to it), where a pixel is the most wheel units.
     const LEAST_PX_PER_NOTCH: f64 = 1.0;
 
-    /// What the input threads do with a command's numbers, every step checked: X clicks a
-    /// wheel button once a notch, macOS negates a count and Windows negates and scales it;
-    /// a pixel scroll is scaled to wheel units (on macOS to points, which are fewer),
-    /// added to a remainder of up to a notch, and its whole units are sent as an i32. A
-    /// position and a button go through as they are.
+    /// What the input threads do with a command's numbers, every step checked: a pixel
+    /// scroll is scaled to wheel units (on macOS to points, which are fewer), added to a
+    /// remainder of up to a notch, and its whole units are sent as an i32. A position and a
+    /// button go through as they are.
     fn through_the_input_threads(c: &Command) -> Result<(), String> {
-        match c {
-            Command::Scroll { dx, dy } => {
-                for n in [dx.get(), dy.get()] {
-                    let clicks = n.unsigned_abs() <= MAX_NOTCHES.unsigned_abs();
-                    let scaled = i32::from(n)
-                        .checked_neg()
-                        .and_then(|n| n.checked_mul(UNITS_PER_NOTCH as i32));
-                    if !clicks || scaled.is_none() {
-                        return Err(format!("{n} notches"));
-                    }
+        if let Command::ScrollPx { dx, dy } = c {
+            for px in [dx.0, dy.0] {
+                let units = UNITS_PER_NOTCH + px.abs() * UNITS_PER_NOTCH / LEAST_PX_PER_NOTCH;
+                if !units.is_finite() || units.trunc() > f64::from(i32::MAX) {
+                    return Err(format!("{px} px: {units} wheel units"));
                 }
             }
-            Command::ScrollPx { dx, dy } => {
-                for px in [dx.0, dy.0] {
-                    let units = UNITS_PER_NOTCH + px.abs() * UNITS_PER_NOTCH / LEAST_PX_PER_NOTCH;
-                    if !units.is_finite() || units.trunc() > f64::from(i32::MAX) {
-                        return Err(format!("{px} px: {units} wheel units"));
-                    }
-                }
-            }
-            _ => {}
         }
         Ok(())
     }
 
     /// 200,000 random lines: every command name, and some that are none, with no fields up
     /// to four, each empty, at an edge of a type or a range, signed, huge, a float, `NaN`,
-    /// `inf`, not a number, or random. Nothing panics; a position, a button, a wheel, a
-    /// pixel scroll or a clipboard is a command exactly when `takes` says it is; and each
-    /// that parses into a position, a button, a wheel or a pixel scroll holds exactly the
+    /// `inf`, not a number, or random. Nothing panics; a position, a button, a pixel
+    /// scroll, a clipboard or a wheel is a command exactly when `takes` says it is; and
+    /// each that parses into a position, a button or a pixel scroll holds exactly the
     /// numbers the line says (a button the one `BUTTONS` names), and they go through the
     /// input threads' arithmetic.
     #[test]
@@ -1123,8 +1060,8 @@ mod tests {
             seed ^= seed << 17;
             seed
         };
-        // Lines that parsed into a position, a button, a wheel and a pixel scroll.
-        let mut parsed = [0; 4];
+        // Lines that parsed into a position, a button and a pixel scroll.
+        let mut parsed = [0; 3];
         let mut out = vec![];
         for _ in 0..200_000 {
             let mut line = NAMES[next() as usize % NAMES.len()].to_string();
@@ -1169,12 +1106,8 @@ mod tests {
                     1,
                     BUTTONS.contains(&(int(0).expect("a button is a number"), *button)),
                 ),
-                Command::Scroll { dx, dy } => (
-                    2,
-                    int(0) == Some(dx.get().into()) && int(1) == Some(dy.get().into()),
-                ),
                 Command::ScrollPx { dx, dy } => {
-                    (3, float(0) == Some(dx.0) && float(1) == Some(dy.0))
+                    (2, float(0) == Some(dx.0) && float(1) == Some(dy.0))
                 }
                 _ => continue,
             };
@@ -1189,7 +1122,7 @@ mod tests {
         assert!(out.is_empty(), "{out:#?}");
         assert!(
             parsed.iter().all(|&n| n >= 100),
-            "too few reached (positions, buttons, wheels, pixel scrolls): {parsed:?}"
+            "too few reached (positions, buttons, pixel scrolls): {parsed:?}"
         );
     }
 

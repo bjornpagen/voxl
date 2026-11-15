@@ -36,11 +36,6 @@ pub enum InputEvent {
         button: crate::server::Button,
         down: bool,
     },
-    /// Wheel notches: positive dy scrolls down, positive dx scrolls right.
-    Scroll {
-        dx: crate::server::Notches,
-        dy: crate::server::Notches,
-    },
     /// Precise scroll in desktop pixels (trackpads, smooth wheels).
     ScrollPx {
         dx: f64,
@@ -235,6 +230,20 @@ const SHIFT_L: u32 = 0xffe1;
 
 /// Scroll units per wheel notch (the X server's scroll increment, as for hi-res wheels).
 const NOTCH: f64 = 120.0;
+
+/// The most notches one pixel scroll turns, either way, on an X server without smooth
+/// scrolling; the rest of a longer scroll is dropped.
+///
+/// Who needs it: X turns its wheel by a press and a release of a button per notch, so
+/// this bounds what one message makes the input thread send X at 40 events.
+///
+/// What sets it: 93ad2d4 clamps every wheel message to 20 notches on X, macOS and
+/// Windows, and the pixel-scroll fallback to wheel clicks keeps that clamp. A message is
+/// what pointer.ts gathered in one animation frame; at the default 180 px a notch, 20
+/// notches is 3,600 desktop pixels in a sixtieth of a second. Unmeasured beyond that:
+/// half of it drops the rest of a flick above 1,800 px a frame, double lets one message
+/// send X 80 events.
+const MAX_NOTCHES: i8 = 20;
 
 /// Smooth scrolling through relative motion on the XTEST pointer's scroll axes.
 /// Stock X servers give that device no scroll axes; Xvfb built with
@@ -599,10 +608,6 @@ impl Injector {
                     0,
                 )
             }
-            InputEvent::Scroll { dx, dy } => {
-                self.wheel(dy.get(), (4, 5));
-                self.wheel(dx.get(), (6, 7));
-            }
             InputEvent::ScrollPx { dx, dy } => {
                 let k = NOTCH / self.px_per_notch;
                 self.scroll_acc.0 += dx * k;
@@ -616,15 +621,15 @@ impl Injector {
                     }
                 } else {
                     // Whole notches only; the remainder carries into the next gesture event.
-                    // Like a wheel message, one turns at most MAX_NOTCHES each way, and the
-                    // rest of a longer scroll is dropped.
+                    // One turns at most MAX_NOTCHES each way, and the rest of a longer
+                    // scroll is dropped.
                     let (nx, ny) = (
                         (self.scroll_acc.0 / NOTCH).trunc(),
                         (self.scroll_acc.1 / NOTCH).trunc(),
                     );
                     self.scroll_acc.0 -= nx * NOTCH;
                     self.scroll_acc.1 -= ny * NOTCH;
-                    let most = f64::from(crate::server::MAX_NOTCHES);
+                    let most = f64::from(MAX_NOTCHES);
                     self.wheel(ny.clamp(-most, most) as i8, (4, 5));
                     self.wheel(nx.clamp(-most, most) as i8, (6, 7));
                 }

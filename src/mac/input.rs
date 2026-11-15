@@ -27,11 +27,6 @@ pub enum InputEvent {
         button: crate::server::Button,
         down: bool,
     },
-    /// Wheel notches: positive dy scrolls down, positive dx scrolls right.
-    Scroll {
-        dx: crate::server::Notches,
-        dy: crate::server::Notches,
-    },
     /// Precise scroll in desktop pixels (trackpads, smooth wheels).
     ScrollPx {
         dx: f64,
@@ -296,19 +291,6 @@ impl Injector {
                     Button::Forward => (kCGEventOtherMouseDown, kCGEventOtherMouseUp, 4),
                 };
                 self.mouse(if down { dn } else { up }, mb);
-            }
-            InputEvent::Scroll { dx, dy } => {
-                let e = unsafe {
-                    CGEventCreateScrollWheelEvent2(
-                        self.src,
-                        kCGScrollEventUnitLine,
-                        2,
-                        -i32::from(dy.get()),
-                        -i32::from(dx.get()),
-                        0,
-                    )
-                };
-                self.post(e);
             }
             InputEvent::ScrollPx { dx, dy } => {
                 // Desktop pixels -> points; macOS scrolls content down for positive values.

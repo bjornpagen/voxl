@@ -32,11 +32,6 @@ pub enum InputEvent {
         button: crate::server::Button,
         down: bool,
     },
-    /// Wheel notches: positive dy scrolls down, positive dx scrolls right.
-    Scroll {
-        dx: crate::server::Notches,
-        dy: crate::server::Notches,
-    },
     /// Precise scroll in desktop pixels (trackpads, smooth wheels).
     ScrollPx {
         dx: f64,
@@ -332,18 +327,6 @@ impl Injector {
                     (Button::Forward, false) => (MOUSEEVENTF_XUP, 2),
                 };
                 send(&[mouse_input(0, 0, data, flags)]);
-            }
-            InputEvent::Scroll { dx, dy } => {
-                let d = WHEEL_DELTA as i32;
-                let (dx, dy) = (i32::from(dx.get()), i32::from(dy.get()));
-                let mut v = Vec::new();
-                if dy != 0 {
-                    v.push(mouse_input(0, 0, -dy * d, MOUSEEVENTF_WHEEL));
-                }
-                if dx != 0 {
-                    v.push(mouse_input(0, 0, dx * d, MOUSEEVENTF_HWHEEL));
-                }
-                send(&v);
             }
             InputEvent::ScrollPx { dx, dy } => {
                 // Desktop pixels -> wheel units (120 per notch); apps that support
