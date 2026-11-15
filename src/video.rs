@@ -22,13 +22,11 @@ pub struct VideoConfig {
     pub threads: u32,
     pub convert_threads: usize,
     pub crf: f32,
-    /// The most the stream is steered to (`--max-kbps`). None: no ceiling, and encoders
-    /// opened without a rate cap.
-    pub max_kbps: Option<Kbps>,
+    /// What the stream is steered between (`--min-kbps`, `--max-kbps`).
+    pub bounds: Bounds,
     pub paintover_crf: f32,
     pub paintover_burst: u32,
     pub paintover_delay_ms: u64,
-    pub min_kbps: u32,
     pub coalesce: Duration,
     pub stripes: u32,
     pub adaptive_threads: bool,
@@ -335,7 +333,7 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
                 threads: fixed,
             },
             crf: cfg.crf,
-            max_kbps: cfg.max_kbps,
+            max_kbps: cfg.bounds.ceiling(),
         };
         let max_threads = if cfg.adaptive_threads {
             (cfg.threads / layout.len() as u32).max(1)
@@ -429,10 +427,9 @@ struct PathNow {
 /// nothing queues, down below it when something does. Nothing has to press against the
 /// cap for the cap to rise, and an idle screen doesn't lower it.
 struct RateCtl {
+    /// Always within `bounds`.
     target: Kbps,
-    /// The most the target may be. None: as much as the paths carry.
-    max: Option<Kbps>,
-    min: Kbps,
+    bounds: Bounds,
     /// When it last decided, lowered the target for a queue, and raised it.
     last_eval: Option<Instant>,
     last_dec: Option<Instant>,
@@ -453,19 +450,45 @@ const OVERDUE_MS: f64 = 80.0;
 /// The round trip assumed for a client whose pings haven't been answered yet.
 const RTT_GUESS_MS: u32 = 40;
 
-/// `rate`, held to `ceiling` if there is one.
-fn at_most(ceiling: Option<Kbps>, rate: Kbps) -> Kbps {
-    ceiling.into_iter().fold(rate, Kbps::min)
+/// What the target may be: never under a floor, and never over a ceiling if there is
+/// one. Where the two cross, the ceiling wins: it is the most a person lets the stream
+/// send (Selkies' `--video-bitrate` sets it alone), where the floor only keeps the
+/// controller from starving the picture.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Bounds {
+    /// Never over the ceiling.
+    floor: Kbps,
+    ceiling: Option<Kbps>,
+}
+
+impl Bounds {
+    /// A floor over the ceiling is the ceiling.
+    pub fn new(floor: Kbps, ceiling: Option<Kbps>) -> Self {
+        let floor = ceiling.into_iter().fold(floor, Kbps::min);
+        Bounds { floor, ceiling }
+    }
+
+    /// None: no ceiling. Encoders open without a rate cap, so nothing applies the
+    /// target: a viewer on a slow path gets every frame at its CRF.
+    pub fn ceiling(self) -> Option<Kbps> {
+        self.ceiling
+    }
+
+    /// `rate`, or the bound it is past.
+    fn hold(self, rate: Kbps) -> Kbps {
+        self.ceiling
+            .into_iter()
+            .fold(rate.max(self.floor), Kbps::min)
+    }
 }
 
 impl RateCtl {
     /// Carries on from `resume`, the last pipeline's target: one rebuilt for a new
     /// screen size streams over the same paths as before.
-    fn new(max: Option<Kbps>, min: Kbps, resume: Option<Kbps>) -> Self {
+    fn new(bounds: Bounds, resume: Option<Kbps>) -> Self {
         RateCtl {
-            target: at_most(max, resume.unwrap_or(START).max(at_most(max, min))),
-            max,
-            min,
+            target: bounds.hold(resume.unwrap_or(START)),
+            bounds,
             last_eval: None,
             last_dec: None,
             last_inc: None,
@@ -501,41 +524,37 @@ impl RateCtl {
             return;
         }
         self.last_eval = Some(now);
-        // The most the target may be, and what it may rise to.
-        let (ceiling, goal) = match Capacity::of(paths.iter().map(|p| p.capacity)) {
-            Capacity::NoViewers => return,
-            // An unknown path gets the cautious start, whatever was reached before it:
-            // no more than it, and up to it, since frames at a target far under it
-            // are too small to show the path's rate, and the target would stay there.
-            Capacity::Unknown => {
-                let start = at_most(self.max, START);
-                (start, Some(start))
-            }
-            // A path that got slower is followed down at once, queue or no queue.
-            Capacity::Known(c) => {
-                let share = c.times(CAPACITY_SHARE);
-                (share.max(self.min), Some(at_most(self.max, share)))
-            }
-        };
-        self.target = self.target.min(ceiling);
+        // Where the target goes while nothing queues, and the most it may be now.
+        let aim = self
+            .bounds
+            .hold(match Capacity::of(paths.iter().map(|p| p.capacity)) {
+                Capacity::NoViewers => return,
+                // An unknown path gets the cautious start, whatever was reached before
+                // it: no more than it, and up to it, since frames at a target far under
+                // it are too small to show the path's rate, and the target would stay
+                // there.
+                Capacity::Unknown => START,
+                Capacity::Known(c) => c.times(CAPACITY_SHARE),
+            });
+        // A path that got slower is followed down at once, queue or no queue.
+        self.target = self.target.min(aim);
         let congested = paths
             .iter()
             .any(|p| p.queue_ms > QUEUE_CONGESTED_MS || p.overdue);
         let clear = paths.iter().all(|p| p.queue_ms <= QUEUE_CLEAR_MS);
         if congested {
             if waited(self.last_dec, Duration::from_millis(300)) {
-                self.target = self.target.times(0.85).max(self.min);
+                self.target = self.bounds.hold(self.target.times(0.85));
                 self.last_dec = Some(now);
                 log::debug!("rate: congested, target {:.0} kbps", self.target.get());
             }
         } else if clear
+            && self.target < aim
             && waited(self.last_dec, Duration::from_secs(1))
             && waited(self.last_inc, Duration::from_millis(200))
         {
-            if let Some(goal) = goal.filter(|&goal| self.target < goal) {
-                self.target = Kbps::new(self.target.get() * 1.25 + 100.0).min(goal);
-                self.last_inc = Some(now);
-            }
+            self.target = Kbps::new(self.target.get() * 1.25 + 100.0).min(aim);
+            self.last_inc = Some(now);
         }
     }
 }
@@ -836,7 +855,7 @@ fn capture_loop(
     let mut last_capture = Instant::now() - interval;
     let paintover_delay = Duration::from_millis(cfg.paintover_delay_ms);
     let mut sharpening = Sharpening::new(cfg.paintover_burst, paintover_delay);
-    let mut rc = RateCtl::new(cfg.max_kbps, Kbps::new(cfg.min_kbps as f64), hub.target());
+    let mut rc = RateCtl::new(cfg.bounds, hub.target());
     hub.set_target(rc.target);
     let mut had_clients = false;
     let mut full_next = true;
@@ -2207,7 +2226,10 @@ mod rate_tests {
                 free: now,
                 flying: VecDeque::new(),
                 est: PathEst::new(now),
-                rc: RateCtl::new(Some(Kbps::new(max_kbps)), Kbps::new(2000.0), None),
+                rc: RateCtl::new(
+                    Bounds::new(Kbps::new(2000.0), Some(Kbps::new(max_kbps))),
+                    None,
+                ),
                 budget: FrameBudget::new(now),
                 worst_wait: Duration::ZERO,
                 worst_share: 1.0,
@@ -2356,7 +2378,7 @@ mod rate_tests {
         for _ in 0..40 {
             let rate = rng.range(20_000_000, 80_000_000) as f64;
             let mut sim = Sim::new(rate, rng.range(20, 100), 30_000.0);
-            sim.rc.target = sim.rc.min;
+            sim.rc.target = sim.rc.bounds.floor;
             sim.run(30, rest);
             sim.run(60 * 3, |_| 60_000);
             assert!(
@@ -2368,8 +2390,7 @@ mod rate_tests {
         // And with nothing but the unknown path to go by, it reaches the start, not more.
         let now = Instant::now();
         let mut rc = RateCtl::new(
-            Some(Kbps::new(30_000.0)),
-            Kbps::new(2000.0),
+            Bounds::new(Kbps::new(2000.0), Some(Kbps::new(30_000.0))),
             Some(Kbps::new(2000.0)),
         );
         let unknown = PathNow {
@@ -2398,8 +2419,9 @@ mod rate_tests {
             (Some(kbps(30_000.0)), Some(kbps(50_000.0)), kbps(30_000.0)),
             (Some(kbps(5000.0)), None, kbps(5000.0)),
             (Some(kbps(1000.0)), None, kbps(1000.0)),
+            (Some(kbps(1000.0)), Some(kbps(500.0)), kbps(1000.0)),
         ] {
-            let rc = RateCtl::new(max, floor, resume);
+            let rc = RateCtl::new(Bounds::new(floor, max), resume);
             assert_eq!(rc.target, start, "ceiling {max:?}, resuming {resume:?}");
         }
     }
@@ -2417,7 +2439,7 @@ mod rate_tests {
             overdue: false,
         };
         let steer = |max, path| {
-            let mut rc = RateCtl::new(max, floor, None);
+            let mut rc = RateCtl::new(Bounds::new(floor, max), None);
             let t0 = Instant::now();
             for i in 0..100 {
                 rc.step(t0 + Duration::from_millis(100 * i), &[path]);
@@ -2438,6 +2460,63 @@ mod rate_tests {
         assert_eq!(steer(None, path(None, 0.0)), START);
         assert_eq!(steer(ceiling, path(Some(fast), 50.0)), floor);
         assert_eq!(steer(None, path(Some(fast), 50.0)), floor);
+    }
+
+    /// `--max-kbps 1000` with `--min-kbps` at its 2000: the target starts at the ceiling,
+    /// and a queue lowering it must not lift it to the floor. (RED's finding 20.)
+    #[test]
+    fn a_queue_never_raises_the_target_over_its_ceiling() {
+        let ceiling = Kbps::new(1000.0);
+        let mut rc = RateCtl::new(Bounds::new(Kbps::new(2000.0), Some(ceiling)), None);
+        let t0 = Instant::now();
+        let queued = PathNow {
+            queue_ms: 50.0,
+            capacity: Some(Kbps::new(100_000.0)),
+            overdue: false,
+        };
+        for i in 0..10 {
+            rc.step(t0 + Duration::from_millis(100 * i), &[queued]);
+            assert!(
+                rc.target <= ceiling,
+                "target {:?} over the ceiling {ceiling:?}",
+                rc.target
+            );
+        }
+    }
+
+    /// Whatever the flags and the paths say, the target stays between the floor and the
+    /// ceiling, and where the two cross, at the ceiling: random bounds (crossing, and
+    /// with no ceiling), random resumes, and 30 s of random paths (unknown, slow, fast,
+    /// queued, overdue) every 100 ms.
+    #[test]
+    fn the_target_never_leaves_its_bounds() {
+        let kbps = |k: u64| Kbps::new(k as f64);
+        let mut rng = Rng(0x2545F4914F6CDD1D);
+        let t0 = Instant::now();
+        for _ in 0..300 {
+            let floor = kbps(rng.range(0, 20_000));
+            let ceiling = (rng.range(0, 4) > 0).then(|| kbps(rng.range(1, 40_000)));
+            let resume = (rng.range(0, 2) > 0).then(|| kbps(rng.range(0, 100_000)));
+            let mut rc = RateCtl::new(Bounds::new(floor, ceiling), resume);
+            let (low, high) = match ceiling {
+                Some(c) if c < floor => (c, c),
+                Some(c) => (floor, c),
+                None => (floor, Kbps::new(f64::INFINITY)),
+            };
+            for i in 0..300 {
+                let path = PathNow {
+                    queue_ms: rng.range(0, 60) as f64,
+                    capacity: (rng.range(0, 3) > 0).then(|| kbps(rng.range(500, 100_000))),
+                    overdue: rng.range(0, 10) == 0,
+                };
+                rc.step(t0 + Duration::from_millis(100 * i), &[path]);
+                assert!(
+                    low <= rc.target && rc.target <= high,
+                    "floor {floor:?}, ceiling {ceiling:?}: target {:?}",
+                    rc.target
+                );
+            }
+        }
     }
 
     #[test]

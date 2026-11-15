@@ -85,20 +85,28 @@ fn whole_kbps(v: &str) -> Option<u32> {
     }
 }
 
-/// `--max-kbps`, or Selkies' `--video-bitrate`: the most the stream is steered to, in
-/// whole kbit/s; 30000 when not given. 0 is no ceiling: the target goes as high as the
-/// viewers' paths carry, and encoders open without a rate cap.
-fn ceiling(v: Option<&String>) -> Result<Option<path::Kbps>, String> {
+/// A rate flag in whole kbit/s; `default` when it is not given.
+fn rate_flag(flag: &str, v: Option<&String>, default: u32) -> Result<u32, String> {
     let Some(v) = v else {
-        return Ok(Some(path::Kbps::new(30000.0)));
+        return Ok(default);
     };
-    match whole_kbps(v) {
-        Some(0) => Ok(None),
-        Some(kbps) => Ok(Some(path::Kbps::new(kbps as f64))),
-        None => Err(format!(
-            "--max-kbps {v:?}: not a whole number of kbit/s, or a range of two from low to high"
-        )),
-    }
+    whole_kbps(v).ok_or_else(|| {
+        format!("--{flag} {v:?}: not a whole number of kbit/s, or a range of two from low to high")
+    })
+}
+
+/// `--min-kbps` and `--max-kbps` (or Selkies' `--video-bitrate`), read together: what the
+/// stream is steered between; 2000 and 30000 kbit/s when not given. A ceiling of 0 is
+/// none: the target goes as high as the viewers' paths carry, and encoders open without
+/// a rate cap.
+fn bounds(min: Option<&String>, max: Option<&String>) -> Result<video::Bounds, String> {
+    let floor = rate_flag("min-kbps", min, 2000)?;
+    let ceiling = rate_flag("max-kbps", max, 30000)?;
+    let kbps = |kbps: u32| path::Kbps::new(kbps as f64);
+    Ok(video::Bounds::new(
+        kbps(floor),
+        (ceiling > 0).then(|| kbps(ceiling)),
+    ))
 }
 
 pub(crate) fn truthy(v: Option<&String>, default: bool) -> bool {
@@ -170,7 +178,8 @@ async fn serve(a: HashMap<String, String>) {
     let ncpu = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4) as u32;
-    let max_kbps = ceiling(a.get("max-kbps").or(a.get("video-bitrate"))).unwrap_or_else(|e| {
+    let max = a.get("max-kbps").or(a.get("video-bitrate"));
+    let bounds = bounds(a.get("min-kbps"), max).unwrap_or_else(|e| {
         log::error!("{e}");
         std::process::exit(1);
     });
@@ -194,11 +203,10 @@ async fn serve(a: HashMap<String, String>) {
             .and_then(|v| v.parse().ok())
             .unwrap_or(4),
         crf: range_max(a.get("crf"), 24.0) as f32,
-        max_kbps,
+        bounds,
         paintover_crf: range_max(a.get("paintover-crf"), 16.0) as f32,
         paintover_burst: range_max(a.get("paintover-burst"), 3.0) as u32,
         paintover_delay_ms: range_max(a.get("paintover-delay-ms"), 150.0) as u64,
-        min_kbps: range_max(a.get("min-kbps"), 2000.0) as u32,
         stripes: range_max(a.get("stripes"), 1.0) as u32,
         // Opt-in: one thread unless a frame would miss the frame budget. x264's sliced
         // threads cost ~3x the CPU on desktop content, so this saves 20-55% CPU, but
@@ -497,8 +505,16 @@ async fn serve(a: HashMap<String, String>) {
 mod tests {
     use super::*;
     use path::Kbps;
+    use video::Bounds;
 
-    /// `--max-kbps` is a ceiling or none, decided where the flag is read: 0 is none, and
+    fn read(min: Option<&str>, max: Option<&str>) -> Result<Bounds, String> {
+        bounds(
+            min.map(String::from).as_ref(),
+            max.map(String::from).as_ref(),
+        )
+    }
+
+    /// `--max-kbps` is a ceiling or none, decided where the flags are read: 0 is none, and
     /// what is not a whole number of kbit/s starts nothing.
     #[test]
     fn the_ceiling_is_a_rate_or_none() {
@@ -511,7 +527,7 @@ mod tests {
             (Some("8000-12000"), at(12000.0)),
             (Some("0-0"), Ok(None)),
         ] {
-            assert_eq!(ceiling(flag.map(String::from).as_ref()), want, "{flag:?}");
+            assert_eq!(read(None, flag).map(Bounds::ceiling), want, "{flag:?}");
         }
         for flag in [
             "",
@@ -524,7 +540,7 @@ mod tests {
             "99999999999",
             "true",
         ] {
-            assert!(ceiling(Some(&flag.into())).is_err(), "{flag:?} parsed");
+            assert!(read(None, Some(flag)).is_err(), "{flag:?} parsed");
         }
     }
 
@@ -535,10 +551,43 @@ mod tests {
     fn a_ceiling_that_is_not_a_rate_starts_nothing() {
         for flag in ["-5", "-0", "fast-12000", "1-2-3", "12000-8000"] {
             assert!(
-                ceiling(Some(&flag.into())).is_err(),
+                read(None, Some(flag)).is_err(),
                 "{flag:?} parsed as {:?}",
-                ceiling(Some(&flag.into()))
+                read(None, Some(flag))
             );
+        }
+    }
+
+    /// `--min-kbps` is read the same way, 2000 when not given, and with the ceiling into
+    /// one value: a ceiling under the floor brings the floor down to it.
+    #[test]
+    fn the_floor_is_read_with_the_ceiling() {
+        let kbps = Kbps::new;
+        let default = Some(kbps(30000.0));
+        for (min, max, want) in [
+            (None, None, Bounds::new(kbps(2000.0), default)),
+            (Some("0"), None, Bounds::new(kbps(0.0), default)),
+            (Some("1000-3000"), None, Bounds::new(kbps(3000.0), default)),
+            (Some("5000"), Some("0"), Bounds::new(kbps(5000.0), None)),
+            (
+                None,
+                Some("1000"),
+                Bounds::new(kbps(1000.0), Some(kbps(1000.0))),
+            ),
+            (
+                Some("9000"),
+                Some("4000"),
+                Bounds::new(kbps(4000.0), Some(kbps(4000.0))),
+            ),
+        ] {
+            assert_eq!(
+                read(min, max),
+                Ok(want),
+                "--min-kbps {min:?} --max-kbps {max:?}"
+            );
+        }
+        for min in ["", "fast", "1.5", "-5", "3000-1000"] {
+            assert!(read(Some(min), None).is_err(), "--min-kbps {min:?} parsed");
         }
     }
 }
