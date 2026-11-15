@@ -2,7 +2,9 @@
 
 use crate::capture::{Band, Capturer};
 use crate::convert::I420;
-use crate::encoder::{Encoded, Encoder, EncoderConfig, Fps, Pictures, Planes, Preset, Quality};
+use crate::encoder::{
+    Encoded, Encoder, EncoderConfig, Fps, Pictures, Planes, Preset, Quality, Settling,
+};
 use crate::env::{Debugging, Marker};
 use crate::hub::{wait_any, Waitable};
 use crate::hub::{Backlog, Client, Hub, Out, ServerMessage, Takes, Viewer};
@@ -1802,14 +1804,14 @@ enum StripeOut {
 }
 
 impl StripeOut {
-    /// What x264 made of a stripe's picture, asked for at `crf`; `bytes` is a header's
-    /// room and what it put out.
-    fn coded(e: &Encoded, crf: f32, bytes: BytesMut, coded: Coded) -> StripeOut {
+    /// What x264 made of a stripe's picture, asked for at `crf` after a frame that left it
+    /// `before`; `bytes` is a header's room and what it put out.
+    fn coded(e: &Encoded, crf: f32, before: Settling, bytes: BytesMut, coded: Coded) -> StripeOut {
         match bytes.len() {
             Header::LEN => StripeOut::Empty,
             _ => StripeOut::Sent {
                 key: e.keyframe,
-                quality: e.quality(crf),
+                quality: e.quality(crf, before),
                 bytes,
                 coded,
             },
@@ -1969,13 +1971,14 @@ struct MotionSize {
 }
 
 /// Codes one stripe's part of each frame: its encoder, and what it has learned of the
-/// frames it coded (how cheap their motion is).
+/// frames it coded (how cheap their motion is, and where x264 started the last one).
 struct Coder {
     s: Stripe,
     fps: Fps,
     crfs: Crfs,
     debug: bool,
     motion: MotionQuality,
+    settling: Settling,
     /// What x264 put out for the last frame: kept, so a frame allocates nothing for it.
     out: Vec<u8>,
     /// x264's hint for each macroblock of the stripe (1: unchanged), kept likewise.
@@ -2039,6 +2042,7 @@ impl Coder {
             crfs,
             debug,
             motion: MotionQuality::default(),
+            settling: Settling::Unknown,
             out: Vec::new(),
             hints: Vec::new(),
             arenas: Arenas::new(),
@@ -2054,6 +2058,7 @@ impl Coder {
             crfs,
             debug,
             motion,
+            settling,
             out,
             hints,
             arenas,
@@ -2134,9 +2139,11 @@ impl Coder {
                     crf: asked,
                 });
                 motion.note(&e, crf, size);
+                let before = std::mem::replace(settling, e.settling(crf));
                 StripeOut::coded(
                     &e,
                     crf,
+                    before,
                     arenas.message(out),
                     Coded {
                         woke,
@@ -2147,6 +2154,7 @@ impl Coder {
             }
             Err(e) => {
                 log::error!("{e}");
+                *settling = Settling::Unknown;
                 StripeOut::Failed
             }
         };
@@ -3404,7 +3412,7 @@ mod tests {
             quality: if d & 2 == 2 {
                 Quality::AsAsked
             } else {
-                Quality::Squeezed
+                Quality::Coarser
             },
             coded: Coded {
                 woke: at,
@@ -3609,7 +3617,9 @@ mod tests {
                         };
                         let mut bytes = BytesMut::zeroed(Header::LEN);
                         bytes.extend(g.bytes(len));
-                        sharp &= len == 0 || e.crf_avg < crf + 0.5;
+                        // After a frame x264 started at its CRF, as this one: a predicted
+                        // frame the cap left at the CRF is as asked, a keyframe never.
+                        sharp &= len == 0 || (!e.keyframe && e.crf_avg < crf + 0.5);
                         all_key &= len > 0 && e.keyframe;
                         empty |= len == 0;
                         if len > 0 {
@@ -3621,7 +3631,7 @@ mod tests {
                             x264: at,
                             encoded: at,
                         };
-                        outs.push(StripeOut::coded(&e, crf, bytes, coded));
+                        outs.push(StripeOut::coded(&e, crf, Settling::Over(0.0), bytes, coded));
                     }
                 }
             }

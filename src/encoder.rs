@@ -352,24 +352,68 @@ pub struct Encoded {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Quality {
     AsAsked,
-    /// The rate cap raised its quantizers.
-    Squeezed,
+    /// Coarser than asked: the rate cap raised its quantizers, or x264 was still coming
+    /// down from the frames before it.
+    Coarser,
+}
+
+/// Where a stripe's last frame left x264's QP, for judging the next one.
+///
+/// x264 starts a predicted frame at the CRF plus a term from the picture's complexity,
+/// which it blurs over the frames before, halving their weight each frame. After a
+/// keyframe or motion, passes over a still picture start well above where x264 comes to
+/// rest and fall about 2.4 QP a frame: on a 1280x768 page of text, uncapped, after a
+/// keyframe at CRF 24 (QP 21) passes at CRF 16 started at QP 24, 21, 19, 16, 14, 12, 11,
+/// 10, 9, 9 and sent 38, 64, 1,812, 19,283, then fewer bytes, 285 and 74 by the last; after
+/// twelve frames of scrolling, at 24, 22, 19, 17, 15, 13, 11, 10, 9, 9. A pass x264 started
+/// lower than the frame before it has not caught up with the picture it codes.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Settling {
+    /// Nothing to go by: the encoder is new, the last frame was a keyframe (whose own
+    /// intra cost x264 blurs into the frames after it), or no frame came out.
+    Unknown,
+    /// The last frame was predicted, and x264 started it this many QP over its CRF.
+    Over(f32),
 }
 
 impl Encoded {
-    /// Whether the rate cap left the frame at `crf`, but for a small squeeze. `crf_avg` is
-    /// `crf` plus what the cap added to the frame's average QP, before the frame and within
-    /// it, so a frame the cap left alone reads `crf` exactly. A sharpening pass over a slow
-    /// link almost never does: the cap raises a few of its rows. So a raise of under half a
-    /// step on average (half the rows one step coarser, or fewer rows by more) counts as
-    /// asked. It is a tolerance, not rounding: at 6 Mbit/s, 2 of 2,503 sharpening frames
-    /// read `crf` exactly, and a quarter of a step or a whole one sharpened a page, a flick
-    /// and a scroll in the same time as half a step.
-    pub fn quality(&self, crf: f32) -> Quality {
-        if self.crf_avg < crf + 0.5 {
-            Quality::AsAsked
-        } else {
-            Quality::Squeezed
+    /// Whether x264 coded the frame at `crf`: a predicted frame, started no lower above
+    /// `crf` than the frame before it (`before`), which the rate cap left at `crf` but for
+    /// a small squeeze.
+    ///
+    /// The start: judged by the cap alone, the first pass after a keyframe the cap left
+    /// alone (38 bytes, above) sharpened every block. Judged by its QP against `crf` alone,
+    /// the pass at QP 16 did (49.9 dB on a 640x384 page, where x264 went on to 56.1 at QP
+    /// 9; live, after a keyframe from an encoder opened for it, 57.5-57.6 dB at 40 Mbit/s
+    /// against 60.5-60.6 judged this way). Started no lower than the frame before, a pass
+    /// comes where x264 rests. No number: the bound is the frame before. A keyframe never
+    /// counts, nor the frame after one: x264 plans those from its own rules.
+    ///
+    /// The squeeze: `crf_avg` is `crf` plus what the cap added to the frame's average QP,
+    /// before the frame and within it, so a frame the cap left alone reads `crf` exactly. A
+    /// sharpening pass over a slow link almost never does: the cap raises a few of its
+    /// rows. So a raise of under half a step on average (half the rows one step coarser, or
+    /// fewer rows by more) counts as asked. It is a tolerance, not rounding: at 6 Mbit/s, 2
+    /// of 2,503 sharpening frames read `crf` exactly, and a quarter of a step or a whole one
+    /// sharpened a page, a flick and a scroll in the same time as half a step.
+    pub fn quality(&self, crf: f32, before: Settling) -> Quality {
+        match (self.keyframe, self.qp, before) {
+            (false, Some(qp), Settling::Over(over))
+                if qp - crf >= over && self.crf_avg < crf + 0.5 =>
+            {
+                Quality::AsAsked
+            }
+            (false | true, Some(_) | None, Settling::Unknown | Settling::Over(_)) => {
+                Quality::Coarser
+            }
+        }
+    }
+
+    /// Where this frame, coded at `crf`, leaves x264's QP for the next one.
+    pub fn settling(&self, crf: f32) -> Settling {
+        match (self.keyframe, self.qp) {
+            (false, Some(qp)) => Settling::Over(qp - crf),
+            (true, Some(_) | None) | (false, None) => Settling::Unknown,
         }
     }
 }
@@ -589,6 +633,108 @@ mod tests {
                 "{i}: {w}x{h}: {lines:?}"
             );
         }
+    }
+
+    /// Passes over a still picture after a keyframe, or a keyframe and a scroll, that the
+    /// cap leaves alone (uncapped: `crf_avg` reads the CRF on every one, so the cap cannot
+    /// tell them apart). The frame after a keyframe never counts; a pass that counts is one
+    /// x264 has come to rest at, which the oracle checks by going on: six more passes of
+    /// the same picture start at most one QP lower. And one counts within 40, so
+    /// sharpening ends. Over 40 cases: pages of 2 to 13 rows of 30 px text, a keyframe at
+    /// CRF 18-30, 0 to 12 frames scrolling a row at a time at that CRF, passes at 10-17.
+    #[test]
+    fn a_pass_counts_once_x264_has_come_to_rest() {
+        let mut rng = crate::xorshift::Xorshift::new(0x2545F4914F6CDD1D);
+        let mut next = |n: u64| rng.below(n);
+        let mut coming_down = 0;
+        for _ in 0..40 {
+            let (w, h) = (320, 64 + 32 * next(11) as usize);
+            let (key_crf, crf) = (18.0 + next(13) as f32, 10.0 + next(8) as f32);
+            let scroll = next(13) as usize;
+            let page = text_page(w, h + 30 * scroll);
+            let (u, v) = (vec![128u8; w * h / 4], vec![128u8; w * h / 4]);
+            let at = |top: usize| Planes {
+                y: &page[top * w..(top + h) * w],
+                u: &u,
+                v: &v,
+                stride_y: w,
+                stride_uv: w / 2,
+            };
+            let mut enc = Encoder::new(&EncoderConfig {
+                pictures: Pictures {
+                    width: w as u32,
+                    height: h as u32,
+                    fps: Fps::new(60).unwrap(),
+                    preset: Preset::parse("ultrafast").unwrap(),
+                    threads: 1,
+                    debug: Debugging::read(|_| None).0,
+                },
+                crf: key_crf,
+                max_kbps: None,
+            })
+            .unwrap();
+            let mut out = Vec::new();
+            let mut f = 0;
+            let mut code = |enc: &mut Encoder, top: usize, crf: f32, before: Settling| {
+                out.clear();
+                let e = enc
+                    .encode(&at(top), f * 16, f == 0, None, None, &mut out)
+                    .unwrap();
+                f += 1;
+                (e.quality(crf, before), e.settling(crf), e)
+            };
+            let (_, mut settling, key) = code(&mut enc, 0, key_crf, Settling::Unknown);
+            assert!(key.keyframe);
+            // The frame after the keyframe, a row of scrolling or the first pass.
+            let mut after_key = None;
+            for row in 1..=scroll {
+                let (quality, now, _) = code(&mut enc, row * 30, key_crf, settling);
+                after_key.get_or_insert(quality);
+                settling = now;
+            }
+            enc.set_crf(crf);
+            let (first, now, _) = code(&mut enc, scroll * 30, crf, settling);
+            settling = now;
+            let after_key = after_key.unwrap_or(first);
+            assert_eq!(
+                after_key,
+                Quality::Coarser,
+                "the frame after a keyframe counted"
+            );
+            let mut rest = None;
+            for _ in 0..40 {
+                let (quality, now, e) = code(&mut enc, scroll * 30, crf, settling);
+                assert!(
+                    (e.crf_avg - crf).abs() < 0.01,
+                    "uncapped, crf_avg {}",
+                    e.crf_avg
+                );
+                settling = now;
+                match quality {
+                    Quality::AsAsked => {
+                        rest = e.qp;
+                        break;
+                    }
+                    Quality::Coarser => coming_down += 1,
+                }
+            }
+            let rest = rest.unwrap_or_else(|| {
+                panic!("{w}x{h}, keyframe at CRF {key_crf}, {scroll} scrolled: no pass counted")
+            });
+            for _ in 0..6 {
+                let (_, now, e) = code(&mut enc, scroll * 30, crf, settling);
+                settling = now;
+                let qp = e.qp.unwrap();
+                assert!(
+                    qp >= rest - 1.0,
+                    "counted at QP {rest}, x264 went on to {qp}"
+                );
+            }
+        }
+        assert!(
+            coming_down > 80,
+            "{coming_down} passes were still coming down"
+        );
     }
 }
 
