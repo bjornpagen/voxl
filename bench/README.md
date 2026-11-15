@@ -31,12 +31,23 @@ is its log. CBR from 30 Mbps, with congestion control down to 2 Mbps.
 
 - `nclient.py voxl|selkies host:port secs [x y]`: native client (FFmpeg decode)
   that reads the marker at (x, y). Reports unique FPS, latency and Mbps.
-- `linkviewer.py host:port scenario out`: a headless viewer behind an emulated link (a
-  rate and a round trip, an unbounded queue served in order, like `shaper.py`). It acks
-  each frame once its last part has crossed the link, after a decode hold (3 ms, or a
-  software decoder's with `--hold`, carried in the ack as the page's is), and can
-  scroll and type into a terminal on the benchmark display (`--fifo`). It does not decode:
-  it is for rate control, and writes when each message arrived and each ack left.
+- `linkviewer.py host:port scenario out`: a headless viewer behind an emulated link
+  (`link.py`'s, the one `shaper.py` imposes). It acks each frame once its last part has
+  crossed the link, after a decode hold (3 ms, or a software decoder's with `--hold`,
+  carried in the ack as the page's is), and can scroll and type into a terminal on
+  the benchmark display (`--fifo`). With `--late page` its acks and pongs leave late as
+  a real page's do (`link.PAGE_LATE`, seeded by `--seed`), `--cumulative` lets acks that
+  leave together name only the newest frame, `--stall EVERY_S,LENGTH_MS` stops the link
+  periodically and `--jitter MS` jitters its arrivals. The `cold` scenario is a first
+  load: the terminal is filled with dense text before the viewer connects, and it is
+  measured from the connect. It reads the window's `carries_bytes` from `/stats` as it
+  watches, and the run fails (exit 1) when the window says the path carries less than
+  `START` (or the link's own rate, if less), or a frame waits more than three times
+  `LATENESS` behind the link's queue. It does not decode: it is for rate control, and
+  writes when each message arrived and each ack left.
+- `link.py`: the link model both use: a rate through an unbounded queue served in order,
+  half the round trip each way, one-sided jitter, a page's lateness, periodic stalls.
+  `python3 -I link.py` checks it against an oracle that serves the queue a tick at a time.
 - `keyhold.py host:port keysym repeat`: holds a key as a browser does, behind a link: the
   down, the browser's repeats (each sent as `k,<keysym>,<repeat>`, `1` as upstream's page
   sends a repeat or `2` as this one does), the up; every key message late by `--delay` ms
@@ -71,8 +82,9 @@ is its log. CBR from 30 Mbps, with congestion control down to 2 Mbps.
   `shaper.py`). Needs the `daytona` SDK and `DAYTONA_API_KEY`.
 - `suite.sh`: every config (`CONFIGS`: selkies with and without picom, voxl and
   KasmVNC with and without picom) x workload
-  (Chromium scroll, 1080p and full-screen animation) x link (LAN, 10 Mbps/40 ms,
-  5 Mbps/60 ms) via `shaper.py`, a userspace bottleneck proxy.
+  (Chromium scroll, 1080p and full-screen animation) x link (`NETS`: LAN, 10 Mbps/40 ms,
+  5 Mbps/60 ms, and 50 Mbps/20 ms with arrivals jittered by up to 10 ms) via `shaper.py`,
+  a userspace bottleneck proxy (`--jitter`, `--late page`, `--stall` as `linkviewer.py`).
 - `ab.sh <workload> <reps>`: interleaved voxl vs selkies runs.
 - `cpusuite.sh`: server CPU (X server + streamer) per workload with one client connected.
 - `scroll.html`: the long page `scrolltarget.mjs` smooth-scrolls, with a marker drawn every frame.

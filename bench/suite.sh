@@ -18,8 +18,8 @@ run_one() { # config client port workload net
     animfull) mx=0; my=0; (DISPLAY=$BD ./loadgen 2560 1600 60 $((SECS+12)) 0 0 >/dev/null 2>&1 &) ;;
   esac
   if [ "$net" != "lan" ]; then
-    mbps=${net%/*}; rtt=${net#*/}; target=$((port+1000))
-    ./py.sh shaper.py $target localhost:$port $mbps $rtt >/dev/null 2>&1 &
+    local jitter; IFS=/ read -r mbps rtt jitter <<< "$net"; target=$((port+1000))
+    ./py.sh shaper.py $target localhost:$port $mbps $rtt --jitter ${jitter:-0} >/dev/null 2>&1 &
   fi
   sleep 4
   case $cli in
@@ -41,7 +41,9 @@ for cfg in ${CONFIGS:-py_picom py_nopicom voxl}; do
   case $cfg in *_picom) env/picom-start.sh ;; esac
   sleep 2
   for wl in ${WORKLOADS:-scroll anim1080 animfull}; do
-    for net in ${NETS:-lan 10/40 5/60}; do
+    # NETS: lan, or MBPS/RTT_MS[/JITTER_MS] through shaper.py; 50/20/10 is a fast link
+    # whose arrivals jitter by up to 10 ms.
+    for net in ${NETS:-lan 10/40 5/60 50/20/10}; do
       [ $wl = animfull ] && [ $net != lan ] && continue
       run_one $cfg $cli $port $wl $net
     done
