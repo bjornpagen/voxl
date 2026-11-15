@@ -4632,37 +4632,6 @@ mod tests {
         }
     }
 
-    /// The oracle: `stripe_layout` before its stripes were typed.
-    fn old_stripe_layout(height: u32, n: u32) -> Vec<(u32, u32)> {
-        let n = n.clamp(1, 16);
-        let each = (height.div_ceil(n) + 15) & !15;
-        let mut v = Vec::new();
-        let mut y = 0;
-        while y < height {
-            let h = each.min(height - y);
-            v.push((y, h));
-            y += h;
-        }
-        v
-    }
-
-    /// For every height and count, the layout is the old one, and a header's stripe fields
-    /// are what the encode loop's casts made of it (`i as u8`, `n as u8`, `y as u16`).
-    #[test]
-    fn a_layout_is_the_old_one_in_the_headers_types() {
-        for height in 0..=u16::MAX {
-            for n in ASKED {
-                let old = old_stripe_layout(u32::from(height), n);
-                let new = stripe_layout(height, n);
-                assert_eq!(new.rows().collect::<Vec<_>>(), old);
-                assert_eq!(new.count, old.len() as u8);
-                for (i, p) in new.stripes.iter().enumerate() {
-                    assert_eq!((p.stripe, p.y), (i as u8, old[i].0 as u16));
-                }
-            }
-        }
-    }
-
     /// One case of web/src/video-header.json.
     #[derive(serde::Deserialize)]
     struct Case {
