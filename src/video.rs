@@ -554,23 +554,24 @@ const MOST_IN_FLIGHT: usize = 40;
 /// fps and past `MOST_IN_FLIGHT`. At half (60 ms) this holds first up to 86 fps, at 60
 /// fps from Y = 61 to 77 ms; at double (240 ms) only below 10 fps.
 const MOST_QUEUED_MS: u128 = 120;
-/// A viewer whose oldest frame in flight is older than this has stalled (a dead socket, a
-/// viewer that stopped acknowledging): 4 s. Upstream's guess (051bb63), unmeasured. Until
+/// A viewer whose oldest frame in flight is this old has stalled (a dead socket, a viewer
+/// that stopped acknowledging): 4 s. Upstream's guess (051bb63), unmeasured. Until
 /// then it holds every viewer's picture, its frames being past `MOST_QUEUED_MS`; then it
 /// starts over at a keyframe and holds nobody. At half (2 s) a path whose round trip and
 /// queue reach 2 s is resynced, a keyframe to everyone, every 2 s; at double (8 s) one
 /// stopped viewer freezes every other viewer's picture for 8 s.
 pub const STALLED: Duration = Duration::from_millis(4000);
 
-/// What one viewer's frames in flight say about capturing another now.
+/// What one viewer's frames in flight say about capturing another now, and, while it has
+/// any and has not stalled, how long until it has: the one change time alone brings.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Flow {
     /// Room for one more.
-    Room,
+    Room(Option<Duration>),
     /// As many in flight as its round trip covers, or its oldest past the queue it may
     /// have: the capture waits for its acks.
-    Full,
-    /// Its oldest is older than `STALLED`: no wait would help.
+    Full(Duration),
+    /// Its oldest is `STALLED` old: no wait would help.
     Stalled(Backlog),
 }
 
@@ -578,21 +579,22 @@ impl Flow {
     /// From what it has in flight, its round trip, and the time between frames.
     fn of(backlog: Option<Backlog>, rtt_ms: u32, interval_ms: f64) -> Flow {
         let Some(b) = backlog else {
-            return Flow::Room;
+            return Flow::Room(None);
         };
-        let age = b.oldest.as_millis();
-        if age > STALLED.as_millis() {
+        if b.oldest >= STALLED {
             return Flow::Stalled(b);
         }
+        let stalls_in = STALLED - b.oldest;
+        let age = b.oldest.as_millis();
         // Enough frames in flight to cover one round trip plus decode, and no more than
         // `MOST_QUEUED_MS` of queue past the round trip.
         let rtt = rtt_ms as f64;
         let room =
             (((rtt + DECODE_MS) / interval_ms).ceil() as usize + SPARE_FRAMES).min(MOST_IN_FLIGHT);
         if b.frames.get() >= room || age > rtt_ms as u128 + MOST_QUEUED_MS {
-            Flow::Full
+            Flow::Full(stalls_in)
         } else {
-            Flow::Room
+            Flow::Room(Some(stalls_in))
         }
     }
 }
@@ -600,8 +602,10 @@ impl Flow {
 /// What the flow gate finds at one moment: whether a frame may be captured, and which
 /// viewers have stalled.
 struct Gate {
-    /// No viewer asked is `Full`.
-    open: bool,
+    /// None while no viewer asked is `Full`. Otherwise the soonest a viewer asked will
+    /// have stalled: until then only an ack, a viewer going or a keyframe asked for can
+    /// open the gate, and each of those wakes the hub.
+    held: Option<Instant>,
     /// The stalled viewers asked: all of them if the gate is open, and those before the
     /// first full one if not.
     stalled: Vec<(Arc<Client>, Backlog)>,
@@ -612,13 +616,16 @@ impl Gate {
     /// only reads: what is done to a stalled viewer is `resync`'s.
     fn ask(hub: &Hub, interval_ms: f64, now: Instant) -> Gate {
         let mut stalled = Vec::new();
+        // How soon the first of the viewers asked so far stalls, if one has frames in
+        // flight: one before the full one may stall first.
+        let mut soonest: Option<Duration> = None;
         for (c, _) in hub.viewers() {
             let rtt = c.rtt_ms().unwrap_or(RTT_GUESS_MS);
             match Flow::of(c.backlog(now), rtt, interval_ms) {
-                Flow::Room => {}
-                Flow::Full => {
+                Flow::Room(stalls_in) => soonest = soonest.into_iter().chain(stalls_in).min(),
+                Flow::Full(stalls_in) => {
                     return Gate {
-                        open: false,
+                        held: Some(now + soonest.into_iter().fold(stalls_in, Duration::min)),
                         stalled,
                     }
                 }
@@ -626,7 +633,7 @@ impl Gate {
             }
         }
         Gate {
-            open: true,
+            held: None,
             stalled,
         }
     }
@@ -1014,9 +1021,12 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
             for (c, b) in gate.stalled {
                 resync(&c, b);
             }
-            if !gate.open {
+            if let Some(until) = gate.held {
                 hub.stats.flow_blocked.fetch_add(1, Ordering::Relaxed);
-                wait_any(&[cap.fd(), hub.waker.waitable()], 4);
+                // Woken by what can open it, or by damage to take in; time alone only
+                // when a viewer stalls, at `until`.
+                let ms = (until - now).as_micros().div_ceil(1000);
+                wait_any(&[cap.fd(), hub.waker.waitable()], ms as i32);
                 continue;
             }
         }
@@ -3204,5 +3214,101 @@ mod tests {
             threads.is_empty() && others == 0,
             "recording allocated: {threads:?}, and {others} times on threads past the table"
         );
+    }
+
+    /// A held gate names the soonest moment time alone can change its answer: a viewer it
+    /// asked, with frames in flight, stalls. Over generated viewers (watching or not,
+    /// a round trip of up to 4 s or none, up to 45 frames in flight whose oldest is about
+    /// its round trip old, about to stall, or anything up to 5 s, to the microsecond) at 1
+    /// to 240 fps, once what the gate found stalled
+    /// is resynced as the capture loop does: asked again at any moment before it, with no
+    /// ack, no viewer coming or going and no keyframe asked for, the gate is held and finds
+    /// nobody stalled, so a wait until then misses nothing; that moment is when a viewer
+    /// asked stalls, so the wait is no shorter; and asked at it, the gate names a later
+    /// one.
+    #[test]
+    fn a_held_flow_gate_waits_until_a_viewer_stalls() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let now = Instant::now() + Duration::from_secs(10);
+        // Held with a viewer before the full one stalling first, held by the full one's
+        // own stall, and open.
+        let mut seen = [0u32; 3];
+        for case in 0..20_000 {
+            let fps = 1 + next(240);
+            let interval = Duration::from_secs_f64(1.0 / fps as f64).as_secs_f64() * 1000.0;
+            let hub = Hub::new();
+            // Each viewer's oldest frame in flight, if it watches and has any.
+            let mut oldest = Vec::new();
+            for _ in 0..1 + next(4) {
+                let c = hub.add_client(tokio::sync::mpsc::unbounded_channel().0);
+                let watching = next(5) > 0;
+                if watching {
+                    c.watch();
+                }
+                let rtt = next(4000);
+                c.min_rtt_ms.store(rtt as u32, Ordering::Relaxed);
+                // About its round trip old, about stalling, or anything up to 5 s.
+                let age = Duration::from_micros(match next(3) {
+                    0 => rtt * 1000 + next(200_000),
+                    1 => 3_990_000 + next(20_000),
+                    _ => next(5_000_000),
+                });
+                let frames = next(46);
+                let mut q = c.inflight();
+                for i in 0..frames {
+                    q.push_back(crate::hub::Inflight {
+                        id: i as u32,
+                        sent: now - age.saturating_sub(Duration::from_micros(i * next(30_000))),
+                        bytes: 1000,
+                        alone: i == 0,
+                    });
+                }
+                if watching {
+                    oldest.extend(q.front().map(|f| f.sent));
+                }
+            }
+            let gate = Gate::ask(&hub, interval, now);
+            for (c, b) in gate.stalled {
+                resync(&c, b);
+            }
+            let Some(until) = gate.held else {
+                seen[2] += 1;
+                continue;
+            };
+            let at = format!("case {case}: {fps} fps, held until {:?}", until - now);
+            assert!(
+                oldest.iter().any(|&sent| sent + STALLED == until),
+                "not when a viewer stalls: {at}"
+            );
+            for t in [
+                now,
+                now + (until - now) / 2,
+                until - Duration::from_micros(1),
+            ] {
+                let again = Gate::ask(&hub, interval, t);
+                assert!(
+                    again.held.is_some() && again.stalled.is_empty(),
+                    "changed at {:?}: {at}",
+                    t - now
+                );
+            }
+            assert_ne!(Gate::ask(&hub, interval, until).held, Some(until), "{at}");
+            // Whether the full one's own stall sets it, or one asked before it stalls first.
+            let full = hub.viewers().into_iter().find_map(|(c, _)| {
+                let rtt = c.rtt_ms().unwrap_or(RTT_GUESS_MS);
+                match Flow::of(c.backlog(now), rtt, interval) {
+                    Flow::Full(stalls_in) => Some(now + stalls_in),
+                    Flow::Room(_) | Flow::Stalled(_) => None,
+                }
+            });
+            seen[usize::from(full == Some(until))] += 1;
+        }
+        assert!(seen.iter().all(|&n| n > 100), "unreached: {seen:?}");
     }
 }
