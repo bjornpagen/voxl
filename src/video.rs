@@ -856,8 +856,8 @@ enum Wait {
     /// The sharpening pass due in this long, or damage or a wake.
     Pass(Duration),
     /// The rest of the least interval since the capture that gates this one (`Captured`),
-    /// or a wake.
-    Interval(Duration),
+    /// or what the capture it holds back is woken by (`Next::interval_ends`).
+    Interval { rest: Duration, next: Next },
     /// The rest of the coalesce window, whatever happens.
     Settle(Duration),
     /// The flow gate: an ack, a viewer going or a keyframe asked for (a wake), or damage
@@ -891,7 +891,7 @@ impl Wait {
         match self {
             Wait::Change => poll(On::Event, None),
             Wait::Pass(due) => poll(On::Event, Some(due)),
-            Wait::Interval(rest) => poll(On::Wake, Some(rest)),
+            Wait::Interval { rest, next } => poll(next.interval_ends(), Some(rest)),
             Wait::Settle(rest) => sleep(rest),
             Wait::Gate(stalls) => poll(On::Event, Some(stalls)),
             Wait::Buffer => poll(On::Wake, None),
@@ -1008,7 +1008,8 @@ fn step(look: &Look) -> Step {
     };
     let since = look.now.saturating_duration_since(look.captured.gate(next));
     if since < look.min_interval {
-        return Step::Wait(Wait::Interval(look.min_interval - since));
+        let rest = look.min_interval - since;
+        return Step::Wait(Wait::Interval { rest, next });
     }
     // Apps present a frame as a burst of puts; give the burst a moment to land so
     // the capture holds one whole frame instead of its first tiles.
@@ -1082,6 +1083,15 @@ enum Next {
     Change,
     /// Nothing moved and a pass is due.
     Pass,
+}
+
+impl Next {
+    /// What ends the wait for the frame interval before capturing this, besides its time.
+    fn interval_ends(self) -> On {
+        match self {
+            Next::Change | Next::Pass => On::Wake,
+        }
+    }
 }
 
 /// When the last frames were captured: what holds the next one to the frame rate.
@@ -3774,7 +3784,7 @@ mod tests {
                     Due::In(due) => Wait::Pass(due),
                     Due::Now | Due::Never => Wait::Change,
                 }),
-                (false, Some(rest), _) => Step::Wait(Wait::Interval(rest)),
+                (false, Some(rest), _) => Step::Wait(Wait::Interval { rest, next }),
                 (false, None, Some(rest)) => Step::Wait(Wait::Settle(rest)),
                 (false, None, None) => match (gate_asked, c.gate, c.home) {
                     (true, Gated::Held { until }, _) => Step::Wait(Wait::Gate(until - c.now)),
@@ -3810,7 +3820,7 @@ mod tests {
             let want = match wait {
                 Wait::Change => (Some((On::Event, None)), None),
                 Wait::Pass(due) => (Some((On::Event, Some(due))), None),
-                Wait::Interval(rest) => (Some((On::Wake, Some(rest))), None),
+                Wait::Interval { rest, .. } => (Some((On::Wake, Some(rest))), None),
                 Wait::Settle(rest) => (None, Some(rest)),
                 Wait::Gate(stalls) => (Some((On::Event, Some(stalls))), None),
                 Wait::Buffer => (Some((On::Wake, None)), None),
@@ -3913,5 +3923,30 @@ mod tests {
                 assert_eq!(damage, want, "sequence {seq}, event {i}");
             }
         }
+    }
+
+    /// Damage that comes while the loop waits out the frame interval for a pass ends the
+    /// wait: it makes the capture a change, which the pass does not hold back. Waiting out
+    /// the interval for a change, more damage changes nothing, and only a wake ends it
+    /// early. Over every interval wait `step` makes in `each_case`.
+    #[test]
+    #[ignore = "fails until the next commit: a pass's interval wait wakes on the waker alone"]
+    fn damage_ends_the_wait_before_a_pass() {
+        let mut waits = [0; 2];
+        each_case(|c| {
+            let Step::Wait(wait @ Wait::Interval { .. }) = step(&c.look()) else {
+                return;
+            };
+            // What the capture held back would be, as the look says.
+            let (next, on) = match c.damage != Damage::None || c.want_key {
+                true => (Next::Change, On::Wake),
+                false => (Next::Pass, On::Event),
+            };
+            waits[usize::from(next == Next::Pass)] += 1;
+            let mut polled = None;
+            wait.through(|on, _| polled = Some(on), |_| {});
+            assert_eq!(polled, Some(on), "waiting out the interval for {next:?}");
+        });
+        assert!(waits.iter().all(|&n| n > 0), "unreached: {waits:?}");
     }
 }
