@@ -287,8 +287,14 @@ impl Capturer {
     }
 
     /// Convert rows [y0, y1) of the current frame into `dst`.
-    pub fn convert(&self, dst: &mut crate::convert::I420, y0: usize, y1: usize, threads: usize) {
-        crate::convert::convert_band(self.pixels(), self.stride, dst, y0, y1, threads);
+    pub fn convert(
+        &self,
+        dst: &mut crate::convert::I420,
+        y0: usize,
+        y1: usize,
+        rows: &crate::convert::Rows,
+    ) {
+        crate::convert::convert_band(self.pixels(), self.stride, dst, y0, y1, rows);
     }
 
     /// The current frame as packed BGRX (`width * 4` bytes per row), for screenshots,

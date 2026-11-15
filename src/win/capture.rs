@@ -486,7 +486,13 @@ impl Capturer {
     }
 
     /// Convert rows [y0, y1) of the current frame into `dst`.
-    pub fn convert(&self, dst: &mut crate::convert::I420, y0: usize, y1: usize, threads: usize) {
+    pub fn convert(
+        &self,
+        dst: &mut crate::convert::I420,
+        y0: usize,
+        y1: usize,
+        rows: &crate::convert::Rows,
+    ) {
         let stride = self.geometry.width as usize * 4;
         crate::convert::convert_band(
             &self.frame,
@@ -494,7 +500,7 @@ impl Capturer {
             dst,
             y0,
             y1.min(self.height as usize),
-            threads,
+            rows,
         );
     }
 

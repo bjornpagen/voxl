@@ -280,6 +280,8 @@ struct Stream {
     slots: [Slot; 2],
     /// The slot the next capture is converted into.
     next: usize,
+    /// The threads a capture is converted on.
+    rows: crate::convert::Rows,
     /// Dropped last: waits until the encode loop has stopped.
     _encode: Stopped,
 }
@@ -366,6 +368,7 @@ impl Stream {
             ret_rx,
             slots: [slot(), slot()],
             next: 0,
+            rows: crate::convert::Rows::new(cfg.convert_threads),
             _encode: encode,
         })
     }
@@ -982,7 +985,7 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
             *other = Some(union(*other, b));
         }
         if let Some(t) = todo {
-            cap.convert(&mut buf, t.y0 as usize, t.y1 as usize, cfg.convert_threads);
+            cap.convert(&mut buf, t.y0 as usize, t.y1 as usize, &s.rows);
         }
         let t2 = Instant::now();
         hub.stats
@@ -2816,10 +2819,10 @@ mod tests {
     /// goes through C's malloc, which this allocator does not see.
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "frames allocate on main: the conversion's threads (split_rows); the encode \
-                loop's selected, results, parts and msgs, its viewer list and each message's \
-                Bytes header; the stripe worker's output and hint vectors; the blocks of the \
-                unbounded channels between the loops"]
+    #[ignore = "frames allocate on main: the encode loop's selected, results, parts and \
+                msgs, its viewer list and each message's Bytes header; the stripe worker's \
+                output and hint vectors; the blocks of the unbounded channels between the \
+                loops"]
     fn a_steady_state_frame_allocates_nothing() {
         if !in_a_process_of_its_own("video::tests::a_steady_state_frame_allocates_nothing") {
             return;
@@ -2925,7 +2928,7 @@ mod tests {
                 stream.returned(r);
             }
             let mut buf = stream.slots[idx].buf.take().unwrap();
-            crate::convert::convert_band(&screen, w * 4, &mut buf, y0, y1, cfg.convert_threads);
+            crate::convert::convert_band(&screen, w * 4, &mut buf, y0, y1, &stream.rows);
             stream
                 .job_tx
                 .send(Job {

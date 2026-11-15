@@ -40,6 +40,8 @@ impl I420 {
     }
 }
 
+use std::sync::mpsc;
+
 struct SendPtr(*mut u8);
 unsafe impl Send for SendPtr {}
 unsafe impl Sync for SendPtr {}
@@ -49,32 +51,125 @@ impl SendPtr {
     }
 }
 
-/// Runs `run(a, b)` over row chunks of [y0, y1) on up to `threads` threads; chunk
-/// edges stay even for 4:2:0.
-fn split_rows(y0: usize, y1: usize, threads: usize, run: impl Fn(usize, usize) + Sync) {
-    let rows = y1 - y0;
-    if rows == 0 {
-        return;
+/// The fewest rows a conversion hands to a thread of its own: upstream's guess,
+/// unmeasured. A band of fewer than twice as many is converted on the capture thread
+/// alone.
+const LEAST_ROWS: usize = 64;
+
+/// Threads that share out ranges of rows with the thread that asks. They are made once,
+/// with the stream, so that splitting a band starts no thread: a thread started per
+/// capture waits to be scheduled, and allocates.
+pub struct Rows {
+    /// Each helper's next range.
+    helpers: Vec<mpsc::SyncSender<Range>>,
+    /// One message per range a helper has finished.
+    done: mpsc::Receiver<()>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+/// A range of rows for a helper, and what to run over it. `run` points into the frame
+/// of the `split` that sent it, which waits for the helper to finish before returning.
+struct Range {
+    run: *const (dyn Fn(usize, usize) + Sync),
+    a: usize,
+    b: usize,
+}
+
+unsafe impl Send for Range {}
+
+impl Rows {
+    /// `threads` threads in all, the caller's among them: so `threads - 1` helpers.
+    pub fn new(threads: usize) -> Rows {
+        let (done_tx, done) = mpsc::sync_channel(threads);
+        let (helpers, threads) = (1..threads)
+            .map(|i| {
+                let (tx, rx) = mpsc::sync_channel::<Range>(1);
+                let done = done_tx.clone();
+                let thread = std::thread::Builder::new()
+                    .name(format!("rows-{i}"))
+                    .spawn(move || {
+                        while let Ok(r) = rx.recv() {
+                            unsafe { (*r.run)(r.a, r.b) };
+                            if done.send(()).is_err() {
+                                return;
+                            }
+                        }
+                    })
+                    .expect("a thread for converting rows");
+                (tx, thread)
+            })
+            .unzip();
+        Rows {
+            helpers,
+            done,
+            threads,
+        }
     }
-    let n = threads.clamp(1, (rows / 64).max(1));
-    if n == 1 {
-        run(y0, y1);
-        return;
-    }
-    let chunk = (rows.div_ceil(n) + 1) & !1;
-    std::thread::scope(|s| {
+
+    /// Runs `run(a, b)` over ranges that cover rows [y0, y1): at most one a thread, each
+    /// starting `step` rows apart from y0 and, but the last, at least `least` rows long.
+    /// The calling thread takes the last range. Returns once every range has run.
+    pub fn split(
+        &self,
+        y0: usize,
+        y1: usize,
+        step: usize,
+        least: usize,
+        run: impl Fn(usize, usize) + Sync,
+    ) {
+        let rows = y1.saturating_sub(y0);
+        let n = (self.helpers.len() + 1).min(rows / least).max(1);
+        let chunk = rows.div_ceil(n).next_multiple_of(step);
+        let run: &(dyn Fn(usize, usize) + Sync) = &run;
+        // The helpers run it only while this call waits for them (`Wait`, below).
+        let shared: *const (dyn Fn(usize, usize) + Sync + 'static) =
+            unsafe { std::mem::transmute(run) };
+        let mut wait = Wait {
+            done: &self.done,
+            left: 0,
+        };
         let mut a = y0;
-        while a < y1 {
+        for helper in &self.helpers {
             let b = (a + chunk).min(y1);
-            let run = &run;
             if b == y1 {
-                run(a, b);
-            } else {
-                s.spawn(move || run(a, b));
+                break;
             }
+            helper
+                .send(Range { run: shared, a, b })
+                .expect("a thread for converting rows ended");
+            wait.left += 1;
             a = b;
         }
-    });
+        if a < y1 {
+            run(a, y1);
+        }
+    }
+}
+
+/// Waits for the helpers' ranges still out, also if the caller's own range panics: they
+/// run a closure that lives in the caller's frame.
+struct Wait<'a> {
+    done: &'a mpsc::Receiver<()>,
+    left: usize,
+}
+
+impl Drop for Wait<'_> {
+    fn drop(&mut self) {
+        for _ in 0..self.left {
+            self.done
+                .recv()
+                .expect("a thread for converting rows ended");
+        }
+    }
+}
+
+impl Drop for Rows {
+    fn drop(&mut self) {
+        self.helpers.clear();
+        for t in self.threads.drain(..) {
+            let _ = t.join();
+        }
+    }
 }
 
 /// Convert rows [y0, y1) (even-aligned) of `src` into `dst`.
@@ -85,10 +180,9 @@ pub fn convert_band(
     dst: &mut I420,
     y0: usize,
     y1: usize,
-    threads: usize,
+    rows: &Rows,
 ) {
-    let rows = y1 - y0;
-    if rows == 0 {
+    if y1 <= y0 {
         return;
     }
     let w = dst.width;
@@ -113,7 +207,8 @@ pub fn convert_band(
             (b - a) as i32,
         );
     };
-    split_rows(y0, y1, threads, run);
+    // Chunk edges stay even, for 4:2:0.
+    rows.split(y0, y1, 2, LEAST_ROWS, run);
 }
 
 /// Copy rows [y0, y1) (even-aligned) of an NV12 frame into `dst`: the luma rows as
@@ -128,7 +223,7 @@ pub fn convert_nv12_band(
     dst: &mut I420,
     y0: usize,
     y1: usize,
-    threads: usize,
+    rows: &Rows,
 ) {
     let w = dst.width;
     let cw = w.div_ceil(2);
@@ -139,7 +234,7 @@ pub fn convert_nv12_band(
         SendPtr(dst.v.as_mut_ptr()),
     );
     let (sy, suv_src) = (SendPtr(src_y as *mut u8), SendPtr(src_uv as *mut u8));
-    split_rows(y0, y1, threads, |a, b| unsafe {
+    rows.split(y0, y1, 2, LEAST_ROWS, |a, b| unsafe {
         for r in a..b {
             std::ptr::copy_nonoverlapping(sy.get().add(r * stride_y), yp.get().add(r * w), w);
         }
@@ -177,6 +272,117 @@ pub fn nv12_to_bgrx(
             px[1] = clamp(c - 100 * d - 208 * e + 128);
             px[2] = clamp(c + 409 * e + 128);
             px[3] = 255;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct Rng(u64);
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 as usize % n
+        }
+    }
+
+    /// The oracle: `split_rows` as it was, a scoped thread started for each range but the
+    /// last.
+    fn old_split_rows(y0: usize, y1: usize, threads: usize, run: impl Fn(usize, usize) + Sync) {
+        let rows = y1 - y0;
+        if rows == 0 {
+            return;
+        }
+        let n = threads.clamp(1, (rows / 64).max(1));
+        if n == 1 {
+            run(y0, y1);
+            return;
+        }
+        let chunk = (rows.div_ceil(n) + 1) & !1;
+        std::thread::scope(|s| {
+            let mut a = y0;
+            while a < y1 {
+                let b = (a + chunk).min(y1);
+                let run = &run;
+                if b == y1 {
+                    run(a, b);
+                } else {
+                    s.spawn(move || run(a, b));
+                }
+                a = b;
+            }
+        });
+    }
+
+    /// The ranges a split ran, sorted, and the one the calling thread ran.
+    #[derive(Debug, PartialEq)]
+    struct Ran {
+        ranges: Vec<(usize, usize)>,
+        by_caller: Option<(usize, usize)>,
+    }
+
+    fn ranges(split: impl FnOnce(&(dyn Fn(usize, usize) + Sync))) -> Ran {
+        let caller = std::thread::current().id();
+        let ran = Mutex::new(vec![]);
+        let mine = Mutex::new(None);
+        split(&|a, b| {
+            ran.lock().unwrap().push((a, b));
+            if std::thread::current().id() == caller {
+                *mine.lock().unwrap() = Some((a, b));
+            }
+        });
+        let mut ranges = ran.into_inner().unwrap();
+        ranges.sort();
+        Ran {
+            ranges,
+            by_caller: mine.into_inner().unwrap(),
+        }
+    }
+
+    /// A band is cut into the ranges `split_rows` cut it into, and the calling thread
+    /// runs the same one, for every number of threads and any band.
+    #[test]
+    fn rows_are_split_as_split_rows_split_them() {
+        let crews: Vec<Rows> = (0..=8).map(Rows::new).collect();
+        let mut rng = Rng(0x2545F4914F6CDD1D);
+        for _ in 0..20_000 {
+            let threads = rng.below(crews.len());
+            let y0 = rng.below(2000);
+            let y1 = y0 + [rng.below(64), rng.below(600), rng.below(2000)][rng.below(3)];
+            let old = ranges(|run| old_split_rows(y0, y1, threads, run));
+            let new = ranges(|run| crews[threads].split(y0, y1, 2, LEAST_ROWS, run));
+            assert_eq!(new, old, "rows {y0}..{y1} on {threads} threads");
+        }
+    }
+
+    /// Converting a band on any number of threads gives the bytes one thread gives.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_band_converts_on_many_threads_as_on_one() {
+        let (w, h) = (333usize, 700usize);
+        let mut rng = Rng(0x9E3779B97F4A7C15);
+        let src: Vec<u8> = (0..w * 4 * h).map(|_| rng.below(256) as u8).collect();
+        let one = Rows::new(1);
+        let crews: Vec<Rows> = (2..=6).map(Rows::new).collect();
+        for _ in 0..200 {
+            let y0 = rng.below(h) & !1;
+            let y1 = (y0 + rng.below(h - y0 + 1)) & !1;
+            let mut want = I420::new(w, h);
+            convert_band(&src, w * 4, &mut want, y0, y1, &one);
+            for rows in &crews {
+                let mut got = I420::new(w, h);
+                convert_band(&src, w * 4, &mut got, y0, y1, rows);
+                assert!(
+                    got.y == want.y && got.u == want.u && got.v == want.v,
+                    "rows {y0}..{y1} on {} threads",
+                    rows.helpers.len() + 1
+                );
+            }
         }
     }
 }
