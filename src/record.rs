@@ -152,7 +152,7 @@ fn begin(
     let hub = r.hub.clone();
     Ok(tokio::spawn(async move {
         let res = collect(&hub, &client, rx, stop, max).await;
-        hub.remove_client(client.id);
+        hub.remove_client(client.id, Instant::now());
         res
     }))
 }

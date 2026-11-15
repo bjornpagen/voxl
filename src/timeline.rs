@@ -7,10 +7,13 @@
 //! readings and stores a frame.
 //!
 //! Each viewer also has a `Trace`: the frames it was sent and the acks that came back,
-//! which is what its path did to them.
+//! which is what its path did to them. The traces of the last viewers to leave are kept.
 
 use crate::hub::{Hold, Inflight};
+use parking_lot::Mutex;
+use std::collections::VecDeque;
 use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// The frames kept: 68 s at 60 fps, so a scene of 10 to 30 s and what came before it can
@@ -19,6 +22,13 @@ use std::time::Instant;
 /// runs. A viewer's trace keeps as many of its frames, 288 KB (72 bytes a frame): on a
 /// slow link, which carried 214 frames in 48 s (4.5 a second), 15 minutes of it.
 pub const FRAMES_KEPT: usize = 4096;
+
+/// The viewers that have left whose traces are kept: the last 4. The stall that ends in a
+/// reconnect is what a trace is most wanted for, and by the time anyone reads it the viewer
+/// that stalled has gone. Asked for in review, unmeasured. At 288 KB a trace, 1.2 MB at
+/// most. At half, two short connections of a run of reconnects push out the stall that
+/// began it; at double, 2.3 MB kept for connections nobody reads.
+pub const LEFT_KEPT: usize = 4;
 
 /// The points a frame passes up to its hand-off to the viewers, in order, as `/stats`
 /// names them. A viewer's socket task writing the frame comes after.
@@ -382,6 +392,35 @@ impl Trace {
     }
 }
 
+/// A viewer that has left: when, and its trace, which may yet take a frame the encode loop
+/// was handing out as it left.
+pub struct Leaver {
+    pub id: u64,
+    pub at: Instant,
+    pub trace: Arc<Mutex<Trace>>,
+}
+
+/// The last `LEFT_KEPT` viewers to leave, oldest first. Made with the hub with room for all
+/// of them, so a viewer leaving allocates nothing: its trace moves in, and the oldest out.
+pub struct Leavers(VecDeque<Leaver>);
+
+impl Leavers {
+    pub fn with_room() -> Leavers {
+        Leavers(VecDeque::with_capacity(LEFT_KEPT))
+    }
+
+    pub fn left(&mut self, leaver: Leaver) {
+        if self.0.len() == LEFT_KEPT {
+            self.0.pop_front();
+        }
+        self.0.push_back(leaver);
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Leaver> {
+        self.0.iter()
+    }
+}
+
 /// A frame sent to a viewer as `/stats/trace` gives it, its times on the timeline's clock.
 #[derive(Debug, serde::Serialize)]
 pub struct SentRow {
@@ -702,25 +741,36 @@ mod tests {
     }
 
     /// Each viewer's trace holds exactly the last `FRAMES_KEPT` frames it was sent, oldest
-    /// first, each with the ack that covered it as the model says, and `/stats/trace` lists
-    /// exactly the viewers present, its rows saying the same. Generated over several laps
-    /// of the ring: one viewer stays, others join and leave, a stream starts over (its frames numbered from
-    /// 1 again), a viewer is sent most frames but not every one, and goes deaf for spells
-    /// long enough that frames no ack covered leave its ring. Acks name the oldest frame
-    /// open, one of the newest (skipping the frames between, whose own acks never come),
-    /// one already covered (out of order, or twice), a number never sent, a frame no
-    /// longer kept or any frame sent; with a hold said, unsaid or unreadable. The run must
-    /// reach every one of those, and an ack naming a number two open frames share.
+    /// first, each with the ack that covered it as the model says; the hub lists exactly
+    /// the viewers present, and the last `LEFT_KEPT` to leave with when each left, their
+    /// traces as they stood; and their rows in `/stats/trace` say the same. Generated over
+    /// several laps of the ring: viewers join and leave (one now and then after laps of
+    /// its ring), a frame goes to a viewer as it leaves, a viewer gone already leaves
+    /// again, a stream starts over (its frames numbered from 1 again), a viewer is sent
+    /// most frames but not every one, and goes deaf for spells long enough that frames no
+    /// ack covered leave its ring. Acks name the oldest frame open, one of the newest
+    /// (skipping the frames between, whose own acks never come), one already covered (out
+    /// of order, or twice), a number never sent, a frame no longer kept or any frame sent;
+    /// with a hold said, unsaid or unreadable. The run must reach every one of those, an
+    /// ack naming a number two open frames share, and a leaver pushed out by later ones.
     #[test]
     fn each_viewer_keeps_its_last_frames_and_their_acks() {
-        const STEPS: u32 = 48_000;
+        const STEPS: u32 = 64_000;
         let hub = crate::hub::Hub::new();
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
         let mut at = Instant::now();
         let mut watchers: Vec<Watcher> = vec![];
+        // The last to leave, with when each left and at which step, oldest first.
+        let mut leavers: VecDeque<(Watcher, Instant, u32)> = VecDeque::new();
         let mut number = 0u32;
         // How often each situation the run must reach came up.
-        let (mut left, mut restarted, mut shared, mut covered_nothing) = (0, 0, 0, 0);
+        let (mut left, mut restarted, mut shared, mut covered_nothing) = (0usize, 0, 0, 0);
+        let (mut late, mut again, mut longest_left, mut fell_open) = (0, 0, 0, 0);
+        // Frames that left a viewer's ring with no ack.
+        let open_fallen = |w: &Watcher| {
+            let gone = &w.sent[..w.sent.len().saturating_sub(FRAMES_KEPT)];
+            gone.iter().filter(|s| s.ack.is_none()).count()
+        };
         let mut kinds = [0usize; 6];
         for step in 0..STEPS {
             at += Duration::from_micros(rng.below(30_000));
@@ -730,14 +780,32 @@ mod tests {
                     sent: vec![],
                     heard_from: step,
                 }),
-                // The first stays all along; the others come and go.
-                30..=59 if watchers.len() > 1 => {
-                    let w = 1 + rng.below(watchers.len() as u64 - 1) as usize;
-                    let w = watchers.remove(w);
-                    hub.remove_client(w.client.id);
+                // The first stays a long while (a leave in 20,000 steps); the others come
+                // and go.
+                30..=60 if watchers.len() > 1 || rng.below(2) == 0 => {
+                    let w = match rng.below(62) {
+                        0 => 0,
+                        _ if watchers.len() > 1 => 1 + rng.below(watchers.len() as u64 - 1),
+                        _ => continue,
+                    };
+                    let w = watchers.remove(w as usize);
+                    hub.remove_client(w.client.id, at);
+                    longest_left = longest_left.max(w.sent.len());
+                    if leavers.len() == LEFT_KEPT {
+                        if let Some((w, _, _)) = leavers.pop_front() {
+                            fell_open += open_fallen(&w);
+                        }
+                    }
+                    leavers.push_back((w, at, step));
                     left += 1;
                 }
-                60..=89 => {
+                // One that left already leaves again, and leaves nothing more.
+                61..=62 if !leavers.is_empty() => {
+                    let w = rng.below(leavers.len() as u64) as usize;
+                    hub.remove_client(leavers[w].0.client.id, at);
+                    again += 1;
+                }
+                63..=89 => {
                     number = 0;
                     restarted += 1;
                 }
@@ -766,6 +834,22 @@ mod tests {
                             key,
                             ack: None,
                         });
+                    }
+                    // The encode loop read the viewers just before the last one left.
+                    if let Some((w, _, _)) = leavers.back_mut().filter(|l| l.2 + 2 >= step) {
+                        let frame = Inflight {
+                            id: number,
+                            sent: at,
+                            bytes,
+                            alone: false,
+                        };
+                        w.client.trace.lock().sent(frame, key);
+                        w.sent.push(Sent {
+                            frame,
+                            key,
+                            ack: None,
+                        });
+                        late += 1;
                     }
                 }
                 6000.. if !watchers.is_empty() => {
@@ -809,11 +893,22 @@ mod tests {
                 _ => {}
             }
             if rng.below(400) == 0 || step == STEPS - 1 {
+                let rows = rng.below(8) == 0 || step == STEPS - 1;
                 let traces = hub.traces();
                 let ids: Vec<u64> = traces.iter().map(|(id, _)| *id).collect();
                 let want: Vec<u64> = watchers.iter().map(|w| w.client.id).collect();
                 assert_eq!(ids, want, "the viewers listed at step {step}");
-                for ((id, trace), w) in traces.iter().zip(&watchers) {
+                let gone = hub.left_traces();
+                let ids: Vec<(u64, Instant)> = gone.iter().map(|(id, at, _)| (*id, *at)).collect();
+                let want: Vec<(u64, Instant)> = leavers
+                    .iter()
+                    .map(|(w, at, _)| (w.client.id, *at))
+                    .collect();
+                assert_eq!(ids, want, "the leavers listed at step {step}");
+                let all = traces.iter().map(|(id, trace)| (id, trace));
+                let all = all.chain(gone.iter().map(|(id, _, trace)| (id, trace)));
+                let models = watchers.iter().chain(leavers.iter().map(|l| &l.0));
+                for ((id, trace), w) in all.zip(models) {
                     let kept = &w.sent[w.sent.len().saturating_sub(FRAMES_KEPT)..];
                     let got: Vec<&Sent> = trace.frames().collect();
                     assert_eq!(got.len(), kept.len(), "viewer {id} at step {step}");
@@ -825,7 +920,7 @@ mod tests {
                             kept[i]
                         );
                     }
-                    if rng.below(4) == 0 || step == STEPS - 1 {
+                    if rows {
                         let rows = serde_json::to_value(hub.timeline.rows(trace)).unwrap();
                         assert!(
                             rows == model_rows(&hub.timeline, kept),
@@ -835,18 +930,24 @@ mod tests {
                 }
             }
         }
-        let fell_open = watchers
-            .iter()
-            .flat_map(|w| &w.sent[..w.sent.len().saturating_sub(FRAMES_KEPT)])
-            .filter(|s| s.ack.is_none())
-            .count();
-        let later = watchers
-            .iter()
+        let everyone = || watchers.iter().chain(leavers.iter().map(|l| &l.0));
+        let fell_open = fell_open + everyone().map(open_fallen).sum::<usize>();
+        let later = everyone()
             .flat_map(|w| &w.sent)
             .filter(|s| s.ack.is_some_and(|a| a.of == AckOf::Later))
             .count();
         let reached = [
             ("a viewer left", left),
+            (
+                "a leaver was pushed out by later ones",
+                left.saturating_sub(LEFT_KEPT),
+            ),
+            ("a frame went to a viewer as it left", late),
+            ("a viewer gone already left again", again),
+            (
+                "a viewer left after a lap of its ring",
+                longest_left.saturating_sub(FRAMES_KEPT),
+            ),
             ("a stream started over", restarted),
             ("an ack named a number two open frames shared", shared),
             ("an ack covered nothing", covered_nothing),
@@ -861,7 +962,7 @@ mod tests {
             assert!(n > 0, "never reached: {what}");
         }
         assert!(
-            watchers.iter().any(|w| w.sent.len() > 3 * FRAMES_KEPT),
+            everyone().any(|w| w.sent.len() > 3 * FRAMES_KEPT) || longest_left > 3 * FRAMES_KEPT,
             "no viewer went three times round its ring"
         );
     }

@@ -210,8 +210,8 @@ async fn stats(State(s): State<AppState>) -> Response {
 
 /// What the server remembers of the last frames, every time in microseconds on the
 /// timeline's clock (`Timeline::us`), as `/stats`'s `now_us` is: each frame's way from
-/// the screen to the sockets, and each viewer's frames as they were sent and acked
-/// (crate::timeline).
+/// the screen to the sockets, and each viewer's frames as they were sent and acked, those
+/// of the last viewers to leave with when they left (crate::timeline).
 async fn trace(State(s): State<AppState>) -> Response {
     use crate::timeline::{Recorded, SentRow, MARKS};
     /// Written by serde straight, not through a `serde_json::Value`, whose numbers stop
@@ -222,15 +222,23 @@ async fn trace(State(s): State<AppState>) -> Response {
         marks: [&'static str; MARKS.len()],
         frames: Vec<Recorded>,
         viewers: Vec<Viewer>,
+        left: Vec<Gone>,
     }
     #[derive(serde::Serialize)]
     struct Viewer {
         id: u64,
         frames: Vec<SentRow>,
     }
+    #[derive(serde::Serialize)]
+    struct Gone {
+        id: u64,
+        left_us: u64,
+        frames: Vec<SentRow>,
+    }
     let timeline = &s.hub.timeline;
     let frames = timeline.newest(crate::timeline::FRAMES_KEPT);
     let viewers = s.hub.traces();
+    let left = s.hub.left_traces();
     axum::Json(Body {
         now_us: timeline.us(Instant::now()),
         marks: MARKS,
@@ -239,6 +247,14 @@ async fn trace(State(s): State<AppState>) -> Response {
             .iter()
             .map(|(id, trace)| Viewer {
                 id: *id,
+                frames: timeline.rows(trace),
+            })
+            .collect(),
+        left: left
+            .iter()
+            .map(|(id, at, trace)| Gone {
+                id: *id,
+                left_us: timeline.us(*at),
                 frames: timeline.rows(trace),
             })
             .collect(),
@@ -347,7 +363,7 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
     if let Some(tx) = &s.mic {
         let _ = tx.send(crate::mic::MicMsg::Stop(client.id));
     }
-    s.hub.remove_client(client.id);
+    s.hub.remove_client(client.id, Instant::now());
     log::info!("client {} disconnected", client.id);
 }
 

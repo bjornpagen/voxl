@@ -312,8 +312,9 @@ pub struct Client {
     /// How long the client keeps a frame between its arrival and the ack (decode, draw,
     /// frames ahead of it), as it reports it: smoothed ms, 0 for a client that doesn't.
     pub client_ms: Mutex<f64>,
-    /// Its last frames as they were sent and acked (`/stats/trace`).
-    pub trace: Mutex<crate::timeline::Trace>,
+    /// Its last frames as they were sent and acked (`/stats/trace`), kept a while once it
+    /// has left.
+    pub trace: Arc<Mutex<crate::timeline::Trace>>,
 }
 
 impl Client {
@@ -661,6 +662,8 @@ pub struct Hub {
     pub activity: crate::wait::Activity,
     /// When each of the last frames passed each point of the pipeline.
     pub timeline: crate::timeline::Timeline,
+    /// The traces of the last viewers to leave (`/stats/trace`).
+    pub left: Mutex<crate::timeline::Leavers>,
 }
 
 impl Hub {
@@ -687,6 +690,7 @@ impl Hub {
             snapshots: Mutex::new(Vec::new()),
             activity: Default::default(),
             timeline: crate::timeline::Timeline::new(Instant::now()),
+            left: Mutex::new(crate::timeline::Leavers::with_room()),
         })
     }
 
@@ -711,7 +715,7 @@ impl Hub {
             pings: Mutex::new(Pings::default()),
             path: Mutex::new(crate::path::PathEst::new(Instant::now())),
             client_ms: Mutex::new(0.0),
-            trace: Mutex::new(crate::timeline::Trace::with_room()),
+            trace: Arc::new(Mutex::new(crate::timeline::Trace::with_room())),
         });
         self.clients.lock().push(c.clone());
         c
@@ -727,8 +731,31 @@ impl Hub {
             .collect()
     }
 
-    pub fn remove_client(&self, id: u64) {
-        self.clients.lock().retain(|c| c.id != id);
+    /// The traces of the last viewers to leave, by id, with when each left, oldest first.
+    pub fn left_traces(&self) -> Vec<(u64, Instant, crate::timeline::Trace)> {
+        let left = self.left.lock();
+        left.iter()
+            .map(|l| (l.id, l.at, l.trace.lock().clone()))
+            .collect()
+    }
+
+    /// Client `id` leaves at `now`: it is sent nothing more, and its trace is kept among the
+    /// last to leave. One already gone (the display switch retires every client) leaves
+    /// nothing more.
+    pub fn remove_client(&self, id: u64, now: Instant) {
+        let mut clients = self.clients.lock();
+        let gone = clients
+            .iter()
+            .position(|c| c.id == id)
+            .map(|i| clients.remove(i));
+        drop(clients);
+        if let Some(c) = gone {
+            self.left.lock().left(crate::timeline::Leaver {
+                id,
+                at: now,
+                trace: c.trace.clone(),
+            });
+        }
         self.wake();
     }
 

@@ -5120,26 +5120,31 @@ mod tests {
         );
     }
 
-    /// Recording a viewer's frames and acks allocates nothing once it has joined: its trace
-    /// is made then, with room for every frame it keeps. The oracle is the counting
-    /// allocator. The viewer is sent three rings' worth of frames, numbered from 1 again
-    /// every 1000 as streams start over, as the encode loop records them; acks come as
-    /// on_ack records them: for the frame just sent or up to three before it (several at
-    /// once, out of order, twice), now and then for a number never sent, and none for a
-    /// spell longer than the ring, after which an ack scans a whole ring of open frames;
-    /// with every kind of hold.
+    /// Recording viewers' frames and acks, and viewers leaving, allocate nothing once they
+    /// have joined: a trace is made at its viewer's join with room for every frame it keeps,
+    /// and the hub's list of leavers with room for all it keeps. The oracle is the counting
+    /// allocator. Six viewers join; three rings' worth of frames go out, numbered from 1
+    /// again every 1000 as streams start over, recorded as the encode loop records them;
+    /// acks come as on_ack records them: for the frame just sent or up to three before it
+    /// (several at once, out of order, twice), now and then for a number never sent, and
+    /// none for a spell longer than the ring, after which an ack scans a whole ring of open
+    /// frames; with every kind of hold. Every 2000 frames a viewer leaves, until one is left,
+    /// and is sent a frame as it goes; the first to leave is pushed out by the four after it.
     #[cfg(target_os = "linux")]
     #[test]
     fn recording_a_viewers_frames_and_acks_allocates_nothing() {
         use crate::hub::{Hold, Inflight};
-        use crate::timeline::FRAMES_KEPT;
+        use crate::timeline::{FRAMES_KEPT, LEFT_KEPT};
         if !in_a_process_of_its_own(
             "video::tests::recording_a_viewers_frames_and_acks_allocates_nothing",
         ) {
             return;
         }
         let hub = Hub::new();
-        let viewer = hub.add_client(tokio::sync::mpsc::unbounded_channel().0);
+        let viewers: Vec<_> = (0..LEFT_KEPT + 2)
+            .map(|_| hub.add_client(tokio::sync::mpsc::unbounded_channel().0))
+            .collect();
+        let mut gone = 0;
         let t0 = Instant::now();
         // A fixed scramble of a frame's place in the run: what it is and how it is acked.
         let mix = |k: u64| k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32;
@@ -5154,7 +5159,15 @@ mod tests {
                 bytes: (mix(k) % 100_000) as usize,
                 alone: mix(k) % 2 == 0,
             };
-            viewer.trace.lock().sent(frame, mix(k) % 30 == 0);
+            let key = mix(k) % 30 == 0;
+            for viewer in &viewers[gone..] {
+                viewer.trace.lock().sent(frame, key);
+            }
+            if k % 2000 == 1999 && gone + 1 < viewers.len() {
+                hub.remove_client(viewers[gone].id, at);
+                viewers[gone].trace.lock().sent(frame, key);
+                gone += 1;
+            }
             if deaf.contains(&k) {
                 continue;
             }
@@ -5168,9 +5181,12 @@ mod tests {
                 n => id.wrapping_sub((n % 4) as u32),
             };
             let acked = at + Duration::from_millis(mix(k) % 400);
-            viewer.trace.lock().acked(acked, named, hold);
+            for viewer in &viewers[gone..] {
+                viewer.trace.lock().acked(acked, named, hold);
+            }
         }
         let (threads, others) = counting::disarm();
+        assert_eq!(gone, viewers.len() - 1);
         assert!(
             threads.is_empty() && others == 0,
             "recording allocated: {threads:?}, and {others} times on threads past the table"
