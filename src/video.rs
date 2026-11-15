@@ -863,6 +863,9 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
                 let s = Stream::new(&cfg, &hub, cap.width, cap.height)?;
                 cap.grab(cap.full())?;
                 cap.damaged = true;
+                // Nobody waited for what was drawn while nobody watched: the stream's first
+                // frame counts from its capture, not from damage no frame took.
+                cap.damaged_at = None;
                 refiner.mark_all(Instant::now());
                 Some(s)
             }
