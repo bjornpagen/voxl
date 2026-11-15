@@ -944,4 +944,65 @@ mod tests {
             assert!(sim.late(1.0) <= own * 2 + LATENESS * 3, "{what}");
         }
     }
+
+    /// Every ack and ping that would come back before `until` comes back at `until`
+    /// instead, one behind the other a microsecond apart, in the order they left: what a
+    /// return path or a client that stalls and then catches up hands the server.
+    fn hold_acks(sim: &mut Sim, until: Instant) {
+        let mut at = until;
+        for f in sim.flying.iter_mut().filter(|f| f.acked < until) {
+            f.acked = at;
+            at += Duration::from_micros(1);
+        }
+        for p in sim.pings.iter_mut().filter(|p| p.0 < until) {
+            p.0 = until;
+        }
+    }
+
+    /// Acks that a stall held back and that then come together (a client that stopped
+    /// reading its socket and catches up, a busy server, a return path that stalled) do
+    /// not read as a faster path: they say nothing of what the path carried while they
+    /// were held. So after them the window never carries more than the link does in
+    /// `LATENESS`, and the frames that leave after them come back within the lateness of
+    /// sustained motion (three times `LATENESS`, as in
+    /// `sustained_motion_fills_the_link_and_adds_about_the_lateness`). Sustained motion on
+    /// links of 1 to 80 Mbit/s and round trips of 2 to 300 ms, whose acks are held for 20
+    /// ms to 2 s, then 5 s more of it.
+    #[test]
+    #[ignore = "fails until the next commit but one (heels can show the path carries less, never more): 9.79 of the link and 2.43 s late, at 0.4 MB/s, 92 ms, acks held 1.86 s"]
+    fn acks_that_bunch_after_a_stall_do_not_read_as_a_faster_path() {
+        let mut rng = Rng(0x5851_F42D_4C95_7F2D);
+        for _ in 0..200 {
+            let rate = rng.range(125_000, 10_000_000) as f64;
+            let mut sim = Sim::new(rate, rng.range(2, 300));
+            sim.run(600, |_| HEAVY);
+            let held = Duration::from_millis(rng.range(20, 2000));
+            let until = sim.now + held;
+            while sim.now < until {
+                hold_acks(&mut sim, until);
+                sim.tick(HEAVY);
+            }
+            // The frames that left before the acks came together, and how late each of
+            // those that left after came back.
+            let after = sim.now;
+            let mut most = 0;
+            let mut late = Duration::ZERO;
+            for _ in 0..300 {
+                for f in sim.flying.iter().filter(|f| f.left.at > after) {
+                    if f.acked <= sim.now + FRAME {
+                        late = late.max((f.acked - f.left.at).saturating_sub(sim.rtt));
+                    }
+                }
+                sim.tick(HEAVY);
+                most = most.max(sim.window.carries());
+            }
+            let what = format!(
+                "{rate} B/s, {:?}, acks held {held:?}: window {:.2} of the link, late {late:?}",
+                sim.rtt,
+                most as f64 / sim.fits()
+            );
+            assert!(most as f64 <= sim.fits() * 1.1, "{what}");
+            assert!(late <= LATENESS * 3, "{what}");
+        }
+    }
 }
