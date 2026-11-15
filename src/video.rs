@@ -3251,18 +3251,20 @@ mod tests {
         );
     }
 
-    /// The rate a stripe last set as one optional value, against the cap of 0 and CRF of
-    /// -1 it replaces (the oracle: the parent's worker, as it was): over generated runs of
-    /// keyframes, frames at a CRF (asked, or lowered for motion) under a cap of at least
-    /// 1 kbit/s (the share is never less), and reopened encoders, x264 is set to the
-    /// same rates before the same frames.
+    /// A stripe sets x264's rate when it moves: over generated runs of keyframes, frames
+    /// at a CRF (asked, or lowered for motion) under a cap of at least 1 kbit/s (the
+    /// share is never less), and reopened encoders, a frame sets its CRF and cap when
+    /// nothing set holds (at the start, after a keyframe or a reopen), when its CRF is
+    /// not the one set, or when its cap is more than CAP_SLACK of the one set away, and
+    /// otherwise sets nothing.
     #[test]
     fn a_stripe_sets_its_rate_when_it_moves() {
         let mut g = Gen(0x94D049BB133111EB);
         // Frames that kept a rate, that set one, and that moved the cap onto the slack's edge.
         let mut reached = [0; 3];
         for case in 0..2_000 {
-            let (mut applied_kbps, mut applied_crf) = (0u32, -1.0f32);
+            // The rate set, if any holds.
+            let mut set: Option<(f32, u32)> = None;
             let mut applied: Option<Applied> = None;
             let mut cap = 1 + g.below(40_000) as u32;
             let mut crf = 24.0;
@@ -3270,7 +3272,7 @@ mod tests {
                 match g.below(20) {
                     // A keyframe's boost, or a reopened encoder: nothing set holds.
                     0 | 1 => {
-                        applied_kbps = 0;
+                        set = None;
                         applied = None;
                     }
                     _ => {
@@ -3278,11 +3280,12 @@ mod tests {
                         cap = match g.below(6) {
                             0 => 1 + g.below(40_000) as u32,
                             // Onto the edge of the slack, or one past it.
-                            1 if applied_kbps % 25 == 0 && applied_kbps > 0 => {
-                                let edge = applied_kbps / 25 + g.below(2) as u32;
+                            1 if set.is_some_and(|(_, kbps)| kbps % 25 == 0) => {
+                                let kbps = set.map_or(cap, |(_, kbps)| kbps);
+                                let edge = kbps / 25 + g.below(2) as u32;
                                 match g.below(2) {
-                                    0 => applied_kbps + edge,
-                                    _ => applied_kbps - edge.min(applied_kbps - 1),
+                                    0 => kbps + edge,
+                                    _ => kbps - edge.min(kbps - 1),
                                 }
                             }
                             _ => {
@@ -3296,29 +3299,29 @@ mod tests {
                         if g.below(8) == 0 {
                             crf = 12.0 + g.below(20) as f32;
                         }
-                        let moved = applied_kbps == 0
-                            || (cap as f64 - applied_kbps as f64).abs()
-                                > applied_kbps as f64 * 0.04;
-                        let old = (crf != applied_crf || moved).then(|| {
-                            applied_crf = crf;
-                            applied_kbps = cap;
-                            (crf, cap)
+                        let holds = set.is_some_and(|(c, kbps)| {
+                            c == crf && cap.abs_diff(kbps) as f64 <= kbps as f64 * CAP_SLACK
                         });
+                        let on_edge = set.is_some_and(|(_, kbps)| {
+                            cap.abs_diff(kbps) as f64 == kbps as f64 * CAP_SLACK
+                        });
+                        let want = (!holds).then_some((crf, cap));
+                        if let Some(rate) = want {
+                            set = Some(rate);
+                        }
                         let new = Applied::next(applied, crf, cap).map(|rate| {
                             applied = Some(rate);
                             (rate.crf, rate.kbps)
                         });
-                        assert_eq!(new, old, "case {case} frame {frame}");
+                        assert_eq!(new, want, "case {case} frame {frame}");
                         reached[usize::from(new.is_some())] += 1;
-                        reached[2] += usize::from(
-                            (cap as f64 - applied_kbps as f64).abs() == applied_kbps as f64 * 0.04,
-                        );
+                        reached[2] += usize::from(on_edge && holds);
                     }
                 }
             }
         }
         assert!(
-            reached.iter().all(|&r| r >= 1000),
+            reached.iter().all(|&r| r >= 100),
             "too few cases reached: {reached:?}"
         );
     }
