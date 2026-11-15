@@ -5,7 +5,7 @@ use crate::convert::I420;
 use crate::encoder::{Encoded, Encoder, EncoderConfig, Pictures, Planes, Preset, Quality};
 use crate::env::{Debugging, Marker};
 use crate::hub::{wait_any, wait_event};
-use crate::hub::{Hub, Inflight, Out, ServerMessage};
+use crate::hub::{Client, Hub, Inflight, Out, ServerMessage};
 use crate::path::{Capacity, Kbps};
 use crate::rate::{Bounds, FrameBudget, RateCtl, RTT_GUESS_MS};
 use bytes::Bytes;
@@ -134,7 +134,11 @@ enum Frame {
     /// A new viewer, or a decoder that lost its place: every stripe, from nothing.
     /// `blocks`: it went out in place of a sharpening pass, so it is coded at paint-over
     /// quality and sharpens every block, as that pass would have.
-    Key { blocks: Option<Sharpen> },
+    /// `starts`: the viewers its plan promised it to, which it starts if it comes out whole.
+    Key {
+        blocks: Option<Sharpen>,
+        starts: Vec<Arc<Client>>,
+    },
     /// What changed on screen, and which blocks.
     Motion { band: Band, dirty: Arc<Vec<u8>> },
     /// The screen is still: re-encode `blocks` at paint-over quality.
@@ -163,7 +167,7 @@ impl Frame {
     /// How a stripe codes it.
     fn coding(&self) -> Coding {
         match self {
-            Frame::Key { blocks } => Coding::Key {
+            Frame::Key { blocks, .. } => Coding::Key {
                 still: blocks.is_some(),
             },
             Frame::Motion { .. } => Coding::Motion,
@@ -174,7 +178,7 @@ impl Frame {
     /// Whether it is coded at paint-over quality (a flag in each message's header).
     fn sharpens(&self) -> bool {
         match self {
-            Frame::Key { blocks } => blocks.is_some(),
+            Frame::Key { blocks, .. } => blocks.is_some(),
             Frame::Motion { .. } => false,
             Frame::Sharpen { .. } | Frame::MotionAndSharpen { .. } => true,
         }
@@ -191,12 +195,14 @@ impl Frame {
         }
     }
 
-    /// The blocks it sharpens, cleared once it came out sharp.
-    fn into_sharpened(self) -> Option<Sharpen> {
+    /// The blocks it sharpens, cleared once it came out sharp, and the viewers it starts.
+    fn into_parts(self) -> (Option<Sharpen>, Vec<Arc<Client>>) {
         match self {
-            Frame::Motion { .. } => None,
-            Frame::Key { blocks } => blocks,
-            Frame::Sharpen { blocks, .. } | Frame::MotionAndSharpen { blocks, .. } => Some(blocks),
+            Frame::Motion { .. } => (None, vec![]),
+            Frame::Key { blocks, starts } => (blocks, starts),
+            Frame::Sharpen { blocks, .. } | Frame::MotionAndSharpen { blocks, .. } => {
+                (Some(blocks), vec![])
+            }
         }
     }
 }
@@ -1000,10 +1006,12 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
                     Keyframe::Fresh => None,
                 };
                 sharpening.on_key(keyframe, t0);
-                for c in &clients {
-                    c.keyframe_planned();
-                }
-                Frame::Key { blocks }
+                let starts = clients
+                    .iter()
+                    .filter(|c| c.keyframe_planned())
+                    .cloned()
+                    .collect();
+                Frame::Key { blocks, starts }
             }
             Plan::Sharpen { map, band } => {
                 hub.stats.paintovers.fetch_add(1, Ordering::Relaxed);
@@ -1428,10 +1436,11 @@ fn encode_loop(
             )
         });
         let sharpens = job.frame.sharpens();
+        let (sharpened, starts) = job.frame.into_parts();
         let _ = ret.send(Returned {
             idx: job.idx,
             buf: job.buf,
-            sharpened: job.frame.into_sharpened().filter(|_| sharp),
+            sharpened: sharpened.filter(|_| sharp),
         });
         hub.wake();
         let parts: Vec<(usize, bool, Vec<u8>)> = results
@@ -1444,11 +1453,15 @@ fn encode_loop(
                 StripeOut::Failed => None,
             })
             .collect();
+        let all_key = parts.len() == n && parts.iter().all(|p| p.1);
+        // The viewers this keyframe was promised to start on it, or wait for another.
+        for c in &starts {
+            c.keyframe_sent(all_key);
+        }
         if parts.is_empty() {
             continue;
         }
         let enc_us = t0.elapsed().as_micros() as u64;
-        let all_key = parts.len() == n && parts.iter().all(|p| p.1);
         let total: usize = parts.iter().map(|p| p.2.len()).sum();
         hub.stats.encode_us.fetch_add(enc_us, Ordering::Relaxed);
         hub.stats.encoded.fetch_add(1, Ordering::Relaxed);
@@ -1479,7 +1492,7 @@ fn encode_loop(
             .collect();
         let now = Instant::now();
         for c in hub.video_clients() {
-            if !c.takes(all_key) {
+            if !c.started() {
                 continue;
             }
             {
@@ -1754,7 +1767,10 @@ mod tests {
         });
         for i in 0..HOPELESSLY_BEHIND + 3 {
             let frame = match i {
-                0 => super::Frame::Key { blocks: None },
+                0 => super::Frame::Key {
+                    blocks: None,
+                    starts: vec![viewer.clone()],
+                },
                 _ => super::Frame::Motion {
                     band: Band {
                         y0: 0,
@@ -1809,9 +1825,13 @@ mod tests {
         for stripes in 1..=4 {
             for band in bands {
                 let frames = [
-                    super::Frame::Key { blocks: None },
+                    super::Frame::Key {
+                        blocks: None,
+                        starts: vec![],
+                    },
                     super::Frame::Key {
                         blocks: Some(sharpen()),
+                        starts: vec![],
                     },
                     super::Frame::Motion {
                         band,
@@ -1834,8 +1854,8 @@ mod tests {
                     let viewer = hub.add_client(tx);
                     // A viewer that has started, whatever the stream sends first.
                     viewer.watch();
-                    viewer.keyframe_planned();
-                    assert!(viewer.takes(true));
+                    assert!(viewer.keyframe_planned());
+                    viewer.keyframe_sent(true);
                     let cfg = VideoConfig {
                         display: None,
                         #[cfg(target_os = "macos")]
@@ -1891,8 +1911,10 @@ mod tests {
 
     fn frame_kind(f: &super::Frame) -> &'static str {
         match f {
-            super::Frame::Key { blocks: None } => "key",
-            super::Frame::Key { blocks: Some(_) } => "key in place of a pass",
+            super::Frame::Key { blocks: None, .. } => "key",
+            super::Frame::Key {
+                blocks: Some(_), ..
+            } => "key in place of a pass",
             super::Frame::Motion { .. } => "motion",
             super::Frame::Sharpen { .. } => "sharpen",
             super::Frame::MotionAndSharpen { .. } => "motion and sharpen",
@@ -2152,15 +2174,19 @@ mod tests {
         let mut r = Refiner::new(4, 2, t0);
         r.mark(&[1, 0, 1, 0], ms(10));
         r.mark_all(ms(200));
-        let key = super::Frame::Key { blocks: None };
-        assert!(key.into_sharpened().is_none());
+        let key = super::Frame::Key {
+            blocks: None,
+            starts: vec![],
+        };
+        assert!(key.into_parts().0.is_none());
         assert_eq!(r.pending_map().map(|p| p.0), Some(vec![1, 1, 1, 1]));
         let key = super::Frame::Key {
             blocks: Some(r.every_block(ms(200))),
+            starts: vec![],
         };
         assert!(key.sharpens());
         r.mark(&[0, 0, 0, 1], ms(210));
-        let s = key.into_sharpened().expect("it sharpens what it codes");
+        let s = key.into_parts().0.expect("it sharpens what it codes");
         r.sharpened(&s.map, s.at);
         assert_eq!(r.pending_map().map(|p| p.0), Some(vec![0, 0, 0, 1]));
     }
@@ -2604,13 +2630,18 @@ mod tests {
         });
         // A page joins; the capture loop plans its keyframe and clears its request.
         let (_page, _page_rx) = watch();
-        for c in hub.video_clients() {
-            c.keyframe_planned();
-        }
+        let starts = hub
+            .video_clients()
+            .into_iter()
+            .filter(|c| c.keyframe_planned())
+            .collect();
         let key = Job {
             buf: Box::new(I420::new(w, h)),
             idx: 0,
-            frame: super::Frame::Key { blocks: None },
+            frame: super::Frame::Key {
+                blocks: None,
+                starts,
+            },
             target: Kbps::new(8000.0),
             capacity: Capacity::Unknown,
             captured_at: Instant::now(),

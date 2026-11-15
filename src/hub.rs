@@ -179,9 +179,10 @@ enum Viewer {
     NotWatching,
     /// It waits for a keyframe, and none has been planned for it: the capture loop plans one.
     Waiting,
-    /// A keyframe has been planned for it: it starts on the first whole keyframe sent. One
-    /// still `Waiting` does not, as it may have joined after that frame was planned, even
-    /// after the stream that coded it ended.
+    /// A keyframe has been planned for it: it starts on that keyframe if it comes out
+    /// whole, and waits again if it does not. One still `Waiting` is not started by it, as
+    /// it may have joined after the frame was planned, even after the stream that coded it
+    /// ended.
     Promised,
     /// It is sent every frame.
     Started,
@@ -262,28 +263,32 @@ impl Client {
         self.inflight.lock().clear();
     }
 
-    /// The capture loop planned a keyframe: one waiting for one has it on its way.
-    pub fn keyframe_planned(&self) {
+    /// The capture loop planned a keyframe: one waiting for one is promised it. Whether it
+    /// was, and so whether that keyframe starts it.
+    pub fn keyframe_planned(&self) -> bool {
         let mut v = self.viewer.lock();
-        *v = match *v {
-            Viewer::Waiting => Viewer::Promised,
-            same @ (Viewer::NotWatching | Viewer::Promised | Viewer::Started) => same,
-        };
+        match *v {
+            Viewer::Waiting => {
+                *v = Viewer::Promised;
+                true
+            }
+            Viewer::NotWatching | Viewer::Promised | Viewer::Started => false,
+        }
     }
 
-    /// Whether it is sent a frame the encode loop has coded, `whole_key` when every stripe
-    /// of it is a keyframe. One with a keyframe on its way starts on the first whole one,
-    /// and acks for frames sent before it no longer apply.
-    pub fn takes(&self, whole_key: bool) -> bool {
+    /// The encode loop sent a keyframe this client was promised, `whole` when every stripe
+    /// of it is a keyframe. A whole one starts it, and acks for frames sent before it no
+    /// longer apply; one that is not leaves it waiting for another. A client that has since
+    /// stopped watching, asked again or started over is what that made it.
+    pub fn keyframe_sent(&self, whole: bool) {
         let mut v = self.viewer.lock();
-        match (*v, whole_key) {
-            (Viewer::Started, _) => true,
+        match (*v, whole) {
             (Viewer::Promised, true) => {
                 *v = Viewer::Started;
                 self.inflight.lock().clear();
-                true
             }
-            (Viewer::Promised, false) | (Viewer::NotWatching | Viewer::Waiting, _) => false,
+            (Viewer::Promised, false) => *v = Viewer::Waiting,
+            (Viewer::NotWatching | Viewer::Waiting | Viewer::Started, _) => {}
         }
     }
 
@@ -747,10 +752,13 @@ mod tests {
                 m.held.push(planned.then_some(starts));
             }
             Step::Send { whole } => {
-                m.held.remove(0);
+                let starts = m.held.remove(0).unwrap_or([false; 2]);
                 for (i, c) in c.iter_mut().enumerate() {
-                    if whole && c.0 == Promised {
-                        *c = (Started, 0);
+                    if starts[i] && c.0 == Promised {
+                        *c = match whole {
+                            true => (Started, 0),
+                            false => (Waiting, c.1),
+                        };
                     }
                     if c.0 == Started {
                         c.1 += 1;
@@ -839,18 +847,27 @@ mod tests {
             Step::Capture => {
                 let clients = hub.video_clients();
                 planned = clients.iter().any(|c| c.wants_keyframe());
-                let starts = [0, 1].map(|i| c[i].wants_keyframe());
-                if planned {
-                    for c in &clients {
-                        c.keyframe_planned();
-                    }
-                }
+                let promised: Vec<u64> = match planned {
+                    true => clients
+                        .iter()
+                        .filter(|c| c.keyframe_planned())
+                        .map(|c| c.id)
+                        .collect(),
+                    false => vec![],
+                };
+                let starts = [0, 1].map(|i| promised.contains(&c[i].id));
                 after.held.push(planned.then_some(starts));
             }
             Step::Send { whole } => {
-                after.held.remove(0);
+                if let Some(starts) = after.held.remove(0) {
+                    for (i, c) in c.iter().enumerate() {
+                        if starts[i] {
+                            c.keyframe_sent(whole);
+                        }
+                    }
+                }
                 for v in hub.video_clients() {
-                    if v.takes(whole) {
+                    if v.started() {
                         let id = v.inflight.lock().back().map_or(1, |f| f.id + 1);
                         v.inflight.lock().push_back(Inflight {
                             id,
@@ -897,7 +914,6 @@ mod tests {
     /// once the encoder has sent what it holds, one capture and its keyframe sent whole
     /// start every viewer watching.
     #[test]
-    #[ignore = "fails until a keyframe starts the viewers it was planned for, or sends them back to wait"]
     fn a_viewer_starts_only_on_a_whole_keyframe_promised_it() {
         let hub = Hub::new();
         let start = Model {
@@ -934,7 +950,8 @@ mod tests {
                         if viewer == Viewer::Started && before.c[i].0 != Viewer::Started {
                             assert!(
                                 matches!(step, Step::Send { whole: true })
-                                    && before.c[i].0 == Viewer::Promised,
+                                    && before.c[i].0 == Viewer::Promised
+                                    && before.held[0].is_some_and(|starts| starts[i]),
                                 "client {i} started: {what}"
                             );
                         }
