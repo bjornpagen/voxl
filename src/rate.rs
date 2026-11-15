@@ -2,6 +2,7 @@
 
 use crate::hub::{Client, Hub, Viewer};
 use crate::path::{Bits, Capacity, Kbps};
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -275,8 +276,14 @@ impl FrameBudget {
     }
 
     /// What a frame encoded at `now` may spend.
-    pub fn allow(&mut self, now: Instant, target: Kbps, capacity: Option<Kbps>, fps: u32) -> Bits {
-        let steady = target.over(Duration::from_secs_f64(1.0 / fps.max(1) as f64));
+    pub fn allow(
+        &mut self,
+        now: Instant,
+        target: Kbps,
+        capacity: Option<Kbps>,
+        fps: NonZeroU32,
+    ) -> Bits {
+        let steady = target.over(Duration::from_secs_f64(1.0 / fps.get() as f64));
         let depth = match capacity {
             Some(c) => c.over(LATENCY_BUDGET).max(steady.times(DEPTH_FRAMES)),
             // A path nothing is known about gets `DEPTH_FRAMES` of the target at most.
@@ -306,7 +313,7 @@ mod rate_tests {
     use crate::path::PathEst;
     use std::collections::VecDeque;
 
-    const FPS: u32 = 60;
+    const FPS: NonZeroU32 = NonZeroU32::new(60).unwrap();
 
     struct Rng(u64);
     impl Rng {
@@ -375,7 +382,7 @@ mod rate_tests {
 
         /// One frame time passes; the screen wants to send `want` bytes (0: it is still).
         fn tick(&mut self, want: usize) {
-            self.now += Duration::from_secs_f64(1.0 / FPS as f64);
+            self.now += Duration::from_secs_f64(1.0 / FPS.get() as f64);
             while self.flying.front().is_some_and(|f| f.0 <= self.now) {
                 let (acked, sent, bytes, alone) = self.flying.pop_front().unwrap();
                 self.est.on_ack(acked, sent, bytes, alone);
@@ -752,7 +759,7 @@ mod rate_tests {
         // latency budget.
         let mut rng = Rng(0xBF58476D1CE4E5B9);
         let t0 = Instant::now();
-        let frame_time = Duration::from_secs_f64(1.0 / FPS as f64);
+        let frame_time = Duration::from_secs_f64(1.0 / FPS.get() as f64);
         for _ in 0..500 {
             let mut b = FrameBudget::new(t0);
             let target = Kbps::new(rng.range(500, 30_000) as f64);
@@ -784,7 +791,7 @@ mod rate_tests {
         let t0 = Instant::now();
         let target = Kbps::new(9_000.0);
         let capacity = Some(Kbps::new(10_000.0));
-        let frame_time = Duration::from_secs_f64(1.0 / FPS as f64);
+        let frame_time = Duration::from_secs_f64(1.0 / FPS.get() as f64);
         let steady = target.over(frame_time);
         let depth = Kbps::new(10_000.0)
             .over(LATENCY_BUDGET)
@@ -824,7 +831,7 @@ mod rate_tests {
         let target = Kbps::new(2_000.0);
         let capacity = Kbps::new(3_000.0);
         let known = Some(capacity);
-        let frame_time = Duration::from_secs_f64(1.0 / FPS as f64);
+        let frame_time = Duration::from_secs_f64(1.0 / FPS.get() as f64);
         let steady = target.over(frame_time);
         let depth = capacity.over(LATENCY_BUDGET).max(steady.times(2.0));
         // A minute of frames x264 cannot make smaller than one and a half shares.
@@ -842,5 +849,59 @@ mod rate_tests {
             depth.bytes() / 1000.0,
             -b.tokens.bytes() * 8.0 / target.bps()
         );
+    }
+
+    /// FrameBudget::allow as it was when it took the frame rate as a u32 and raised a 0
+    /// to 1: the oracle for the non-zero frame rate.
+    fn old_allow(
+        b: &mut FrameBudget,
+        now: Instant,
+        target: Kbps,
+        capacity: Option<Kbps>,
+        fps: u32,
+    ) -> Bits {
+        let steady = target.over(Duration::from_secs_f64(1.0 / fps.max(1) as f64));
+        let depth = match capacity {
+            Some(c) => c.over(LATENCY_BUDGET).max(steady.times(DEPTH_FRAMES)),
+            None => steady.times(DEPTH_FRAMES),
+        };
+        let passed = now.saturating_duration_since(b.at);
+        b.at = now;
+        b.depth = depth;
+        b.tokens = (b.tokens + target.over(passed)).min(depth);
+        b.tokens.max(steady.times(DEBT_SHARE))
+    }
+
+    /// A non-zero frame rate allows what the u32 did at every rate it can be: 1 to 240,
+    /// and any up to u32::MAX, with any target, capacity, gap and spend.
+    #[test]
+    fn a_non_zero_frame_rate_allows_what_the_u32_did() {
+        let mut rng = Rng(0xD1B54A32D192ED03);
+        let t0 = Instant::now();
+        for _ in 0..2000 {
+            let (mut new, mut old) = (FrameBudget::new(t0), FrameBudget::new(t0));
+            let mut now = t0;
+            for _ in 0..200 {
+                now += match rng.range(0, 2) {
+                    0 => Duration::from_millis(50 * rng.range(0, 25)),
+                    _ => Duration::from_micros(rng.range(0, 500_000)),
+                };
+                let target = Kbps::new(rng.range(0, 40_000) as f64);
+                let capacity =
+                    (rng.range(0, 3) > 0).then(|| Kbps::new(rng.range(1, 100_000) as f64));
+                let fps = match rng.range(0, 2) {
+                    0 => rng.range(1, 241),
+                    _ => rng.range(1, u32::MAX as u64 + 1),
+                } as u32;
+                assert_eq!(
+                    new.allow(now, target, capacity, NonZeroU32::new(fps).unwrap()),
+                    old_allow(&mut old, now, target, capacity, fps)
+                );
+                let bytes = rng.range(0, 400_000) as usize;
+                new.spend(bytes);
+                old.spend(bytes);
+                assert_eq!((new.tokens, new.depth), (old.tokens, old.depth));
+            }
+        }
     }
 }

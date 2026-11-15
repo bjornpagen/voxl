@@ -231,7 +231,7 @@ async fn serve(a: HashMap<String, String>, env: env::Env) {
         display: display.clone(),
         #[cfg(target_os = "macos")]
         enable_resize: truthy(a.get("enable-resize"), false) && !truthy(a.get("read-only"), false),
-        fps: fps.get(),
+        fps,
         preset,
         // Four sliced threads: lower latency than one, and x264's slicing overhead grows
         // with thread count, so more threads only add CPU (measured on 2560x1600).
@@ -565,7 +565,7 @@ mod tests {
                     pictures: encoder::Pictures {
                         width: 64,
                         height: 64,
-                        fps: 60,
+                        fps: std::num::NonZeroU32::new(60).unwrap(),
                         preset,
                         threads: 1,
                         debug: env::Debugging::read(|_| None).unwrap(),

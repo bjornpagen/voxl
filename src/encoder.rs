@@ -13,6 +13,7 @@ mod ffi {
 use crate::env::{Debugging, X264Log};
 use crate::path::Kbps;
 use std::ffi::{CStr, CString};
+use std::num::NonZeroU32;
 use std::ptr;
 
 /// What every encoder is tuned for: no frame held back to look ahead.
@@ -49,7 +50,7 @@ impl std::fmt::Display for Preset {
 pub struct Pictures {
     pub width: u32,
     pub height: u32,
-    pub fps: u32,
+    pub fps: NonZeroU32,
     pub preset: Preset,
     pub threads: u32,
     pub debug: Debugging,
@@ -79,6 +80,8 @@ pub struct Encoder {
     pub width: u32,
     pub height: u32,
     debug: Debugging,
+    /// The frame rate it was opened with, which sizes its VBV buffer.
+    fps: NonZeroU32,
 }
 
 unsafe impl Send for Encoder {}
@@ -110,7 +113,7 @@ impl Encoder {
             param.i_width = pictures.width as i32;
             param.i_height = pictures.height as i32;
             param.i_csp = ffi::X264_CSP_I420 as i32;
-            param.i_fps_num = pictures.fps;
+            param.i_fps_num = pictures.fps.get();
             param.i_fps_den = 1;
             param.i_timebase_num = 1;
             param.i_timebase_den = 1000;
@@ -192,6 +195,7 @@ impl Encoder {
                 width: pictures.width,
                 height: pictures.height,
                 debug: pictures.debug,
+                fps: pictures.fps,
             })
         }
     }
@@ -211,11 +215,7 @@ impl Encoder {
 
     /// Reconfigure rate control on the fly (buffer of ~1.25 frames at `max_kbps`).
     pub fn set_rate(&mut self, crf: f32, max_kbps: u32) {
-        self.set_rate_buf(
-            crf,
-            max_kbps,
-            vbv_buffer_kbit(max_kbps, self.param.i_fps_num),
-        );
+        self.set_rate_buf(crf, max_kbps, vbv_buffer_kbit(max_kbps, self.fps));
     }
 
     /// Change the CRF alone; the cap stays what it was.
@@ -304,8 +304,8 @@ impl Encoder {
 /// A VBV buffer of 1.25 frames at `max_kbps`, rounded up: x264 treats a buffer under
 /// 1.1 frames as a single-frame VBV, which may lower rows of a frame below its starting
 /// QP (video.rs's MotionQuality relies on it not doing that).
-fn vbv_buffer_kbit(max_kbps: u32, fps: u32) -> u32 {
-    (max_kbps * 5).div_ceil(4 * fps.max(1))
+fn vbv_buffer_kbit(max_kbps: u32, fps: NonZeroU32) -> u32 {
+    (max_kbps * 5).div_ceil(4 * fps.get())
 }
 
 /// What x264 made of one picture.
@@ -395,7 +395,7 @@ mod tests {
                 pictures: Pictures {
                     width: w as u32,
                     height: h as u32,
-                    fps: 60,
+                    fps: NonZeroU32::new(60).unwrap(),
                     preset: Preset::parse("ultrafast").unwrap(),
                     threads: 1,
                     debug: Debugging::read(|_| None).unwrap(),
@@ -449,7 +449,7 @@ mod tests {
                 pictures: Pictures {
                     width: w as u32,
                     height: h as u32,
-                    fps: 60,
+                    fps: NonZeroU32::new(60).unwrap(),
                     preset: Preset::parse("ultrafast").unwrap(),
                     threads: 1,
                     debug: Debugging::read(|_| None).unwrap(),
@@ -486,6 +486,62 @@ mod tests {
             uncapped.len()
         );
     }
+
+    /// vbv_buffer_kbit as it was when it took the frame rate as a u32 and raised a 0 to 1:
+    /// the oracle for the non-zero frame rate.
+    fn old_vbv_buffer_kbit(max_kbps: u32, fps: u32) -> u32 {
+        (max_kbps * 5).div_ceil(4 * fps.max(1))
+    }
+
+    /// The buffer is what it was at every rate and cap that fit (5 x the cap and 4 x the
+    /// rate in a u32); and an encoder's own rate is the one it gave x264, which is where
+    /// set_rate read it before, so set_rate gives x264 the buffer it gave before.
+    #[test]
+    fn a_non_zero_frame_rate_sizes_the_buffer_as_the_u32_did() {
+        let mut x = 0x9E3779B97F4A7C15u64;
+        let mut draw = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        for _ in 0..100_000 {
+            let max_kbps = draw(u32::MAX as u64 / 5 + 1) as u32;
+            let fps = match draw(2) {
+                0 => 1 + draw(240),
+                _ => 1 + draw(u32::MAX as u64 / 4),
+            } as u32;
+            assert_eq!(
+                vbv_buffer_kbit(max_kbps, NonZeroU32::new(fps).unwrap()),
+                old_vbv_buffer_kbit(max_kbps, fps),
+                "{max_kbps} kbit/s at {fps} fps"
+            );
+        }
+        for _ in 0..40 {
+            let fps = NonZeroU32::new(1 + draw(240) as u32).unwrap();
+            let mut enc = Encoder::new(&EncoderConfig {
+                pictures: Pictures {
+                    width: 64,
+                    height: 64,
+                    fps,
+                    preset: Preset::parse("ultrafast").unwrap(),
+                    threads: 1,
+                    debug: Debugging::read(|_| None).unwrap(),
+                },
+                crf: 24.0,
+                max_kbps: Some(Kbps::new(2000.0)),
+            })
+            .unwrap();
+            assert_eq!(enc.param.i_fps_num, fps.get());
+            let kbps = 1 + draw(30_000) as u32;
+            enc.set_rate(24.0, kbps);
+            assert_eq!(enc.param.i_fps_num, fps.get());
+            assert_eq!(
+                enc.param.rc.i_vbv_buffer_size,
+                old_vbv_buffer_kbit(kbps, enc.param.i_fps_num).max(1) as i32
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -509,7 +565,7 @@ mod bench {
             pictures: Pictures {
                 width: w as u32,
                 height: h as u32,
-                fps: 60,
+                fps: NonZeroU32::new(60).unwrap(),
                 preset: Preset::parse("ultrafast").unwrap(),
                 threads: 4,
                 debug: Debugging::read(|_| None).unwrap(),
@@ -592,7 +648,7 @@ mod bench {
                 pictures: Pictures {
                     width: w as u32,
                     height: h as u32,
-                    fps: 60,
+                    fps: NonZeroU32::new(60).unwrap(),
                     preset: Preset::parse("ultrafast").unwrap(),
                     threads,
                     debug: Debugging::read(|_| None).unwrap(),

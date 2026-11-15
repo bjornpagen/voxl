@@ -10,6 +10,7 @@ use crate::path::Kbps;
 use crate::rate::{Bounds, FrameBudget, RateCtl, RTT_GUESS_MS};
 use crate::timeline::{CaptureMarks, Coded};
 use bytes::Bytes;
+use std::num::NonZeroU32;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -20,7 +21,7 @@ pub struct VideoConfig {
     pub display: Option<String>,
     #[cfg(target_os = "macos")]
     pub enable_resize: bool,
-    pub fps: u32,
+    pub fps: NonZeroU32,
     pub preset: Preset,
     pub threads: u32,
     pub convert_threads: usize,
@@ -774,7 +775,7 @@ fn note_changes(cap: &mut Capturer, hub: &Hub) {
 
 fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(), String> {
     let (w, h) = (cap.width as usize, cap.height as usize);
-    let interval = Duration::from_secs_f64(1.0 / cfg.fps as f64);
+    let interval = Duration::from_secs_f64(1.0 / cfg.fps.get() as f64);
     // Allow slight early capture so source jitter doesn't alias into dropped frames.
     let min_interval = interval.mul_f64(0.85);
     let interval_ms = interval.as_secs_f64() * 1000.0;
@@ -1253,7 +1254,7 @@ fn stripe_worker(
     mut s: Stripe,
     rx: mpsc::Receiver<StripeJob>,
     done: mpsc::Sender<StripeResult>,
-    fps: u32,
+    fps: NonZeroU32,
     crfs: Crfs,
     debug: bool,
 ) {
@@ -1272,7 +1273,7 @@ fn stripe_worker(
             // A keyframe is what a new viewer sees first; don't starve it to the
             // steady-state frame budget (up to ~8 frames' worth at 4x the cap).
             let boost = job.cap.saturating_mul(4).max(16_000);
-            s.enc.set_rate_buf(asked, boost, boost / fps.max(1) * 8);
+            s.enc.set_rate_buf(asked, boost, boost / fps * 8);
             s.applied_kbps = 0;
         } else {
             let moved = s.applied_kbps == 0
@@ -1382,7 +1383,7 @@ fn encode_loop(
     rx: mpsc::Receiver<Job>,
     ret: mpsc::Sender<Returned>,
     hub: Arc<Hub>,
-    fps: u32,
+    fps: NonZeroU32,
     crfs: Crfs,
     debug: Debugging,
 ) {
@@ -1430,7 +1431,7 @@ fn encode_loop(
         // so several stripes moving at once is paid for by the frames that follow.
         let frame = budget
             .allow(t0, job.target, job.capacity, fps)
-            .a_frame_at(fps)
+            .a_frame_at(fps.get())
             .get() as u32;
         let share = (frame.saturating_mul(2) / n as u32).clamp(1, frame.max(1));
         let ts = job.captured.damage.duration_since(epoch).as_millis() as i64;
@@ -1769,7 +1770,7 @@ mod tests {
             pictures: Pictures {
                 width: w as u32,
                 height: h as u32,
-                fps: 60,
+                fps: NonZeroU32::new(60).unwrap(),
                 preset: Preset::parse("ultrafast").unwrap(),
                 threads: 1,
                 debug: Debugging::read(|_| None).unwrap(),
@@ -1794,7 +1795,7 @@ mod tests {
                     job_rx,
                     ret_tx,
                     hub,
-                    60,
+                    NonZeroU32::new(60).unwrap(),
                     Crfs {
                         configured: 23.0,
                         paintover: 18.0,
@@ -1899,7 +1900,7 @@ mod tests {
                         display: None,
                         #[cfg(target_os = "macos")]
                         enable_resize: false,
-                        fps: 60,
+                        fps: NonZeroU32::new(60).unwrap(),
                         preset: Preset::parse("ultrafast").unwrap(),
                         threads: 1,
                         convert_threads: 1,
@@ -2031,7 +2032,7 @@ mod tests {
                     pictures: Pictures {
                         width: W as u32,
                         height: H as u32,
-                        fps: 60,
+                        fps: NonZeroU32::new(60).unwrap(),
                         preset: Preset::parse("ultrafast").unwrap(),
                         threads: 1,
                         debug: Debugging::read(|_| None).unwrap(),
@@ -2633,7 +2634,7 @@ mod tests {
             pictures: Pictures {
                 width: w as u32,
                 height: h as u32,
-                fps: 60,
+                fps: NonZeroU32::new(60).unwrap(),
                 preset: Preset::parse("ultrafast").unwrap(),
                 threads: 1,
                 debug: Debugging::read(|_| None).unwrap(),
@@ -2658,7 +2659,7 @@ mod tests {
                     job_rx,
                     ret_tx,
                     hub,
-                    60,
+                    NonZeroU32::new(60).unwrap(),
                     Crfs {
                         configured: 23.0,
                         paintover: 18.0,
@@ -2872,7 +2873,7 @@ mod tests {
         let (w, h) = (1024usize, 768usize);
         let cfg = VideoConfig {
             display: None,
-            fps: 60,
+            fps: NonZeroU32::new(60).unwrap(),
             preset: Preset::parse("ultrafast").unwrap(),
             threads: 4,
             convert_threads: 4,
