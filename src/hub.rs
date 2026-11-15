@@ -654,18 +654,6 @@ impl Hub {
 mod tests {
     use super::*;
 
-    /// The oracle: a client before what it is to the stream was one value (three booleans,
-    /// and how many of its frames are in flight), and what each step did to them, copied
-    /// from where it was. `new_client`: nothing has been done to it since it was added.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-    struct Old {
-        video: bool,
-        needs_keyframe: bool,
-        started: bool,
-        inflight: usize,
-        new_client: bool,
-    }
-
     /// A step of the hub's, for one of two clients or for all.
     #[derive(Clone, Copy, Debug)]
     enum Step {
@@ -709,89 +697,59 @@ mod tests {
         Step::Ack(1),
     ];
 
-    /// The oracle's steps: what the old code did, line for line. Returns whether a keyframe
-    /// was planned (`Capture`) and which clients were sent the frame (`Send`).
-    fn old_step(c: &mut [Old; 2], step: Step) -> (bool, Vec<usize>) {
+    /// The rule, step by step, as each value and method says it: what each step makes of
+    /// two clients, whether it plans a keyframe, and who is sent the frame.
+    fn rule(before: [(Viewer, usize); 2], step: Step) -> (bool, Vec<usize>, [(Viewer, usize); 2]) {
+        use Viewer::{NotWatching, Promised, Started, Waiting};
+        let mut c = before;
         let (mut planned, mut sent) = (false, vec![]);
         match step {
-            // server.rs, Command::Video(on)
-            Step::Watch(i) | Step::StopWatching(i) => {
-                let on = matches!(step, Step::Watch(_));
-                c[i].video = on;
-                if on {
-                    c[i].inflight = 0;
-                    c[i].started = false;
-                    c[i].needs_keyframe = true;
-                }
-            }
-            // server.rs, Command::Keyframe and Command::Display's failure
+            Step::Watch(i) | Step::Record(i) | Step::Stall(i) => c[i] = (Waiting, 0),
+            Step::StopWatching(i) => c[i].0 = NotWatching,
             Step::AskKeyframe(i) => {
-                c[i].started = false;
-                c[i].needs_keyframe = true;
+                if c[i].0 != NotWatching {
+                    c[i].0 = Waiting;
+                }
             }
-            // record.rs, begin
-            Step::Record(i) => c[i].video = true,
-            // video.rs, flow_ok
-            Step::Stall(i) => {
-                c[i].inflight = 0;
-                c[i].needs_keyframe = true;
-                c[i].started = false;
-            }
-            // hub.rs, restart_clients
             Step::Restart => {
-                for c in c.iter_mut() {
-                    c.inflight = 0;
-                    c.started = false;
-                    c.needs_keyframe = true;
+                for c in &mut c {
+                    if c.0 != NotWatching {
+                        c.0 = Waiting;
+                    }
+                    c.1 = 0;
                 }
             }
-            // video.rs, capture_loop: want_key, then Plan::Key
             Step::Capture => {
-                planned = c.iter().any(|c| c.video && c.needs_keyframe);
-                if planned {
-                    for c in c.iter_mut().filter(|c| c.video) {
-                        c.needs_keyframe = false;
+                planned = c.iter().any(|c| c.0 == Waiting);
+                for c in &mut c {
+                    if c.0 == Waiting {
+                        c.0 = Promised;
                     }
                 }
             }
-            // video.rs, encode_loop
-            Step::Send { whole: all_key } => {
-                for (i, c) in c.iter_mut().enumerate().filter(|(_, c)| c.video) {
-                    if !c.started {
-                        if !all_key || c.needs_keyframe {
-                            continue;
-                        }
-                        c.started = true;
-                        c.inflight = 0;
+            Step::Send { whole } => {
+                for (i, c) in c.iter_mut().enumerate() {
+                    if whole && c.0 == Promised {
+                        *c = (Started, 0);
                     }
-                    c.inflight += 1;
-                    sent.push(i);
+                    if c.0 == Started {
+                        c.1 += 1;
+                        sent.push(i);
+                    }
                 }
             }
-            // server.rs, Command::Ack: on_ack takes every frame up to the one acked
-            Step::Ack(i) => c[i].inflight = 0,
+            Step::Ack(i) => c[i].1 = 0,
         }
-        if let Step::Watch(i)
-        | Step::StopWatching(i)
-        | Step::AskKeyframe(i)
-        | Step::Record(i)
-        | Step::Stall(i)
-        | Step::Ack(i) = step
-        {
-            c[i].new_client = false;
-        }
-        if let Step::Restart = step {
-            c.iter_mut().for_each(|c| c.new_client = false);
-        }
-        (planned, sent)
+        (planned, sent, c)
     }
 
-    /// Whether the hub takes `step` in the old state: a recording only begins on a new
-    /// client, and the flow check only stalls a watching client with frames in flight.
-    fn applies(c: &[Old; 2], step: Step) -> bool {
+    /// Whether the hub takes `step` from these clients: a recording begins only on a
+    /// client nothing has been done to (`fresh`), and the flow check stalls only a watching
+    /// client with frames in flight.
+    fn applies(c: [(Viewer, usize); 2], fresh: [bool; 2], step: Step) -> bool {
         match step {
-            Step::Record(i) => c[i].new_client,
-            Step::Stall(i) => c[i].video && c[i].inflight > 0,
+            Step::Record(i) => fresh[i],
+            Step::Stall(i) => c[i].0 != Viewer::NotWatching && c[i].1 > 0,
             Step::Watch(_)
             | Step::StopWatching(_)
             | Step::AskKeyframe(_)
@@ -896,73 +854,76 @@ mod tests {
         c.map(|c| v.iter().any(|v| v.id == c.id))
     }
 
-    /// What a client is to the stream is one value, and every step that changes it is a
-    /// method. Against the oracle (the three booleans and the code that wrote them), over
-    /// every sequence of up to 12 of the hub's steps on two clients: breadth first over
-    /// every state the two reach, every step from every state. After each, the two agree
-    /// on whether each client watches, wants a keyframe and has started, on its frames in
-    /// flight, on whether a keyframe was planned and on who was sent the frame.
+    /// A viewer starts only on a whole keyframe promised it, and is sent frames only once
+    /// started. Over every state two clients reach in up to 12 of the hub's steps (`v,1`,
+    /// `v,0`, `kf`, a recording on a new client, a stall, `restart_clients`, a capture, a
+    /// frame sent whole or not, an ack), breadth first, every step from every state, run on
+    /// a real hub's clients through the methods: each step does what the rule says, the
+    /// hub reads each client as its value is, and a client that starts was promised a
+    /// keyframe and was sent a whole one.
     #[test]
-    fn a_viewer_is_one_value_and_does_what_its_three_booleans_did() {
-        let fresh = Old {
-            video: false,
-            needs_keyframe: true,
-            started: false,
-            inflight: 0,
-            new_client: true,
-        };
-        let start = ([fresh; 2], [(Viewer::NotWatching, 0); 2]);
+    fn a_viewer_starts_only_on_a_whole_keyframe_promised_it() {
+        let start = ([(Viewer::NotWatching, 0); 2], [true; 2]);
         let mut seen = std::collections::HashSet::from([start]);
         let mut frontier = vec![start];
-        let mut transitions = 0;
         for _depth in 0..12 {
             let mut next = vec![];
-            for (old, new) in frontier {
+            for (before, fresh) in frontier {
                 for step in STEPS {
-                    if !applies(&old, step) {
+                    if !applies(before, fresh, step) {
                         continue;
                     }
-                    let mut o = old;
-                    let (o_planned, o_sent) = old_step(&mut o, step);
-                    let (n_planned, n_sent, n, read) = new_step(new, step);
-                    transitions += 1;
-                    let what = format!("{step:?} from {old:?} / {new:?}");
-                    assert_eq!(n_planned, o_planned, "planned: {what}");
-                    assert_eq!(n_sent, o_sent, "sent: {what}");
-                    for (i, o) in o.iter().enumerate() {
-                        let oracle = (
-                            o.video,
-                            o.video && o.needs_keyframe,
-                            o.video && o.started,
-                            o.inflight,
+                    let what = format!("{step:?} from {before:?}");
+                    let (planned, sent, after, read) = new_step(before, step);
+                    assert_eq!((planned, sent.clone(), after), rule(before, step), "{what}");
+                    for (i, &(viewer, inflight)) in after.iter().enumerate() {
+                        let as_it_is = (
+                            viewer != Viewer::NotWatching,
+                            viewer == Viewer::Waiting,
+                            viewer == Viewer::Started,
+                            inflight,
                         );
-                        assert_eq!(read[i], oracle, "client {i}: {what}");
+                        assert_eq!(read[i], as_it_is, "client {i}: {what}");
+                        if viewer == Viewer::Started && before[i].0 != Viewer::Started {
+                            assert!(
+                                matches!(step, Step::Send { whole: true })
+                                    && before[i].0 == Viewer::Promised,
+                                "client {i} started: {what}"
+                            );
+                        }
                     }
-                    assert_eq!(
-                        hub_watching(&n),
-                        [o[0].video, o[1].video],
-                        "the hub's viewers: {what}"
+                    assert!(
+                        sent.iter().all(|&i| after[i].0 == Viewer::Started),
+                        "{what}"
                     );
-                    if seen.insert((o, n)) {
-                        next.push((o, n));
+                    assert_eq!(
+                        hub_watching(&after),
+                        after.map(|c| c.0 != Viewer::NotWatching),
+                        "{what}"
+                    );
+                    let mut fresh = fresh;
+                    if let Step::Watch(i)
+                    | Step::StopWatching(i)
+                    | Step::AskKeyframe(i)
+                    | Step::Record(i)
+                    | Step::Stall(i)
+                    | Step::Ack(i) = step
+                    {
+                        fresh[i] = false;
+                    }
+                    if let Step::Restart = step {
+                        fresh = [false; 2];
+                    }
+                    if seen.insert((after, fresh)) {
+                        next.push((after, fresh));
                     }
                 }
             }
             frontier = next;
         }
-        assert_eq!(
-            (seen.len(), transitions),
-            (1937, 19010),
-            "states and steps checked"
-        );
-        // Every value is reached, and only these pairs of the old booleans were: a client
-        // that has started never also asks for a keyframe.
         let reached: std::collections::HashSet<Viewer> =
-            seen.iter().flat_map(|(_, n)| n.map(|c| c.0)).collect();
+            seen.iter().flat_map(|(c, _)| c.map(|c| c.0)).collect();
         assert_eq!(reached.len(), 4, "{reached:?}");
-        assert!(seen.iter().all(|(o, _)| o
-            .iter()
-            .all(|c| !(c.video && c.started && c.needs_keyframe))));
     }
 
     /// Frame `id` of `bytes`, sent `id` x 100 ms after `t0`, which spent `path_ms` on
