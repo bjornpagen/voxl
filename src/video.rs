@@ -7379,7 +7379,6 @@ mod tests {
     /// each frame as it arrives, and a ping every `PING_EVERY` behind whatever is queued.
     /// Paths of 0.2 to 40 Mbit/s, round trips of 2 to 300 ms, encodes of 1 to 30 ms.
     #[test]
-    #[ignore = "fails until a ping is the path's own only if nothing left between the last empty moment and it (the next commit): case 0, 13.4 Mbit/s, 289 ms, 60 KB a frame, a frame 68.6 s in waits 729 ms behind the queue"]
     fn sustained_motion_stays_on_the_path_past_the_fastest_trips_memory() {
         let mut rng = Xorshift::new(0x7FB5_D329_728E_A185);
         let mut next = |n: u64| rng.below(n);

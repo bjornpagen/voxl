@@ -128,8 +128,10 @@ pub struct Window {
     /// while frames follow one another every trip holds some of their queue, and one of
     /// those must never pass for the path's own.
     own: Fastest,
-    /// When there was last nothing on its way.
+    /// When there was last nothing on its way, and when the first frame after that left,
+    /// if one has: between the two the path was empty.
     emptied: Instant,
+    resumed: Option<Instant>,
     round: Round,
     /// When the last frame that came back did, and when it had left.
     last: Option<(Instant, Instant)>,
@@ -187,6 +189,7 @@ impl Window {
                 trips: VecDeque::new(),
             },
             emptied: now,
+            resumed: None,
             round: Round::new(now),
             last: None,
             flying: VecDeque::new(),
@@ -290,6 +293,9 @@ impl Window {
         );
         self.queued = self.queued.saturating_sub(through) + bytes;
         self.as_of = now;
+        if self.flying.is_empty() {
+            self.resumed = Some(now);
+        }
         self.flying.push_back((now, bytes));
         while self
             .lately
@@ -311,6 +317,7 @@ impl Window {
         self.queued = 0;
         self.as_of = now;
         self.emptied = now;
+        self.resumed = None;
         self.last = None;
         self.round = Round::new(now);
     }
@@ -321,15 +328,13 @@ impl Window {
     /// have queued behind it, and counts only toward the fastest trip of any kind.
     pub fn pinged(&mut self, now: Instant, trip: Duration) {
         self.fastest.take(now, trip, 0);
-        // Nothing was on its way when it left: nothing has been since before then, or what
-        // is on its way now left after it.
+        // Nothing was on its way when it left: it left after the path was last empty and
+        // before any frame left after that. What is on its way when it comes back says
+        // nothing of that: every frame that left ahead of it has come back by then.
         let Some(left) = now.checked_sub(trip) else {
             return;
         };
-        let behind = self
-            .flying
-            .front()
-            .is_some_and(|&(oldest, _)| oldest <= left);
+        let behind = self.resumed.is_some_and(|resumed| resumed <= left);
         if self.emptied <= left && !behind {
             self.own.take(now, trip, 0);
         }
@@ -350,6 +355,7 @@ impl Window {
             self.queued = 0;
             self.as_of = back;
             self.emptied = back;
+            self.resumed = None;
         }
         let trip = back.saturating_duration_since(left.at);
         self.fastest.take(back, trip, bytes);
