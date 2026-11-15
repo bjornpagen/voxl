@@ -3,6 +3,7 @@
 use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -92,11 +93,11 @@ impl Hold {
 pub const PING_EVERY: Duration = Duration::from_millis(500);
 
 /// The longest round trip a client's replies can show: 4 s. A client whose oldest
-/// unacknowledged frame is that old is stalled, and the flow check resyncs it (video.rs),
+/// unacknowledged frame is that old is stalled, and the flow gate resyncs it (video.rs),
 /// so a longer round trip steers nothing; the bench's links have 80 to 140 ms. At half, a
 /// path of 2 to 4 s would show no round trip and be judged by the 40 ms guess; at double,
 /// a client's record would keep twice the pings for nothing.
-const LONGEST_ROUND_TRIP: Duration = Duration::from_secs(4);
+const LONGEST_ROUND_TRIP: Duration = crate::video::STALLED;
 
 /// The pings a client's record keeps: one goes out every `PING_EVERY`, so this many are
 /// out at once on the longest round trip, 8.
@@ -385,14 +386,22 @@ impl Client {
         }
     }
 
-    /// Frames in flight and age of the oldest unacknowledged one.
-    pub fn backlog(&self) -> (usize, u128) {
+    /// What it has in flight at `now`, if anything.
+    pub fn backlog(&self, now: Instant) -> Option<Backlog> {
         let q = self.inflight();
-        (
-            q.len(),
-            q.front().map(|f| f.sent.elapsed().as_millis()).unwrap_or(0),
-        )
+        Some(Backlog {
+            frames: NonZeroUsize::new(q.len())?,
+            oldest: now.saturating_duration_since(q.front()?.sent),
+        })
     }
+}
+
+/// The frames sent to a client that it has not acknowledged, while there are any.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Backlog {
+    pub frames: NonZeroUsize,
+    /// How long ago the oldest of them went.
+    pub oldest: Duration,
 }
 
 /// A non-blocking, close-on-exec pipe for waking a thread that polls file descriptors
@@ -904,7 +913,7 @@ mod tests {
             Step::AskKeyframe(i) => c[i].ask_keyframe(),
             Step::Stall(i) => {
                 assert!(
-                    c[i].viewer() != Viewer::NotWatching && c[i].backlog().0 > 0,
+                    c[i].viewer() != Viewer::NotWatching && c[i].backlog(t0).is_some(),
                     "stalls only a watcher"
                 );
                 c[i].start_over();
@@ -953,7 +962,7 @@ mod tests {
         after.fresh = rule(m, step).2.fresh;
         let read = [0, 1].map(|i| {
             let c = &c[i];
-            let inflight = c.backlog().0;
+            let inflight = c.backlog(t0).map_or(0, |b| b.frames.get());
             (c.viewer(), inflight)
         });
         let listed = hub.viewers();

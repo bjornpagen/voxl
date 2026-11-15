@@ -5,7 +5,7 @@ use crate::convert::I420;
 use crate::encoder::{Encoded, Encoder, EncoderConfig, Fps, Pictures, Planes, Preset, Quality};
 use crate::env::{Debugging, Marker};
 use crate::hub::{wait_any, wait_event};
-use crate::hub::{Client, Hub, Out, ServerMessage, Takes, Viewer};
+use crate::hub::{Backlog, Client, Hub, Out, ServerMessage, Takes, Viewer};
 use crate::path::Kbps;
 use crate::rate::{Bounds, FrameBudget, RateCtl, RTT_GUESS_MS};
 use crate::timeline::{CaptureMarks, Coded};
@@ -524,32 +524,124 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Capturer, String> {
     Ok(cap)
 }
 
-fn flow_ok(hub: &Hub, interval_ms: f64) -> bool {
-    for (c, _) in hub.viewers() {
-        let (n, age) = c.backlog();
-        if n == 0 {
-            continue;
+// The flow gate's bounds. For a viewer sent a frame every frame time, each acknowledged
+// its round trip plus some Y after it went (wire, decode, queue), the count holds the
+// capture once Y passes `DECODE_MS` plus two to three frame times (by where the round
+// trip falls on them), and the age once Y passes `MOST_QUEUED_MS` plus up to one. At 60
+// fps the count holds from Y = 73 to 90 ms, the age from 121 to 137 ms.
+
+/// What a viewer is taken to keep a frame for between its arrival and the ack (decode and
+/// draw), in the frames it may have in flight: 40 ms. Upstream's guess (051bb63, unchanged
+/// since), unmeasured. At 60 fps the count holds from Y = 73 to 90 ms; at half (20 ms)
+/// from 53 to 70, at double (80 ms) from 113 to 130, where the age holds anyway.
+const DECODE_MS: f64 = 40.0;
+/// Frames a viewer may have in flight beyond those its round trip and decode cover: 2.
+/// Upstream's guess (051bb63), unmeasured. At 60 fps the count holds from Y = 73 to
+/// 90 ms; with 1 from 57 to 73, with 3 from 90 to 107. The round trip and decode cover
+/// at least one frame time, so a viewer may always have 3: upstream's floor of 3 on the
+/// count (`clamp(3, 40)`) never bound, and is gone.
+const SPARE_FRAMES: usize = 2;
+/// The most frames a viewer may have in flight, whatever its round trip: 40. Upstream's
+/// guess (051bb63), unmeasured. It binds where the round trip and decode cover 38 frame
+/// times, a round trip over 593 ms at 60 fps, and there the stream sends at most 40
+/// frames a round trip. At 39 or 41 that is one frame either way; at half (20) it binds
+/// from a 260 ms round trip, and holds a 400 ms path to about 49 fps; at double (80) only
+/// past 1.26 s.
+const MOST_IN_FLIGHT: usize = 40;
+/// How long past its round trip a viewer's oldest frame may go unacknowledged before
+/// the capture waits for it: 120 ms, of wire time, decode and queue. Upstream's guess
+/// (051bb63), unmeasured. The count holds first (or with it) from 25 fps, this below 25
+/// fps and past `MOST_IN_FLIGHT`. At half (60 ms) this holds first up to 86 fps, at 60
+/// fps from Y = 61 to 77 ms; at double (240 ms) only below 10 fps.
+const MOST_QUEUED_MS: u128 = 120;
+/// A viewer whose oldest frame in flight is older than this has stalled (a dead socket, a
+/// viewer that stopped acknowledging): 4 s. Upstream's guess (051bb63), unmeasured. Until
+/// then it holds every viewer's picture, its frames being past `MOST_QUEUED_MS`; then it
+/// starts over at a keyframe and holds nobody. At half (2 s) a path whose round trip and
+/// queue reach 2 s is resynced, a keyframe to everyone, every 2 s; at double (8 s) one
+/// stopped viewer freezes every other viewer's picture for 8 s.
+pub const STALLED: Duration = Duration::from_millis(4000);
+
+/// What one viewer's frames in flight say about capturing another now.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Flow {
+    /// Room for one more.
+    Room,
+    /// As many in flight as its round trip covers, or its oldest past the queue it may
+    /// have: the capture waits for its acks.
+    Full,
+    /// Its oldest is older than `STALLED`: no wait would help.
+    Stalled(Backlog),
+}
+
+impl Flow {
+    /// From what it has in flight, its round trip, and the time between frames.
+    fn of(backlog: Option<Backlog>, rtt_ms: u32, interval_ms: f64) -> Flow {
+        let Some(b) = backlog else {
+            return Flow::Room;
+        };
+        let age = b.oldest.as_millis();
+        if age > STALLED.as_millis() {
+            return Flow::Stalled(b);
         }
-        let rtt = c.rtt_ms().unwrap_or(RTT_GUESS_MS) as f64;
-        // Enough frames in flight to cover one RTT plus decode, but never more than ~rtt+120ms of queue.
-        let max_n = (((rtt + 40.0) / interval_ms).ceil() as usize + 2).clamp(3, 40);
-        let max_age = rtt as u128 + 120;
-        if age > 4000 {
-            // Stalled client (hidden tab, dead socket): stop letting it gate everyone.
-            log::warn!(
-                "client {} stalled ({} frames, {} ms); resyncing",
-                c.id,
-                n,
-                age
-            );
-            c.start_over();
-            continue;
-        }
-        if n >= max_n || age > max_age {
-            return false;
+        // Enough frames in flight to cover one round trip plus decode, and no more than
+        // `MOST_QUEUED_MS` of queue past the round trip.
+        let rtt = rtt_ms as f64;
+        let room =
+            (((rtt + DECODE_MS) / interval_ms).ceil() as usize + SPARE_FRAMES).min(MOST_IN_FLIGHT);
+        if b.frames.get() >= room || age > rtt_ms as u128 + MOST_QUEUED_MS {
+            Flow::Full
+        } else {
+            Flow::Room
         }
     }
-    true
+}
+
+/// What the flow gate finds at one moment: whether a frame may be captured, and which
+/// viewers have stalled.
+struct Gate {
+    /// No viewer asked is `Full`.
+    open: bool,
+    /// The stalled viewers asked: all of them if the gate is open, and those before the
+    /// first full one if not.
+    stalled: Vec<(Arc<Client>, Backlog)>,
+}
+
+impl Gate {
+    /// Asks the viewers at `now`, in the hub's order, up to the first that is full. It
+    /// only reads: what is done to a stalled viewer is `resync`'s.
+    fn ask(hub: &Hub, interval_ms: f64, now: Instant) -> Gate {
+        let mut stalled = Vec::new();
+        for (c, _) in hub.viewers() {
+            let rtt = c.rtt_ms().unwrap_or(RTT_GUESS_MS);
+            match Flow::of(c.backlog(now), rtt, interval_ms) {
+                Flow::Room => {}
+                Flow::Full => {
+                    return Gate {
+                        open: false,
+                        stalled,
+                    }
+                }
+                Flow::Stalled(b) => stalled.push((c, b)),
+            }
+        }
+        Gate {
+            open: true,
+            stalled,
+        }
+    }
+}
+
+/// A stalled viewer starts over: what it has in flight is forgotten, and it waits for a
+/// keyframe. The one place the flow gate changes a viewer.
+fn resync(c: &Client, b: Backlog) {
+    log::warn!(
+        "client {} stalled ({} frames, {} ms); resyncing",
+        c.id,
+        b.frames,
+        b.oldest.as_millis()
+    );
+    c.start_over();
 }
 
 /// Regional sharpening. Blocks encoded while they changed carry motion-level quality;
@@ -917,10 +1009,16 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
                 continue;
             }
         }
-        if !want_key && !flow_ok(&hub, interval_ms) {
-            hub.stats.flow_blocked.fetch_add(1, Ordering::Relaxed);
-            wait_any(&[cap.fd(), hub.waker.waitable()], 4);
-            continue;
+        if !want_key {
+            let gate = Gate::ask(&hub, interval_ms, now);
+            for (c, b) in gate.stalled {
+                resync(&c, b);
+            }
+            if !gate.open {
+                hub.stats.flow_blocked.fetch_add(1, Ordering::Relaxed);
+                wait_any(&[cap.fd(), hub.waker.waitable()], 4);
+                continue;
+            }
         }
         // Need a free buffer (the encoder may still hold the other).
         if s.slots[s.next].buf.is_none() {
@@ -3106,5 +3204,220 @@ mod tests {
             threads.is_empty() && others == 0,
             "recording allocated: {threads:?}, and {others} times on threads past the table"
         );
+    }
+
+    /// `flow_ok` as 3fbeac6 has it (and 6346ee5 before it), word for word but for its
+    /// clock, which it read once a viewer (`Client::backlog`'s `elapsed`) and takes as
+    /// `now` here, and for what viewer-state made of it (the viewers read once, by
+    /// `Hub::viewers`; the stall's three writes `Client::start_over`): the oracle for
+    /// `Gate` and `resync`.
+    fn old_flow_ok(hub: &Hub, interval_ms: f64, now: Instant) -> bool {
+        for (c, _) in hub.viewers() {
+            // 3fbeac6's `Client::backlog`, at `now`.
+            let (n, age) = {
+                let q = c.inflight();
+                (
+                    q.len(),
+                    q.front()
+                        .map(|f| now.saturating_duration_since(f.sent).as_millis())
+                        .unwrap_or(0),
+                )
+            };
+            if n == 0 {
+                continue;
+            }
+            let rtt = c.rtt_ms().unwrap_or(RTT_GUESS_MS) as f64;
+            // Enough frames in flight to cover one RTT plus decode, but never more than ~rtt+120ms of queue.
+            let max_n = (((rtt + 40.0) / interval_ms).ceil() as usize + 2).clamp(3, 40);
+            let max_age = rtt as u128 + 120;
+            if age > 4000 {
+                // Stalled client (hidden tab, dead socket): stop letting it gate everyone.
+                log::warn!(
+                    "client {} stalled ({} frames, {} ms); resyncing",
+                    c.id,
+                    n,
+                    age
+                );
+                c.start_over();
+                continue;
+            }
+            if n >= max_n || age > max_age {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// What a viewer is to the stream, as `hub::Viewer` has it.
+    #[derive(Clone, Copy, Debug)]
+    enum Is {
+        NotWatching,
+        Waiting,
+        Promised,
+        Started,
+    }
+
+    /// One viewer as the flow gate may find it.
+    #[derive(Clone, Debug)]
+    struct Viewer {
+        is: Is,
+        /// 0 until a ping has been answered.
+        min_rtt_ms: u32,
+        /// How long before `now` each frame in flight went, oldest first.
+        sent_ago: Vec<Duration>,
+    }
+
+    impl Viewer {
+        fn video(&self) -> bool {
+            !matches!(self.is, Is::NotWatching)
+        }
+    }
+
+    /// What the flow gate and its stall action can change of a viewer, and what tells
+    /// viewers apart.
+    fn state(hub: &Hub) -> Vec<(u64, Vec<u32>, crate::hub::Viewer)> {
+        hub.clients
+            .lock()
+            .iter()
+            .map(|c| {
+                let inflight = c.inflight().iter().map(|f| f.id).collect();
+                (c.id, inflight, c.viewer())
+            })
+            .collect()
+    }
+
+    fn hub_of(viewers: &[Viewer], now: Instant) -> Arc<Hub> {
+        let hub = Hub::new();
+        for v in viewers {
+            let c = hub.add_client(tokio::sync::mpsc::unbounded_channel().0);
+            match v.is {
+                Is::NotWatching => {}
+                Is::Waiting => c.watch(),
+                Is::Promised => {
+                    c.watch();
+                    c.keyframe_planned();
+                }
+                Is::Started => {
+                    c.watch();
+                    c.keyframe_planned();
+                    c.keyframe_sent(true);
+                }
+            }
+            c.min_rtt_ms.store(v.min_rtt_ms, Ordering::Relaxed);
+            let mut q = c.inflight();
+            for (id, ago) in v.sent_ago.iter().enumerate() {
+                q.push_back(crate::hub::Inflight {
+                    id: id as u32,
+                    sent: now - *ago,
+                    bytes: 1000,
+                    alone: id == 0,
+                });
+            }
+        }
+        hub
+    }
+
+    /// The flow gate and its stall action against 3fbeac6's `flow_ok`, over generated
+    /// viewers: watching or not, with or without a round trip, with frames in flight
+    /// whose oldest is about as old as each bound, in each viewer state, at frame rates from 1
+    /// to 240. Asking the gate changes no viewer; asking it and resyncing what it found
+    /// stalled, as the capture loop does, answers as `flow_ok` did and leaves every
+    /// viewer as `flow_ok` left it. Every way the gate can answer is reached.
+    #[test]
+    fn the_flow_gate_is_the_old_flow_check() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let now = Instant::now() + Duration::from_secs(10);
+        // Cases where the gate held on the count alone, held on the age alone, was open,
+        // resynced a viewer, and left a stalled viewer after a full one as it was.
+        let mut seen = [0u32; 5];
+        for case in 0..50_000 {
+            let fps = 1 + next(240) as u32;
+            let interval_ms = Duration::from_secs_f64(1.0 / fps as f64).as_secs_f64() * 1000.0;
+            let viewers: Vec<Viewer> = (0..next(5))
+                .map(|_| {
+                    let min_rtt_ms = match next(4) {
+                        0 => 0,
+                        _ => 1 + next(800) as u32,
+                    };
+                    let rtt = match min_rtt_ms {
+                        0 => 40,
+                        ms => ms as u64,
+                    };
+                    let frames = match next(3) {
+                        0 => 0,
+                        _ => 1 + next(45),
+                    };
+                    // About as old as the queue bound or the stall, or anything up to 5 s;
+                    // to the microsecond, since the old check truncated to whole ms.
+                    let oldest_ms = match next(3) {
+                        0 => (rtt + 118 + next(5)).min(4002),
+                        1 => 3998 + next(5),
+                        _ => next(5000),
+                    };
+                    let oldest = Duration::from_micros(oldest_ms * 1000 + next(1000));
+                    let sent_ago = (0..frames)
+                        .map(|i| oldest.saturating_sub(Duration::from_micros(i * next(20_000))))
+                        .collect();
+                    Viewer {
+                        is: match next(5) {
+                            0 => Is::NotWatching,
+                            _ => [Is::Waiting, Is::Promised, Is::Started][next(3) as usize],
+                        },
+                        min_rtt_ms,
+                        sent_ago,
+                    }
+                })
+                .collect();
+            let (old, new) = (hub_of(&viewers, now), hub_of(&viewers, now));
+            let before = state(&new);
+            let gate = Gate::ask(&new, interval_ms, now);
+            assert_eq!(state(&new), before, "case {case}: asking changed a viewer");
+            let open = gate.open;
+            let resynced = gate.stalled.len();
+            for (c, b) in gate.stalled {
+                resync(&c, b);
+            }
+            assert_eq!(
+                old_flow_ok(&old, interval_ms, now),
+                open,
+                "case {case}: {fps} fps, {viewers:?}"
+            );
+            assert_eq!(
+                state(&old),
+                state(&new),
+                "case {case}: {fps} fps, {viewers:?}"
+            );
+            // The first watching viewer that holds the gate, and why, by the oracle's
+            // own bounds.
+            let watching: Vec<&Viewer> = viewers.iter().filter(|v| v.video()).collect();
+            let rtt = |v: &Viewer| match v.min_rtt_ms {
+                0 => 40,
+                ms => ms,
+            };
+            let age = |v: &Viewer| v.sent_ago.first().map(|o| o.as_millis());
+            let by_count = |v: &Viewer| {
+                v.sent_ago.len()
+                    >= (((rtt(v) as f64 + 40.0) / interval_ms).ceil() as usize + 2).clamp(3, 40)
+            };
+            let by_age = |v: &Viewer| age(v).is_some_and(|a| a > rtt(v) as u128 + 120);
+            let stalled = |v: &Viewer| age(v).is_some_and(|a| a > 4000);
+            let full = watching
+                .iter()
+                .position(|v| !v.sent_ago.is_empty() && !stalled(v) && (by_count(v) || by_age(v)));
+            seen[0] += u32::from(full.is_some_and(|i| !by_age(watching[i])));
+            seen[1] += u32::from(full.is_some_and(|i| !by_count(watching[i])));
+            seen[2] += u32::from(open);
+            seen[3] += u32::from(resynced > 0);
+            seen[4] +=
+                u32::from(full.is_some_and(|i| watching[i + 1..].iter().any(|v| stalled(v))));
+        }
+        eprintln!("reached: {seen:?}");
+        assert!(seen.iter().all(|&n| n > 0), "unreached: {seen:?}");
     }
 }

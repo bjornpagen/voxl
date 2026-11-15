@@ -174,12 +174,13 @@ impl RateCtl {
             .iter()
             .filter(|(_, viewer)| *viewer == Viewer::Started)
             .map(|(c, _)| {
-                let (_, age) = c.backlog();
                 let rtt = c.rtt_ms().unwrap_or(RTT_GUESS_MS) as f64;
                 PathNow {
                     queue_ms: c.queue_ms(),
                     capacity: c.capacity(),
-                    overdue: age as f64 > rtt + OVERDUE_MS,
+                    overdue: c
+                        .backlog(Instant::now())
+                        .is_some_and(|b| b.oldest.as_millis() as f64 > rtt + OVERDUE_MS),
                 }
             })
             .collect();
