@@ -543,6 +543,8 @@ const DEBT_SHARE: f64 = 0.5;
 /// sends what the target carries in it, give or take one depth.
 struct FrameBudget {
     tokens: Bits,
+    /// The most the tokens pile up to, and the most that is ever owed.
+    depth: Bits,
     at: Instant,
 }
 
@@ -550,6 +552,7 @@ impl FrameBudget {
     fn new(now: Instant) -> Self {
         FrameBudget {
             tokens: Bits::ZERO,
+            depth: Bits::ZERO,
             at: now,
         }
     }
@@ -564,13 +567,17 @@ impl FrameBudget {
         };
         let passed = now.saturating_duration_since(self.at);
         self.at = now;
+        self.depth = depth;
         self.tokens = (self.tokens + target.over(passed)).min(depth);
         self.tokens.max(steady.times(DEBT_SHARE))
     }
 
-    /// A frame of `bytes` was sent.
+    /// A frame of `bytes` was sent. What it took beyond the tokens is owed, up to one
+    /// depth: a picture the encoder cannot make as small as its share (a video at a
+    /// target far under what it costs) would otherwise run up a debt for as long as it
+    /// plays, and everything after it would pay.
     fn spend(&mut self, bytes: usize) {
-        self.tokens = self.tokens - Bits::of_bytes(bytes);
+        self.tokens = (self.tokens - Bits::of_bytes(bytes)).max(Bits::ZERO - self.depth);
     }
 }
 
@@ -2133,6 +2140,11 @@ mod rate_tests {
         /// Smallest share of what it wanted that a frame got, since `reset`.
         worst_share: f64,
         sent_bytes: usize,
+        /// Every ack comes up to this late, at random.
+        late: Duration,
+        late_rng: Rng,
+        /// The highest the estimate read, as a share of the link's rate.
+        highest_read: f64,
     }
 
     impl Sim {
@@ -2150,6 +2162,9 @@ mod rate_tests {
                 worst_wait: Duration::ZERO,
                 worst_share: 1.0,
                 sent_bytes: 0,
+                late: Duration::ZERO,
+                late_rng: Rng(0x9E3779B97F4A7C15),
+                highest_read: 0.0,
             }
         }
 
@@ -2165,6 +2180,9 @@ mod rate_tests {
             while self.flying.front().is_some_and(|f| f.0 <= self.now) {
                 let (acked, sent, bytes, alone) = self.flying.pop_front().unwrap();
                 self.est.on_ack(acked, sent, bytes, alone);
+                if let Some(c) = self.est.capacity() {
+                    self.highest_read = self.highest_read.max(c.bps() / self.rate);
+                }
             }
             let oldest = self
                 .flying
@@ -2192,8 +2210,14 @@ mod rate_tests {
             self.worst_share = self.worst_share.min(bytes as f64 / want as f64);
             self.free = start + Duration::from_secs_f64(bytes as f64 * 8.0 / self.rate);
             let alone = self.flying.is_empty();
-            self.flying
-                .push_back((self.free + self.rtt, self.now, bytes, alone));
+            let late = match self.late.as_micros() as u64 {
+                0 => Duration::ZERO,
+                most => Duration::from_micros(self.late_rng.range(0, most + 1)),
+            };
+            // Acks arrive in the order their frames were sent.
+            let acked =
+                (self.free + self.rtt + late).max(self.flying.back().map_or(self.now, |f| f.0));
+            self.flying.push_back((acked, self.now, bytes, alone));
             self.sent_bytes += bytes;
         }
 
@@ -2307,6 +2331,31 @@ mod rate_tests {
             rc.step(now + Duration::from_millis(100 * i), &[unknown]);
         }
         assert_eq!(rc.target, START);
+    }
+
+    #[test]
+    fn late_acks_on_a_long_path_do_not_read_as_a_faster_one() {
+        // A round trip longer than the gap between a desktop's frames at rest, so that
+        // few frames are sent with nothing unacknowledged, and every ack a few ms late:
+        // rest, then scrolls, then rest again. A late ack makes a frame look slower,
+        // never the path faster.
+        let mut rng = Rng(0xE7037ED1A0B428DB);
+        for late_ms in [1, 3, 6] {
+            for _ in 0..30 {
+                let rate = rng.range(20_000_000, 60_000_000) as f64;
+                let mut sim = Sim::new(rate, rng.range(120, 180), 30_000.0);
+                sim.late = Duration::from_millis(late_ms);
+                for _ in 0..4 {
+                    sim.run(60 * 2, rest);
+                    sim.run(60 * 2, |_| 62_000);
+                }
+                assert!(
+                    sim.highest_read <= 1.15,
+                    "rate {rate}, acks up to {late_ms} ms late: read {:.0}% of the link",
+                    sim.highest_read * 100.0
+                );
+            }
+        }
     }
 
     #[test]
@@ -2450,6 +2499,38 @@ mod rate_tests {
         assert!(
             over.is_empty(),
             "(pace, spends, sent over the most): {over:?}"
+        );
+    }
+
+    /// FrameBudget's doc: over any stretch the stream sends what the
+    /// target carries in it, give or take one depth; so a debt is at most a depth, and
+    /// stillness pays it back. x264 cannot make a frame smaller than what the picture
+    /// costs at its highest quantizer, and on a full-screen video at a low target that
+    /// is over the target's share. `spend` takes all of it off, with no bound, and the
+    /// debt grows for as long as the video plays.
+    #[test]
+    fn a_debt_is_never_more_than_a_depth() {
+        let t0 = Instant::now();
+        let target = Kbps::new(2_000.0);
+        let capacity = Kbps::new(3_000.0);
+        let known = Capacity::Known(capacity);
+        let frame_time = Duration::from_secs_f64(1.0 / FPS as f64);
+        let steady = target.over(frame_time);
+        let depth = capacity.over(LATENCY_BUDGET).max(steady.times(2.0));
+        // A minute of frames x264 cannot make smaller than one and a half shares.
+        let mut b = FrameBudget::new(t0);
+        let mut now = t0;
+        for _ in 0..60 * 60 {
+            now += frame_time;
+            let may = b.allow(now, target, known, FPS);
+            b.spend(may.max(steady.times(1.5)).bytes() as usize);
+        }
+        assert!(
+            b.tokens >= Bits::ZERO - depth,
+            "a debt of {:.0} KB after a minute, a depth is {:.0} KB: {:.0} s of the target to pay",
+            -b.tokens.bytes() / 1000.0,
+            depth.bytes() / 1000.0,
+            -b.tokens.bytes() * 8.0 / target.bps()
         );
     }
 }
