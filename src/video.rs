@@ -2936,34 +2936,13 @@ mod tests {
             .collect()
     }
 
-    /// The picture lent to the stripe workers by Arc, against the raw pointer it replaces
-    /// (the oracle, the parent's dispatch as it was): over generated pictures, stripe
-    /// layouts, selections and jobs, every worker reads the same rows and answers the
-    /// same, and the very picture lent comes back, each plane where it was and as it
-    /// was, and no longer shared, so the capture loop can write it again.
+    /// The picture lent to the stripe workers comes back whole: over generated pictures,
+    /// stripe layouts, selections and jobs, every selected stripe's worker reads its rows
+    /// of the picture and answers for them, and the very picture lent comes back, each
+    /// plane where it was and as it was, and no longer shared, so the capture loop can
+    /// write it again.
     #[test]
     fn a_lent_picture_comes_back_as_it_went() {
-        struct SendPtr<T>(*const T);
-        unsafe impl<T> Send for SendPtr<T> {}
-        impl<T> Clone for SendPtr<T> {
-            fn clone(&self) -> Self {
-                *self
-            }
-        }
-        impl<T> Copy for SendPtr<T> {}
-        struct OldJob {
-            buf: SendPtr<I420>,
-            ts: i64,
-            coding: Coding,
-            cap: u32,
-            mb_dirty: Dirty,
-            mb_cols: usize,
-        }
-        struct OldResult {
-            stripe: usize,
-            out: StripeOut,
-        }
-
         let mut g = Gen(0x5851F42D4C957F2D);
         for case in 0..300 {
             let width = 16 + g.below(80) as usize;
@@ -2973,37 +2952,6 @@ mod tests {
                 .map(|(y, h)| (y as usize, h as usize))
                 .collect();
             let n = layout.len();
-
-            let (done_tx, done_rx) = mpsc::channel::<OldResult>();
-            let workers: Vec<(mpsc::Sender<OldJob>, std::thread::JoinHandle<()>)> = layout
-                .iter()
-                .enumerate()
-                .map(|(i, &rows)| {
-                    let (tx, rx) = mpsc::channel::<OldJob>();
-                    let done = done_tx.clone();
-                    let h = std::thread::spawn(move || {
-                        let mut served = 0;
-                        while let Ok(job) = rx.recv() {
-                            let buf = unsafe { &*job.buf.0 };
-                            let out = fake_answer(
-                                rows,
-                                buf,
-                                job.ts,
-                                job.coding,
-                                job.cap,
-                                &job.mb_dirty,
-                                job.mb_cols,
-                                served,
-                            );
-                            served += 1;
-                            if done.send(OldResult { stripe: i, out }).is_err() {
-                                return;
-                            }
-                        }
-                    });
-                    (tx, h)
-                })
-                .collect();
             let crew = Crew::spawn(layout.iter().enumerate().map(|(i, &rows)| {
                 move |rx: mpsc::Receiver<StripeJob>, done: mpsc::Sender<StripeResult>| {
                     let mut served = 0;
@@ -3030,6 +2978,7 @@ mod tests {
                     }
                 }
             }));
+            let mut served = vec![0; n];
 
             // Two buffers, as the capture loop has, written afresh before each frame.
             let mut pool = [
@@ -3063,29 +3012,24 @@ mod tests {
                     0 => Dirty::All,
                     _ => Dirty::Blocks(Arc::new(g.bytes(mb_cols * height.div_ceil(16)))),
                 };
-
-                // The oracle: encode_loop's dispatch at the parent, but for its inputs.
-                let buf_ptr = SendPtr(Arc::as_ptr(&buf));
-                let mut pending = 0;
-                for (i, &on) in selected.iter().enumerate() {
-                    if on {
-                        let _ = workers[i].0.send(OldJob {
-                            buf: buf_ptr,
+                let want: Vec<StripeOut> = (0..n)
+                    .map(|i| {
+                        if !selected[i] {
+                            return StripeOut::Failed;
+                        }
+                        served[i] += 1;
+                        fake_answer(
+                            layout[i],
+                            &buf,
                             ts,
                             coding,
-                            cap: share,
-                            mb_dirty: mb_dirty.clone(),
-                            mb_cols: buf.width.div_ceil(16),
-                        });
-                        pending += 1;
-                    }
-                }
-                let mut results: Vec<StripeOut> = (0..n).map(|_| StripeOut::Failed).collect();
-                for _ in 0..pending {
-                    if let Ok(r) = done_rx.recv() {
-                        results[r.stripe] = r.out;
-                    }
-                }
+                            share,
+                            &mb_dirty,
+                            mb_cols,
+                            served[i] - 1,
+                        )
+                    })
+                    .collect();
 
                 let (outs, mut back) = crew.run(
                     &selected,
@@ -3098,7 +3042,7 @@ mod tests {
                         mb_cols,
                     },
                 );
-                assert_eq!(shown(&outs), shown(&results), "case {case} frame {frame}");
+                assert_eq!(shown(&outs), shown(&want), "case {case} frame {frame}");
                 assert_eq!(
                     (back.y.as_ptr(), back.u.as_ptr(), back.v.as_ptr()),
                     at,
