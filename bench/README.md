@@ -37,6 +37,11 @@ is its log. CBR from 30 Mbps, with congestion control down to 2 Mbps.
   software decoder's with `--hold`, reported in the ack with `--report-hold`), and can
   scroll and type into a terminal on the benchmark display (`--fifo`). It does not decode:
   it is for rate control, and writes when each message arrived and each ack left.
+- `keyhold.py host:port keysym repeat`: holds a key as a browser does, behind a link: the
+  down, the browser's repeats (each sent as `k,<keysym>,<repeat>`, `1` as upstream's page
+  sends a repeat or `2` as this one does), the up; every key message late by `--delay` ms
+  and the up `--stall` ms later still. Prints how many presses it sent; what landed is
+  counted on the desktop (`xev`).
 - `kclient.py host:port secs [x y]`: native KasmVNC client. Speaks RFB over its
   WebSocket the way KasmVNC's web client does (same pixel format and encodings,
   including JPEG, WebP and CopyRect, continuous updates and fences), keeps a full
