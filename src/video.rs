@@ -2014,17 +2014,22 @@ fn encode_frames(
     let mut selected: Vec<bool> = Vec::with_capacity(n);
     let mut msgs: Vec<Bytes> = Vec::with_capacity(n);
     let mut viewers = Vec::new();
+    // A picture goes home only once its frame is in flight to its viewers: the capture
+    // loop, woken by it, asks the flow gate next, and the gate must count that frame.
+    let home = |r: Returned| {
+        let _ = ret.send(r);
+        hub.wake();
+    };
     while let Ok(job) = rx.recv() {
         let t0 = Instant::now();
         // A sharpening frame's band covers the blocks it sharpens.
         selected.clear();
         selected.extend(stripes.iter().map(|&(y, h)| job.frame.touches(y, h)));
         if !selected.iter().any(|&x| x) {
-            let _ = ret.send(Returned {
+            home(Returned {
                 buf: job.buf,
                 sharpened: None,
             });
-            hub.wake();
             continue;
         }
         let coding = job.frame.coding();
@@ -2058,17 +2063,17 @@ fn encode_frames(
         let all_key = out.all_key();
         let sharpens = job.frame.sharpens();
         let (sharpened, starts) = job.frame.into_parts();
-        let _ = ret.send(Returned {
+        let back = Returned {
             buf,
             sharpened: sharpened.filter(|_| sharp),
-        });
-        hub.wake();
+        };
         // The viewers this keyframe was promised to start on it, or wait for another.
         for c in &starts {
             c.keyframe_sent(all_key);
         }
         // A frame waits for the stripe coded last; one with nothing to send is not sent.
         let Some(coded) = out.coded() else {
+            home(back);
             continue;
         };
         let nparts = out.parts() as u8;
@@ -2125,6 +2130,7 @@ fn encode_frames(
                 }
             }
         }
+        home(back);
         // What the viewers were sent is theirs now: dropped here, each stripe's arena is
         // taken back once they are done with it.
         msgs.clear();
@@ -3612,9 +3618,10 @@ mod tests {
     /// thread plays the capture loop (it draws into the picture that came back and hands
     /// it over) and the viewer's socket task (acks each frame as it arrives, and holds
     /// what was sent until the next frame, as a socket that takes its time); what it
-    /// allocates is theirs and not counted. First every kind of frame goes
-    /// through over every band, which brings every buffer the encode loop and its workers
-    /// keep to its size; then a generated run of frames is counted. What x264 allocates
+    /// allocates is theirs and not counted. First every kind of frame goes through over
+    /// every band, of noise and then of text, which brings every buffer the encode loop
+    /// and its workers keep to its size (x264's output vector to the largest part it put
+    /// out); then a generated run of frames of text is counted. What x264 allocates
     /// goes through C's malloc, which this allocator does not see.
     #[cfg(target_os = "linux")]
     #[test]
@@ -3712,7 +3719,7 @@ mod tests {
             // The viewer the first keyframe was planned for; it starts on it.
             let mut starts = vec![viewer.clone()];
             let mut writing: Vec<Bytes> = vec![];
-            let mut frame = |kind: usize, which: usize, n: usize| {
+            let mut frame = |kind: usize, which: usize, n: usize, noise: bool| {
                 let (band, map) = &maps[which];
                 let frame = match kind {
                     0 => super::Frame::Key {
@@ -3746,9 +3753,22 @@ mod tests {
                     home = Some(ret_rx.recv().unwrap().buf);
                 }
                 let mut buf = home.take().unwrap();
-                // What moved: lines of 9 px glyphs scrolled 3 px a frame through the band.
+                // What moved: lines of 9 px glyphs scrolled 3 px a frame through the band;
+                // or noise over the whole picture, which wants more bytes than any text.
                 let pic = Arc::get_mut(&mut buf).unwrap();
-                let (y0, y1) = (band.y0 as usize, band.y1 as usize);
+                if noise {
+                    let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ n as u64;
+                    for p in pic.y.iter_mut() {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        *p = state as u8;
+                    }
+                }
+                let (y0, y1) = match noise {
+                    true => (0, 0),
+                    false => (band.y0 as usize, band.y1 as usize),
+                };
                 for (y, row) in pic.y.chunks_exact_mut(w).enumerate().take(y1).skip(y0) {
                     let (line, within) = ((y + 3 * n) / 18, (y + 3 * n) % 18);
                     for (x, glyph) in row.chunks_mut(9).enumerate() {
@@ -3779,10 +3799,10 @@ mod tests {
                 writing = arrived;
             };
             let mut n = 0;
-            for _ in 0..2 {
+            for noise in [true, false] {
                 for kind in 0..6 {
                     for which in 0..maps.len() {
-                        frame(kind, which, n);
+                        frame(kind, which, n, noise);
                         n += 1;
                     }
                 }
@@ -3795,7 +3815,7 @@ mod tests {
                     0 => next(2),
                     _ => 2 + next(4),
                 };
-                frame(kind, next(maps.len()), n);
+                frame(kind, next(maps.len()), n, false);
                 n += 1;
             }
             let (threads, others) = counting::disarm();
@@ -4167,6 +4187,149 @@ mod tests {
         }
         assert!(
             reached.iter().all(|&r| r >= 20),
+            "too few cases reached: {reached:?}"
+        );
+    }
+
+    /// A frame is in flight to its viewers before its picture goes home. The capture loop,
+    /// woken by the picture, asks the flow gate next, and the gate counts what is in
+    /// flight: a frame not yet counted would let it capture one frame past the gate's room.
+    /// Over generated screens of 1-4 stripes and runs of frames over any band of rows
+    /// (some touching no stripe), each stripe's part put out or failed, and a viewer that
+    /// has started and acks nothing: the way home holds no picture (a rendezvous), so the
+    /// test takes each one the moment the encode loop hands it over, and then the viewer
+    /// has in flight every frame so far that put out a part, and no other.
+    #[test]
+    fn a_frame_is_in_flight_before_its_picture_goes_home() {
+        let mut g = Gen(0x2545F4914F6CDD1D);
+        // Frames counted in flight, frames every stripe of which failed, frames that
+        // touched no stripe.
+        let mut reached = [0; 3];
+        for case in 0..300 {
+            let height = 16 * (1 + g.below(12) as usize);
+            let stripes: Vec<(usize, usize)> = stripe_layout(height as u32, 1 + g.below(4) as u32)
+                .into_iter()
+                .map(|(y, h)| (y as usize, h as usize))
+                .collect();
+            let n = stripes.len();
+            let frames: Vec<Band> = (0..1 + g.below(20))
+                .map(|_| {
+                    let y0 = g.below(height as u64 + 8) as u32;
+                    Band {
+                        y0,
+                        y1: y0 + 1 + g.below(height as u64) as u32,
+                    }
+                })
+                .collect();
+            // Whether each stripe's k-th part fails.
+            let fails: Vec<Vec<bool>> = (0..n)
+                .map(|_| (0..frames.len()).map(|_| g.below(3) == 0).collect())
+                .collect();
+            let coder = |i: usize| {
+                let (fails, mut k) = (fails[i].clone(), 0);
+                move |job: StripeJob| {
+                    let out = match fails[k] {
+                        true => StripeOut::Failed,
+                        false => {
+                            let mut bytes = BytesMut::zeroed(Header::LEN);
+                            bytes.extend([i as u8]);
+                            let at = Instant::now();
+                            StripeOut::Sent {
+                                key: false,
+                                bytes,
+                                quality: Quality::AsAsked,
+                                coded: Coded {
+                                    woke: at,
+                                    x264: at,
+                                    encoded: at,
+                                },
+                            }
+                        }
+                    };
+                    k += 1;
+                    StripeResult { out, buf: job.buf }
+                }
+            };
+            let crew = Crew::spawn(
+                coder(0),
+                (1..n).map(|i| {
+                    let mut code = coder(i);
+                    move |rx: mpsc::Receiver<StripeJob>, done: mpsc::SyncSender<StripeResult>| {
+                        while let Ok(job) = rx.recv() {
+                            if done.send(code(job)).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }),
+            );
+            let hub = Hub::new();
+            let (tx, _socket) = tokio::sync::mpsc::unbounded_channel();
+            let viewer = hub.add_client(tx);
+            // A viewer that has started: watching, a keyframe planned and sent it whole.
+            viewer.watch();
+            viewer.keyframe_planned();
+            viewer.keyframe_sent(true);
+            let (job_tx, rx) = mpsc::sync_channel::<Job>(1);
+            let (ret, ret_rx) = mpsc::sync_channel(0);
+            let (ended_tx, ended) = mpsc::channel();
+            let encode = encoder_thread(hub.clone(), {
+                let (hub, stripes) = (hub.clone(), stripes.clone());
+                let fps = Fps::new(60).unwrap();
+                move || {
+                    let mut crew = crew;
+                    let _ = ended_tx.send(encode_frames(&mut crew, &stripes, fps, rx, ret, &hub));
+                }
+            });
+            // The model: each stripe's parts so far, and the frames that put one out.
+            let mut served = vec![0; n];
+            let mut in_flight = 0;
+            for (idx, band) in frames.into_iter().enumerate() {
+                let touched: Vec<usize> = (0..n)
+                    .filter(|&i| {
+                        let (y, h) = stripes[i];
+                        (band.y0 as usize) < y + h && (band.y1 as usize) > y
+                    })
+                    .collect();
+                let parts = touched.iter().filter(|&&i| !fails[i][served[i]]).count();
+                for &i in &touched {
+                    served[i] += 1;
+                }
+                match (touched.len(), parts) {
+                    (0, _) => reached[2] += 1,
+                    (_, 0) => reached[1] += 1,
+                    _ => {
+                        in_flight += 1;
+                        reached[0] += 1;
+                    }
+                }
+                job_tx
+                    .send(Job {
+                        buf: Arc::new(I420::new(16, height)),
+                        frame: super::Frame::Motion {
+                            band,
+                            dirty: Arc::new(vec![]),
+                        },
+                        target: Kbps::new(1000.0),
+                        capacity: None,
+                        captured: CaptureMarks::at(Instant::now()),
+                        marker_ms: None,
+                    })
+                    .unwrap();
+                let home = ret_rx.recv().unwrap();
+                assert_eq!(
+                    viewer.inflight().len(),
+                    in_flight,
+                    "case {case}: frame {idx} over {band:?}, {n} stripes, its picture home"
+                );
+                drop(home);
+            }
+            drop(job_tx);
+            drop(encode);
+            ended.recv().unwrap().unwrap();
+        }
+        assert!(
+            reached.iter().all(|&r| r >= 100),
             "too few cases reached: {reached:?}"
         );
     }
