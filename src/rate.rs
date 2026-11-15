@@ -24,10 +24,46 @@ pub struct RateCtl {
     /// Always within `bounds`.
     pub target: Kbps,
     bounds: Bounds,
-    /// When it last decided, lowered the target for a queue, and raised it.
-    last_eval: Option<Instant>,
-    last_dec: Option<Instant>,
-    last_inc: Option<Instant>,
+    /// When it last decided.
+    decided: Option<Instant>,
+    /// What it last did to the target.
+    moved: Moved,
+}
+
+/// What the controller last did to the target, and when: all it needs of the past to
+/// know whether it may move the target again. A rise waits longer after a fall than a fall
+/// or a rise waits after their own kind, so after a rise a fall may come at once, and
+/// after a fall the rise before it is long enough ago.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Moved {
+    Never,
+    Lowered(Instant),
+    Raised(Instant),
+}
+
+const _: () = assert!(
+    RAISE_AFTER_LOWER.as_nanos() >= LOWER_EVERY.as_nanos()
+        && RAISE_AFTER_LOWER.as_nanos() >= RAISE_EVERY.as_nanos()
+);
+
+impl Moved {
+    /// A queue may lower the target `LOWER_EVERY` after it last did.
+    fn may_lower(self, now: Instant) -> bool {
+        match self {
+            Moved::Lowered(at) => now.saturating_duration_since(at) >= LOWER_EVERY,
+            Moved::Never | Moved::Raised(_) => true,
+        }
+    }
+
+    /// A clear path may raise it `RAISE_AFTER_LOWER` after a fall, and `RAISE_EVERY` after
+    /// a rise.
+    fn may_raise(self, now: Instant) -> bool {
+        match self {
+            Moved::Never => true,
+            Moved::Lowered(at) => now.saturating_duration_since(at) >= RAISE_AFTER_LOWER,
+            Moved::Raised(at) => now.saturating_duration_since(at) >= RAISE_EVERY,
+        }
+    }
 }
 
 /// The bitrate cap of a path nothing is known about yet.
@@ -126,9 +162,8 @@ impl RateCtl {
         RateCtl {
             target: bounds.hold(resume.unwrap_or(START)),
             bounds,
-            last_eval: None,
-            last_dec: None,
-            last_inc: None,
+            decided: None,
+            moved: Moved::Never,
         }
     }
 
@@ -154,13 +189,13 @@ impl RateCtl {
 
     /// One decision, at most every `DECIDE_EVERY`, from what every watched path says now.
     fn step(&mut self, now: Instant, paths: &[PathNow]) {
-        let waited = |since: Option<Instant>, time: Duration| {
-            since.is_none_or(|t| now.saturating_duration_since(t) >= time)
-        };
-        if !waited(self.last_eval, DECIDE_EVERY) {
+        if self
+            .decided
+            .is_some_and(|t| now.saturating_duration_since(t) < DECIDE_EVERY)
+        {
             return;
         }
-        self.last_eval = Some(now);
+        self.decided = Some(now);
         // Where the target goes while nothing queues, and the most it may be now.
         let aim = self
             .bounds
@@ -180,18 +215,14 @@ impl RateCtl {
             .any(|p| p.queue_ms > QUEUE_CONGESTED_MS || p.overdue);
         let clear = paths.iter().all(|p| p.queue_ms <= QUEUE_CLEAR_MS);
         if congested {
-            if waited(self.last_dec, LOWER_EVERY) {
+            if self.moved.may_lower(now) {
                 self.target = self.bounds.hold(self.target.times(LOWER_TO));
-                self.last_dec = Some(now);
+                self.moved = Moved::Lowered(now);
                 log::debug!("rate: congested, target {:.0} kbps", self.target.get());
             }
-        } else if clear
-            && self.target < aim
-            && waited(self.last_dec, RAISE_AFTER_LOWER)
-            && waited(self.last_inc, RAISE_EVERY)
-        {
+        } else if clear && self.target < aim && self.moved.may_raise(now) {
             self.target = Kbps::new(self.target.get() * RAISE_BY + RAISE_STEP.get()).min(aim);
-            self.last_inc = Some(now);
+            self.moved = Moved::Raised(now);
         }
     }
 }
@@ -803,5 +834,114 @@ mod rate_tests {
             depth.bytes() / 1000.0,
             -b.tokens.bytes() * 8.0 / target.bps()
         );
+    }
+
+    /// RateCtl as it was before what it last did was one value: the oracle for that
+    /// refactor.
+    struct OldRateCtl {
+        target: Kbps,
+        bounds: Bounds,
+        last_eval: Option<Instant>,
+        last_dec: Option<Instant>,
+        last_inc: Option<Instant>,
+    }
+
+    impl OldRateCtl {
+        fn step(&mut self, now: Instant, paths: &[PathNow]) {
+            let waited = |since: Option<Instant>, time: Duration| {
+                since.is_none_or(|t| now.saturating_duration_since(t) >= time)
+            };
+            if !waited(self.last_eval, DECIDE_EVERY) {
+                return;
+            }
+            self.last_eval = Some(now);
+            let aim = self
+                .bounds
+                .hold(match Capacity::of(paths.iter().map(|p| p.capacity)) {
+                    Capacity::NoViewers => return,
+                    Capacity::Unknown => START,
+                    Capacity::Known(c) => c.times(CAPACITY_SHARE),
+                });
+            self.target = self.target.min(aim);
+            let congested = paths
+                .iter()
+                .any(|p| p.queue_ms > QUEUE_CONGESTED_MS || p.overdue);
+            let clear = paths.iter().all(|p| p.queue_ms <= QUEUE_CLEAR_MS);
+            if congested {
+                if waited(self.last_dec, LOWER_EVERY) {
+                    self.target = self.bounds.hold(self.target.times(LOWER_TO));
+                    self.last_dec = Some(now);
+                }
+            } else if clear
+                && self.target < aim
+                && waited(self.last_dec, RAISE_AFTER_LOWER)
+                && waited(self.last_inc, RAISE_EVERY)
+            {
+                self.target = Kbps::new(self.target.get() * RAISE_BY + RAISE_STEP.get()).min(aim);
+                self.last_inc = Some(now);
+            }
+        }
+    }
+
+    /// A gap between decisions: often a whole number of 50 ms, so every interval the
+    /// controller waits is hit exactly, else anything up to half a second.
+    fn gap(rng: &mut Rng) -> Duration {
+        match rng.range(0, 2) {
+            0 => Duration::from_millis(50 * rng.range(0, 25)),
+            _ => Duration::from_micros(rng.range(0, 500_000)),
+        }
+    }
+
+    /// What up to three watched paths say: queues on and around both thresholds,
+    /// capacities unknown or anything, and now and then a frame overdue.
+    fn paths(rng: &mut Rng) -> Vec<PathNow> {
+        (0..rng.range(0, 4))
+            .map(|_| PathNow {
+                queue_ms: [15.0, 30.0, rng.range(0, 60) as f64][rng.range(0, 3) as usize],
+                capacity: (rng.range(0, 3) > 0).then(|| Kbps::new(rng.range(1, 100_000) as f64)),
+                overdue: rng.range(0, 10) == 0,
+            })
+            .collect()
+    }
+
+    /// What the controller last did decides as the three times did: the same targets at
+    /// the same instants over random bounds, resumes, paths and gaps, and the move it
+    /// holds is the later of the old fall and rise.
+    #[test]
+    fn what_it_last_did_decides_as_its_three_times_did() {
+        let kbps = |k: u64| Kbps::new(k as f64);
+        let mut rng = Rng(0xD1B54A32D192ED03);
+        let t0 = Instant::now();
+        for _ in 0..2000 {
+            let floor = kbps(rng.range(0, 20_000));
+            let ceiling = (rng.range(0, 4) > 0).then(|| kbps(rng.range(1, 40_000)));
+            let resume = (rng.range(0, 2) > 0).then(|| kbps(rng.range(0, 100_000)));
+            let mut new = RateCtl::new(Bounds::new(floor, ceiling), resume);
+            let mut old = OldRateCtl {
+                target: new.target,
+                bounds: new.bounds,
+                last_eval: None,
+                last_dec: None,
+                last_inc: None,
+            };
+            let mut now = t0;
+            for _ in 0..200 {
+                now += gap(&mut rng);
+                let paths = paths(&mut rng);
+                new.step(now, &paths);
+                old.step(now, &paths);
+                let later = match (old.last_dec, old.last_inc) {
+                    (None, None) => Moved::Never,
+                    (Some(fell), None) => Moved::Lowered(fell),
+                    (None, Some(rose)) => Moved::Raised(rose),
+                    (Some(fell), Some(rose)) if fell > rose => Moved::Lowered(fell),
+                    (Some(_), Some(rose)) => Moved::Raised(rose),
+                };
+                assert_eq!(
+                    (new.target, new.decided, new.moved),
+                    (old.target, old.last_eval, later)
+                );
+            }
+        }
     }
 }
