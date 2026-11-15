@@ -48,6 +48,7 @@ use mac::{audio, capture, desktop, input, screen};
 use win::{audio, capture, desktop, input, screen};
 
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 
 /// Parses `--key=value` / `--key value` / `--flag`; unknown options are accepted so the
 /// binary can take the same argument list as the Python selkies service it replaces.
@@ -105,6 +106,21 @@ fn rate_flag(flag: &str, v: Option<&String>, default: u32) -> Result<u32, String
 fn preset(flag: Option<&String>) -> Result<encoder::Preset, String> {
     let name = flag.map_or("ultrafast", String::as_str);
     encoder::Preset::parse(name).ok_or_else(|| format!("--preset {name}: x264 has no such preset"))
+}
+
+/// The most frames a second when `--framerate` is not given, or is not a number:
+/// upstream's default.
+const FRAMERATE: NonZeroU32 = NonZeroU32::new(60).unwrap();
+
+/// `--framerate` (or a Selkies range, whose upper bound is the rate): the most frames a
+/// second. Under one (0, or a fraction of one) is refused: the capture loop would space
+/// its frames an endless time apart, and stops the server instead.
+fn framerate(v: Option<&String>) -> Result<NonZeroU32, String> {
+    let Some(v) = v else {
+        return Ok(FRAMERATE);
+    };
+    NonZeroU32::new(range_max(Some(v), FRAMERATE.get() as f64) as u32)
+        .ok_or_else(|| format!("--framerate {v:?}: under one frame a second"))
 }
 
 /// `--min-kbps` and `--max-kbps` (or Selkies' `--video-bitrate`), read together: what the
@@ -207,11 +223,15 @@ async fn serve(a: HashMap<String, String>, env: env::Env) {
         log::error!("{e}");
         std::process::exit(1);
     });
+    let fps = framerate(a.get("framerate")).unwrap_or_else(|e| {
+        log::error!("{e}");
+        std::process::exit(1);
+    });
     let vcfg = video::VideoConfig {
         display: display.clone(),
         #[cfg(target_os = "macos")]
         enable_resize: truthy(a.get("enable-resize"), false) && !truthy(a.get("read-only"), false),
-        fps: range_max(a.get("framerate"), 60.0) as u32,
+        fps: fps.get(),
         preset,
         // Four sliced threads: lower latency than one, and x264's slicing overhead grows
         // with thread count, so more threads only add CPU (measured on 2560x1600).
@@ -647,5 +667,38 @@ mod tests {
         for min in ["", "fast", "1.5", "-5", "3000-1000"] {
             assert!(read(Some(min), None).is_err(), "--min-kbps {min:?} parsed");
         }
+    }
+
+    /// `--framerate` reads as it did wherever that was at least one frame a second, and
+    /// starts nothing where it was under one, which stopped the server at its first
+    /// capture: over whole and fractional numbers, ranges, a leading `-`, and words.
+    #[test]
+    fn a_framerate_under_one_starts_nothing() {
+        let mut x = 0x2545F4914F6CDD1Du64;
+        let mut draw = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        for _ in 0..20_000 {
+            let v = match draw(5) {
+                0 => format!("{}", draw(300)),
+                1 => format!("{}.{}", draw(3), draw(100)),
+                2 => format!("{}-{}", draw(200), draw(200)),
+                3 => format!("-{}.{}", draw(3), draw(10)),
+                _ => ["", "fast", "NaN", "inf", "-0", "0-0", " 0 ", "0.0"][draw(8) as usize].into(),
+            };
+            let before = range_max(Some(&v), 60.0) as u32;
+            assert_eq!(
+                framerate(Some(&v)).map(NonZeroU32::get),
+                match before {
+                    0 => Err(format!("--framerate {v:?}: under one frame a second")),
+                    fps => Ok(fps),
+                },
+                "{v:?}"
+            );
+        }
+        assert_eq!(framerate(None).map(NonZeroU32::get), Ok(60));
     }
 }
