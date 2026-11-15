@@ -842,8 +842,8 @@ const MIN_INTERVAL_SHARE: f64 = 0.85;
 #[derive(Debug, PartialEq)]
 enum Step {
     Wait(Wait),
-    /// Capture into the buffer that is home.
-    Capture,
+    /// Capture a change or a pass into the buffer that is home.
+    Capture(Next),
 }
 
 /// What the capture loop waits for before it looks again. Damage wakes it through the
@@ -855,7 +855,8 @@ enum Wait {
     Change,
     /// The sharpening pass due in this long, or damage or a wake.
     Pass(Duration),
-    /// The rest of the least interval since the last capture, or a wake.
+    /// The rest of the least interval since the capture that gates this one (`Captured`),
+    /// or a wake.
     Interval(Duration),
     /// The rest of the coalesce window, whatever happens.
     Settle(Duration),
@@ -982,7 +983,7 @@ struct Look {
     damage: Damage,
     due: Due,
     now: Instant,
-    last_capture: Instant,
+    captured: Captured,
     /// The least time between two captures.
     min_interval: Duration,
     /// How long damage may settle before it is captured (`--coalesce-us`).
@@ -993,17 +994,19 @@ struct Look {
 
 /// What the loop does next, from what it knows.
 fn step(look: &Look) -> Step {
-    if let (Damage::None, Key::NotWanted) = (look.damage, look.key) {
+    let next = match (look.damage, look.key) {
         // Nothing moved and no keyframe is wanted. A pass goes only to an idle encoder,
         // as every capture does (below); until then a change may come, and with it the
         // capture is motion's.
-        match (look.due, look.encoding) {
-            (Due::Now, Encoding::Idle) => {}
+        (Damage::None, Key::NotWanted) => match (look.due, look.encoding) {
+            (Due::Now, Encoding::Idle) => Next::Pass,
             (Due::Now, Encoding::Busy) | (Due::Never, _) => return Step::Wait(Wait::Change),
             (Due::In(due), _) => return Step::Wait(Wait::Pass(due)),
-        }
-    }
-    let since = look.now.saturating_duration_since(look.last_capture);
+        },
+        (Damage::Unreported | Damage::Rows { .. }, Key::Wanted | Key::NotWanted)
+        | (Damage::None, Key::Wanted) => Next::Change,
+    };
+    let since = look.now.saturating_duration_since(look.captured.gate(next));
     if since < look.min_interval {
         return Step::Wait(Wait::Interval(look.min_interval - since));
     }
@@ -1023,7 +1026,7 @@ fn step(look: &Look) -> Step {
     // would wait for it, a whole encode older by the time it is coded; made once it is
     // done, it holds what changed meanwhile, and goes at once.
     match look.encoding {
-        Encoding::Idle => Step::Capture,
+        Encoding::Idle => Step::Capture(next),
         Encoding::Busy => Step::Wait(Wait::Buffer),
     }
 }
@@ -1036,7 +1039,7 @@ impl Step {
         matches!(
             (self, key),
             (
-                Step::Capture | Step::Wait(Wait::Gate(_) | Wait::Buffer),
+                Step::Capture(_) | Step::Wait(Wait::Gate(_) | Wait::Buffer),
                 Key::NotWanted
             )
         )
@@ -1072,6 +1075,50 @@ fn plan(key: Key, band: Option<Band>, due: Due, refiner: &Refiner) -> Planned {
     }
 }
 
+/// What the capture loop is about to capture.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Next {
+    /// Something moved, or a viewer wants a keyframe.
+    Change,
+    /// Nothing moved and a pass is due.
+    Pass,
+}
+
+/// When the last frames were captured: what holds the next one to the frame rate.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Captured {
+    /// Any frame, a pass included.
+    any: Instant,
+    /// The last change: motion or a keyframe.
+    change: Instant,
+}
+
+impl Captured {
+    fn new(at: Instant) -> Self {
+        Captured {
+            any: at,
+            change: at,
+        }
+    }
+    /// The capture the next frame waits a frame interval after. A pass waits after any
+    /// frame, so passes go at most at the frame rate and never right behind a change. A
+    /// change waits only after the last change: a keystroke that comes just after a pass
+    /// is captured at once and waits for that pass's encode at most, not for a frame.
+    fn gate(&self, next: Next) -> Instant {
+        match next {
+            Next::Pass => self.any,
+            Next::Change => self.change,
+        }
+    }
+    fn on_capture(&mut self, next: Next, at: Instant) {
+        self.any = at;
+        match next {
+            Next::Pass => {}
+            Next::Change => self.change = at,
+        }
+    }
+}
+
 /// Notes the damage the capturer has taken for /wait, whether or not anyone is watching.
 fn note_changes(cap: &mut Capturer, hub: &Hub) {
     if !cap.changes.is_empty() {
@@ -1085,7 +1132,7 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
     let interval = Duration::from_secs_f64(1.0 / cfg.fps.get() as f64);
     let min_interval = interval.mul_f64(MIN_INTERVAL_SHARE);
     let interval_ms = interval.as_secs_f64() * 1000.0;
-    let mut last_capture = Instant::now() - interval;
+    let mut captured = Captured::new(Instant::now() - interval);
     let paintover_delay = Duration::from_millis(cfg.paintover_delay_ms);
     let mut sharpening = Sharpening::new(paintover_delay);
     let mut rc = RateCtl::new(cfg.bounds, hub.target());
@@ -1205,7 +1252,7 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
             damage: cap.damage,
             due,
             now,
-            last_capture,
+            captured,
             min_interval,
             coalesce: cfg.coalesce,
             gate: gate.gated,
@@ -1217,7 +1264,7 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
                 resync(&c, b);
             }
         }
-        match step {
+        let next = match step {
             Step::Wait(wait) => {
                 if let Wait::Gate(_) = wait {
                     hub.stats.flow_blocked.fetch_add(1, Ordering::Relaxed);
@@ -1225,8 +1272,8 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
                 wait.wait(cap, &hub);
                 continue;
             }
-            Step::Capture => {}
-        }
+            Step::Capture(next) => next,
+        };
 
         let t0 = Instant::now();
         let origin = match cap.damage {
@@ -1246,7 +1293,7 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
         if marker.is_some() {
             log::info!(
                 "cap dt {:.1} ms band {:?} grab {} us",
-                last_capture.elapsed().as_secs_f64() * 1000.0,
+                captured.any.elapsed().as_secs_f64() * 1000.0,
                 band,
                 (t1 - t0).as_micros()
             );
@@ -1338,7 +1385,7 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
                 }
             }
         };
-        last_capture = t0;
+        captured.on_capture(next, t0);
         if s.job_tx
             .send(Job {
                 buf,
@@ -2746,7 +2793,7 @@ mod tests {
                 damage: Damage::None,
                 due,
                 now,
-                last_capture: now - Duration::from_secs(1),
+                captured: Captured::new(now - Duration::from_secs(1)),
                 min_interval: ms(14),
                 coalesce: ms(2),
                 gate: Gated::Open,
@@ -2755,13 +2802,50 @@ mod tests {
             step(&look)
         };
         let on_wake = Step::Wait(Wait::Change);
-        assert_eq!(still(Due::Now, Encoding::Idle), Step::Capture);
+        assert_eq!(still(Due::Now, Encoding::Idle), Step::Capture(Next::Pass));
         assert_eq!(still(Due::Now, Encoding::Busy), on_wake);
         assert_eq!(still(Due::Never, Encoding::Idle), on_wake);
         assert_eq!(
             still(Due::In(ms(40)), Encoding::Busy),
             Step::Wait(Wait::Pass(ms(40)))
         );
+    }
+
+    /// The frame interval as the capture loop applies it, over 20,000 random requests: a
+    /// change asked for at `t` is captured at `t`, or a frame after the last change if that
+    /// is later, and never later for a pass in between; a pass goes a frame after any
+    /// capture, so passes never come faster than the frame rate or right behind a change.
+    #[test]
+    fn a_pass_never_holds_a_change_back() {
+        let t0 = Instant::now();
+        let frame = Duration::from_micros(14_167);
+        let mut rng = 0x9E3779B97F4A7C15u64;
+        let mut next = |n: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % n
+        };
+        let mut captured = Captured::new(t0);
+        let (mut now, mut last_any, mut last_change) = (t0, t0, t0);
+        for _ in 0..20_000 {
+            now += Duration::from_micros(next(30_000));
+            let what = match next(3) {
+                0 => Next::Change,
+                _ => Next::Pass,
+            };
+            // The loop waits until a frame has passed since the capture that gates it.
+            let at = now.max(captured.gate(what) + frame);
+            match what {
+                Next::Change => {
+                    assert_eq!(at, now.max(last_change + frame), "a change held back");
+                    last_change = at;
+                }
+                Next::Pass => assert!(at >= last_any + frame, "a pass within a frame"),
+            }
+            captured.on_capture(what, at);
+            (now, last_any) = (at, at);
+        }
     }
 
     /// Once the screen goes still the paint-overs show x264 forgetting the drag, so the
@@ -3509,7 +3593,7 @@ mod tests {
         want_key: bool,
         now: Instant,
         due: Due,
-        last_capture: Instant,
+        captured: Captured,
         min_interval: Duration,
         coalesce: Duration,
         gate: Gated,
@@ -3531,7 +3615,7 @@ mod tests {
                 damage: self.damage,
                 due: self.due,
                 now: self.now,
-                last_capture: self.last_capture,
+                captured: self.captured,
                 min_interval: self.min_interval,
                 coalesce: self.coalesce,
                 gate: self.gate,
@@ -3544,14 +3628,15 @@ mod tests {
     }
 
     /// How many looks `each_case` makes: four frame rates, three coalesce windows, six
-    /// damages, seven times since the last capture, nine dues, six answers of the gate,
-    /// and 16 ways for the rest.
-    const CASES: usize = 4 * 3 * 6 * 7 * 9 * 6 * 16;
+    /// damages, 28 pairs of times since the last change and the last capture, nine dues,
+    /// six answers of the gate, and 16 ways for the rest.
+    const CASES: usize = 4 * 3 * 6 * 28 * 9 * 6 * 16;
 
     /// Every look over a discretised domain: each state the capturer's damage takes, at
     /// four times since it came either side of three coalesce windows; four frame rates,
-    /// at seven times since the last capture either side of the least interval and its
-    /// rounding to whole milliseconds; seven waits for a pass, a pass due and none; a
+    /// at seven times since the last change and since the last capture (no longer ago than
+    /// the change), either side of the least interval and its rounding to whole
+    /// milliseconds; seven waits for a pass, a pass due and none; a
     /// keyframe wanted or not; the gate open, or holding until a viewer stalls now, either
     /// side of a millisecond or seconds away; the buffer home or out; damage that came to
     /// an area or to none; and blocks pending or none.
@@ -3617,11 +3702,18 @@ mod tests {
                         y0: 16,
                         y1: 48,
                     }));
-                for (damage, since, due) in damages.flat_map(|d| {
+                // The last capture of any kind is the last change or later.
+                let captures = sinces.iter().enumerate().flat_map(|(i, &change)| {
+                    sinces[..=i].iter().map(move |&any| Captured {
+                        any: now - any,
+                        change: now - change,
+                    })
+                });
+                for (damage, captured, due) in damages.flat_map(|d| {
                     let dues = dues.clone();
-                    sinces
-                        .into_iter()
-                        .flat_map(move |s| dues.clone().map(move |due| (d, s, due)))
+                    captures
+                        .clone()
+                        .flat_map(move |c| dues.clone().map(move |due| (d, c, due)))
                 }) {
                     for (case, gate) in (0..16).flat_map(|case| gates.map(move |g| (case, g))) {
                         let bit = |i: u32| case >> i & 1 == 1;
@@ -3630,7 +3722,7 @@ mod tests {
                             want_key: bit(0),
                             now,
                             due,
-                            last_capture: now - since,
+                            captured,
                             min_interval,
                             coalesce,
                             gate,
@@ -3662,7 +3754,12 @@ mod tests {
             // A due pass goes only to an idle encoder.
             let pass_goes = c.due == Due::Now && c.home;
             let still = !(c.damage != Damage::None || c.want_key || pass_goes);
-            let since = c.now - c.last_capture;
+            // A change waits a frame after the last change, a pass after any capture.
+            let (next, after) = match c.damage != Damage::None || c.want_key {
+                true => (Next::Change, c.captured.change),
+                false => (Next::Pass, c.captured.any),
+            };
+            let since = c.now - after;
             let early = (since < c.min_interval).then(|| c.min_interval - since);
             let settling = match c.damage {
                 Damage::Rows { since, .. } => Some(c.now - since),
@@ -3681,7 +3778,7 @@ mod tests {
                 (false, None, Some(rest)) => Step::Wait(Wait::Settle(rest)),
                 (false, None, None) => match (gate_asked, c.gate, c.home) {
                     (true, Gated::Held { until }, _) => Step::Wait(Wait::Gate(until - c.now)),
-                    (_, _, true) => Step::Capture,
+                    (_, _, true) => Step::Capture(next),
                     (_, _, false) => Step::Wait(Wait::Buffer),
                 },
             };
