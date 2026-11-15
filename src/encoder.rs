@@ -286,10 +286,14 @@ pub enum Quality {
 }
 
 impl Encoded {
-    /// Whether the rate cap left the frame at `crf`. `crf_avg` is `crf` plus what the cap
-    /// added to the frame's average QP, before the frame and within it. Every macroblock's
-    /// QP is a whole step, so a frame the cap left alone averages within half a step of
-    /// `crf`: under that is rounding, at or over it a raised quantizer.
+    /// Whether the rate cap left the frame at `crf`, but for a small squeeze. `crf_avg` is
+    /// `crf` plus what the cap added to the frame's average QP, before the frame and within
+    /// it, so a frame the cap left alone reads `crf` exactly. A sharpening pass over a slow
+    /// link almost never does: the cap raises a few of its rows. So a raise of under half a
+    /// step on average (half the rows one step coarser, or fewer rows by more) counts as
+    /// asked. It is a tolerance, not rounding: at 6 Mbit/s, 2 of 2,503 sharpening frames
+    /// read `crf` exactly, and a quarter of a step or a whole one sharpened a page, a flick
+    /// and a scroll in the same time as half a step.
     pub fn quality(&self, crf: f32) -> Quality {
         if self.crf_avg < crf + 0.5 {
             Quality::AsAsked
