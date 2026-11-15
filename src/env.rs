@@ -10,6 +10,8 @@ use std::path::PathBuf;
 /// holds Unicode, as `std::env::var` reads it; a path is taken as it is.
 #[derive(Debug, PartialEq)]
 pub struct Env {
+    /// What env_logger logs, and how.
+    pub log: Log,
     /// The `VOXL_*` debugging variables.
     pub debug: Debugging,
     /// `DISPLAY`: the X display, before `--display`.
@@ -27,6 +29,16 @@ pub struct Env {
     pub tls_dir: PathBuf,
     /// `XDG_RUNTIME_DIR`: where the keyboard's scratch file is kept, on Linux.
     pub runtime_dir: Option<String>,
+}
+
+/// env_logger's two variables, as `env_logger::Builder::from_env` would read them.
+#[derive(Debug, PartialEq)]
+pub struct Log {
+    /// `RUST_LOG`, else `info`: which records are logged.
+    pub filter: String,
+    /// `RUST_LOG_STYLE`: whether they are coloured (`always`, `never`, `auto`); unset,
+    /// env_logger decides from the terminal.
+    pub style: Option<String>,
 }
 
 /// What voxl's `VOXL_*` debugging variables ask for.
@@ -76,6 +88,10 @@ impl Env {
     pub fn read(var: impl Fn(&str) -> Option<OsString>) -> Env {
         let text = |name: &str| var(name).and_then(|v| v.into_string().ok());
         Env {
+            log: Log {
+                filter: text("RUST_LOG").unwrap_or_else(|| "info".into()),
+                style: text("RUST_LOG_STYLE"),
+            },
             debug: Debugging::read(&var),
             #[cfg(target_os = "linux")]
             display: text("DISPLAY"),
@@ -176,9 +192,10 @@ mod tests {
     }
 
     /// Every variable as it was read where it was used: in `serve` (DISPLAY, the files
-    /// root, the certificate's names), `Login::from_args`, `tls::tls_dir` and the keyboard's
-    /// scratch file. What each use site adds to the read (`--display` before DISPLAY, the
-    /// files root's `--files-root` and `/`, `/tmp` for the scratch file) stays there.
+    /// root, the certificate's names), `Login::from_args`, `tls::tls_dir`, the keyboard's
+    /// scratch file, and env_logger's own reads in `run`. What each use site adds to the
+    /// read (`--display` before DISPLAY, the files root's `--files-root` and `/`, `/tmp` for
+    /// the scratch file) stays there.
     fn old_env(var_os: &dyn Fn(&str) -> Option<OsString>) -> Env {
         let var = |name: &str| std_var(var_os, name);
         let mut names = Vec::new();
@@ -188,6 +205,15 @@ mod tests {
             }
         }
         Env {
+            // env_logger's `Var::get` (`env::var(name).ok()`, else the default), with the
+            // default run() gave it: `default_filter_or("info")`.
+            log: Log {
+                filter: var("RUST_LOG")
+                    .ok()
+                    .or_else(|| Some("info".to_string()))
+                    .unwrap(),
+                style: var("RUST_LOG_STYLE").ok(),
+            },
             debug: old_debugging(var),
             #[cfg(target_os = "linux")]
             display: var("DISPLAY").ok(),
@@ -265,7 +291,7 @@ mod tests {
     /// where it was a path, or with another's precedence, fails.
     #[test]
     fn every_variable_reads_as_it_did_where_it_was_used() {
-        const NAMES: [&str; 20] = [
+        const NAMES: [&str; 21] = [
             "VOXL_X264_INFO",
             "VOXL_NO_MBINFO",
             "VOXL_NO_DIRECT_FB",
@@ -285,6 +311,7 @@ mod tests {
             "XDG_CONFIG_HOME",
             "XDG_RUNTIME_DIR",
             "RUST_LOG",
+            "RUST_LOG_STYLE",
             "PATH",
         ];
         let mut state = 0u64;

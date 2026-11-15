@@ -126,8 +126,13 @@ pub fn run(args: impl IntoIterator<Item = String>) {
     }
     let a = parse_args(args);
     let env = env::Env::read(|name| std::env::var_os(name));
-    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .try_init();
+    // What env_logger::Builder::from_env does with RUST_LOG and RUST_LOG_STYLE, from Env.
+    let mut log = env_logger::Builder::new();
+    log.parse_filters(&env.log.filter);
+    if let Some(style) = &env.log.style {
+        log.parse_write_style(style);
+    }
+    let _ = log.try_init();
     // A panic on any thread ends the process, as in voxl's own release build (panic = "abort"),
     // rather than leaving the server up without that thread when the embedder unwinds.
     #[cfg(panic = "unwind")]
