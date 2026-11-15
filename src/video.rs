@@ -1471,24 +1471,31 @@ impl Crew {
 
     /// Lends the job's picture to the workers of the selected stripes and waits for
     /// their results. The picture comes back with them, no longer shared.
-    fn run(&self, selected: &[bool], job: StripeJob) -> Result<(Vec<StripeOut>, Arc<I420>), Gone> {
+    fn run(&self, selected: &[bool], job: StripeJob) -> Result<(FrameOut, Arc<I420>), Gone> {
         let asked = || self.0.iter().enumerate().filter(|&(i, _)| selected[i]);
         for (i, hand) in asked() {
             hand.jobs.send(job.clone()).map_err(|_| Gone(i))?;
         }
-        let mut results: Vec<StripeOut> = (0..self.0.len()).map(|_| StripeOut::Failed).collect();
+        let mut results: Vec<StripeOut> = (0..self.0.len()).map(|_| StripeOut::Skipped).collect();
         for (i, hand) in asked() {
             let StripeResult { out, buf } = hand.done.recv().map_err(|_| Gone(i))?;
             results[i] = out;
             drop(buf);
         }
-        Ok((results, job.buf))
+        Ok((FrameOut(results), job.buf))
     }
 }
 
+/// What came of a frame in one stripe.
 enum StripeOut {
-    /// The encode failed, or the frame didn't touch the stripe.
+    /// The frame didn't touch the stripe, so its worker wasn't asked.
+    Skipped,
+    /// The encode failed.
     Failed,
+    /// x264 put out nothing for the picture. With no B-frames, lookahead or frame
+    /// threads it holds no picture back, so this doesn't come.
+    Empty,
+    /// The stripe's part of the frame: a header's room, then what x264 put out.
     Sent {
         key: bool,
         bytes: Vec<u8>,
@@ -1496,6 +1503,62 @@ enum StripeOut {
         /// When the worker took the stripe, handed it to x264 and had it back.
         coded: Coded,
     },
+}
+
+impl StripeOut {
+    /// What x264 made of a stripe's picture, asked for at `crf`; `bytes` is a header's
+    /// room and what it put out.
+    fn coded(e: &Encoded, crf: f32, bytes: Vec<u8>, coded: Coded) -> StripeOut {
+        match bytes.len() {
+            Header::LEN => StripeOut::Empty,
+            _ => StripeOut::Sent {
+                key: e.keyframe,
+                quality: e.quality(crf),
+                bytes,
+                coded,
+            },
+        }
+    }
+}
+
+/// What came of a frame in each stripe, in stripe order.
+struct FrameOut(Vec<StripeOut>);
+
+impl FrameOut {
+    /// Whether the frame's blocks came out sharp: every stripe it touched came back as
+    /// asked.
+    fn sharp(&self) -> bool {
+        self.0.iter().all(|o| match o {
+            StripeOut::Skipped => true,
+            StripeOut::Sent { quality, .. } => *quality == Quality::AsAsked,
+            StripeOut::Failed => false,
+            // As the picture x264 didn't fill in read: a CRF average of 0, so as asked.
+            StripeOut::Empty => true,
+        })
+    }
+
+    /// Whether a viewer can start on the frame: every stripe is a keyframe.
+    fn all_key(&self) -> bool {
+        self.0.iter().all(|o| match o {
+            StripeOut::Sent { key, .. } => *key,
+            StripeOut::Skipped | StripeOut::Failed | StripeOut::Empty => false,
+        })
+    }
+
+    /// The parts that go to the viewers: each stripe that has some, whether it is a
+    /// keyframe, its bytes, and when it was coded.
+    fn into_parts(self) -> Vec<(usize, bool, Vec<u8>, Coded)> {
+        self.0
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, o)| match o {
+                StripeOut::Sent {
+                    key, bytes, coded, ..
+                } => Some((i, key, bytes, coded)),
+                StripeOut::Skipped | StripeOut::Failed | StripeOut::Empty => None,
+            })
+            .collect()
+    }
 }
 
 /// x264's CRF raises the QP of frames it judges complex, and its quick half-resolution
@@ -1684,16 +1747,16 @@ fn stripe_worker(
                     crf: asked,
                 });
                 motion.note(&e, crf, size);
-                StripeOut::Sent {
-                    key: e.keyframe,
-                    quality: e.quality(crf),
-                    bytes: out,
-                    coded: Coded {
+                StripeOut::coded(
+                    &e,
+                    crf,
+                    out,
+                    Coded {
                         woke,
                         x264: te,
                         encoded,
                     },
-                }
+                )
             }
             Err(e) => {
                 log::error!("{e}");
@@ -1815,7 +1878,7 @@ fn encode_frames(
         let dispatched = Instant::now();
         // Sharpening spends from the same budget as motion: what the budget doesn't
         // cover now is left pending for a later pass.
-        let (results, buf) = crew.run(
+        let (out, buf) = crew.run(
             &selected,
             StripeJob {
                 buf: job.buf,
@@ -1827,16 +1890,8 @@ fn encode_frames(
             },
         )?;
         let collected = Instant::now();
-        // A frame's blocks are sharp when every stripe it touched came back as asked.
-        let sharp = selected.iter().zip(&results).all(|(&on, r)| {
-            !on || matches!(
-                r,
-                StripeOut::Sent {
-                    quality: Quality::AsAsked,
-                    ..
-                }
-            )
-        });
+        let sharp = out.sharp();
+        let all_key = out.all_key();
         let sharpens = job.frame.sharpens();
         let (sharpened, starts) = job.frame.into_parts();
         let _ = ret.send(Returned {
@@ -1844,17 +1899,7 @@ fn encode_frames(
             sharpened: sharpened.filter(|_| sharp),
         });
         hub.wake();
-        let parts: Vec<(usize, bool, Vec<u8>, Coded)> = results
-            .into_iter()
-            .enumerate()
-            .filter_map(|(i, r)| match r {
-                StripeOut::Sent {
-                    key, bytes, coded, ..
-                } => (bytes.len() > Header::LEN).then_some((i, key, bytes, coded)),
-                StripeOut::Failed => None,
-            })
-            .collect();
-        let all_key = parts.len() == n && parts.iter().all(|p| p.1);
+        let parts = out.into_parts();
         // The viewers this keyframe was promised to start on it, or wait for another.
         for c in &starts {
             c.keyframe_sent(all_key);
@@ -2963,7 +3008,9 @@ mod tests {
     fn shown(outs: &[StripeOut]) -> Vec<String> {
         outs.iter()
             .map(|o| match o {
+                StripeOut::Skipped => "skipped".to_string(),
                 StripeOut::Failed => "failed".to_string(),
+                StripeOut::Empty => "empty".to_string(),
                 StripeOut::Sent {
                     key,
                     bytes,
@@ -3049,7 +3096,7 @@ mod tests {
                 let want: Vec<StripeOut> = (0..n)
                     .map(|i| {
                         if !selected[i] {
-                            return StripeOut::Failed;
+                            return StripeOut::Skipped;
                         }
                         served[i] += 1;
                         fake_answer(
@@ -3078,7 +3125,7 @@ mod tests {
                         },
                     )
                     .expect("no worker dies");
-                assert_eq!(shown(&outs), shown(&want), "case {case} frame {frame}");
+                assert_eq!(shown(&outs.0), shown(&want), "case {case} frame {frame}");
                 assert_eq!(
                     (back.y.as_ptr(), back.u.as_ptr(), back.v.as_ptr()),
                     at,
@@ -3095,6 +3142,124 @@ mod tests {
                 pool[idx] = Some(back);
             }
         }
+    }
+
+    /// What came of a frame in four states per stripe, against the two they replace (the
+    /// oracle: the parent's StripeOut, worker and encode loop, as they were): over
+    /// generated frames of 1-8 stripes, each untouched, failed, or coded by x264 (a
+    /// keyframe or not, at a CRF average either side of as asked, with bytes or none, a
+    /// picture x264 put nothing out for reading as one it didn't fill in), the frame comes
+    /// out as sharp, as much a whole keyframe, and with the same parts.
+    #[test]
+    fn a_frame_comes_out_as_its_stripes_did() {
+        enum OldOut {
+            Failed,
+            Sent {
+                key: bool,
+                bytes: Vec<u8>,
+                quality: Quality,
+            },
+        }
+        type Parts = Vec<(usize, bool, Vec<u8>)>;
+        fn old(n: usize, selected: &[bool], results: Vec<OldOut>) -> (bool, bool, Parts) {
+            let sharp = selected.iter().zip(&results).all(|(&on, r)| {
+                !on || matches!(
+                    r,
+                    OldOut::Sent {
+                        quality: Quality::AsAsked,
+                        ..
+                    }
+                )
+            });
+            let parts: Vec<(usize, bool, Vec<u8>)> = results
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, r)| match r {
+                    OldOut::Sent { key, bytes, .. } => {
+                        (bytes.len() > Header::LEN).then_some((i, key, bytes))
+                    }
+                    OldOut::Failed => None,
+                })
+                .collect();
+            let all_key = parts.len() == n && parts.iter().all(|p| p.1);
+            (sharp, all_key, parts)
+        }
+
+        let mut g = Gen(0xD1B54A32D192ED03);
+        // Frames that came out sharp, not sharp, a whole keyframe, and with an empty stripe.
+        let mut reached = [0; 4];
+        for case in 0..20_000 {
+            let n = 1 + g.below(8) as usize;
+            let (mut selected, mut olds, mut news) = (vec![], vec![], vec![]);
+            for _ in 0..n {
+                let crf = g.below(52) as f32;
+                match g.below(5) {
+                    0 => {
+                        selected.push(false);
+                        olds.push(OldOut::Failed);
+                        news.push(StripeOut::Skipped);
+                    }
+                    1 => {
+                        selected.push(true);
+                        olds.push(OldOut::Failed);
+                        news.push(StripeOut::Failed);
+                    }
+                    _ => {
+                        selected.push(true);
+                        let len = match g.below(4) {
+                            0 => 0,
+                            _ => 1 + g.below(64) as usize,
+                        };
+                        let e = match len {
+                            // What x264 leaves of a picture it put nothing out for.
+                            0 => Encoded {
+                                keyframe: false,
+                                qp: None,
+                                crf_avg: 0.0,
+                            },
+                            _ => Encoded {
+                                keyframe: g.below(3) != 0,
+                                qp: Some(crf),
+                                crf_avg: crf + (g.below(40) as f32 - 10.0) / 10.0,
+                            },
+                        };
+                        let mut bytes = vec![0; Header::LEN];
+                        bytes.extend(g.bytes(len));
+                        olds.push(OldOut::Sent {
+                            key: e.keyframe,
+                            quality: e.quality(crf),
+                            bytes: bytes.clone(),
+                        });
+                        let at = Instant::now();
+                        let coded = Coded {
+                            woke: at,
+                            x264: at,
+                            encoded: at,
+                        };
+                        news.push(StripeOut::coded(&e, crf, bytes, coded));
+                    }
+                }
+            }
+            let empty = news.iter().any(|o| matches!(o, StripeOut::Empty));
+            let want = old(n, &selected, olds);
+            let out = FrameOut(news);
+            let (sharp, all_key) = (out.sharp(), out.all_key());
+            // When each stripe was coded is the timeline's, and none of the old parts'.
+            let parts: Parts = out
+                .into_parts()
+                .into_iter()
+                .map(|(i, key, bytes, _)| (i, key, bytes))
+                .collect();
+            let got = (sharp, all_key, parts);
+            reached[usize::from(!want.0)] += 1;
+            reached[2] += usize::from(want.1);
+            reached[3] += usize::from(empty && want.0);
+            assert!(got == want, "case {case}: {:?} for {:?}", got.0, want.0);
+        }
+        assert!(
+            reached.iter().all(|&r| r >= 200),
+            "too few cases reached: {reached:?}"
+        );
     }
 
     /// How a fake stripe worker ends.
