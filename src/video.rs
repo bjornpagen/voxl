@@ -862,7 +862,8 @@ enum Wait {
     Change,
     /// The sharpening pass due in this long, or damage or a wake.
     Pass(Duration),
-    /// The rest of the least interval since the last capture, or a wake.
+    /// The rest of the least interval since the last capture, or a wake. It ends on
+    /// time: the whole milliseconds are polled for, and under one is slept.
     Interval(Duration),
     /// The rest of the coalesce window, whatever happens.
     Settle(Duration),
@@ -906,7 +907,11 @@ impl Wait {
         match self {
             Wait::Change => poll(On::Event, None),
             Wait::Pass(due) => poll(On::Event, ms(due)),
-            Wait::Interval(rest) => poll(On::Wake, ms(rest)),
+            // `poll` counts whole milliseconds: the rest of one is slept.
+            Wait::Interval(rest) => match rest.as_millis() {
+                0 => sleep(rest),
+                ms => poll(On::Wake, Some(ms as i32)),
+            },
             Wait::Settle(rest) => sleep(rest),
             Wait::Gate(stalls) => poll(On::Event, ms(stalls)),
             Wait::Buffer => poll(On::Wake, None),
@@ -3692,10 +3697,11 @@ mod tests {
     }
 
     /// Each wait wakes on what it waits for, and on its time: a change on damage or a
-    /// wake, with no limit; a pass on damage or a wake, or once due, and the interval only
-    /// on a wake, or once over, each in whole milliseconds less than one late; the gate
-    /// the same way, until a viewer stalls; a buffer only on a wake, with no limit; the
-    /// coalesce window as a sleep of exactly its rest. Over every wait `step` makes in
+    /// wake, with no limit; a pass on damage or a wake, or once due, in whole milliseconds
+    /// less than one late; the gate the same way, until a viewer stalls; a buffer only on
+    /// a wake, with no limit; the coalesce window as a sleep of exactly its rest; the
+    /// interval only on a wake or after its whole milliseconds, and under one as a sleep
+    /// of exactly its rest, so it never ends late. Over every wait `step` makes in
     /// `each_case`.
     #[test]
     fn a_wait_wakes_on_what_it_waits_for() {
@@ -3716,7 +3722,10 @@ mod tests {
                 (Wait::Change, Some((On::Event, None)), None) => true,
                 (Wait::Buffer, Some((On::Wake, None)), None) => true,
                 (Wait::Pass(due), Some((On::Event, Some(m))), None) => up_to(due, m),
-                (Wait::Interval(rest), Some((On::Wake, Some(m))), None) => up_to(rest, m),
+                (Wait::Interval(rest), Some((On::Wake, Some(m))), None) => {
+                    m > 0 && ms(m) <= rest && rest < ms(m + 1)
+                }
+                (Wait::Interval(rest), None, Some(t)) => t == rest && rest < ms(1),
                 (Wait::Gate(stalls), Some((On::Event, Some(m))), None) => up_to(stalls, m),
                 (Wait::Settle(rest), None, Some(t)) => t == rest,
                 _ => false,
