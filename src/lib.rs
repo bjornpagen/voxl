@@ -9,6 +9,7 @@ mod access;
 mod audio;
 #[cfg(target_os = "linux")]
 mod capture;
+mod clipboard;
 mod convert;
 #[cfg(target_os = "linux")]
 mod corners;
