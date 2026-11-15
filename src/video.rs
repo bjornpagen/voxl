@@ -117,7 +117,9 @@ impl Header {
 }
 
 struct Job {
-    buf: Box<I420>,
+    /// The picture, shared with the stripe workers while they code it, and the capture
+    /// loop's alone again once it comes back.
+    buf: Arc<I420>,
     frame: Frame,
     /// The bitrate the stream is steered to, and what the viewers' paths are known to
     /// carry (None: not yet), as the rate controller had them when the frame was captured.
@@ -265,7 +267,7 @@ struct Sharpen {
 /// A buffer back from the encoder, with the blocks it sharpened if it came out at
 /// paint-over quality.
 struct Returned {
-    buf: Box<I420>,
+    buf: Arc<I420>,
     sharpened: Option<Sharpen>,
 }
 
@@ -293,7 +295,7 @@ struct Stream {
     /// The threads a capture is converted on.
     rows: crate::convert::Rows,
     /// None while the encoder holds it.
-    buf: Option<Box<I420>>,
+    buf: Option<Arc<I420>>,
     /// The rows that changed on screen since the buffer was last converted into: the
     /// whole screen, until the first capture.
     pending: Option<Band>,
@@ -368,7 +370,7 @@ impl Stream {
         Ok(Stream {
             job_tx,
             ret_rx,
-            buf: Some(Box::new(I420::new(w as usize, h as usize))),
+            buf: Some(Arc::new(I420::new(w as usize, h as usize))),
             pending: Some(Band { y0: 0, y1: h }),
             rows: crate::convert::Rows::new(cfg.convert_threads),
             _encode: encode,
@@ -1280,7 +1282,8 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
             (p, None) => p,
         };
         if let Some(t) = todo {
-            cap.convert(&mut buf, t.y0 as usize, t.y1 as usize, &s.rows);
+            let pic = Arc::get_mut(&mut buf).expect("a picture comes back from every stripe");
+            cap.convert(pic, t.y0 as usize, t.y1 as usize, &s.rows);
         }
         let t2 = Instant::now();
         let rows = todo.map_or(0, |t| t.y1 - t.y0);
@@ -1405,18 +1408,10 @@ struct Stripe {
     applied_crf: f32,
 }
 
-struct SendPtr<T>(*const T);
-unsafe impl<T> Send for SendPtr<T> {}
-impl<T> Clone for SendPtr<T> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl<T> Copy for SendPtr<T> {}
-
+#[derive(Clone)]
 struct StripeJob {
-    /// Valid until the worker replies: the encode loop waits for every stripe.
-    buf: SendPtr<I420>,
+    /// The frame's picture, lent to every stripe that codes it.
+    buf: Arc<I420>,
     ts: i64,
     coding: Coding,
     cap: u32,
@@ -1428,6 +1423,64 @@ struct StripeJob {
 struct StripeResult {
     stripe: usize,
     out: StripeOut,
+    /// The picture it was lent, handed back with the result, so that once every result
+    /// is in the capture loop has it alone again.
+    buf: Arc<I420>,
+}
+
+/// The stripe workers, each with its stripe's encoder, and the channel they answer on.
+struct Crew {
+    jobs: Vec<mpsc::Sender<StripeJob>>,
+    done: mpsc::Receiver<StripeResult>,
+    /// The encode loop's own end of `done`.
+    _done: mpsc::Sender<StripeResult>,
+}
+
+impl Crew {
+    /// Starts a thread per stripe: `work` codes the jobs that arrive on its receiver and
+    /// answers on its sender.
+    fn spawn<W>(workers: impl IntoIterator<Item = W>) -> Crew
+    where
+        W: FnOnce(mpsc::Receiver<StripeJob>, mpsc::Sender<StripeResult>) + Send + 'static,
+    {
+        let (done_tx, done) = mpsc::channel();
+        let jobs = workers
+            .into_iter()
+            .enumerate()
+            .map(|(i, work)| {
+                let (tx, rx) = mpsc::channel();
+                let answer = done_tx.clone();
+                std::thread::Builder::new()
+                    .name(format!("enc-{i}"))
+                    .spawn(move || work(rx, answer))
+                    .unwrap();
+                tx
+            })
+            .collect();
+        Crew {
+            jobs,
+            done,
+            _done: done_tx,
+        }
+    }
+
+    /// Lends the job's picture to the workers of the selected stripes and waits for
+    /// their results. The picture comes back with them, no longer shared.
+    fn run(&self, selected: &[bool], job: StripeJob) -> (Vec<StripeOut>, Arc<I420>) {
+        let mut pending = 0;
+        for (tx, _) in self.jobs.iter().zip(selected).filter(|(_, &on)| on) {
+            let _ = tx.send(job.clone());
+            pending += 1;
+        }
+        let mut results: Vec<StripeOut> = (0..self.jobs.len()).map(|_| StripeOut::Failed).collect();
+        for _ in 0..pending {
+            if let Ok(r) = self.done.recv() {
+                results[r.stripe] = r.out;
+                drop(r.buf);
+            }
+        }
+        (results, job.buf)
+    }
 }
 
 enum StripeOut {
@@ -1548,7 +1601,7 @@ fn stripe_worker(
     let mut motion = MotionQuality::default();
     while let Ok(job) = rx.recv() {
         let woke = Instant::now();
-        let buf = unsafe { &*job.buf.0 };
+        let buf = &*job.buf;
         // The CRF the job asks for, and the one x264 is given: MotionQuality may lower
         // a motion frame's.
         let asked = crfs.of(job.coding);
@@ -1649,6 +1702,7 @@ fn stripe_worker(
             .send(StripeResult {
                 stripe: i,
                 out: result,
+                buf: job.buf,
             })
             .is_err()
         {
@@ -1687,20 +1741,13 @@ fn encode_loop(
     let debug_stripes = debug.stripes;
     // Geometry stays here; encoders move to their workers.
     let stripes: Vec<(usize, usize)> = stripes_in.iter().map(|s| (s.y, s.h)).collect();
-    let (done_tx, done_rx) = mpsc::channel::<StripeResult>();
-    let workers: Vec<(mpsc::Sender<StripeJob>, std::thread::JoinHandle<()>)> = stripes_in
-        .into_iter()
-        .enumerate()
-        .map(|(i, s)| {
-            let (tx, rx) = mpsc::channel();
-            let done = done_tx.clone();
-            let h = std::thread::Builder::new()
-                .name(format!("enc-{i}"))
-                .spawn(move || stripe_worker(i, s, rx, done, fps, crfs, debug_stripes))
-                .unwrap();
-            (tx, h)
-        })
-        .collect();
+    // Persistent per-stripe workers keep each encoder's state warm in one core's cache.
+    let crew = Crew::spawn(
+        stripes_in
+            .into_iter()
+            .enumerate()
+            .map(|(i, s)| move |rx, done| stripe_worker(i, s, rx, done, fps, crfs, debug_stripes)),
+    );
     while let Ok(job) = rx.recv() {
         let t0 = Instant::now();
         // A sharpening frame's band covers the blocks it sharpens.
@@ -1727,31 +1774,21 @@ fn encode_loop(
             .get() as u32;
         let share = (frame.saturating_mul(2) / n as u32).clamp(1, frame.max(1));
         let ts = job.captured.damage.duration_since(epoch).as_millis() as i64;
-        // Persistent per-stripe workers keep each encoder's state warm in one core's cache.
-        let buf_ptr = SendPtr(&*job.buf as *const I420);
-        let mut pending = 0;
+        let mb_cols = job.buf.width.div_ceil(16);
         let dispatched = Instant::now();
-        for (i, &on) in selected.iter().enumerate() {
-            if on {
-                // Sharpening spends from the same budget as motion: what the budget
-                // doesn't cover now is left pending for a later pass.
-                let _ = workers[i].0.send(StripeJob {
-                    buf: buf_ptr,
-                    ts,
-                    coding,
-                    cap: share,
-                    mb_dirty: mb_dirty.clone(),
-                    mb_cols: job.buf.width.div_ceil(16),
-                });
-                pending += 1;
-            }
-        }
-        let mut results: Vec<StripeOut> = (0..n).map(|_| StripeOut::Failed).collect();
-        for _ in 0..pending {
-            if let Ok(r) = done_rx.recv() {
-                results[r.stripe] = r.out;
-            }
-        }
+        // Sharpening spends from the same budget as motion: what the budget doesn't
+        // cover now is left pending for a later pass.
+        let (results, buf) = crew.run(
+            &selected,
+            StripeJob {
+                buf: job.buf,
+                ts,
+                coding,
+                cap: share,
+                mb_dirty,
+                mb_cols,
+            },
+        );
         let collected = Instant::now();
         // A frame's blocks are sharp when every stripe it touched came back as asked.
         let sharp = selected.iter().zip(&results).all(|(&on, r)| {
@@ -1766,7 +1803,7 @@ fn encode_loop(
         let sharpens = job.frame.sharpens();
         let (sharpened, starts) = job.frame.into_parts();
         let _ = ret.send(Returned {
-            buf: job.buf,
+            buf,
             sharpened: sharpened.filter(|_| sharp),
         });
         hub.wake();
@@ -2111,7 +2148,7 @@ mod tests {
             };
             job_tx
                 .send(Job {
-                    buf: Box::new(I420::new(w, h)),
+                    buf: Arc::new(I420::new(w, h)),
                     frame,
                     target: Kbps::new(8000.0),
                     capacity: None,
@@ -2212,7 +2249,7 @@ mod tests {
                     for frame in [frame, next] {
                         s.job_tx
                             .send(Job {
-                                buf: Box::new(I420::new(w as usize, h as usize)),
+                                buf: Arc::new(I420::new(w as usize, h as usize)),
                                 frame,
                                 target: Kbps::new(8000.0),
                                 capacity: None,
@@ -2815,6 +2852,271 @@ mod tests {
         }
     }
 
+    /// A tiny xorshift generator, for properties over generated cases.
+    struct Gen(u64);
+    impl Gen {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
+        }
+        fn bytes(&mut self, len: usize) -> Vec<u8> {
+            (0..len).map(|_| self.below(256) as u8).collect()
+        }
+    }
+
+    /// A fake stripe worker's answer for the rows `y..y + h` of `buf`: a digest of every
+    /// byte of them, of the job, and of how many jobs it served before this one.
+    #[allow(clippy::too_many_arguments)]
+    fn fake_answer(
+        (y, h): (usize, usize),
+        buf: &I420,
+        ts: i64,
+        coding: Coding,
+        cap: u32,
+        mb_dirty: &Dirty,
+        mb_cols: usize,
+        served: u64,
+    ) -> StripeOut {
+        let mut d = 0xcbf29ce484222325u64;
+        let mut eat = |bytes: &[u8]| {
+            for &b in bytes {
+                d = (d ^ b as u64).wrapping_mul(0x100000001b3);
+            }
+        };
+        let suv = buf.stride_uv();
+        eat(&buf.y[y * buf.width..(y + h) * buf.width]);
+        eat(&buf.u[y / 2 * suv..(y + h).div_ceil(2) * suv]);
+        eat(&buf.v[y / 2 * suv..(y + h).div_ceil(2) * suv]);
+        eat(&ts.to_be_bytes());
+        eat(&[match coding {
+            Coding::Key { still: false } => 0,
+            Coding::Key { still: true } => 1,
+            Coding::Motion => 2,
+            Coding::Sharpen => 3,
+        }]);
+        eat(&cap.to_be_bytes());
+        match mb_dirty {
+            Dirty::All => eat(&[2]),
+            Dirty::Blocks(m) => {
+                let start = (y / 16) * mb_cols;
+                eat(&m[start..start + h.div_ceil(16) * mb_cols]);
+            }
+        }
+        eat(&served.to_be_bytes());
+        let at = Instant::now();
+        StripeOut::Sent {
+            key: d & 1 == 1,
+            bytes: d.to_be_bytes().to_vec(),
+            quality: if d & 2 == 2 {
+                Quality::AsAsked
+            } else {
+                Quality::Squeezed
+            },
+            coded: Coded {
+                woke: at,
+                x264: at,
+                encoded: at,
+            },
+        }
+    }
+
+    fn shown(outs: &[StripeOut]) -> Vec<String> {
+        outs.iter()
+            .map(|o| match o {
+                StripeOut::Failed => "failed".to_string(),
+                StripeOut::Sent {
+                    key,
+                    bytes,
+                    quality,
+                    ..
+                } => format!("{key} {bytes:?} {quality:?}"),
+            })
+            .collect()
+    }
+
+    /// The picture lent to the stripe workers by Arc, against the raw pointer it replaces
+    /// (the oracle, the parent's dispatch as it was): over generated pictures, stripe
+    /// layouts, selections and jobs, every worker reads the same rows and answers the
+    /// same, and the very picture lent comes back, each plane where it was and as it
+    /// was, and no longer shared, so the capture loop can write it again.
+    #[test]
+    fn a_lent_picture_comes_back_as_it_went() {
+        struct SendPtr<T>(*const T);
+        unsafe impl<T> Send for SendPtr<T> {}
+        impl<T> Clone for SendPtr<T> {
+            fn clone(&self) -> Self {
+                *self
+            }
+        }
+        impl<T> Copy for SendPtr<T> {}
+        struct OldJob {
+            buf: SendPtr<I420>,
+            ts: i64,
+            coding: Coding,
+            cap: u32,
+            mb_dirty: Dirty,
+            mb_cols: usize,
+        }
+        struct OldResult {
+            stripe: usize,
+            out: StripeOut,
+        }
+
+        let mut g = Gen(0x5851F42D4C957F2D);
+        for case in 0..300 {
+            let width = 16 + g.below(80) as usize;
+            let height = 16 + g.below(200) as usize;
+            let layout: Vec<(usize, usize)> = stripe_layout(height as u32, 1 + g.below(6) as u32)
+                .into_iter()
+                .map(|(y, h)| (y as usize, h as usize))
+                .collect();
+            let n = layout.len();
+
+            let (done_tx, done_rx) = mpsc::channel::<OldResult>();
+            let workers: Vec<(mpsc::Sender<OldJob>, std::thread::JoinHandle<()>)> = layout
+                .iter()
+                .enumerate()
+                .map(|(i, &rows)| {
+                    let (tx, rx) = mpsc::channel::<OldJob>();
+                    let done = done_tx.clone();
+                    let h = std::thread::spawn(move || {
+                        let mut served = 0;
+                        while let Ok(job) = rx.recv() {
+                            let buf = unsafe { &*job.buf.0 };
+                            let out = fake_answer(
+                                rows,
+                                buf,
+                                job.ts,
+                                job.coding,
+                                job.cap,
+                                &job.mb_dirty,
+                                job.mb_cols,
+                                served,
+                            );
+                            served += 1;
+                            if done.send(OldResult { stripe: i, out }).is_err() {
+                                return;
+                            }
+                        }
+                    });
+                    (tx, h)
+                })
+                .collect();
+            let crew = Crew::spawn(layout.iter().enumerate().map(|(i, &rows)| {
+                move |rx: mpsc::Receiver<StripeJob>, done: mpsc::Sender<StripeResult>| {
+                    let mut served = 0;
+                    while let Ok(job) = rx.recv() {
+                        let out = fake_answer(
+                            rows,
+                            &job.buf,
+                            job.ts,
+                            job.coding,
+                            job.cap,
+                            &job.mb_dirty,
+                            job.mb_cols,
+                            served,
+                        );
+                        served += 1;
+                        let back = StripeResult {
+                            stripe: i,
+                            out,
+                            buf: job.buf,
+                        };
+                        if done.send(back).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }));
+
+            // Two buffers, as the capture loop has, written afresh before each frame.
+            let mut pool = [
+                Some(Arc::new(I420::new(width, height))),
+                Some(Arc::new(I420::new(width, height))),
+            ];
+            for frame in 0..12 {
+                let idx = frame % 2;
+                let mut buf = pool[idx].take().unwrap();
+                let pic = Arc::get_mut(&mut buf).expect("the picture came back alone");
+                let (y, u, v) = (
+                    g.bytes(pic.y.len()),
+                    g.bytes(pic.u.len()),
+                    g.bytes(pic.v.len()),
+                );
+                pic.y.copy_from_slice(&y);
+                pic.u.copy_from_slice(&u);
+                pic.v.copy_from_slice(&v);
+                let at = (pic.y.as_ptr(), pic.u.as_ptr(), pic.v.as_ptr());
+                let selected: Vec<bool> = (0..n).map(|_| g.below(3) != 0).collect();
+                let ts = g.below(1 << 40) as i64;
+                let coding = match g.below(4) {
+                    0 => Coding::Key { still: false },
+                    1 => Coding::Key { still: true },
+                    2 => Coding::Motion,
+                    _ => Coding::Sharpen,
+                };
+                let share = 1 + g.below(50_000) as u32;
+                let mb_cols = width.div_ceil(16);
+                let mb_dirty = match g.below(2) {
+                    0 => Dirty::All,
+                    _ => Dirty::Blocks(Arc::new(g.bytes(mb_cols * height.div_ceil(16)))),
+                };
+
+                // The oracle: encode_loop's dispatch at the parent, but for its inputs.
+                let buf_ptr = SendPtr(Arc::as_ptr(&buf));
+                let mut pending = 0;
+                for (i, &on) in selected.iter().enumerate() {
+                    if on {
+                        let _ = workers[i].0.send(OldJob {
+                            buf: buf_ptr,
+                            ts,
+                            coding,
+                            cap: share,
+                            mb_dirty: mb_dirty.clone(),
+                            mb_cols: buf.width.div_ceil(16),
+                        });
+                        pending += 1;
+                    }
+                }
+                let mut results: Vec<StripeOut> = (0..n).map(|_| StripeOut::Failed).collect();
+                for _ in 0..pending {
+                    if let Ok(r) = done_rx.recv() {
+                        results[r.stripe] = r.out;
+                    }
+                }
+
+                let (outs, mut back) = crew.run(
+                    &selected,
+                    StripeJob {
+                        buf,
+                        ts,
+                        coding,
+                        cap: share,
+                        mb_dirty,
+                        mb_cols,
+                    },
+                );
+                assert_eq!(shown(&outs), shown(&results), "case {case} frame {frame}");
+                assert_eq!(
+                    (back.y.as_ptr(), back.u.as_ptr(), back.v.as_ptr()),
+                    at,
+                    "case {case} frame {frame}: the planes came back moved"
+                );
+                assert!(
+                    back.y == y && back.u == u && back.v == v && back.width == width,
+                    "case {case} frame {frame}: the picture came back changed"
+                );
+                assert!(
+                    Arc::get_mut(&mut back).is_some(),
+                    "case {case} frame {frame}: the picture came back still shared"
+                );
+                pool[idx] = Some(back);
+            }
+        }
+    }
+
     /// Once the screen goes still the paint-overs show x264 forgetting the drag, so the
     /// next motion frame isn't handed the drag's correction.
     #[test]
@@ -3020,7 +3322,7 @@ mod tests {
             .filter(|c| c.keyframe_planned())
             .collect();
         let key = Job {
-            buf: Box::new(I420::new(w, h)),
+            buf: Arc::new(I420::new(w, h)),
             frame: super::Frame::Key {
                 blocks: None,
                 starts,
@@ -3313,7 +3615,8 @@ mod tests {
                 stream.returned(r, &mut refiner);
             }
             let mut buf = stream.buf.take().unwrap();
-            crate::convert::convert_band(&screen, w * 4, &mut buf, y0, y1, &stream.rows);
+            let pic = Arc::get_mut(&mut buf).unwrap();
+            crate::convert::convert_band(&screen, w * 4, pic, y0, y1, &stream.rows);
             stream
                 .job_tx
                 .send(Job {
