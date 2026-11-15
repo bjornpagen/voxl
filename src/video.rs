@@ -9,7 +9,7 @@ use crate::hub::{Backlog, Client, Hub, Out, ServerMessage, Takes, Viewer};
 use crate::path::Kbps;
 use crate::rate::{Bounds, FrameBudget, RateCtl, RTT_GUESS_MS};
 use crate::timeline::{CaptureMarks, Coded};
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -334,7 +334,8 @@ impl Stream {
     fn new(cfg: &VideoConfig, hub: &Arc<Hub>, w: u32, h: u32) -> Result<Self, String> {
         log::info!("streaming");
         let (job_tx, job_rx) = mpsc::sync_channel::<Job>(1);
-        let (ret_tx, ret_rx) = mpsc::channel::<Returned>();
+        // One picture goes round, so no more than one comes back at once.
+        let (ret_tx, ret_rx) = mpsc::sync_channel::<Returned>(1);
         let layout = hub.stripes.lock().clone();
         let mut stripes = Vec::new();
         for &(y, sh) in &layout {
@@ -1466,6 +1467,8 @@ struct Crew {
     own: Box<dyn FnMut(StripeJob) -> StripeResult + Send>,
     /// Stripe 1's worker onwards.
     hands: Vec<Hand>,
+    /// What came of the last frame: kept, so a frame allocates nothing for it.
+    out: FrameOut,
 }
 
 /// The encode loop's ends of one stripe worker's channels.
@@ -1505,13 +1508,18 @@ impl Crew {
         Crew {
             own: Box::new(own),
             hands,
+            out: FrameOut(Vec::new()),
         }
     }
 
     /// Lends the job's picture to the workers of the selected stripes, codes stripe 0
     /// while they code theirs, and waits for their results. The picture comes back with
     /// them, no longer shared.
-    fn run(&mut self, selected: &[bool], job: StripeJob) -> Result<(FrameOut, Arc<I420>), Gone> {
+    fn run(
+        &mut self,
+        selected: &[bool],
+        job: StripeJob,
+    ) -> Result<(&mut FrameOut, Arc<I420>), Gone> {
         let asked = || {
             self.hands
                 .iter()
@@ -1523,8 +1531,9 @@ impl Crew {
         for (i, hand) in asked() {
             hand.jobs.send(job.clone()).map_err(|_| Gone(i))?;
         }
-        let mut results: Vec<StripeOut> =
-            (0..=self.hands.len()).map(|_| StripeOut::Skipped).collect();
+        let results = &mut self.out.0;
+        results.clear();
+        results.extend((0..=self.hands.len()).map(|_| StripeOut::Skipped));
         if selected[0] {
             results[0] = (self.own)(job.clone()).out;
         }
@@ -1533,7 +1542,7 @@ impl Crew {
             results[i] = out;
             drop(buf);
         }
-        Ok((FrameOut(results), job.buf))
+        Ok((&mut self.out, job.buf))
     }
 }
 
@@ -1549,7 +1558,7 @@ enum StripeOut {
     /// The stripe's part of the frame: a header's room, then what x264 put out.
     Sent {
         key: bool,
-        bytes: Vec<u8>,
+        bytes: BytesMut,
         quality: Quality,
         /// When the worker took the stripe, handed it to x264 and had it back.
         coded: Coded,
@@ -1559,7 +1568,7 @@ enum StripeOut {
 impl StripeOut {
     /// What x264 made of a stripe's picture, asked for at `crf`; `bytes` is a header's
     /// room and what it put out.
-    fn coded(e: &Encoded, crf: f32, bytes: Vec<u8>, coded: Coded) -> StripeOut {
+    fn coded(e: &Encoded, crf: f32, bytes: BytesMut, coded: Coded) -> StripeOut {
         match bytes.len() {
             Header::LEN => StripeOut::Empty,
             _ => StripeOut::Sent {
@@ -1596,19 +1605,36 @@ impl FrameOut {
         })
     }
 
-    /// The parts that go to the viewers: each stripe that has some, whether it is a
-    /// keyframe, its bytes, and when it was coded.
-    fn into_parts(self) -> Vec<(usize, bool, Vec<u8>, Coded)> {
+    /// When the stripe coded last was coded, if any stripe has a part to send: the frame
+    /// waits for it.
+    fn coded(&self) -> Option<Coded> {
         self.0
-            .into_iter()
-            .enumerate()
-            .filter_map(|(i, o)| match o {
-                StripeOut::Sent {
-                    key, bytes, coded, ..
-                } => Some((i, key, bytes, coded)),
+            .iter()
+            .filter_map(|o| match o {
+                StripeOut::Sent { coded, .. } => Some(*coded),
                 StripeOut::Skipped | StripeOut::Failed | StripeOut::Empty => None,
             })
-            .collect()
+            .reduce(Coded::later)
+    }
+
+    /// How many parts go to the viewers.
+    fn parts(&self) -> usize {
+        self.0
+            .iter()
+            .filter(|o| match o {
+                StripeOut::Sent { .. } => true,
+                StripeOut::Skipped | StripeOut::Failed | StripeOut::Empty => false,
+            })
+            .count()
+    }
+
+    /// The parts that go to the viewers, taken out: each stripe that has some, whether
+    /// it is a keyframe, and its bytes.
+    fn take_parts(&mut self) -> impl Iterator<Item = (usize, bool, BytesMut)> + '_ {
+        self.0.drain(..).enumerate().filter_map(|(i, o)| match o {
+            StripeOut::Sent { key, bytes, .. } => Some((i, key, bytes)),
+            StripeOut::Skipped | StripeOut::Failed | StripeOut::Empty => None,
+        })
     }
 }
 
@@ -1714,6 +1740,59 @@ struct Coder {
     crfs: Crfs,
     debug: bool,
     motion: MotionQuality,
+    /// What x264 put out for the last frame: kept, so a frame allocates nothing for it.
+    out: Vec<u8>,
+    /// x264's hint for each macroblock of the stripe (1: unchanged), kept likewise.
+    hints: Vec<u8>,
+    arenas: Arenas,
+}
+
+/// The bytes a stripe's messages are cut from, in two arenas taken in turn. A message
+/// is the next stretch of the arena in use; when that one is full the other is taken
+/// back, once every message cut from it has been sent and dropped. So a stream whose
+/// viewers keep up allocates nothing for its messages.
+struct Arenas {
+    two: [BytesMut; 2],
+    at: usize,
+}
+
+/// What each of a stripe's two arenas holds. Sized from the four numbers' scroll scene:
+/// a message there is about 11 KB, so an arena holds some 90 frames' messages, and is
+/// taken back after the other has held as many, long after a viewer that keeps up has
+/// been sent them; a keyframe of 300 KB fits three times. Half would still hold 45
+/// frames; one message bigger than an arena gets an arena of its own size. Unmeasured
+/// beyond that.
+const ARENA_BYTES: usize = 1 << 20;
+
+impl Arenas {
+    fn new() -> Arenas {
+        // Cutting from an arena the first time allocates bytes' count of who shares it:
+        // done here, once, and not on some later frame.
+        let shared = || {
+            let mut arena = BytesMut::with_capacity(ARENA_BYTES);
+            drop(arena.split());
+            arena
+        };
+        Arenas {
+            two: [shared(), shared()],
+            at: 0,
+        }
+    }
+
+    /// A message: a header's room, then `payload`.
+    fn message(&mut self, payload: &[u8]) -> BytesMut {
+        let len = Header::LEN + payload.len();
+        if !self.two[self.at].try_reclaim(len) {
+            self.at = 1 - self.at;
+            if !self.two[self.at].try_reclaim(len) {
+                self.two[self.at] = BytesMut::with_capacity(ARENA_BYTES.max(len));
+            }
+        }
+        let arena = &mut self.two[self.at];
+        arena.put_bytes(0, Header::LEN);
+        arena.put_slice(payload);
+        arena.split()
+    }
 }
 
 impl Coder {
@@ -1724,6 +1803,9 @@ impl Coder {
             crfs,
             debug,
             motion: MotionQuality::default(),
+            out: Vec::new(),
+            hints: Vec::new(),
+            arenas: Arenas::new(),
         }
     }
 
@@ -1736,6 +1818,9 @@ impl Coder {
             crfs,
             debug,
             motion,
+            out,
+            hints,
+            arenas,
         } = self;
         let buf = &*job.buf;
         // The CRF the job asks for, and the one x264 is given: MotionQuality may lower
@@ -1763,20 +1848,20 @@ impl Coder {
             stride_y: buf.width,
             stride_uv: suv,
         };
-        let mut out = Vec::with_capacity(64 << 10);
-        out.resize(Header::LEN, 0);
+        out.clear();
         // x264 wants X264_MBINFO_CONSTANT (1) on unchanged macroblocks of this stripe.
-        let mut info = match &job.mb_dirty {
+        let info = match &job.mb_dirty {
             Dirty::All => None,
             Dirty::Blocks(d) => {
                 let rows = s.h.div_ceil(16);
                 let start = (s.y / 16) * job.mb_cols;
-                Some(
+                hints.clear();
+                hints.extend(
                     d[start..start + rows * job.mb_cols]
                         .iter()
-                        .map(|&x| (x == 0) as u8)
-                        .collect::<Vec<u8>>(),
-                )
+                        .map(|&x| (x == 0) as u8),
+                );
+                Some(&mut hints[..])
             }
         };
         // Changed macroblocks in this stripe (all of them without a damage map).
@@ -1790,8 +1875,8 @@ impl Coder {
             job.ts,
             matches!(job.coding, Coding::Key { .. }),
             None,
-            info.as_deref_mut(),
-            &mut out,
+            info,
+            out,
         );
         let encoded = Instant::now();
         if *debug {
@@ -1801,13 +1886,13 @@ impl Coder {
                 s.y,
                 te.elapsed().as_micros(),
                 cpu_now,
-                out.len()
+                Header::LEN + out.len()
             );
         }
         let result = match r {
             Ok(e) => {
                 let size = matches!(job.coding, Coding::Motion).then(|| MotionSize {
-                    bits: (out.len() - Header::LEN) * 8,
+                    bits: out.len() * 8,
                     changed,
                     mbs: stripe_mbs,
                     crf: asked,
@@ -1816,7 +1901,7 @@ impl Coder {
                 StripeOut::coded(
                     &e,
                     crf,
-                    out,
+                    arenas.message(out),
                     Coded {
                         woke,
                         x264: te,
@@ -1888,7 +1973,7 @@ impl Drop for Woken {
 fn encode_loop(
     stripes_in: Vec<Stripe>,
     rx: mpsc::Receiver<Job>,
-    ret: mpsc::Sender<Returned>,
+    ret: mpsc::SyncSender<Returned>,
     hub: Arc<Hub>,
     fps: Fps,
     crfs: Crfs,
@@ -1918,20 +2003,22 @@ fn encode_frames(
     stripes: &[(usize, usize)],
     fps: Fps,
     rx: mpsc::Receiver<Job>,
-    ret: mpsc::Sender<Returned>,
+    ret: mpsc::SyncSender<Returned>,
     hub: &Hub,
 ) -> Result<(), Gone> {
     let epoch = Instant::now();
     let mut frame_id: u32 = 0;
     let n = stripes.len();
     let mut budget = FrameBudget::new(epoch);
+    // Kept from frame to frame, so a frame allocates nothing for them.
+    let mut selected: Vec<bool> = Vec::with_capacity(n);
+    let mut msgs: Vec<Bytes> = Vec::with_capacity(n);
+    let mut viewers = Vec::new();
     while let Ok(job) = rx.recv() {
         let t0 = Instant::now();
         // A sharpening frame's band covers the blocks it sharpens.
-        let selected: Vec<bool> = stripes
-            .iter()
-            .map(|&(y, h)| job.frame.touches(y, h))
-            .collect();
+        selected.clear();
+        selected.extend(stripes.iter().map(|&(y, h)| job.frame.touches(y, h)));
         if !selected.iter().any(|&x| x) {
             let _ = ret.send(Returned {
                 buf: job.buf,
@@ -1976,17 +2063,33 @@ fn encode_frames(
             sharpened: sharpened.filter(|_| sharp),
         });
         hub.wake();
-        let parts = out.into_parts();
         // The viewers this keyframe was promised to start on it, or wait for another.
         for c in &starts {
             c.keyframe_sent(all_key);
         }
         // A frame waits for the stripe coded last; one with nothing to send is not sent.
-        let Some(coded) = parts.iter().map(|p| p.3).reduce(Coded::later) else {
+        let Some(coded) = out.coded() else {
             continue;
         };
+        let nparts = out.parts() as u8;
         let enc_us = t0.elapsed().as_micros() as u64;
-        let total: usize = parts.iter().map(|p| p.2.len()).sum();
+        frame_id = frame_id.wrapping_add(1);
+        let pipe = Pipe::of(job.captured.damage.elapsed());
+        msgs.extend(out.take_parts().map(|(i, key, mut out)| {
+            let header = Header {
+                key,
+                sharpens,
+                frame: frame_id,
+                pipe,
+                stripe: i as u8,
+                stripes: n as u8,
+                parts: nparts,
+                y: stripes[i].0 as u16,
+            };
+            out[..Header::LEN].copy_from_slice(&header.bytes());
+            out.freeze()
+        }));
+        let total: usize = msgs.iter().map(Bytes::len).sum();
         hub.stats.encode_us.fetch_add(enc_us, Ordering::Relaxed);
         hub.stats.encoded.fetch_add(1, Ordering::Relaxed);
         hub.stats.bytes.fetch_add(total as u64, Ordering::Relaxed);
@@ -1994,26 +2097,6 @@ fn encode_frames(
         if all_key {
             hub.stats.keyframes.fetch_add(1, Ordering::Relaxed);
         }
-        frame_id = frame_id.wrapping_add(1);
-        let pipe = Pipe::of(job.captured.damage.elapsed());
-        let nparts = parts.len() as u8;
-        let msgs: Vec<Bytes> = parts
-            .into_iter()
-            .map(|(i, key, mut out, _)| {
-                let header = Header {
-                    key,
-                    sharpens,
-                    frame: frame_id,
-                    pipe,
-                    stripe: i as u8,
-                    stripes: n as u8,
-                    parts: nparts,
-                    y: stripes[i].0 as u16,
-                };
-                out[..Header::LEN].copy_from_slice(&header.bytes());
-                Bytes::from(out)
-            })
-            .collect();
         let now = Instant::now();
         hub.timeline.record(
             frame_id,
@@ -2027,7 +2110,8 @@ fn encode_frames(
                 bytes: total,
             },
         );
-        for (c, _) in hub.viewers() {
+        hub.viewers_into(&mut viewers);
+        for (c, _) in &viewers {
             match c.takes(frame_id, now, total, all_key, HOPELESSLY_BEHIND) {
                 Takes::Nothing => {}
                 Takes::Frame => {
@@ -2041,6 +2125,10 @@ fn encode_frames(
                 }
             }
         }
+        // What the viewers were sent is theirs now: dropped here, each stripe's arena is
+        // taken back once they are done with it.
+        msgs.clear();
+        viewers.clear();
         hub.stats.send_lat_us.fetch_add(
             job.captured.damage.elapsed().as_micros() as u64,
             Ordering::Relaxed,
@@ -2273,7 +2361,10 @@ mod tests {
             applied: None,
         };
         let (job_tx, job_rx) = mpsc::sync_channel::<Job>(1);
-        let (ret_tx, _ret_rx) = mpsc::channel::<Returned>();
+        // The way home holds one picture: the capture loop's part, taking each home, is
+        // played by a thread of its own.
+        let (ret_tx, ret_rx) = mpsc::sync_channel::<Returned>(1);
+        let home = std::thread::spawn(move || ret_rx.iter().count());
         let encode = std::thread::spawn({
             let hub = hub.clone();
             move || {
@@ -2318,6 +2409,7 @@ mod tests {
         }
         drop(job_tx);
         encode.join().unwrap();
+        assert_eq!(home.join().unwrap(), HOPELESSLY_BEHIND + 3);
         let sent: Vec<Out> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         let frames = sent.iter().take_while(|m| matches!(m, Out::Bin(_))).count();
         assert_eq!(frames, HOPELESSLY_BEHIND + 1);
@@ -2416,6 +2508,9 @@ mod tests {
                                 marker_ms: None,
                             })
                             .unwrap();
+                        // Its picture comes home before the next is sent, as the capture
+                        // loop's one picture does: the way home holds one.
+                        s.ret_rx.recv().unwrap();
                     }
                     drop(s);
                     // Whether each part a stripe sent was coded from nothing, in order.
@@ -3067,7 +3162,7 @@ mod tests {
         let at = Instant::now();
         StripeOut::Sent {
             key: d & 1 == 1,
-            bytes: d.to_be_bytes().to_vec(),
+            bytes: BytesMut::from(&d.to_be_bytes()[..]),
             quality: if d & 2 == 2 {
                 Quality::AsAsked
             } else {
@@ -3274,7 +3369,7 @@ mod tests {
                                 crf_avg: crf + (g.below(40) as f32 - 10.0) / 10.0,
                             },
                         };
-                        let mut bytes = vec![0; Header::LEN];
+                        let mut bytes = BytesMut::zeroed(Header::LEN);
                         bytes.extend(g.bytes(len));
                         sharp &= len == 0 || e.crf_avg < crf + 0.5;
                         all_key &= len > 0 && e.keyframe;
@@ -3292,21 +3387,14 @@ mod tests {
                     }
                 }
             }
-            let out = FrameOut(outs);
-            let (got_sharp, got_key) = (out.sharp(), out.all_key());
-            // When each stripe was coded is the timeline's, and not the model's.
-            let got: Vec<(usize, bool, Vec<u8>)> = out
-                .into_parts()
-                .into_iter()
-                .map(|(i, key, bytes, _)| (i, key, bytes))
-                .collect();
+            let mut out = FrameOut(outs);
+            let (sharp_got, all_key_got, count) = (out.sharp(), out.all_key(), out.parts());
+            let got = (sharp_got, all_key_got, out.take_parts().collect::<Vec<_>>());
+            assert_eq!(count, got.2.len(), "case {case}");
             reached[usize::from(!sharp)] += 1;
             reached[2] += usize::from(all_key);
             reached[3] += usize::from(empty && sharp);
-            assert!(
-                (got_sharp, got_key, got) == (sharp, all_key, parts),
-                "case {case}"
-            );
+            assert!(got == (sharp, all_key, parts), "case {case}");
         }
         assert!(
             reached.iter().all(|&r| r >= 200),
@@ -3395,7 +3483,8 @@ mod tests {
     /// selection, every coding, caps that move, block maps or none), real x264 encoders
     /// on one thread each put out, stripe by stripe, the bytes, keyframes and quality
     /// their coders put out when handed the same jobs one by one on this thread, and a
-    /// stripe not selected is skipped.
+    /// stripe not selected is skipped. And once the crew is done with a frame nothing it
+    /// ran holds the frame's block map, so the capture loop may write it again.
     #[test]
     fn a_stripe_coded_where_its_frame_is_comes_out_as_on_a_worker() {
         let crfs = Crfs {
@@ -3496,14 +3585,254 @@ mod tests {
                         false => StripeOut::Skipped,
                     })
                     .collect();
+                let map = match &job.mb_dirty {
+                    Dirty::Blocks(map) => Some(Arc::downgrade(map)),
+                    Dirty::All => None,
+                };
                 let (got, back) = new.run(&selected, job).unwrap();
                 let want = shown(&want);
                 assert_eq!(shown(&got.0), want, "case {case} frame {frame}");
+                assert!(
+                    map.is_none_or(|map| map.upgrade().is_none()),
+                    "case {case} frame {frame}: the block map is still held"
+                );
                 sent += want.iter().filter(|w| w.len() > 20).count();
                 buf = back;
             }
         }
         assert!(sent >= 300, "only {sent} stripes coded");
+    }
+
+    /// A frame in steady state allocates nothing on the encode loop's thread or a stripe
+    /// worker's, whatever it is. The oracle is the allocator itself: it counts every
+    /// allocation the process makes while frames go through.
+    ///
+    /// The encode loop runs on a thread of its own, as the stream runs it, with real
+    /// encoders for 1 to 3 stripes of a 1024x768 screen and one viewer. This test's
+    /// thread plays the capture loop (it draws into the picture that came back and hands
+    /// it over) and the viewer's socket task (acks each frame as it arrives, and holds
+    /// what was sent until the next frame, as a socket that takes its time); what it
+    /// allocates is theirs and not counted. First every kind of frame goes
+    /// through over every band, which brings every buffer the encode loop and its workers
+    /// keep to its size; then a generated run of frames is counted. What x264 allocates
+    /// goes through C's malloc, which this allocator does not see.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_encode_loop_and_its_workers_allocate_nothing_a_frame() {
+        if !in_a_process_of_its_own(
+            "video::tests::the_encode_loop_and_its_workers_allocate_nothing_a_frame",
+        ) {
+            return;
+        }
+        let (w, h) = (1024usize, 768usize);
+        let (cols, rows) = (w.div_ceil(16), h.div_ceil(16));
+        let crfs = Crfs {
+            configured: 24.0,
+            paintover: 16.0,
+        };
+        let mut rng = 0x2545F4914F6CDD1Du64;
+        let mut next = |n: usize| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng as usize % n
+        };
+        for stripes in 1..=3 {
+            let layout = stripe_layout(h as u32, stripes);
+            let mut coders = layout.iter().map(|&(y, sh)| {
+                let cfg = EncoderConfig {
+                    pictures: Pictures {
+                        width: w as u32,
+                        height: sh,
+                        fps: Fps::new(60).unwrap(),
+                        preset: Preset::parse("ultrafast").unwrap(),
+                        threads: (4 / layout.len() as u32).max(1),
+                        debug: Debugging::read(|_| None).unwrap(),
+                    },
+                    crf: 24.0,
+                    max_kbps: Some(Kbps::new(30_000.0)),
+                };
+                let s = Stripe {
+                    y: y as usize,
+                    h: sh as usize,
+                    enc: Encoder::new(&cfg).unwrap(),
+                    applied: None,
+                };
+                Coder::new(s, Fps::new(60).unwrap(), crfs, false)
+            });
+            let mut own = coders.next().unwrap();
+            let crew = Crew::spawn(
+                move |job| own.code(job),
+                coders.map(|c| move |rx, done| stripe_worker(c, rx, done)),
+            );
+            let geometry: Vec<(usize, usize)> = layout
+                .iter()
+                .map(|&(y, sh)| (y as usize, sh as usize))
+                .collect();
+            let hub = Hub::new();
+            let (tx, mut socket) = tokio::sync::mpsc::unbounded_channel();
+            let viewer = hub.add_client(tx);
+            viewer.watch();
+            // The capture loop planned its keyframe: the first frame played is one.
+            viewer.keyframe_planned();
+            let (job_tx, job_rx) = mpsc::sync_channel::<Job>(1);
+            // One picture goes round (capture-when-idle).
+            let (ret_tx, ret_rx) = mpsc::sync_channel::<Returned>(1);
+            let encoding = hub.clone();
+            let encode = std::thread::Builder::new()
+                .name("encode".into())
+                .spawn(move || {
+                    let mut crew = crew;
+                    let fps = Fps::new(60).unwrap();
+                    encode_frames(&mut crew, &geometry, fps, job_rx, ret_tx, &encoding).unwrap()
+                })
+                .unwrap();
+            // Bands of block rows, each with a map of the blocks in it that changed,
+            // made before anything is counted.
+            let maps: Vec<(Band, Arc<Vec<u8>>)> = (0..8)
+                .map(|_| {
+                    let first = next(rows);
+                    let last = first + next(rows - first);
+                    let map = (0..cols * rows)
+                        .map(|b| ((first..=last).contains(&(b / cols)) && next(3) > 0) as u8)
+                        .collect();
+                    let band = Band {
+                        y0: (first * 16) as u32,
+                        y1: ((last + 1) * 16).min(h) as u32,
+                    };
+                    (band, Arc::new(map))
+                })
+                .collect();
+            let every = Arc::new(vec![1u8; cols * rows]);
+            let sharpen = |map: &Arc<Vec<u8>>| Sharpen {
+                map: map.clone(),
+                at: Instant::now(),
+            };
+            let mut home = Some(Arc::new(I420::new(w, h)));
+            // The viewer the first keyframe was planned for; it starts on it.
+            let mut starts = vec![viewer.clone()];
+            let mut writing: Vec<Bytes> = vec![];
+            let mut frame = |kind: usize, which: usize, n: usize| {
+                let (band, map) = &maps[which];
+                let frame = match kind {
+                    0 => super::Frame::Key {
+                        blocks: None,
+                        starts: std::mem::take(&mut starts),
+                    },
+                    1 => super::Frame::Key {
+                        blocks: Some(sharpen(&every)),
+                        starts: std::mem::take(&mut starts),
+                    },
+                    2 => super::Frame::Motion {
+                        band: *band,
+                        dirty: every.clone(),
+                    },
+                    3 => super::Frame::Motion {
+                        band: *band,
+                        dirty: map.clone(),
+                    },
+                    4 => super::Frame::Sharpen {
+                        band: *band,
+                        blocks: sharpen(map),
+                    },
+                    _ => super::Frame::MotionAndSharpen {
+                        band: *band,
+                        dirty: map.clone(),
+                        blocks: sharpen(map),
+                    },
+                };
+                // The picture comes home before the next frame is captured into it.
+                while home.is_none() {
+                    home = Some(ret_rx.recv().unwrap().buf);
+                }
+                let mut buf = home.take().unwrap();
+                // What moved: lines of 9 px glyphs scrolled 3 px a frame through the band.
+                let pic = Arc::get_mut(&mut buf).unwrap();
+                let (y0, y1) = (band.y0 as usize, band.y1 as usize);
+                for (y, row) in pic.y.chunks_exact_mut(w).enumerate().take(y1).skip(y0) {
+                    let (line, within) = ((y + 3 * n) / 18, (y + 3 * n) % 18);
+                    for (x, glyph) in row.chunks_mut(9).enumerate() {
+                        let ink = within < 12 && (x * 2654435761 + line * 40503) >> 7 & 1 == 1;
+                        glyph.fill(if ink { 30 } else { 235 });
+                    }
+                }
+                job_tx
+                    .send(Job {
+                        buf,
+                        frame,
+                        target: Kbps::new(6000.0),
+                        capacity: None,
+                        captured: CaptureMarks::at(Instant::now()),
+                        marker_ms: None,
+                    })
+                    .unwrap();
+                // The viewer: every frame is acknowledged as it arrives, and what was
+                // sent to it is written out a frame later, as a socket that takes its time.
+                let mut arrived = vec![];
+                while let Ok(m) = socket.try_recv() {
+                    if let Out::Bin(m) = m {
+                        let id = u32::from_be_bytes([m[2], m[3], m[4], m[5]]);
+                        viewer.on_ack(Instant::now(), id, crate::hub::Hold::Unsaid);
+                        arrived.push(m);
+                    }
+                }
+                writing = arrived;
+            };
+            let mut n = 0;
+            for _ in 0..2 {
+                for kind in 0..6 {
+                    for which in 0..maps.len() {
+                        frame(kind, which, n);
+                        n += 1;
+                    }
+                }
+            }
+            const COUNTED: usize = 120;
+            counting::arm();
+            for _ in 0..COUNTED {
+                // A keyframe now and then, as a viewer joining asks for one.
+                let kind = match next(30) {
+                    0 => next(2),
+                    _ => 2 + next(4),
+                };
+                frame(kind, next(maps.len()), n);
+                n += 1;
+            }
+            let (threads, others) = counting::disarm();
+            drop(job_tx);
+            encode.join().unwrap();
+            let ours: Vec<String> = threads
+                .iter()
+                .map(|t| {
+                    (
+                        String::from_utf8_lossy(&t.name)
+                            .trim_end_matches('\0')
+                            .to_owned(),
+                        t,
+                    )
+                })
+                .filter(|(name, _)| name == "encode" || name.starts_with("enc-"))
+                .map(|(name, t)| {
+                    let sizes: Vec<String> = t
+                        .sizes
+                        .iter()
+                        .flatten()
+                        .map(|(size, n)| format!("{size} B x {n}"))
+                        .collect();
+                    format!(
+                        "{name}: {:.2} a frame ({})",
+                        t.allocations as f64 / COUNTED as f64,
+                        sizes.join(", ")
+                    )
+                })
+                .collect();
+            assert!(
+                ours.is_empty() && others == 0,
+                "{stripes} stripes: {COUNTED} frames allocated, by thread:\n{}\nand {others} \
+                 times on threads past the table",
+                ours.join("\n")
+            );
+        }
     }
 
     /// How a fake stripe worker ends.
@@ -3560,7 +3889,7 @@ mod tests {
                     End::Panics(n) if n == served => panic!("stripe {i} dies on its job {n}"),
                     End::Never | End::Returns(_) | End::Drops(_) | End::Panics(_) => {}
                 }
-                let mut bytes = vec![0; Header::LEN];
+                let mut bytes = BytesMut::zeroed(Header::LEN);
                 bytes.extend([i as u8, served as u8]);
                 let at = Instant::now();
                 let out = StripeOut::Sent {
@@ -3698,7 +4027,7 @@ mod tests {
                     if end0.answers() == Some(served0) {
                         panic!("stripe 0 dies on its job {served0}");
                     }
-                    let mut bytes = vec![0; Header::LEN];
+                    let mut bytes = BytesMut::zeroed(Header::LEN);
                     bytes.extend([0, served0 as u8]);
                     served0 += 1;
                     let at = Instant::now();
@@ -3754,7 +4083,7 @@ mod tests {
             let refused = !dying.is_empty() && frames.len() > back + 2;
 
             let (job_tx, rx) = mpsc::sync_channel::<Job>(1);
-            let (ret, ret_rx) = mpsc::channel();
+            let (ret, ret_rx) = mpsc::sync_channel(2);
             let hub = Hub::new();
             let (ended_tx, ended) = mpsc::channel();
             let encode = encoder_thread(hub.clone(), {
@@ -4019,7 +4348,7 @@ mod tests {
             applied: None,
         };
         let (job_tx, job_rx) = mpsc::sync_channel::<Job>(1);
-        let (ret_tx, _ret_rx) = mpsc::channel::<Returned>();
+        let (ret_tx, _ret_rx) = mpsc::sync_channel::<Returned>(1);
         let encode = std::thread::spawn({
             let hub = hub.clone();
             move || {
@@ -4230,10 +4559,8 @@ mod tests {
     /// goes through C's malloc, which this allocator does not see.
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "frames allocate on main: the encode loop's selected, results, parts and \
-                msgs, its viewer list and each message's Bytes header; the stripe worker's \
-                output and hint vectors; the blocks of the unbounded channels between the \
-                loops"]
+    #[ignore = "frames allocate on main: 40 B once in 120 frames on the test's own thread, \
+                which plays the capture loop and the viewer"]
     fn a_steady_state_frame_allocates_nothing() {
         if !in_a_process_of_its_own("video::tests::a_steady_state_frame_allocates_nothing") {
             return;

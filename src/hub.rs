@@ -650,12 +650,22 @@ impl Hub {
     /// Every client that watches, with what it is to the stream as one read of it saw it:
     /// whatever is decided from them is decided from that read.
     pub fn viewers(&self) -> Vec<(Arc<Client>, Viewer)> {
-        self.clients
-            .lock()
-            .iter()
-            .map(|c| (c.clone(), c.viewer()))
-            .filter(|(_, viewer)| *viewer != Viewer::NotWatching)
-            .collect()
+        let mut v = Vec::new();
+        self.viewers_into(&mut v);
+        v
+    }
+
+    /// As `viewers`, into `into` in place of what it held: one asking every frame keeps one
+    /// vector, and allocates nothing once it is big enough.
+    pub fn viewers_into(&self, into: &mut Vec<(Arc<Client>, Viewer)>) {
+        into.clear();
+        into.extend(
+            self.clients
+                .lock()
+                .iter()
+                .map(|c| (c.clone(), c.viewer()))
+                .filter(|(_, viewer)| *viewer != Viewer::NotWatching),
+        );
     }
 
     /// The bitrate the stream is steered to, once a pipeline has set one.
