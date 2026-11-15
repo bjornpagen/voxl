@@ -23,6 +23,7 @@ mod help;
 mod hub;
 #[cfg(target_os = "linux")]
 mod input;
+mod logging;
 mod login;
 #[cfg(target_os = "macos")]
 mod mac;
@@ -163,7 +164,9 @@ pub fn run(args: impl IntoIterator<Item = String>) {
     if let Some(style) = &env.log.style {
         log.parse_write_style(style);
     }
-    let _ = log.try_init();
+    // x264 says what VOXL_X264_INFO asks of it (its own level), and all of that is written.
+    log.filter_module("x264", log::LevelFilter::Debug);
+    logging::init(log.build());
     if let Some(refused) = &env.refused {
         log::error!("{refused}");
     }
@@ -221,15 +224,15 @@ async fn serve(a: HashMap<String, String>, env: env::Env) {
     let max = a.get("max-kbps").or(a.get("video-bitrate"));
     let bounds = bounds(a.get("min-kbps"), max).unwrap_or_else(|e| {
         log::error!("{e}");
-        std::process::exit(1);
+        logging::exit(1);
     });
     let preset = preset(a.get("preset")).unwrap_or_else(|e| {
         log::error!("{e}");
-        std::process::exit(1);
+        logging::exit(1);
     });
     let fps = framerate(a.get("framerate")).unwrap_or_else(|e| {
         log::error!("{e}");
-        std::process::exit(1);
+        logging::exit(1);
     });
     let vcfg = video::VideoConfig {
         display: display.clone(),
@@ -307,7 +310,7 @@ async fn serve(a: HashMap<String, String>, env: env::Env) {
     let resize_scale = range_max(a.get("resize-scale"), default_scale);
     if let Err(e) = video::spawn(vcfg, hub.clone(), screen) {
         log::error!("video init failed: {e}");
-        std::process::exit(1);
+        logging::exit(1);
     }
     let radius = range_max(a.get("round-corners"), 0.0) as u16;
     // --round-windows=title:radius,...: round specific windows (docks included) by title.
@@ -419,7 +422,7 @@ async fn serve(a: HashMap<String, String>, env: env::Env) {
     let (favicon, favicon_type) = server::favicon(a.get("favicon").map(|s| s.as_str()))
         .unwrap_or_else(|e| {
             log::error!("{e}");
-            std::process::exit(1);
+            logging::exit(1);
         });
     let state = server::AppState {
         hub: hub.clone(),
@@ -523,7 +526,7 @@ async fn serve(a: HashMap<String, String>, env: env::Env) {
             let _ = tx.send(event::InputEvent::Shutdown);
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        std::process::exit(0);
+        logging::exit(0);
     });
     if let Some(config) = tls {
         return tls::serve(listener, app, config).await;

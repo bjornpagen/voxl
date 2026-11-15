@@ -445,7 +445,7 @@ pub fn spawn(
                     log::info!("capture geometry changed: {e}");
                 } else {
                     log::error!("capture loop ended: {e}");
-                    std::process::exit(1);
+                    crate::logging::exit(1);
                 }
             }
             drop(cap);
@@ -457,7 +457,7 @@ pub fn spawn(
                 hub.resize_req.lock().take();
                 cap = switch_display(request, &cfg, &hub, &mut screen).unwrap_or_else(|e| {
                     log::error!("display switch failed: {e}");
-                    std::process::exit(1);
+                    crate::logging::exit(1);
                 });
                 continue;
             }
@@ -471,7 +471,7 @@ pub fn spawn(
                 Ok(cap) => cap,
                 Err(e) => {
                     log::error!("video restart failed: {e}");
-                    std::process::exit(1);
+                    crate::logging::exit(1);
                 }
             };
         })
