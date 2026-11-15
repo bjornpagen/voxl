@@ -53,6 +53,7 @@ pub struct Hello {
     pub settings: serde_json::Map<String, serde_json::Value>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Inflight {
     pub id: u32,
     pub sent: Instant,
@@ -228,6 +229,8 @@ pub struct Client {
     /// How long the client keeps a frame between its arrival and the ack (decode, draw,
     /// frames ahead of it), as it reports it: smoothed ms, 0 for a client that doesn't.
     pub client_ms: Mutex<f64>,
+    /// Its last frames as they were sent and acked (`/stats/trace`).
+    pub trace: Mutex<crate::timeline::Trace>,
 }
 
 impl Client {
@@ -303,10 +306,11 @@ impl Client {
         }
     }
 
-    /// The encode loop has frame `id`, of `bytes`, to send at `now`. A client that has
-    /// started takes it, and it is in flight until acked, unless it already has more than
-    /// `behind` frames in flight: then it stops watching, and is to be sent a close.
-    pub fn takes(&self, id: u32, now: Instant, bytes: usize, behind: usize) -> Takes {
+    /// The encode loop has frame `id`, of `bytes`, to send at `now`; `key`: every stripe of
+    /// it is a keyframe. A client that has started takes it, and it is in flight until
+    /// acked and in its trace, unless it already has more than `behind` frames in flight:
+    /// then it stops watching, and is to be sent a close.
+    pub fn takes(&self, id: u32, now: Instant, bytes: usize, key: bool, behind: usize) -> Takes {
         let mut v = self.viewing.lock();
         match v.viewer {
             Viewer::Started if v.inflight.len() > behind => {
@@ -314,13 +318,14 @@ impl Client {
                 Takes::Close
             }
             Viewer::Started => {
-                let alone = v.inflight.is_empty();
-                v.inflight.push_back(Inflight {
+                let frame = Inflight {
                     id,
                     sent: now,
                     bytes,
-                    alone,
-                });
+                    alone: v.inflight.is_empty(),
+                };
+                v.inflight.push_back(frame);
+                self.trace.lock().sent(frame, key);
                 Takes::Frame
             }
             Viewer::NotWatching | Viewer::Waiting | Viewer::Promised => Takes::Nothing,
@@ -331,6 +336,7 @@ impl Client {
     /// client held of the delay is its own time, not the path's, so the delay sample
     /// ends that much earlier.
     pub fn on_ack(&self, now: Instant, id: u32, hold: Hold) {
+        self.trace.lock().acked(now, id, hold);
         let mut q = self.inflight();
         let mut sample = None;
         while let Some(f) = q.front() {
@@ -608,9 +614,20 @@ impl Hub {
             pings: Mutex::new(Pings::default()),
             path: Mutex::new(crate::path::PathEst::new(Instant::now())),
             client_ms: Mutex::new(0.0),
+            trace: Mutex::new(crate::timeline::Trace::with_room()),
         });
         self.clients.lock().push(c.clone());
         c
+    }
+
+    /// Each client's trace, by its id: the list is let go before a trace is copied, and a
+    /// trace is held only while it is copied.
+    pub fn traces(&self) -> Vec<(u64, crate::timeline::Trace)> {
+        let clients = self.clients.lock().clone();
+        clients
+            .iter()
+            .map(|c| (c.id, c.trace.lock().clone()))
+            .collect()
     }
 
     pub fn remove_client(&self, id: u64) {
@@ -917,7 +934,7 @@ mod tests {
                 }
                 for (v, _) in hub.viewers() {
                     let id = v.inflight().back().map_or(1, |f| f.id + 1);
-                    if v.takes(id, t0, 1000, BEHIND) == Takes::Frame {
+                    if v.takes(id, t0, 1000, whole, BEHIND) == Takes::Frame {
                         sent.push(c.iter().position(|c| c.id == v.id).unwrap());
                     }
                 }

@@ -1540,7 +1540,7 @@ fn encode_loop(
             },
         );
         for (c, _) in hub.viewers() {
-            match c.takes(frame_id, now, total, HOPELESSLY_BEHIND) {
+            match c.takes(frame_id, now, total, all_key, HOPELESSLY_BEHIND) {
                 Takes::Nothing => {}
                 Takes::Frame => {
                     for m in &msgs {
@@ -3048,6 +3048,63 @@ mod tests {
             allocated.is_empty() && others == 0,
             "{COUNTED} frames allocated, by thread:\n{}\nand {others} times on threads past the table",
             allocated.join("\n")
+        );
+    }
+
+    /// Recording a viewer's frames and acks allocates nothing once it has joined: its trace
+    /// is made then, with room for every frame it keeps. The oracle is the counting
+    /// allocator. The viewer is sent three rings' worth of frames, numbered from 1 again
+    /// every 1000 as streams start over, as the encode loop records them; acks come as
+    /// on_ack records them: for the frame just sent or up to three before it (several at
+    /// once, out of order, twice), now and then for a number never sent, and none for a
+    /// spell longer than the ring, after which an ack scans a whole ring of open frames;
+    /// with every kind of hold.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recording_a_viewers_frames_and_acks_allocates_nothing() {
+        use crate::hub::{Hold, Inflight};
+        use crate::timeline::FRAMES_KEPT;
+        if !in_a_process_of_its_own(
+            "video::tests::recording_a_viewers_frames_and_acks_allocates_nothing",
+        ) {
+            return;
+        }
+        let hub = Hub::new();
+        let viewer = hub.add_client(tokio::sync::mpsc::unbounded_channel().0);
+        let t0 = Instant::now();
+        // A fixed scramble of a frame's place in the run: what it is and how it is acked.
+        let mix = |k: u64| k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32;
+        let deaf = FRAMES_KEPT as u64..FRAMES_KEPT as u64 * 9 / 4;
+        counting::arm();
+        for k in 0..3 * FRAMES_KEPT as u64 {
+            let at = t0 + Duration::from_millis(k * 16);
+            let id = (k % 1000) as u32 + 1;
+            let frame = Inflight {
+                id,
+                sent: at,
+                bytes: (mix(k) % 100_000) as usize,
+                alone: mix(k) % 2 == 0,
+            };
+            viewer.trace.lock().sent(frame, mix(k) % 30 == 0);
+            if deaf.contains(&k) {
+                continue;
+            }
+            let hold = match mix(k) % 3 {
+                0 => Hold::Unsaid,
+                1 => Hold::Said(Duration::from_micros(mix(k) % 10_000)),
+                _ => Hold::Unreadable,
+            };
+            let named = match mix(k) % 50 {
+                0 => id + 5000,
+                n => id.wrapping_sub((n % 4) as u32),
+            };
+            let acked = at + Duration::from_millis(mix(k) % 400);
+            viewer.trace.lock().acked(acked, named, hold);
+        }
+        let (threads, others) = counting::disarm();
+        assert!(
+            threads.is_empty() && others == 0,
+            "recording allocated: {threads:?}, and {others} times on threads past the table"
         );
     }
 }

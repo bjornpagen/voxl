@@ -209,20 +209,40 @@ async fn stats(State(s): State<AppState>) -> Response {
 
 /// What the server remembers of the last frames, every time in microseconds on the
 /// timeline's clock (`Timeline::us`), as `/stats`'s `now_us` is: each frame's way from
-/// the screen to the sockets (crate::timeline).
+/// the screen to the sockets, and each viewer's frames as they were sent and acked
+/// (crate::timeline).
 async fn trace(State(s): State<AppState>) -> Response {
+    use crate::timeline::{Recorded, SentRow, MARKS};
+    /// Written by serde straight, not through a `serde_json::Value`, whose numbers stop
+    /// at 64 bits: a viewer may report a hold of more microseconds than that.
+    #[derive(serde::Serialize)]
+    struct Body {
+        now_us: u64,
+        marks: [&'static str; MARKS.len()],
+        frames: Vec<Recorded>,
+        viewers: Vec<Viewer>,
+    }
+    #[derive(serde::Serialize)]
+    struct Viewer {
+        id: u64,
+        frames: Vec<SentRow>,
+    }
     let timeline = &s.hub.timeline;
     let frames = timeline.newest(crate::timeline::FRAMES_KEPT);
-    let body = serde_json::json!({
-        "now_us": timeline.us(Instant::now()),
-        "marks": crate::timeline::MARKS,
-        "frames": frames,
-    });
-    (
-        [(header::CONTENT_TYPE, "application/json")],
-        body.to_string(),
-    )
-        .into_response()
+    let viewers = s.hub.traces();
+    axum::Json(Body {
+        now_us: timeline.us(Instant::now()),
+        marks: MARKS,
+        frames,
+        viewers: viewers
+            .iter()
+            .map(|(id, trace)| Viewer {
+                id: *id,
+                frames: timeline.rows(trace),
+            })
+            .collect(),
+    })
+    .into_response()
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(s): State<AppState>) -> Response {
