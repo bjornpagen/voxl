@@ -48,7 +48,6 @@ use mac::{audio, capture, desktop, input, screen};
 use win::{audio, capture, desktop, input, screen};
 
 use std::collections::HashMap;
-use std::num::NonZeroU32;
 
 /// Parses `--key=value` / `--key value` / `--flag`; unknown options are accepted so the
 /// binary can take the same argument list as the Python selkies service it replaces.
@@ -110,17 +109,23 @@ fn preset(flag: Option<&String>) -> Result<encoder::Preset, String> {
 
 /// The most frames a second when `--framerate` is not given, or is not a number:
 /// upstream's default.
-const FRAMERATE: NonZeroU32 = NonZeroU32::new(60).unwrap();
+const FRAMERATE: encoder::Fps = encoder::Fps::new(60).unwrap();
 
 /// `--framerate` (or a Selkies range, whose upper bound is the rate): the most frames a
-/// second. Under one (0, or a fraction of one) is refused: the capture loop would space
-/// its frames an endless time apart, and stops the server instead.
-fn framerate(v: Option<&String>) -> Result<NonZeroU32, String> {
+/// second, 1 to `Fps::MAX`. Under one (0, or a fraction of one) the capture loop would
+/// space its frames an endless time apart; from 2^30 up, four frames' worth of the rate
+/// no longer fits the VBV buffer's arithmetic. Both stopped the server; now neither
+/// starts it.
+fn framerate(v: Option<&String>) -> Result<encoder::Fps, String> {
     let Some(v) = v else {
         return Ok(FRAMERATE);
     };
-    NonZeroU32::new(range_max(Some(v), FRAMERATE.get() as f64) as u32)
-        .ok_or_else(|| format!("--framerate {v:?}: under one frame a second"))
+    encoder::Fps::new(range_max(Some(v), FRAMERATE.get() as f64) as u32).ok_or_else(|| {
+        format!(
+            "--framerate {v:?}: not 1 to {} frames a second",
+            encoder::Fps::MAX
+        )
+    })
 }
 
 /// `--min-kbps` and `--max-kbps` (or Selkies' `--video-bitrate`), read together: what the
@@ -565,7 +570,7 @@ mod tests {
                     pictures: encoder::Pictures {
                         width: 64,
                         height: 64,
-                        fps: std::num::NonZeroU32::new(60).unwrap(),
+                        fps: encoder::Fps::new(60).unwrap(),
                         preset,
                         threads: 1,
                         debug: env::Debugging::read(|_| None).unwrap(),
@@ -669,11 +674,11 @@ mod tests {
         }
     }
 
-    /// `--framerate` reads as it did wherever that was at least one frame a second, and
-    /// starts nothing where it was under one, which stopped the server at its first
-    /// capture: over whole and fractional numbers, ranges, a leading `-`, and words.
+    /// `--framerate` reads as it did wherever that was 1 to 240 frames a second, and starts
+    /// nothing anywhere else: over whole and fractional numbers, ranges, a leading `-`,
+    /// words, and numbers of every size a u32 holds and past it.
     #[test]
-    fn a_framerate_under_one_starts_nothing() {
+    fn a_framerate_outside_1_to_240_starts_nothing() {
         let mut x = 0x2545F4914F6CDD1Du64;
         let mut draw = |n: u64| {
             x ^= x << 13;
@@ -682,23 +687,76 @@ mod tests {
             x % n
         };
         for _ in 0..20_000 {
-            let v = match draw(5) {
+            let v = match draw(6) {
                 0 => format!("{}", draw(300)),
                 1 => format!("{}.{}", draw(3), draw(100)),
-                2 => format!("{}-{}", draw(200), draw(200)),
+                2 => format!("{}-{}", draw(200), draw(300)),
                 3 => format!("-{}.{}", draw(3), draw(10)),
+                4 => {
+                    let bits = draw(40);
+                    format!("{}", draw(1 << bits))
+                }
                 _ => ["", "fast", "NaN", "inf", "-0", "0-0", " 0 ", "0.0"][draw(8) as usize].into(),
             };
             let before = range_max(Some(&v), 60.0) as u32;
             assert_eq!(
-                framerate(Some(&v)).map(NonZeroU32::get),
+                framerate(Some(&v)).map(encoder::Fps::get),
                 match before {
-                    0 => Err(format!("--framerate {v:?}: under one frame a second")),
-                    fps => Ok(fps),
+                    1..=240 => Ok(before),
+                    _ => Err(format!("--framerate {v:?}: not 1 to 240 frames a second")),
                 },
                 "{v:?}"
             );
         }
-        assert_eq!(framerate(None).map(NonZeroU32::get), Ok(60));
+        assert_eq!(framerate(None).map(encoder::Fps::get), Ok(60));
+    }
+
+    /// Every frame rate `--framerate` lets through is one an encoder opens at under a cap,
+    /// and sets a new cap at: over the edges (240 and 241; 2^30 - 1 and 2^30, where four
+    /// frames' worth of the rate leaves a u32; u32::MAX and past it) and over rates drawn
+    /// across every magnitude a u32 holds.
+    #[test]
+    fn every_framerate_read_opens_an_encoder() {
+        let mut x = 0x9E3779B97F4A7C15u64;
+        let mut draw = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let edges = [
+            "240",
+            "241",
+            "1073741823",
+            "1073741824",
+            "4294967295",
+            "4294967296",
+            "1e12",
+        ];
+        let drawn: Vec<String> = (0..200)
+            .map(|_| {
+                let bits = draw(33);
+                draw(1 << bits).to_string()
+            })
+            .collect();
+        for v in edges.into_iter().map(String::from).chain(drawn) {
+            let Ok(fps) = framerate(Some(&v)) else {
+                continue;
+            };
+            let mut enc = encoder::Encoder::new(&encoder::EncoderConfig {
+                pictures: encoder::Pictures {
+                    width: 64,
+                    height: 64,
+                    fps,
+                    preset: encoder::Preset::parse("ultrafast").unwrap(),
+                    threads: 1,
+                    debug: env::Debugging::read(|_| None).unwrap(),
+                },
+                crf: 24.0,
+                max_kbps: Some(Kbps::new(2000.0)),
+            })
+            .unwrap_or_else(|e| panic!("--framerate {v:?}: {e}"));
+            enc.set_rate(24.0, 3000);
+        }
     }
 }

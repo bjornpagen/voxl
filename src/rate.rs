@@ -1,8 +1,8 @@
 //! Rate control: the bitrate the stream is steered to, and the bits each frame may spend.
 
+use crate::encoder::Fps;
 use crate::hub::{Client, Hub, Viewer};
 use crate::path::{Bits, Capacity, Kbps};
-use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -276,13 +276,7 @@ impl FrameBudget {
     }
 
     /// What a frame encoded at `now` may spend.
-    pub fn allow(
-        &mut self,
-        now: Instant,
-        target: Kbps,
-        capacity: Option<Kbps>,
-        fps: NonZeroU32,
-    ) -> Bits {
+    pub fn allow(&mut self, now: Instant, target: Kbps, capacity: Option<Kbps>, fps: Fps) -> Bits {
         let steady = target.over(Duration::from_secs_f64(1.0 / fps.get() as f64));
         let depth = match capacity {
             Some(c) => c.over(LATENCY_BUDGET).max(steady.times(DEPTH_FRAMES)),
@@ -313,7 +307,7 @@ mod rate_tests {
     use crate::path::PathEst;
     use std::collections::VecDeque;
 
-    const FPS: NonZeroU32 = NonZeroU32::new(60).unwrap();
+    const FPS: Fps = Fps::new(60).unwrap();
 
     struct Rng(u64);
     impl Rng {

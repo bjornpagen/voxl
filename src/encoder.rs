@@ -43,6 +43,33 @@ impl std::fmt::Display for Preset {
     }
 }
 
+/// A frame rate: 1 to `Fps::MAX` frames a second, so that every use of it holds it: a
+/// frame's time, x264's rate, and the four frames' worth of it under a VBV buffer
+/// (`vbv_buffer_kbit`), which leaves a u32 past 2^30 frames a second.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Fps(NonZeroU32);
+
+impl Fps {
+    /// The most frames a second. Upstream's bound for the same flag on macOS (its macOS
+    /// support, 4fdf528, clamps `--framerate` to it), unmeasured: the refresh of the
+    /// fastest common displays. At 120 a 144 or 240 Hz display could not be streamed at
+    /// its rate; at 480 nothing here breaks. It bounds what may be asked, so that every
+    /// use above holds it.
+    pub const MAX: u32 = 240;
+
+    /// `fps`, if it is 1 to `MAX`.
+    pub const fn new(fps: u32) -> Option<Fps> {
+        match NonZeroU32::new(fps) {
+            Some(rate) if fps <= Fps::MAX => Some(Fps(rate)),
+            _ => None,
+        }
+    }
+
+    pub fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
 /// What every encoder is opened with, whatever decides its bits: the pictures' size and
 /// rate, the preset and threads that code them, and the debugging variables voxl was
 /// started with (x264's log and hints, and a line per picture).
@@ -50,7 +77,7 @@ impl std::fmt::Display for Preset {
 pub struct Pictures {
     pub width: u32,
     pub height: u32,
-    pub fps: NonZeroU32,
+    pub fps: Fps,
     pub preset: Preset,
     pub threads: u32,
     pub debug: Debugging,
@@ -81,7 +108,7 @@ pub struct Encoder {
     pub height: u32,
     debug: Debugging,
     /// The frame rate it was opened with, which sizes its VBV buffer.
-    fps: NonZeroU32,
+    fps: Fps,
 }
 
 unsafe impl Send for Encoder {}
@@ -304,7 +331,7 @@ impl Encoder {
 /// A VBV buffer of 1.25 frames at `max_kbps`, rounded up: x264 treats a buffer under
 /// 1.1 frames as a single-frame VBV, which may lower rows of a frame below its starting
 /// QP (video.rs's MotionQuality relies on it not doing that).
-fn vbv_buffer_kbit(max_kbps: u32, fps: NonZeroU32) -> u32 {
+fn vbv_buffer_kbit(max_kbps: u32, fps: Fps) -> u32 {
     (max_kbps * 5).div_ceil(4 * fps.get())
 }
 
@@ -395,7 +422,7 @@ mod tests {
                 pictures: Pictures {
                     width: w as u32,
                     height: h as u32,
-                    fps: NonZeroU32::new(60).unwrap(),
+                    fps: Fps::new(60).unwrap(),
                     preset: Preset::parse("ultrafast").unwrap(),
                     threads: 1,
                     debug: Debugging::read(|_| None).unwrap(),
@@ -449,7 +476,7 @@ mod tests {
                 pictures: Pictures {
                     width: w as u32,
                     height: h as u32,
-                    fps: NonZeroU32::new(60).unwrap(),
+                    fps: Fps::new(60).unwrap(),
                     preset: Preset::parse("ultrafast").unwrap(),
                     threads: 1,
                     debug: Debugging::read(|_| None).unwrap(),
@@ -509,7 +536,7 @@ mod bench {
             pictures: Pictures {
                 width: w as u32,
                 height: h as u32,
-                fps: NonZeroU32::new(60).unwrap(),
+                fps: Fps::new(60).unwrap(),
                 preset: Preset::parse("ultrafast").unwrap(),
                 threads: 4,
                 debug: Debugging::read(|_| None).unwrap(),
@@ -592,7 +619,7 @@ mod bench {
                 pictures: Pictures {
                     width: w as u32,
                     height: h as u32,
-                    fps: NonZeroU32::new(60).unwrap(),
+                    fps: Fps::new(60).unwrap(),
                     preset: Preset::parse("ultrafast").unwrap(),
                     threads,
                     debug: Debugging::read(|_| None).unwrap(),

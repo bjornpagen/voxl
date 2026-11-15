@@ -2,7 +2,7 @@
 
 use crate::capture::{Band, Capturer};
 use crate::convert::I420;
-use crate::encoder::{Encoded, Encoder, EncoderConfig, Pictures, Planes, Preset, Quality};
+use crate::encoder::{Encoded, Encoder, EncoderConfig, Fps, Pictures, Planes, Preset, Quality};
 use crate::env::{Debugging, Marker};
 use crate::hub::{wait_any, wait_event};
 use crate::hub::{Client, Hub, Out, ServerMessage, Takes, Viewer};
@@ -10,7 +10,6 @@ use crate::path::Kbps;
 use crate::rate::{Bounds, FrameBudget, RateCtl, RTT_GUESS_MS};
 use crate::timeline::{CaptureMarks, Coded};
 use bytes::Bytes;
-use std::num::NonZeroU32;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -21,7 +20,7 @@ pub struct VideoConfig {
     pub display: Option<String>,
     #[cfg(target_os = "macos")]
     pub enable_resize: bool,
-    pub fps: NonZeroU32,
+    pub fps: Fps,
     pub preset: Preset,
     pub threads: u32,
     pub convert_threads: usize,
@@ -501,7 +500,7 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Capturer, String> {
         "capturing {}x{} @ {} fps, preset {} threads {}",
         w,
         h,
-        cfg.fps,
+        cfg.fps.get(),
         cfg.preset,
         cfg.threads
     );
@@ -1254,7 +1253,7 @@ fn stripe_worker(
     mut s: Stripe,
     rx: mpsc::Receiver<StripeJob>,
     done: mpsc::Sender<StripeResult>,
-    fps: NonZeroU32,
+    fps: Fps,
     crfs: Crfs,
     debug: bool,
 ) {
@@ -1273,7 +1272,7 @@ fn stripe_worker(
             // A keyframe is what a new viewer sees first; don't starve it to the
             // steady-state frame budget (up to ~8 frames' worth at 4x the cap).
             let boost = job.cap.saturating_mul(4).max(16_000);
-            s.enc.set_rate_buf(asked, boost, boost / fps * 8);
+            s.enc.set_rate_buf(asked, boost, boost / fps.get() * 8);
             s.applied_kbps = 0;
         } else {
             let moved = s.applied_kbps == 0
@@ -1383,7 +1382,7 @@ fn encode_loop(
     rx: mpsc::Receiver<Job>,
     ret: mpsc::Sender<Returned>,
     hub: Arc<Hub>,
-    fps: NonZeroU32,
+    fps: Fps,
     crfs: Crfs,
     debug: Debugging,
 ) {
@@ -1770,7 +1769,7 @@ mod tests {
             pictures: Pictures {
                 width: w as u32,
                 height: h as u32,
-                fps: NonZeroU32::new(60).unwrap(),
+                fps: Fps::new(60).unwrap(),
                 preset: Preset::parse("ultrafast").unwrap(),
                 threads: 1,
                 debug: Debugging::read(|_| None).unwrap(),
@@ -1795,7 +1794,7 @@ mod tests {
                     job_rx,
                     ret_tx,
                     hub,
-                    NonZeroU32::new(60).unwrap(),
+                    Fps::new(60).unwrap(),
                     Crfs {
                         configured: 23.0,
                         paintover: 18.0,
@@ -1900,7 +1899,7 @@ mod tests {
                         display: None,
                         #[cfg(target_os = "macos")]
                         enable_resize: false,
-                        fps: NonZeroU32::new(60).unwrap(),
+                        fps: Fps::new(60).unwrap(),
                         preset: Preset::parse("ultrafast").unwrap(),
                         threads: 1,
                         convert_threads: 1,
@@ -2032,7 +2031,7 @@ mod tests {
                     pictures: Pictures {
                         width: W as u32,
                         height: H as u32,
-                        fps: NonZeroU32::new(60).unwrap(),
+                        fps: Fps::new(60).unwrap(),
                         preset: Preset::parse("ultrafast").unwrap(),
                         threads: 1,
                         debug: Debugging::read(|_| None).unwrap(),
@@ -2634,7 +2633,7 @@ mod tests {
             pictures: Pictures {
                 width: w as u32,
                 height: h as u32,
-                fps: NonZeroU32::new(60).unwrap(),
+                fps: Fps::new(60).unwrap(),
                 preset: Preset::parse("ultrafast").unwrap(),
                 threads: 1,
                 debug: Debugging::read(|_| None).unwrap(),
@@ -2659,7 +2658,7 @@ mod tests {
                     job_rx,
                     ret_tx,
                     hub,
-                    NonZeroU32::new(60).unwrap(),
+                    Fps::new(60).unwrap(),
                     Crfs {
                         configured: 23.0,
                         paintover: 18.0,
@@ -2873,7 +2872,7 @@ mod tests {
         let (w, h) = (1024usize, 768usize);
         let cfg = VideoConfig {
             display: None,
-            fps: NonZeroU32::new(60).unwrap(),
+            fps: Fps::new(60).unwrap(),
             preset: Preset::parse("ultrafast").unwrap(),
             threads: 4,
             convert_threads: 4,
