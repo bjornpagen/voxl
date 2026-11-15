@@ -1,6 +1,6 @@
 //! Shared state between media producers (video/audio/cursor/clipboard) and websocket clients.
 
-use crate::window::{self, Window};
+use crate::window::{self, Way, Window};
 use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -261,8 +261,14 @@ impl Pings {
 pub enum Viewer {
     /// It is sent no video.
     NotWatching,
-    /// It waits for a keyframe, and none has been planned for it: the capture loop plans one.
+    /// It waits for a keyframe, and none has been planned for it, and nothing is on its way
+    /// to it: the capture loop plans one.
     Waiting,
+    /// It waits for a keyframe, but frames are still on their way to it: it asked for one
+    /// with frames on their way, or its path stalled beside others' and it was left behind.
+    /// It is sent nothing, and wants its keyframe once all of them have come back, so that
+    /// no keyframe goes into a path that is still clogged.
+    Behind,
     /// A keyframe has been planned for it: it starts on that keyframe if it comes out
     /// whole, and waits again if it does not. One still `Waiting` is not started by it, as
     /// it may have joined after the frame was planned, even after the stream that coded it
@@ -275,7 +281,7 @@ pub enum Viewer {
 /// What a client is sent of a frame the encode loop has coded.
 #[derive(Debug, PartialEq)]
 pub enum Takes {
-    /// Nothing: it has not started.
+    /// Nothing: it has not started, or has been left behind.
     Nothing,
     /// The frame, which is in flight to it until acked.
     Frame,
@@ -283,11 +289,17 @@ pub enum Takes {
     Close,
 }
 
-/// What asking for a keyframe makes of a viewer: one that watches waits for one.
-fn asked(viewer: Viewer) -> Viewer {
-    match viewer {
-        Viewer::NotWatching => Viewer::NotWatching,
-        Viewer::Waiting | Viewer::Promised | Viewer::Started => Viewer::Waiting,
+/// What needing a keyframe makes of a viewer with `inflight` on its way: one that watches
+/// waits for one, and wants it now if nothing is on its way, else once all of it is back.
+fn asked(viewer: Viewer, inflight: &VecDeque<Inflight>) -> Viewer {
+    match (viewer, inflight.is_empty()) {
+        (Viewer::NotWatching, _) => Viewer::NotWatching,
+        (Viewer::Waiting | Viewer::Behind | Viewer::Promised | Viewer::Started, true) => {
+            Viewer::Waiting
+        }
+        (Viewer::Waiting | Viewer::Behind | Viewer::Promised | Viewer::Started, false) => {
+            Viewer::Behind
+        }
     }
 }
 
@@ -372,18 +384,31 @@ impl Client {
     }
 
     /// It asks for a keyframe (`kf`, or a hello after a failed display switch): if it
-    /// watches, it waits for one.
+    /// watches, it waits for one, once what is on its way has come back.
     pub fn ask_keyframe(&self) {
         let mut v = self.viewing.lock();
-        v.viewer = asked(v.viewer);
+        v.viewer = asked(v.viewer, &v.inflight);
     }
 
     /// The stream starts over for it at `now` (it is rebuilt): if it watches, it waits for a
     /// keyframe; acks for frames sent before no longer apply.
     pub fn start_over(&self, now: Instant) {
         let mut v = self.viewing.lock();
-        v.viewer = asked(v.viewer);
         v.forget(now);
+        v.viewer = asked(v.viewer, &v.inflight);
+    }
+
+    /// At `now` a capture goes to the viewers that have room. One that has started and
+    /// whose path has stalled (the oldest frame on its way has been on its way for
+    /// `STALLED`) is left behind: it is sent nothing more, so it has missed frames, and it
+    /// wants a keyframe once everything on its way has come back. Its window keeps what is
+    /// on its way, which is how its path is known to be still clogged.
+    pub fn falls_behind(&self, now: Instant) {
+        let mut v = self.viewing.lock();
+        let stall = crate::video::STALLED;
+        if let (Viewer::Started, Way::Stalled) = (v.viewer, v.window.way(now, stall)) {
+            v.viewer = Viewer::Behind;
+        }
     }
 
     /// The capture loop planned a keyframe: one waiting for one is promised it. Whether it
@@ -395,7 +420,7 @@ impl Client {
                 v.viewer = Viewer::Promised;
                 true
             }
-            Viewer::NotWatching | Viewer::Promised | Viewer::Started => false,
+            Viewer::NotWatching | Viewer::Behind | Viewer::Promised | Viewer::Started => false,
         }
     }
 
@@ -410,8 +435,8 @@ impl Client {
                 v.viewer = Viewer::Started;
                 v.forget(now);
             }
-            (Viewer::Promised, false) => v.viewer = Viewer::Waiting,
-            (Viewer::NotWatching | Viewer::Waiting | Viewer::Started, _) => {}
+            (Viewer::Promised, false) => v.viewer = asked(v.viewer, &v.inflight),
+            (Viewer::NotWatching | Viewer::Waiting | Viewer::Behind | Viewer::Started, _) => {}
         }
     }
 
@@ -433,7 +458,9 @@ impl Client {
                 self.trace.lock().sent(frame, key);
                 Takes::Frame
             }
-            Viewer::NotWatching | Viewer::Waiting | Viewer::Promised => Takes::Nothing,
+            Viewer::NotWatching | Viewer::Waiting | Viewer::Behind | Viewer::Promised => {
+                Takes::Nothing
+            }
         }
     }
 
@@ -442,12 +469,15 @@ impl Client {
     /// client had it: what the client says it held of the trip is its own time, not the
     /// path's. Any it covers without an ack of its own, and one whose hold cannot be true
     /// (unreadable, or longer than the trip it is part of), came back at `now`: later, so
-    /// what the window reads of the path can only be lower.
+    /// what the window reads of the path can only be lower. One left behind wants its
+    /// keyframe once the last of what is on its way is back.
     pub fn on_ack(&self, now: Instant, id: u32, hold: Hold) {
         self.trace.lock().acked(now, id, hold);
         let mut v = self.viewing.lock();
         let Viewing {
-            inflight, window, ..
+            viewer,
+            inflight,
+            window,
         } = &mut *v;
         let mut said = None;
         while let Some(&f) = inflight.front().filter(|f| wrapping_le(f.id, id)) {
@@ -462,6 +492,9 @@ impl Client {
                 Hold::Unsaid | Hold::Said(_) | Hold::Unreadable => now,
             };
             window.came_back(f.left, back, f.bytes);
+        }
+        if let (Viewer::Behind, true) = (*viewer, inflight.is_empty()) {
+            *viewer = Viewer::Waiting;
         }
         drop(v);
         if let Some(held) = said {
@@ -866,7 +899,8 @@ mod tests {
         AskKeyframe(usize),
         /// A recording begins (record.rs): only on a client nothing has been done to.
         Record(usize),
-        /// The flow check finds a watching client with frames in flight stalled (video.rs).
+        /// A capture finds a client that has started, with frames in flight, stalled, and
+        /// leaves it behind (video.rs).
         Stall(usize),
         /// `build` starts the stream over for every client (`restart_clients`), once the
         /// stream before has sent what it held.
@@ -920,18 +954,21 @@ mod tests {
     /// The rule, step by step, as each value and method says it: what each step makes of
     /// the model, whether it planned a keyframe, and who was sent the frame.
     fn rule(before: &Model, step: Step) -> (bool, Vec<usize>, Model) {
-        use Viewer::{NotWatching, Promised, Started, Waiting};
+        use Viewer::{Behind, NotWatching, Promised, Started, Waiting};
         let mut m = before.clone();
         let c = &mut m.c;
         let (mut planned, mut sent) = (false, vec![]);
+        // Needing a keyframe: wanting it now with nothing in flight, else once it is back.
+        let asked = |(v, n): (Viewer, usize)| match (v, n) {
+            (NotWatching, _) => (NotWatching, n),
+            (_, 0) => (Waiting, 0),
+            (_, n) => (Behind, n),
+        };
         match step {
-            Step::Watch(i) | Step::Record(i) | Step::Stall(i) => c[i] = (Waiting, 0),
+            Step::Watch(i) | Step::Record(i) => c[i] = (Waiting, 0),
+            Step::Stall(i) => c[i].0 = Behind,
             Step::StopWatching(i) => c[i].0 = NotWatching,
-            Step::AskKeyframe(i) => {
-                if c[i].0 != NotWatching {
-                    c[i].0 = Waiting;
-                }
-            }
+            Step::AskKeyframe(i) => c[i] = asked(c[i]),
             Step::Restart => {
                 for c in c.iter_mut() {
                     if c.0 != NotWatching {
@@ -956,7 +993,7 @@ mod tests {
                     if starts[i] && c.0 == Promised {
                         *c = match whole {
                             true => (Started, 0),
-                            false => (Waiting, c.1),
+                            false => asked(*c),
                         };
                     }
                     match c.0 {
@@ -965,11 +1002,16 @@ mod tests {
                             c.1 += 1;
                             sent.push(i);
                         }
-                        NotWatching | Waiting | Promised => {}
+                        NotWatching | Waiting | Behind | Promised => {}
                     }
                 }
             }
-            Step::Ack(i) => c[i].1 = 0,
+            Step::Ack(i) => {
+                c[i].1 = 0;
+                if c[i].0 == Behind {
+                    c[i].0 = Waiting;
+                }
+            }
         }
         if let Step::Watch(i)
         | Step::StopWatching(i)
@@ -987,13 +1029,14 @@ mod tests {
     }
 
     /// Whether the hub takes `step` in this state: a recording begins only on a new
-    /// client; the flow check stalls only a watching client with frames in flight; a
+    /// client; a capture leaves behind only a client that has started, with frames in
+    /// flight; a
     /// restart comes once the encoder has sent what it held; the encoder holds two frames
     /// at most and sends only what it holds, and only a keyframe comes out whole.
     fn applies(m: &Model, step: Step) -> bool {
         match step {
             Step::Record(i) => m.fresh[i],
-            Step::Stall(i) => m.c[i].0 != Viewer::NotWatching && m.c[i].1 > 0,
+            Step::Stall(i) => m.c[i].0 == Viewer::Started && m.c[i].1 > 0,
             Step::Restart => m.held.is_empty(),
             Step::Capture => m.held.len() < 2,
             Step::Send { whole } => match m.held.first() {
@@ -1034,11 +1077,8 @@ mod tests {
             Step::StopWatching(i) => c[i].stop_watching(),
             Step::AskKeyframe(i) => c[i].ask_keyframe(),
             Step::Stall(i) => {
-                assert!(
-                    c[i].viewer() != Viewer::NotWatching && c[i].backlog(t0).is_some(),
-                    "stalls only a watcher"
-                );
-                c[i].start_over(t0);
+                // Its frames went at `t0`: it has stalled `STALLED` later.
+                c[i].falls_behind(t0 + crate::video::STALLED);
             }
             Step::Restart => hub.restart_clients(),
             Step::Capture => {
@@ -1159,7 +1199,8 @@ mod tests {
             frontier = next;
         }
         // Liveness: from every state, the encoder sends what it holds (each keyframe whole),
-        // then one capture, and its keyframe sent whole: nobody watching is left unstarted.
+        // every client acks what it was sent, then one capture, and its keyframe sent whole:
+        // nobody watching is left unstarted, one left behind included.
         for state in &seen {
             let mut m = state.clone();
             let mut path = vec![];
@@ -1170,7 +1211,12 @@ mod tests {
                 path.push(send);
                 m = new_step(&hub, &m, send).2;
             }
-            for step in [Step::Capture, Step::Send { whole: true }] {
+            for step in [
+                Step::Ack(0),
+                Step::Ack(1),
+                Step::Capture,
+                Step::Send { whole: true },
+            ] {
                 if applies(&m, step) {
                     path.push(step);
                     m = new_step(&hub, &m, step).2;
@@ -1184,7 +1230,7 @@ mod tests {
         }
         let reached: std::collections::HashSet<Viewer> =
             seen.iter().flat_map(|m| m.c.map(|c| c.0)).collect();
-        assert_eq!(reached.len(), 4, "{reached:?}");
+        assert_eq!(reached.len(), 5, "{reached:?}");
         assert!(steps > 0);
     }
 

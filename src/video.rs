@@ -578,8 +578,11 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Capturer, String> {
 /// A viewer whose oldest frame on its way has been on its way this long has stalled (a
 /// dead socket, a path queued for seconds): 4 s. Upstream's guess (051bb63), unmeasured.
 /// Until then a viewer whose window has no room holds every viewer's picture; from then
-/// it holds no other viewer's. Nothing is done to it: on TCP its frames are late, not
-/// lost, and a keyframe, the largest thing the stream sends, would reach it last. At half
+/// it holds no other viewer's: a capture that goes to the others leaves it behind
+/// (`Viewer::Behind`), sent nothing more, until everything on its way has come back, and
+/// then it is sent one keyframe. Alone, it holds the capture until its acks come. On TCP
+/// its frames are late, not lost, and a keyframe, the largest thing the stream sends, sent
+/// into its path would reach it last. At half
 /// (2 s), a path whose round trip swings by 2 s (a slow link's reached 2.7 s) stops holding
 /// the others at every swing; at double (8 s), one stopped viewer freezes every other
 /// viewer's picture for 8 s. It is also the longest a sharpening pass waits for one
@@ -588,11 +591,13 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Capturer, String> {
 pub const STALLED: Duration = Duration::from_millis(4000);
 
 impl Gated {
-    /// Asks the windows of `viewers` at `now`, in the hub's order. It only reads.
+    /// Asks the windows of `viewers` at `now`, in the hub's order, but those left behind,
+    /// which are sent nothing. It only reads.
     fn ask(viewers: &[(Arc<Client>, Viewer)], now: Instant) -> Gated {
         Gated::of(
             viewers
                 .iter()
+                .filter(|(_, v)| *v != Viewer::Behind)
                 .map(|(c, _)| c.window(|w| w.way(now, STALLED))),
         )
     }
@@ -1002,6 +1007,15 @@ impl InFlight {
     }
 }
 
+/// A capture at `now` goes to the viewers that have room, or to one that wants a keyframe:
+/// one of them has not stalled. Each viewer that has started and has stalled is left
+/// behind (`Client::falls_behind`).
+fn leave_behind(viewers: &[(Arc<Client>, Viewer)], now: Instant) {
+    for (c, _) in viewers {
+        c.falls_behind(now);
+    }
+}
+
 /// Until when one viewer's window holds a pass at `now`, if it does: until its queue
 /// empties, or the newest frame on its way has had `STALLED`, whichever is first.
 fn holds_pass(w: &Window, now: Instant) -> Option<Instant> {
@@ -1373,11 +1387,13 @@ fn capture_loop(cap: &mut impl Capture, cfg: VideoConfig, hub: Arc<Hub>) -> Resu
             Wait::Change.wait(cap, &hub);
             continue;
         };
-        // A keyframe goes to every viewer: what the slowest path carries bounds it.
+        // A keyframe goes to every viewer but those left behind: what the slowest of their
+        // paths carries bounds it. A pass goes only into their empty queues.
+        let sent = || viewers.iter().filter(|(_, v)| *v != Viewer::Behind);
         let key = viewers
             .iter()
             .any(|(_, v)| *v == Viewer::Waiting)
-            .then(|| viewers.iter().map(|(c, _)| c.window(|w| w.carries())).min())
+            .then(|| sent().map(|(c, _)| c.window(|w| w.carries())).min())
             .flatten()
             .map_or(Key::NotWanted, |carries| Key::Wanted { carries });
         // One reading of the clock for every decision before the capture; the capture
@@ -1395,12 +1411,7 @@ fn capture_loop(cap: &mut impl Capture, cfg: VideoConfig, hub: Arc<Hub>) -> Resu
             deadline: interval,
             gate: Gated::ask(&viewers, now),
             buffer: std::mem::replace(&mut s.buf, Buffer::Away),
-            in_flight: InFlight::of(
-                now,
-                viewers
-                    .iter()
-                    .map(|(c, _)| c.window(|w| holds_pass(w, now))),
-            ),
+            in_flight: InFlight::of(now, sent().map(|(c, _)| c.window(|w| holds_pass(w, now)))),
         };
         let step = step(look);
         let (next, mut buf, allowance) = match step {
@@ -1414,6 +1425,7 @@ fn capture_loop(cap: &mut impl Capture, cfg: VideoConfig, hub: Arc<Hub>) -> Resu
             }
             Step::Capture(next, buf, allowance) => (next, buf, allowance),
         };
+        leave_behind(&viewers, now);
 
         let t0 = Instant::now();
         let origin = match *cap.damage() {
@@ -2240,15 +2252,15 @@ struct Frames {
 /// More frames than this in flight to a viewer, and it is closed (it stops watching, and is
 /// sent the close once): upstream's guess (its first commit), never measured; 10 s of
 /// frames at 60 a second. A viewer's window keeps what a viewer that holds the capture has
-/// on its way to what its path carries, and a viewer alone always holds it. A viewer gets
-/// past that two ways. A keyframe passes the gate, and any client may ask for one (`kf`)
-/// as often as it likes: while one asks at every capture, a viewer that stops reading its
-/// socket is sent a keyframe a capture until this bound closes it, after 10 s at 60 a
-/// second, with 36 to 108 MB of keyframes (60 to 180 KB on a terminal at 3024x1898) queued
-/// for it. And a viewer whose oldest frame has been on its way for `STALLED` holds no
-/// other, so beside one with room it is sent every frame, and is closed once it has stayed
-/// so for about 9 s of frames at 60 a second. At half these are 5 s and 4 s; at double
-/// 20 s and 19 s, with twice that queued.
+/// on its way to what its path carries, a viewer alone always holds it, and one that stalls
+/// beside others is left behind and sent nothing. A keyframe gets past that: it passes the
+/// gate, and any client may ask for one (`kf`) as often as it likes, so while one asks at
+/// every capture, a viewer that stops reading its socket is sent a keyframe a capture
+/// until it has stalled and is left behind, `STALLED` of captures: 282 at 60 frames a
+/// second (70.6 captures a second), under this bound, and 1129 at 240, which this bound
+/// closes after 600, 2.1 s, with up to 108 MB of keyframes (60 to 180 KB on a terminal at
+/// 3024x1898) queued for it. At half (300), a stream from 64 frames a second reaches it
+/// before `STALLED`; at double (1200), none does, and up to 203 MB can queue.
 const HOPELESSLY_BEHIND: usize = 600;
 
 /// Starts the encode loop's thread with `run`, which owns the way home for the capture
@@ -6857,26 +6869,29 @@ mod tests {
         frames: u32,
     }
 
-    /// A viewer whose acks come late (5 s, or anything up to 8 s) is sent no keyframe but
-    /// the one it starts on, is sent every frame after it, and once it has stalled holds
-    /// no other viewer; alone, it holds the capture, and is never sent a frame but a
-    /// keyframe while its window has no room. Nothing is done to it: what it has in flight
-    /// is every frame sent to it and not acknowledged. A model of the capture loop's flow
+    /// A viewer whose acks come late (5 s, or anything up to 8 s) holds no other viewer once
+    /// it has stalled: beside others, a capture leaves it behind, and it is sent no byte
+    /// until everything on its way has come back (its oldest frame included), then exactly
+    /// one keyframe, which starts it again; nothing on its way is forgotten. Alone, it holds
+    /// the capture, is never left behind, and is never sent a frame but a keyframe while
+    /// its window has no room. A model of the capture loop's flow
     /// over 30 s, one frame time at a time with the screen always changing: the acks due
     /// arrive, in order as TCP brings them; then a keyframe if one is wanted, else the gate
-    /// is asked; and a frame goes to every watching viewer as the encode loop sends one.
+    /// is asked; a capture leaves behind the viewers that have stalled, and a frame goes to
+    /// every viewer that has started as the encode loop sends one.
     /// Over the late viewer alone or beside 1 to 3 on time (round trips of 1 to 300 ms,
     /// plus up to 150 ms, so they hold the capture now and then), placed anywhere among
     /// them, its acks each 5 s late or anywhere in a range of 0 to 8 s, at 10 to 120 fps.
     /// Every viewer joins at the start.
     #[test]
-    fn a_late_viewer_is_sent_no_keyframe_and_holds_nobody_else() {
+    fn a_late_viewer_is_left_behind_and_holds_nobody_else() {
         let mut rng = Xorshift::new(0x2545_F491_4F6C_DD1D);
         let mut next = |n: u64| rng.below(n);
         let start = Instant::now() + Duration::from_secs(10);
         // Steps where the late viewer had stalled: beside viewers the gate opened for,
-        // beside viewers one of which held it, and alone; and late viewers that came back.
-        let mut seen = [0u32; 4];
+        // beside viewers one of which held it, and alone; late viewers that came back; and
+        // times one left behind was started again.
+        let mut seen = [0u32; 5];
         for case in 0..400 {
             let fps = 10 + next(111);
             let interval = Duration::from_secs_f64(1.0 / fps as f64);
@@ -6922,6 +6937,10 @@ mod tests {
             }
             let at = format!("case {case}: {fps} fps, {on_time} on time, late {late:?}");
             let mut stalled_before = false;
+            // What the late viewer was a step before, and the keyframes it is owed: one each
+            // time it was left behind, and the first.
+            let mut was = crate::hub::Viewer::Waiting;
+            let mut owed = 1u32;
             let mut id = 0u32;
             let mut t = start;
             while t < start + Duration::from_secs(30) {
@@ -6930,6 +6949,14 @@ mod tests {
                         v.c.on_ack(when, id, crate::hub::Hold::Unsaid);
                         v.coming.pop_front();
                     }
+                }
+                use crate::hub::Viewer::{Behind, Started, Waiting};
+                // What its acks made of it: one left behind wants its keyframe only once all
+                // of what was on its way is back.
+                let mid = viewers[late_at].c.viewer();
+                match (was, mid) {
+                    (Behind, Waiting) => assert!(viewers[late_at].c.backlog(t).is_none(), "{at}"),
+                    (was, mid) => assert_eq!(was, mid, "{at}"),
                 }
                 let stalled = viewers[late_at]
                     .c
@@ -6943,7 +6970,8 @@ mod tests {
                 let way = viewers[late_at].c.window(|w| w.way(t, STALLED));
                 let go = key || {
                     let gate = Gated::ask(&hub.viewers(), t);
-                    if stalled {
+                    // Stalled, or left behind, it holds no other viewer.
+                    if stalled || mid == Behind {
                         let others: Vec<_> =
                             others.iter().map(|c| (c.clone(), c.viewer())).collect();
                         assert_eq!(gate, Gated::ask(&others, t), "{at}");
@@ -6956,6 +6984,7 @@ mod tests {
                     matches!(gate, Gated::Open(_))
                 };
                 if go {
+                    leave_behind(&hub.viewers(), t);
                     // A keyframe is planned for the viewers waiting, and sent whole: it
                     // starts them.
                     if key {
@@ -6990,13 +7019,31 @@ mod tests {
                     id += 1;
                 }
                 let v = &viewers[late_at];
-                assert_eq!(v.keyframes, 1, "{at}");
-                assert_eq!(v.c.viewer(), crate::hub::Viewer::Started, "{at}");
+                let now_is = v.c.viewer();
                 let in_flight = v.c.backlog(t).map_or(0, |b| b.frames.get());
+                // Nothing on its way is forgotten.
                 assert_eq!(in_flight, v.coming.len(), "{at}");
+                // What the capture made of it.
+                match (mid, now_is) {
+                    // Left behind only by a capture, and only once it had stalled.
+                    (Started, Behind) => {
+                        assert!(go && stalled && on_time > 0, "{at}");
+                        owed += 1;
+                    }
+                    (Waiting, Started) => seen[4] += u32::from(owed > 1),
+                    (mid, now_is) => assert_eq!(mid, now_is, "{at}"),
+                }
+                was = now_is;
+                // Every keyframe it is sent starts it: one after each time it was left behind.
+                let started = u32::from(now_is == Started);
+                assert_eq!(v.keyframes + 1 - started, owed, "{at}");
                 match on_time {
                     0 => assert!(!go || key || matches!(way, Way::Room(_)), "{way:?}: {at}"),
-                    _ => assert!(viewers.iter().all(|o| o.frames == v.frames), "{at}"),
+                    _ => {
+                        let on = viewers.iter().enumerate().filter(|(i, _)| *i != late_at);
+                        let frames: Vec<u32> = on.map(|(_, o)| o.frames).collect();
+                        assert!(frames.windows(2).all(|f| f[0] == f[1]), "{at}");
+                    }
                 }
                 t += interval;
             }
@@ -7047,7 +7094,6 @@ mod tests {
     /// path, pings every `PING_EVERY`. A LAN of 50 to 200 Mbit/s and 1 to 5 ms beside a
     /// slow link of 0.3 to 3 Mbit/s and 60 to 300 ms, out for 4.5 to 8 s.
     #[test]
-    #[ignore = "fails until a viewer that stalls beside others is left behind (the next commit): 98.6 s behind, a 2.9 Mbit/s, 225 ms viewer out 4.8 s beside a 150 Mbit/s LAN, 60 KB a frame"]
     fn a_viewer_that_stalls_beside_a_fast_one_is_never_minutes_behind() {
         let mut rng = Xorshift::new(0xBF58_476D_1CE4_E5B9);
         let mut next = |n: u64| rng.below(n);
@@ -7124,6 +7170,8 @@ mod tests {
                     },
                 };
                 if let Some(room) = room {
+                    // A capture leaves behind a viewer that has stalled, as the loop does.
+                    leave_behind(&hub.viewers(), t);
                     let bytes = want.min(room);
                     for (i, c) in cs.iter().enumerate() {
                         let sent = match c.takes(id, t, bytes, key, HOPELESSLY_BEHIND) {
