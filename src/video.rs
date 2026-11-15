@@ -612,14 +612,14 @@ struct Gate {
 }
 
 impl Gate {
-    /// Asks the viewers at `now`, in the hub's order, up to the first that is full. It
+    /// Asks `viewers` at `now`, in the hub's order, up to the first that is full. It
     /// only reads: what is done to a stalled viewer is `resync`'s.
-    fn ask(hub: &Hub, interval_ms: f64, now: Instant) -> Gate {
+    fn ask(viewers: &[(Arc<Client>, Viewer)], interval_ms: f64, now: Instant) -> Gate {
         let mut stalled = Vec::new();
         // How soon the first of the viewers asked so far stalls, if one has frames in
         // flight: one before the full one may stall first.
         let mut soonest: Option<Duration> = None;
-        for (c, _) in hub.viewers() {
+        for (c, _) in viewers {
             let rtt = c.rtt_ms().unwrap_or(RTT_GUESS_MS);
             match Flow::of(c.backlog(now), rtt, interval_ms) {
                 Flow::Room(stalls_in) => soonest = soonest.into_iter().chain(stalls_in).min(),
@@ -630,7 +630,7 @@ impl Gate {
                         stalled,
                     };
                 }
-                Flow::Stalled(b) => stalled.push((c, b)),
+                Flow::Stalled(b) => stalled.push((c.clone(), b)),
             }
         }
         Gate {
@@ -971,13 +971,12 @@ struct Look {
     min_interval: Duration,
     /// How long damage may settle before it is captured (`--coalesce-us`).
     coalesce: Duration,
+    gate: Gated,
     encoding: Encoding,
 }
 
-/// What the loop does next, from what it knows. The flow gate is asked only when
-/// nothing else holds the capture and no keyframe is wanted: asking it resyncs the
-/// stalled viewers it finds.
-fn step(look: &Look, gate: impl FnOnce() -> Gated) -> Step {
+/// What the loop does next, from what it knows.
+fn step(look: &Look) -> Step {
     if let (Damage::None, Key::NotWanted) = (look.damage, look.key) {
         // Nothing moved and no keyframe is wanted. A pass goes only to an idle encoder,
         // as every capture does (below); until then a change may come, and with it the
@@ -1001,10 +1000,8 @@ fn step(look: &Look, gate: impl FnOnce() -> Gated) -> Step {
         }
     }
     // A keyframe is not held by the gate.
-    if let Key::NotWanted = look.key {
-        if let Gated::Held { until } = gate() {
-            return Step::Wait(Wait::Gate(until - look.now));
-        }
+    if let (Key::NotWanted, Gated::Held { until }) = (look.key, look.gate) {
+        return Step::Wait(Wait::Gate(until - look.now));
     }
     // A capture goes only to an idle encoder. One made while it codes the frame before
     // would wait for it, a whole encode older by the time it is coded; made once it is
@@ -1012,6 +1009,21 @@ fn step(look: &Look, gate: impl FnOnce() -> Gated) -> Step {
     match look.encoding {
         Encoding::Idle => Step::Capture,
         Encoding::Busy => Step::Wait(Wait::Buffer),
+    }
+}
+
+impl Step {
+    /// Whether the flow gate had its say in this step: it does once nothing before it
+    /// holds the capture, while no keyframe is wanted. Then the viewers it found stalled
+    /// start over (`resync`), as they did when the gate was asked only there.
+    fn asked_gate(&self, key: Key) -> bool {
+        matches!(
+            (self, key),
+            (
+                Step::Capture | Step::Wait(Wait::Gate(_) | Wait::Buffer),
+                Key::NotWanted
+            )
+        )
     }
 }
 
@@ -1170,6 +1182,7 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
         // itself is stamped `t0` below, after any wait for a buffer.
         let now = Instant::now();
         let due = sharpening.due(now);
+        let gate = Gate::ask(&viewers, interval_ms, now);
         let look = Look {
             key,
             damage: Damage::of(cap.damaged, cap.damaged_at),
@@ -1178,20 +1191,20 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
             last_capture,
             min_interval,
             coalesce: cfg.coalesce,
+            gate: gate.gated,
             encoding: s.encoding(),
         };
-        let gate = || {
-            let gate = Gate::ask(&hub, interval_ms, now);
+        let step = step(&look);
+        if step.asked_gate(key) {
             for (c, b) in gate.stalled {
                 resync(&c, b);
             }
-            if let Gated::Held { .. } = gate.gated {
-                hub.stats.flow_blocked.fetch_add(1, Ordering::Relaxed);
-            }
-            gate.gated
-        };
-        match step(&look, gate) {
+        }
+        match step {
             Step::Wait(wait) => {
+                if let Wait::Gate(_) = wait {
+                    hub.stats.flow_blocked.fetch_add(1, Ordering::Relaxed);
+                }
                 wait.wait(cap, &hub);
                 continue;
             }
@@ -2719,9 +2732,10 @@ mod tests {
                 last_capture: now - Duration::from_secs(1),
                 min_interval: ms(14),
                 coalesce: ms(2),
+                gate: Gated::Open,
                 encoding,
             };
-            step(&look, || Gated::Open)
+            step(&look)
         };
         let on_wake = Step::Wait(Wait::Change);
         assert_eq!(still(Due::Now, Encoding::Idle), Step::Capture);
@@ -3425,7 +3439,7 @@ mod tests {
                     oldest.extend(q.front().map(|f| f.sent));
                 }
             }
-            let gate = Gate::ask(&hub, interval, now);
+            let gate = Gate::ask(&hub.viewers(), interval, now);
             for (c, b) in gate.stalled {
                 resync(&c, b);
             }
@@ -3443,7 +3457,7 @@ mod tests {
                 now + (until - now) / 2,
                 until - Duration::from_micros(1),
             ] {
-                let again = Gate::ask(&hub, interval, t);
+                let again = Gate::ask(&hub.viewers(), interval, t);
                 assert!(
                     matches!(again.gated, Gated::Held { .. }) && again.stalled.is_empty(),
                     "changed at {:?}: {at}",
@@ -3451,7 +3465,7 @@ mod tests {
                 );
             }
             assert_ne!(
-                Gate::ask(&hub, interval, until).gated,
+                Gate::ask(&hub.viewers(), interval, until).gated,
                 Gated::Held { until },
                 "{at}"
             );
@@ -3504,6 +3518,7 @@ mod tests {
                 last_capture: self.last_capture,
                 min_interval: self.min_interval,
                 coalesce: self.coalesce,
+                gate: self.gate,
                 encoding: match self.home {
                     true => Encoding::Idle,
                     false => Encoding::Busy,
@@ -3623,12 +3638,8 @@ mod tests {
     #[test]
     fn a_capture_waits_only_for_what_holds_it() {
         let cases = each_case(|c| {
-            let look = c.look();
-            let mut asked = 0;
-            let got = step(&look, || {
-                asked += 1;
-                c.gate
-            });
+            let got = step(&c.look());
+            let asked = got.asked_gate(c.key());
             // A due pass goes only to an idle encoder.
             let pass_goes = c.due == Due::Now && c.home;
             let still = !(c.damaged || c.want_key || pass_goes);
@@ -3640,7 +3651,7 @@ mod tests {
                 .filter(|&settled| settled < c.coalesce)
                 .map(|settled| c.coalesce - settled);
             let gate_asked = !still && early.is_none() && settling.is_none() && !c.want_key;
-            assert_eq!(asked, gate_asked as u32, "the gate asked");
+            assert_eq!(asked, gate_asked, "the gate asked");
             let want = match (still, early, settling) {
                 (true, _, _) => Step::Wait(match c.due {
                     Due::In(due) => Wait::Pass(due),
@@ -3676,7 +3687,7 @@ mod tests {
         let ms = |ms: i32| Duration::from_millis(ms as u64);
         let mut waits = 0;
         each_case(|c| {
-            let Step::Wait(wait) = step(&c.look(), || c.gate) else {
+            let Step::Wait(wait) = step(&c.look()) else {
                 return;
             };
             waits += 1;
@@ -3743,6 +3754,63 @@ mod tests {
                 }
                 (_, due) => panic!("{shown}: planned with {due:?}"),
             }
+        });
+        assert_eq!(cases, CASES);
+    }
+
+    /// The oracle: `step` as it was, asking the gate through a function.
+    fn old_step(look: &Look, gate: impl FnOnce() -> Gated) -> Step {
+        if let (Damage::None, Key::NotWanted) = (look.damage, look.key) {
+            // Nothing moved and no keyframe is wanted. A pass goes only to an idle encoder,
+            // as every capture does (below); until then a change may come, and with it the
+            // capture is motion's.
+            match (look.due, look.encoding) {
+                (Due::Now, Encoding::Idle) => {}
+                (Due::Now, Encoding::Busy) | (Due::Never, _) => return Step::Wait(Wait::Change),
+                (Due::In(due), _) => return Step::Wait(Wait::Pass(due)),
+            }
+        }
+        let since = look.now.saturating_duration_since(look.last_capture);
+        if since < look.min_interval {
+            return Step::Wait(Wait::Interval(look.min_interval - since));
+        }
+        // Apps present a frame as a burst of puts; give the burst a moment to land so
+        // the capture holds one whole frame instead of its first tiles.
+        if let Damage::Since(at) = look.damage {
+            let settled = look.now.saturating_duration_since(at);
+            if settled < look.coalesce {
+                return Step::Wait(Wait::Settle(look.coalesce - settled));
+            }
+        }
+        // A keyframe is not held by the gate.
+        if let Key::NotWanted = look.key {
+            if let Gated::Held { until } = gate() {
+                return Step::Wait(Wait::Gate(until - look.now));
+            }
+        }
+        // A capture goes only to an idle encoder. One made while it codes the frame before
+        // would wait for it, a whole encode older by the time it is coded; made once it is
+        // done, it holds what changed meanwhile, and goes at once.
+        match look.encoding {
+            Encoding::Idle => Step::Capture,
+            Encoding::Busy => Step::Wait(Wait::Buffer),
+        }
+    }
+
+    /// `step` on the gate as a value decides what it decided asking the gate through a
+    /// function, and `asked_gate` says it had the gate's say exactly when it called that
+    /// function. Over every look of `each_case`.
+    #[test]
+    fn the_gate_as_a_value_is_what_asking_it_was() {
+        let cases = each_case(|c| {
+            let mut asked = false;
+            let was = old_step(&c.look(), || {
+                asked = true;
+                c.gate
+            });
+            let is = step(&c.look());
+            assert_eq!(is, was, "{:?}, key {}", c.gate, c.want_key);
+            assert_eq!(is.asked_gate(c.key()), asked, "{is:?}, key {}", c.want_key);
         });
         assert_eq!(cases, CASES);
     }
