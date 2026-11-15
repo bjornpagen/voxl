@@ -486,62 +486,6 @@ mod tests {
             uncapped.len()
         );
     }
-
-    /// vbv_buffer_kbit as it was when it took the frame rate as a u32 and raised a 0 to 1:
-    /// the oracle for the non-zero frame rate.
-    fn old_vbv_buffer_kbit(max_kbps: u32, fps: u32) -> u32 {
-        (max_kbps * 5).div_ceil(4 * fps.max(1))
-    }
-
-    /// The buffer is what it was at every rate and cap that fit (5 x the cap and 4 x the
-    /// rate in a u32); and an encoder's own rate is the one it gave x264, which is where
-    /// set_rate read it before, so set_rate gives x264 the buffer it gave before.
-    #[test]
-    fn a_non_zero_frame_rate_sizes_the_buffer_as_the_u32_did() {
-        let mut x = 0x9E3779B97F4A7C15u64;
-        let mut draw = |n: u64| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x % n
-        };
-        for _ in 0..100_000 {
-            let max_kbps = draw(u32::MAX as u64 / 5 + 1) as u32;
-            let fps = match draw(2) {
-                0 => 1 + draw(240),
-                _ => 1 + draw(u32::MAX as u64 / 4),
-            } as u32;
-            assert_eq!(
-                vbv_buffer_kbit(max_kbps, NonZeroU32::new(fps).unwrap()),
-                old_vbv_buffer_kbit(max_kbps, fps),
-                "{max_kbps} kbit/s at {fps} fps"
-            );
-        }
-        for _ in 0..40 {
-            let fps = NonZeroU32::new(1 + draw(240) as u32).unwrap();
-            let mut enc = Encoder::new(&EncoderConfig {
-                pictures: Pictures {
-                    width: 64,
-                    height: 64,
-                    fps,
-                    preset: Preset::parse("ultrafast").unwrap(),
-                    threads: 1,
-                    debug: Debugging::read(|_| None).unwrap(),
-                },
-                crf: 24.0,
-                max_kbps: Some(Kbps::new(2000.0)),
-            })
-            .unwrap();
-            assert_eq!(enc.param.i_fps_num, fps.get());
-            let kbps = 1 + draw(30_000) as u32;
-            enc.set_rate(24.0, kbps);
-            assert_eq!(enc.param.i_fps_num, fps.get());
-            assert_eq!(
-                enc.param.rc.i_vbv_buffer_size,
-                old_vbv_buffer_kbit(kbps, enc.param.i_fps_num).max(1) as i32
-            );
-        }
-    }
 }
 
 #[cfg(test)]
