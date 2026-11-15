@@ -13,25 +13,31 @@ mod ffi {
 use std::ffi::CString;
 use std::ptr;
 
+/// What every encoder is opened with, whatever decides its bits: the pictures' size and
+/// rate, and the preset and threads that code them.
 #[derive(Clone)]
-pub struct EncoderConfig {
+pub struct Pictures {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
     pub preset: String,
     pub threads: u32,
+}
+
+/// The settings of an encoder that codes at a quality, under a cap.
+#[derive(Clone)]
+pub struct EncoderConfig {
+    pub pictures: Pictures,
     pub crf: f32,
     /// VBV cap in kbit/s (0 = uncapped).
     pub max_kbps: u32,
-    /// How far the motion search looks, in pixels (`ME_RANGE`).
-    pub me_range: u32,
 }
 
 /// How far x264's motion search looks, in pixels. A trackpad flick through a terminal
 /// moves the text up to ~140 px between frames at 60 fps, and its speed changes every
 /// frame, so the vectors the search starts from are tens of pixels off. At 64 the frames
 /// that moved more than 32 px came out 19-57% bigger than at 128, for the same picture.
-pub const ME_RANGE: u32 = 128;
+const ME_RANGE: u32 = 128;
 
 pub struct Encoder {
     h: *mut ffi::x264_t,
@@ -54,25 +60,30 @@ pub struct Planes<'a> {
 
 impl Encoder {
     pub fn new(cfg: &EncoderConfig) -> Result<Self, String> {
+        let EncoderConfig {
+            ref pictures,
+            crf,
+            max_kbps,
+        } = *cfg;
         unsafe {
             let mut param: ffi::x264_param_t = std::mem::zeroed();
-            let preset = CString::new(cfg.preset.as_str()).unwrap();
+            let preset = CString::new(pictures.preset.as_str()).unwrap();
             let tune = c"zerolatency";
             if ffi::x264_param_default_preset(&mut param, preset.as_ptr(), tune.as_ptr()) < 0 {
-                return Err(format!("bad x264 preset {}", cfg.preset));
+                return Err(format!("bad x264 preset {}", pictures.preset));
             }
-            param.i_width = cfg.width as i32;
-            param.i_height = cfg.height as i32;
+            param.i_width = pictures.width as i32;
+            param.i_height = pictures.height as i32;
             param.i_csp = ffi::X264_CSP_I420 as i32;
-            param.i_fps_num = cfg.fps;
+            param.i_fps_num = pictures.fps;
             param.i_fps_den = 1;
             param.i_timebase_num = 1;
             param.i_timebase_den = 1000;
             // VFR input costs a frame of encoder delay (duration estimation).
             param.b_vfr_input = 0;
-            param.i_threads = cfg.threads as i32;
-            param.b_sliced_threads = (cfg.threads > 1) as i32;
-            param.i_slice_count = cfg.threads as i32;
+            param.i_threads = pictures.threads as i32;
+            param.b_sliced_threads = (pictures.threads > 1) as i32;
+            param.i_slice_count = pictures.threads as i32;
             param.i_keyint_max = ffi::X264_KEYINT_MAX_INFINITE as i32;
             param.i_keyint_min = 1;
             param.i_scenecut_threshold = 0;
@@ -90,13 +101,13 @@ impl Encoder {
                 ffi::X264_LOG_WARNING
             } as i32;
             param.rc.i_rc_method = ffi::X264_RC_CRF as i32;
-            param.rc.f_rf_constant = cfg.crf;
+            param.rc.f_rf_constant = crf;
             param.rc.i_lookahead = 0;
             // ultrafast's diamond search only follows motion of a few pixels, so a dragged
             // window or a fast scroll would be coded as new pixels every frame. UMH finds
             // those shifts (a third of the bits for a window drag) for about the same CPU.
             param.analyse.i_me_method = ffi::X264_ME_UMH as i32;
-            param.analyse.i_me_range = cfg.me_range as i32;
+            param.analyse.i_me_range = ME_RANGE as i32;
             // What a scroll or a page of new text costs is the pixels that weren't on the
             // screen before, and ultrafast codes those the dearest way H.264 has: whole
             // 16x16 blocks, with the simple entropy coder. Text is edges a few pixels wide:
@@ -117,10 +128,10 @@ impl Encoder {
             param.analyse.b_mb_info = (std::env::var("VOXL_NO_MBINFO").is_err()) as i32;
             param.i_sync_lookahead = 0;
             param.rc.b_mb_tree = 0;
-            if cfg.max_kbps > 0 {
-                param.rc.i_vbv_max_bitrate = cfg.max_kbps as i32;
+            if max_kbps > 0 {
+                param.rc.i_vbv_max_bitrate = max_kbps as i32;
                 // ~1.25 frames of buffer keeps single-frame spikes bounded.
-                param.rc.i_vbv_buffer_size = vbv_buffer_kbit(cfg.max_kbps, cfg.fps) as i32;
+                param.rc.i_vbv_buffer_size = vbv_buffer_kbit(max_kbps, pictures.fps) as i32;
             }
             // sRGB content (BT.709 primaries, sRGB transfer) in BT.601 limited range,
             // matching libyuv ARGBToI420 and the macOS NV12 capture.
@@ -144,9 +155,22 @@ impl Encoder {
                 param,
                 pic,
                 pts: 0,
-                width: cfg.width,
-                height: cfg.height,
+                width: pictures.width,
+                height: pictures.height,
             })
+        }
+    }
+
+    /// As `new`, with the motion search looking `me_range` pixels instead of `ME_RANGE`,
+    /// so a test can show what the range buys. Set by reconfiguration before the first
+    /// picture, it gives the stream x264 gives when opened at that range, byte for byte.
+    #[cfg(test)]
+    fn with_me_range(cfg: &EncoderConfig, me_range: u32) -> Result<Self, String> {
+        let mut enc = Self::new(cfg)?;
+        enc.param.analyse.i_me_range = me_range as i32;
+        match unsafe { ffi::x264_encoder_reconfig(enc.h, &mut enc.param) } {
+            0.. => Ok(enc),
+            _ => Err(format!("x264 refused a motion search range of {me_range}")),
         }
     }
 
@@ -320,16 +344,20 @@ mod tests {
             .collect();
         let page = text_page(w, h + steps.iter().sum::<usize>() + 30);
         let (u, v) = (vec![128u8; w * h / 4], vec![128u8; w * h / 4]);
-        let mut enc = Encoder::new(&EncoderConfig {
-            width: w as u32,
-            height: h as u32,
-            fps: 60,
-            preset: "ultrafast".into(),
-            threads: 1,
-            crf: 24.0,
-            max_kbps: 0,
+        let mut enc = Encoder::with_me_range(
+            &EncoderConfig {
+                pictures: Pictures {
+                    width: w as u32,
+                    height: h as u32,
+                    fps: 60,
+                    preset: "ultrafast".into(),
+                    threads: 1,
+                },
+                crf: 24.0,
+                max_kbps: 0,
+            },
             me_range,
-        })
+        )
         .unwrap();
         let (mut top, mut bytes, mut out) = (0, 0, Vec::new());
         for (f, step) in std::iter::once(0).chain(steps).enumerate() {
@@ -382,16 +410,20 @@ mod bench {
             .ok()
             .and_then(|t| t.parse().ok())
             .unwrap_or(ME_RANGE);
-        let mut enc = Encoder::new(&EncoderConfig {
-            width: w as u32,
-            height: h as u32,
-            fps: 60,
-            preset: "ultrafast".into(),
-            threads: 4,
-            crf: 24.0,
-            max_kbps: 0,
-            me_range: range,
-        })
+        let mut enc = Encoder::with_me_range(
+            &EncoderConfig {
+                pictures: Pictures {
+                    width: w as u32,
+                    height: h as u32,
+                    fps: 60,
+                    preset: "ultrafast".into(),
+                    threads: 4,
+                },
+                crf: 24.0,
+                max_kbps: 0,
+            },
+            range,
+        )
         .unwrap();
         let mut y = vec![0u8; w * h];
         let (u, v) = (vec![128u8; w * h / 4], vec![128u8; w * h / 4]);
@@ -463,14 +495,15 @@ mod bench {
         let cpu = || 0.0;
         for (label, hint) in [("no hints", false), ("hints", true)] {
             let mut enc = Encoder::new(&EncoderConfig {
-                width: w as u32,
-                height: h as u32,
-                fps: 60,
-                preset: "ultrafast".into(),
-                threads,
+                pictures: Pictures {
+                    width: w as u32,
+                    height: h as u32,
+                    fps: 60,
+                    preset: "ultrafast".into(),
+                    threads,
+                },
                 crf: 24.0,
                 max_kbps: 30000,
-                me_range: ME_RANGE,
             })
             .unwrap();
             let mut y = vec![0u8; w * h];

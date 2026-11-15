@@ -2,7 +2,7 @@
 
 use crate::capture::{Band, Capturer};
 use crate::convert::I420;
-use crate::encoder::{Encoded, Encoder, EncoderConfig, Planes, Quality};
+use crate::encoder::{Encoded, Encoder, EncoderConfig, Pictures, Planes, Quality};
 use crate::hub::wait_any;
 use crate::hub::{Hub, Inflight, Out};
 use crate::path::{Bits, Capacity, Kbps};
@@ -321,14 +321,15 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
             (cfg.threads / layout.len() as u32).max(1)
         };
         let ecfg = EncoderConfig {
-            width: w,
-            height: sh,
-            fps: cfg.fps,
-            preset: cfg.preset.clone(),
-            threads: fixed,
+            pictures: Pictures {
+                width: w,
+                height: sh,
+                fps: cfg.fps,
+                preset: cfg.preset.clone(),
+                threads: fixed,
+            },
             crf: cfg.crf,
             max_kbps: cfg.max_kbps,
-            me_range: crate::encoder::ME_RANGE,
         };
         let max_threads = if cfg.adaptive_threads {
             (cfg.threads / layout.len() as u32).max(1)
@@ -1337,7 +1338,7 @@ fn stripe_worker(
         ewma_ms: 0.0,
         heavy: 0,
         light_since: None,
-        budget_ms: 1000.0 / s.cfg.fps as f64,
+        budget_ms: 1000.0 / s.cfg.pictures.fps as f64,
         fit: CostFit::default(),
         predicted_ms: 0.0,
     };
@@ -1356,7 +1357,7 @@ fn stripe_worker(
             // steady-state frame budget (up to ~8 frames' worth at 4x the cap).
             let boost = job.cap.saturating_mul(4).max(16_000);
             s.enc
-                .set_rate_buf(asked, boost, boost / s.cfg.fps.max(1) * 8);
+                .set_rate_buf(asked, boost, boost / s.cfg.pictures.fps.max(1) * 8);
             s.applied_kbps = 0;
         } else {
             let moved = s.applied_kbps == 0
@@ -1416,10 +1417,9 @@ fn stripe_worker(
                 changed as f64,
                 s.max_threads,
             ) {
-                match Encoder::new(&EncoderConfig {
-                    threads: t,
-                    ..s.cfg.clone()
-                }) {
+                let mut cfg = s.cfg.clone();
+                cfg.pictures.threads = t;
+                match Encoder::new(&cfg) {
                     Ok(e) => {
                         log::info!(
                             "stripe {i}: encoder now {t} thread(s) (encode {:.1} ms)",
@@ -1481,7 +1481,7 @@ fn encode_loop(
     let epoch = Instant::now();
     let mut frame_id: u32 = 0;
     let n = stripes_in.len();
-    let fps = stripes_in.first().map_or(60, |s| s.cfg.fps);
+    let fps = stripes_in.first().map_or(60, |s| s.cfg.pictures.fps);
     let crfs = Crfs {
         configured: crf,
         paintover: po_crf,
@@ -1794,14 +1794,15 @@ mod tests {
         fn new(correct: bool, crf: f32, max_kbps: u32) -> Run {
             Run {
                 enc: Encoder::new(&EncoderConfig {
-                    width: W as u32,
-                    height: H as u32,
-                    fps: 60,
-                    preset: "ultrafast".into(),
-                    threads: 1,
+                    pictures: Pictures {
+                        width: W as u32,
+                        height: H as u32,
+                        fps: 60,
+                        preset: "ultrafast".into(),
+                        threads: 1,
+                    },
                     crf,
                     max_kbps,
-                    me_range: crate::encoder::ME_RANGE,
                 })
                 .unwrap(),
                 motion: MotionQuality::default(),
