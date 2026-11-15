@@ -2374,7 +2374,6 @@ fn encode_frames(
     let Frames { layout, fps } = frames;
     let fps = *fps;
     let epoch = Instant::now();
-    let mut frame_id: u32 = 0;
     let n = stripes.len();
     // Kept from frame to frame, so a frame allocates nothing for them.
     let mut selected: Vec<bool> = Vec::with_capacity(n);
@@ -2442,14 +2441,14 @@ fn encode_frames(
         };
         let nparts = u8::try_from(out.parts()).expect("a frame's parts are some of its stripes");
         let enc_us = t0.elapsed().as_micros() as u64;
-        frame_id = frame_id.wrapping_add(1);
+        let frame_id = hub.timeline.number();
         let pipe = Pipe::of(job.captured.damage.elapsed());
         msgs.extend(out.take_parts().map(|(i, key, mut out)| {
             let place = layout.stripes[i];
             let header = Header {
                 key,
                 sharpens,
-                frame: frame_id,
+                frame: frame_id.get(),
                 pipe,
                 stripe: place.stripe,
                 stripes: layout.count,
@@ -5901,8 +5900,8 @@ mod tests {
     /// Recording viewers' frames and acks, and viewers leaving, allocate nothing once they
     /// have joined: a trace is made at its viewer's join with room for every frame it keeps,
     /// and the hub's list of leavers with room for all it keeps. The oracle is the counting
-    /// allocator. Six viewers join; three rings' worth of frames go out, numbered from 1
-    /// again every 1000 as streams start over, recorded as the encode loop records them;
+    /// allocator. Six viewers join; three rings' worth of frames go out, numbered by the
+    /// hub's timeline and recorded as the encode loop records them;
     /// acks come as on_ack records them: for the frame just sent or up to three before it
     /// (several at once, out of order, twice), now and then for a number never sent, and
     /// none for a spell longer than the ring, after which an ack scans a whole ring of open
@@ -5930,7 +5929,7 @@ mod tests {
         counting::arm();
         for k in 0..3 * FRAMES_KEPT as u64 {
             let at = t0 + Duration::from_millis(k * 16);
-            let id = (k % 1000) as u32 + 1;
+            let id = hub.timeline.number().get();
             let bytes = (mix(k) % 100_000) as usize;
             let frame = Inflight {
                 id,
@@ -6009,16 +6008,17 @@ mod tests {
                 });
                 let mut at = now - age;
                 let mut sent = vec![];
-                for id in 0..next(31) as u32 {
+                for _ in 0..next(31) {
+                    let id = hub.timeline.number().get();
                     c.fly(id, at, 200 + next(60_000) as usize);
-                    sent.push(at);
+                    sent.push((at, id));
                     at = (at + Duration::from_micros(next(30_000))).min(now);
                 }
                 // The first few acknowledged, as they came back.
                 if !sent.is_empty() && next(2) == 0 {
-                    let k = next(sent.len() as u64) as usize;
-                    let back = (sent[k] + Duration::from_micros(next(300_000))).min(now);
-                    c.on_ack(back, k as u32, crate::hub::Hold::Unsaid);
+                    let (left, id) = sent[next(sent.len() as u64) as usize];
+                    let back = (left + Duration::from_micros(next(300_000))).min(now);
+                    c.on_ack(back, id, crate::hub::Hold::Unsaid);
                 }
             }
             let at = format!("case {case}");
@@ -6130,8 +6130,8 @@ mod tests {
                 now += Duration::from_secs(60);
                 for (c, frames) in viewers.iter().zip(&picked) {
                     c.start_over(now - Duration::from_secs(40));
-                    for (id, &(age, bytes)) in frames.iter().enumerate() {
-                        c.fly(id as u32, now - age, bytes);
+                    for &(age, bytes) in frames.iter() {
+                        c.fly(hub.timeline.number().get(), now - age, bytes);
                     }
                 }
                 let asked = &viewers[..n as usize];
@@ -6981,7 +6981,6 @@ mod tests {
             // time it was left behind, and the first.
             let mut was = crate::hub::Viewer::Waiting;
             let mut owed = 1u32;
-            let mut id = 0u32;
             let mut t = start;
             while t < start + Duration::from_secs(30) {
                 for v in &mut viewers {
@@ -7035,6 +7034,7 @@ mod tests {
                             v.c.keyframe_sent(true, t);
                         }
                     }
+                    let id = hub.timeline.number();
                     for v in &mut viewers {
                         if v.c.viewer() != crate::hub::Viewer::Started {
                             continue;
@@ -7054,9 +7054,8 @@ mod tests {
                         };
                         // In order: an ack waits for the one before it.
                         let when = v.coming.back().map_or(t + after, |a| a.0.max(t + after));
-                        v.coming.push_back((when, id));
+                        v.coming.push_back((when, id.get()));
                     }
-                    id += 1;
                 }
                 let v = &viewers[late_at];
                 let now_is = v.c.viewer();
@@ -7172,7 +7171,7 @@ mod tests {
             // How far behind the slow viewer is: the most any message to it reached it
             // after it was sent, or after its path came back.
             let mut behind = Duration::ZERO;
-            let (mut id, mut t, mut ping) = (0u32, start, start);
+            let (mut t, mut ping) = (start, start);
             while t < start + Duration::from_secs(60) {
                 for (i, c) in cs.iter().enumerate() {
                     while let Some(&(at, f)) = acks[i].front().filter(|a| a.0 <= t) {
@@ -7213,6 +7212,7 @@ mod tests {
                     // A capture leaves behind a viewer that has stalled, as the loop does.
                     leave_behind(&hub.viewers(), t);
                     let bytes = want.min(room);
+                    let id = hub.timeline.number();
                     for (i, c) in cs.iter().enumerate() {
                         let sent = match c.takes(id, t, bytes, key, HOPELESSLY_BEHIND) {
                             Takes::Nothing => continue,
@@ -7225,9 +7225,8 @@ mod tests {
                         }
                         let at = arrives + links[i].rtt / 2;
                         let at = acks[i].back().map_or(at, |a| a.0.max(at));
-                        acks[i].push_back((at, id));
+                        acks[i].push_back((at, id.get()));
                     }
-                    id += 1;
                 }
                 t += frame;
             }
@@ -7304,7 +7303,7 @@ mod tests {
             let (mut failed, mut waits_key) = (None::<Instant>, false);
             // When its `kf` reached the server, and when it was next sent a keyframe.
             let (mut asked, mut keyed) = (None::<Instant>, None::<Instant>);
-            let (mut id, mut t, mut ping, mut drawn) = (0u32, start, start, start);
+            let (mut t, mut ping, mut drawn) = (start, start, start);
             while t < start + Duration::from_secs(30) {
                 // The first viewer decodes what it holds; its decoder fails on the first
                 // frame decoded after `fails`, and it drops all it holds.
@@ -7364,27 +7363,29 @@ mod tests {
                 if let Some(room) = room {
                     leave_behind(&hub.viewers(), t);
                     let bytes = want.min(room);
+                    let id = hub.timeline.number();
                     for (i, c) in cs.iter().enumerate() {
                         if c.takes(id, t, bytes, key, HOPELESSLY_BEHIND) != Takes::Frame {
                             continue;
                         }
                         let arrives = links[i].send(t, bytes);
                         match (i, waits_key, key) {
-                            (0, false, _) => holding.push_back((id, arrives + decode)),
+                            (0, false, _) => holding.push_back((id.get(), arrives + decode)),
                             // Waiting for a keyframe: a frame that is not one is acked as
                             // it arrives, undecoded; the keyframe is decoded.
                             (0, true, false) => {
-                                push(&mut up[0], arrives + links[0].rtt / 2, Up::Ack(id))
+                                push(&mut up[0], arrives + links[0].rtt / 2, Up::Ack(id.get()))
                             }
                             (0, true, true) => {
                                 waits_key = false;
                                 keyed = keyed.or(asked.map(|_| t));
-                                holding.push_back((id, arrives + decode));
+                                holding.push_back((id.get(), arrives + decode));
                             }
-                            (_, _, _) => push(&mut up[i], arrives + links[i].rtt / 2, Up::Ack(id)),
+                            (_, _, _) => {
+                                push(&mut up[i], arrives + links[i].rtt / 2, Up::Ack(id.get()))
+                            }
                         }
                     }
-                    id += 1;
                 }
                 t += frame;
             }

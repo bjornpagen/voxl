@@ -1,5 +1,6 @@
 //! Shared state between media producers (video/audio/cursor/clipboard) and websocket clients.
 
+use crate::timeline::FrameId;
 use crate::window::{self, Way, Window};
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -451,7 +452,14 @@ impl Client {
     /// it is a keyframe. A client that has started takes it, and it is in flight until
     /// acked and in its trace, unless it already has more than `behind` frames in flight:
     /// then it stops watching, and is to be sent a close.
-    pub fn takes(&self, id: u32, now: Instant, bytes: usize, key: bool, behind: usize) -> Takes {
+    pub fn takes(
+        &self,
+        id: FrameId,
+        now: Instant,
+        bytes: usize,
+        key: bool,
+        behind: usize,
+    ) -> Takes {
         let mut v = self.viewing.lock();
         match v.viewer {
             Viewer::Started if v.inflight.len() > behind => {
@@ -460,7 +468,11 @@ impl Client {
             }
             Viewer::Started => {
                 let left = v.window.leave(now, bytes);
-                let frame = Inflight { id, bytes, left };
+                let frame = Inflight {
+                    id: id.get(),
+                    bytes,
+                    left,
+                };
                 v.inflight.push_back(frame);
                 self.trace.lock().sent(frame, key);
                 Takes::Frame
@@ -1072,8 +1084,8 @@ mod tests {
                 .map(|&(viewer, inflight)| {
                     let c = hub.add_client(mpsc::unbounded_channel().0, t0);
                     c.viewing.lock().viewer = viewer;
-                    for id in 1..=inflight as u32 {
-                        c.fly(id, t0, 1000);
+                    for _ in 0..inflight {
+                        c.fly(hub.timeline.number().get(), t0, 1000);
                     }
                     c
                 })
@@ -1111,8 +1123,8 @@ mod tests {
                         }
                     }
                 }
+                let id = hub.timeline.number();
                 for (v, _) in hub.viewers() {
-                    let id = v.viewing.lock().inflight.back().map_or(1, |f| f.id + 1);
                     if v.takes(id, t0, 1000, whole, BEHIND) == Takes::Frame {
                         sent.push(c.iter().position(|c| c.id == v.id).unwrap());
                     }
@@ -1267,7 +1279,7 @@ mod tests {
     #[derive(Clone, Copy)]
     struct Sent {
         at: Instant,
-        id: u32,
+        id: FrameId,
         bytes: usize,
         arrives: Instant,
         acks: Instant,
@@ -1290,14 +1302,15 @@ mod tests {
         let mut rng = Rng(crate::xorshift::Xorshift::new(seed));
         let t0 = Instant::now();
         let (mut at, mut arrives, mut acks) = (t0, t0, t0);
-        let mut frames: Vec<Sent> = (1..=200)
-            .map(|id| {
+        let numbers = crate::timeline::Timeline::new(t0);
+        let mut frames: Vec<Sent> = (0..200)
+            .map(|_| {
                 at += Duration::from_millis(1 + rng.below(40));
                 arrives = arrives.max(at + Duration::from_millis(rng.below(121)));
                 acks = acks.max(arrives + Duration::from_millis(rng.below(51)));
                 Sent {
                     at,
-                    id,
+                    id: numbers.number(),
                     bytes: 200 + rng.below(60_000) as usize,
                     arrives,
                     acks,
@@ -1324,14 +1337,14 @@ mod tests {
         let mut acks = frames.iter().filter(|f| f.acked).peekable();
         for f in frames {
             // The acks that arrive before it leaves, of frames already sent.
-            while let Some(a) = acks.next_if(|a| a.id < f.id && when(a) <= f.at) {
-                c.on_ack(when(a), a.id, hold(a));
+            while let Some(a) = acks.next_if(|a| a.id.get() < f.id.get() && when(a) <= f.at) {
+                c.on_ack(when(a), a.id.get(), hold(a));
             }
             let took = c.takes(f.id, f.at, f.bytes, false, usize::MAX);
             assert_eq!(took, Takes::Frame);
         }
         for a in acks {
-            c.on_ack(when(a), a.id, hold(a));
+            c.on_ack(when(a), a.id.get(), hold(a));
         }
         c
     }
@@ -1380,13 +1393,16 @@ mod tests {
             for f in &mut each {
                 f.acked = true;
             }
-            let covered: std::collections::HashSet<u32> =
-                frames.iter().filter(|f| !f.acked).map(|f| f.id).collect();
+            let covered: std::collections::HashSet<u32> = frames
+                .iter()
+                .filter(|f| !f.acked)
+                .map(|f| f.id.get())
+                .collect();
             let twin = acked(
                 &hub,
                 &each,
                 |f| f.acks,
-                |f| match covered.contains(&f.id) {
+                |f| match covered.contains(&f.id.get()) {
                     true => Hold::Unsaid,
                     false => Hold::Said(f.held()),
                 },
@@ -1425,7 +1441,7 @@ mod tests {
                     &hub,
                     &frames,
                     |f| f.acks,
-                    |f| match f.id % 2 {
+                    |f| match f.id.get() % 2 {
                         0 => lie(f),
                         _ => truth(f),
                     },
@@ -1434,7 +1450,7 @@ mod tests {
                     &hub,
                     &frames,
                     |f| f.acks,
-                    |f| match f.id % 2 {
+                    |f| match f.id.get() % 2 {
                         0 => Hold::Unsaid,
                         _ => truth(f),
                     },
@@ -1743,5 +1759,92 @@ mod tests {
                 assert_eq!(scale(s.resize), scale(resize));
             }
         }
+    }
+
+    /// An ack pops nothing it did not name, whatever came between: over any interleaving of
+    /// viewers that watch, stop and ask for keyframes, streams rebuilt, frames sent, and acks
+    /// of any frame numbered before (one in flight, one acked already, one from before a
+    /// watch or a rebuild, one sent to the other viewer), every frame an ack takes out of
+    /// flight, and every frame it covers in the trace, left no later than the frame it
+    /// names. Frames are numbered as the encode loop numbers them, by the hub's timeline;
+    /// the test knows each frame by the order it numbered it in (its bytes), not by its
+    /// number. Numbering that started again at a rebuild fails it.
+    #[test]
+    fn an_ack_pops_nothing_it_did_not_name() {
+        let mut rng = Rng(crate::xorshift::Xorshift::new(0x9E37_79B9_7F4A_7C15));
+        // Acks that took frames out of flight; that named a frame from before the viewer
+        // last watched, started over or started, and took nothing.
+        let (mut popped, mut stale) = (0, 0);
+        for _ in 0..40 {
+            let t0 = Instant::now();
+            let hub = Hub::new(Paths::ANY);
+            let c = [0, 1].map(|_| hub.add_client(mpsc::unbounded_channel().0, t0));
+            // Every frame numbered, in the order numbered: its number.
+            let mut numbered: Vec<u32> = vec![];
+            let mut now = t0;
+            for _ in 0..500 {
+                now += Duration::from_millis(rng.below(20));
+                let i = rng.below(2) as usize;
+                match rng.below(12) {
+                    0 => c[i].watch(now),
+                    1 => c[i].stop_watching(),
+                    2 => c[i].ask_keyframe(),
+                    3 => hub.restart_clients(),
+                    4 => {
+                        // A keyframe planned and sent: it starts who it was promised to.
+                        let promised = c.each_ref().map(|c| c.keyframe_planned());
+                        for (c, _) in c.iter().zip(promised).filter(|(_, p)| *p) {
+                            c.keyframe_sent(true, now);
+                        }
+                    }
+                    5..=7 => {
+                        let id = hub.timeline.number();
+                        let k = numbered.len();
+                        numbered.push(id.get());
+                        for c in &c {
+                            c.takes(id, now, k, false, usize::MAX);
+                        }
+                    }
+                    _ if numbered.is_empty() => {}
+                    _ => {
+                        // Any frame numbered so far, most often a recent one.
+                        let back = match rng.below(2) {
+                            0 => rng.below(4),
+                            _ => rng.below(numbered.len() as u64),
+                        };
+                        let named = numbered.len() - 1 - (back as usize).min(numbered.len() - 1);
+                        let flying = |c: &Client| -> Vec<usize> {
+                            c.viewing.lock().inflight.iter().map(|f| f.bytes).collect()
+                        };
+                        let covered = |c: &Client| -> Vec<usize> {
+                            let t = c.trace.lock();
+                            t.frames()
+                                .filter(|f| f.ack.is_some())
+                                .map(|f| f.frame.bytes)
+                                .collect()
+                        };
+                        let (before, covered_before) = (flying(&c[i]), covered(&c[i]));
+                        c[i].on_ack(now, numbered[named], Hold::Unsaid);
+                        let (after, covered_after) = (flying(&c[i]), covered(&c[i]));
+                        let gone = &before[..before.len() - after.len()];
+                        assert_eq!(after, before[gone.len()..], "only from the front");
+                        assert!(
+                            gone.iter().all(|&k| k <= named),
+                            "the ack of frame {named} took {gone:?} out of flight"
+                        );
+                        let newly = covered_after.iter().filter(|k| !covered_before.contains(k));
+                        assert!(newly.clone().all(|&k| k <= named), "covered {newly:?}");
+                        popped += usize::from(!gone.is_empty());
+                        stale += usize::from(
+                            gone.is_empty() && before.first().is_some_and(|&k| k > named),
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            popped > 100 && stale > 100,
+            "popped {popped}, stale {stale}"
+        );
     }
 }

@@ -176,10 +176,25 @@ pub struct Recorded {
     pub bytes: u64,
 }
 
+/// A frame's number: the server's one count of the frames it has sent, which goes on from
+/// stream to stream and never starts again. Only `Timeline::number` makes one, so every
+/// frame a viewer is sent and every frame the timeline records has a number no other
+/// frame had (until the count wraps, after 2^32 frames: 2.3 years at 60 a second).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameId(u32);
+
+impl FrameId {
+    /// As a video message's header carries it, and as a viewer's ack names it.
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
 pub struct Timeline {
     start: Instant,
     slots: Box<[Slot]>,
-    /// The number of the newest frame recorded.
+    /// The number of the newest frame numbered: the one count of frames, kept with the
+    /// hub for as long as voxl runs.
     newest: AtomicU32,
 }
 
@@ -210,12 +225,19 @@ impl Timeline {
         &self.slots[frame as usize % FRAMES_KEPT]
     }
 
-    /// Frame number `frame` is handed to the viewers. Called by the encode loop alone,
-    /// with frames numbered one after another.
-    pub fn record(&self, frame: u32, f: &Frame) {
+    /// The next frame's number. A stream that starts (a viewer joins after nobody watched,
+    /// the screen is resized) takes up the count where the last stream left it, so an ack
+    /// for a frame of an earlier stream names no frame of a later one.
+    pub fn number(&self) -> FrameId {
+        FrameId(self.newest.fetch_add(1, Ordering::AcqRel).wrapping_add(1))
+    }
+
+    /// Frame `id` is handed to the viewers. Called by the encode loop alone.
+    pub fn record(&self, id: FrameId, f: &Frame) {
+        let frame = id.get();
         let slot = self.slot(frame);
-        let id = (frame as u64) << 2;
-        slot.seq.store(id | WRITING, Ordering::Relaxed);
+        let seq = (frame as u64) << 2;
+        slot.seq.store(seq | WRITING, Ordering::Relaxed);
         fence(Ordering::Release);
         for (at, instant) in slot.at.iter().zip(f.instants()) {
             at.store(self.us(instant), Ordering::Relaxed);
@@ -223,8 +245,7 @@ impl Timeline {
         slot.rows.store(f.captured.rows, Ordering::Relaxed);
         slot.bytes.store(f.bytes as u64, Ordering::Relaxed);
         slot.written.store((frame as u64) << 32, Ordering::Relaxed);
-        slot.seq.store(id | DONE, Ordering::Release);
-        self.newest.store(frame, Ordering::Release);
+        slot.seq.store(seq | DONE, Ordering::Release);
     }
 
     /// A viewer's socket task wrote a message of frame `frame` to its socket at `now`.
@@ -363,11 +384,9 @@ impl Trace {
         self.sent += 1;
     }
 
-    /// At `at`, an ack named frame `id`, with `hold`. It names the oldest frame still kept
-    /// that no ack has covered and whose number is `id` (TCP carries acks in the order the
-    /// frames went, and a new stream numbers its frames from 1 again), and covers it and
-    /// every frame sent before it. One that names no such frame (covered already, never
-    /// sent, or no longer kept) covers nothing.
+    /// At `at`, an ack named frame `id`, with `hold`. It covers the frame numbered `id`,
+    /// if one is kept that no ack has covered, and every frame sent before it. One that
+    /// names no such frame (covered already, never sent, or no longer kept) covers nothing.
     pub fn acked(&mut self, at: Instant, id: u32, hold: Hold) {
         let first = self.covered.max(self.sent - self.ring.len() as u64);
         let Some(named) = (first..self.sent).find(|&k| self.ring[Self::slot(k)].frame.id == id)
@@ -532,14 +551,22 @@ mod tests {
         // The model: frame number -> (what was recorded, its write).
         let mut model: Vec<(u32, Recorded)> = vec![];
         let mut at = 0u64;
+        // The count from anywhere, its wrap at 2^32 among them.
         let first = rng.below(u32::MAX as u64) as u32;
+        ring.newest.store(first.wrapping_sub(1), Ordering::Relaxed);
         for k in 0..3 * FRAMES_KEPT as u32 + 777 {
-            let id = first.wrapping_add(k);
+            let number = ring.number();
+            let id = number.get();
+            assert_eq!(
+                id,
+                first.wrapping_add(k),
+                "frames are numbered one after another"
+            );
             at += rng.below(40_000);
             let gaps: [u64; MARKS.len() - 1] = std::array::from_fn(|_| rng.below(9_000));
             let (rows, bytes) = (rng.below(2000) as u32, rng.below(1 << 20) as usize);
             let f = frame(start, at, gaps, rows, bytes);
-            ring.record(id, &f);
+            ring.record(number, &f);
             let mut after = [0; MARKS.len() - 1];
             let mut sum = 0;
             for (a, g) in after.iter_mut().zip(gaps) {
@@ -627,8 +654,10 @@ mod tests {
         let done = std::sync::atomic::AtomicBool::new(false);
         std::thread::scope(|s| {
             s.spawn(|| {
-                for id in 1..=FRAMES {
-                    ring.record(id, &said(id));
+                for _ in 0..FRAMES {
+                    let number = ring.number();
+                    let id = number.get();
+                    ring.record(number, &said(id));
                     ring.written(id, start + Duration::from_micros(id as u64 * 16 + 99));
                 }
                 done.store(true, Ordering::Release);
@@ -676,30 +705,29 @@ mod tests {
     }
 
     /// What an ack does, said over a viewer's whole history: among the last `FRAMES_KEPT`
-    /// frames sent, the oldest that no ack has covered and whose number it names is acked
-    /// by it, and every one sent before it still kept and not yet acked is acked by a later
-    /// one. How many frames shared the number, among those still open.
-    fn model_ack(sent: &mut [Sent], at: Instant, id: u32, hold: Hold) -> usize {
+    /// frames sent, the one that no ack has covered and whose number it names is acked by
+    /// it, and every one sent before it still kept and not yet acked is acked by a later
+    /// one. Whether it covered anything.
+    fn model_ack(sent: &mut [Sent], at: Instant, id: u32, hold: Hold) -> bool {
         let from = sent.len().saturating_sub(FRAMES_KEPT);
         let kept = &mut sent[from..];
         let open = |s: &&mut Sent| s.ack.is_none();
-        let named: Vec<usize> = (0..kept.len())
-            .filter(|&i| kept[i].ack.is_none() && kept[i].frame.id == id)
-            .collect();
-        let Some(&named_first) = named.first() else {
-            return 0;
+        let Some(named) =
+            (0..kept.len()).find(|&i| kept[i].ack.is_none() && kept[i].frame.id == id)
+        else {
+            return false;
         };
-        for s in kept[..named_first].iter_mut().filter(open) {
+        for s in kept[..named].iter_mut().filter(open) {
             s.ack = Some(Ack {
                 at,
                 of: AckOf::Later,
             });
         }
-        kept[named_first].ack = Some(Ack {
+        kept[named].ack = Some(Ack {
             at,
             of: AckOf::This(hold),
         });
-        named.len()
+        true
     }
 
     /// The rows `/stats/trace` gives for frames as the model has them, written apart from
@@ -737,13 +765,13 @@ mod tests {
     /// traces as they stood; and their rows in `/stats/trace` say the same. Generated over
     /// several laps of the ring: viewers join and leave (one now and then after laps of
     /// its ring), a frame goes to a viewer as it leaves, a viewer gone already leaves
-    /// again, a stream starts over (its frames numbered from 1 again), a viewer is sent
-    /// most frames but not every one, and goes deaf for spells long enough that frames no
-    /// ack covered leave its ring. Acks name the oldest frame open, one of the newest
-    /// (skipping the frames between, whose own acks never come), one already covered (out
-    /// of order, or twice), a number never sent, a frame no longer kept or any frame sent;
-    /// with a hold said, unsaid or unreadable. The run must reach every one of those, an
-    /// ack naming a number two open frames share, and a leaver pushed out by later ones.
+    /// again, a viewer is sent most frames but not every one, and goes deaf for spells long
+    /// enough that frames no ack covered leave its ring. Frames are numbered by the hub's
+    /// timeline. Acks name the oldest frame open, one of the newest (skipping the frames
+    /// between, whose own acks never come), one already covered (out of order, or twice), a
+    /// number never sent, a frame no longer kept or any frame sent; with a hold said,
+    /// unsaid or unreadable. The run must reach every one of those, and a leaver pushed out
+    /// by later ones.
     #[test]
     fn each_viewer_keeps_its_last_frames_and_their_acks() {
         const STEPS: u32 = 64_000;
@@ -753,9 +781,10 @@ mod tests {
         let mut watchers: Vec<Watcher> = vec![];
         // The last to leave, with when each left and at which step, oldest first.
         let mut leavers: VecDeque<(Watcher, Instant, u32)> = VecDeque::new();
-        let mut number = 0u32;
+        // The number of the newest frame numbered.
+        let mut newest = 0u32;
         // How often each situation the run must reach came up.
-        let (mut left, mut restarted, mut shared, mut covered_nothing) = (0usize, 0, 0, 0);
+        let (mut left, mut covered_nothing) = (0usize, 0);
         let (mut late, mut again, mut longest_left, mut fell_open) = (0, 0, 0, 0);
         // Frames that left a viewer's ring with no ack.
         let open_fallen = |w: &Watcher| {
@@ -796,17 +825,14 @@ mod tests {
                     hub.remove_client(leavers[w].0.client.id, at);
                     again += 1;
                 }
-                63..=89 => {
-                    number = 0;
-                    restarted += 1;
-                }
                 90..=99 if !watchers.is_empty() => {
                     let w = rng.below(watchers.len() as u64) as usize;
                     let w = &mut watchers[w];
                     w.heard_from = w.heard_from.max(step + rng.below(12_000) as u32);
                 }
                 100..=5999 => {
-                    number = number.wrapping_add(1);
+                    let number = hub.timeline.number().get();
+                    newest = number;
                     let (bytes, key) = (rng.below(1 << 20) as usize, rng.below(30) == 0);
                     for w in &mut watchers {
                         // One waiting for a keyframe is not sent the frames before it.
@@ -866,7 +892,7 @@ mod tests {
                         _ => pick(&mut rng, 0, n),
                     };
                     let id = match (kind, named) {
-                        (3, _) | (_, None) => number.wrapping_add(1 + rng.below(1000) as u32),
+                        (3, _) | (_, None) => newest.wrapping_add(1 + rng.below(1000) as u32),
                         (_, Some(i)) => w.sent[i].frame.id,
                     };
                     let hold = match rng.below(3) {
@@ -875,11 +901,7 @@ mod tests {
                         _ => Hold::Unreadable,
                     };
                     w.client.on_ack(at, id, hold);
-                    match model_ack(&mut w.sent, at, id, hold) {
-                        0 => covered_nothing += 1,
-                        1 => {}
-                        _ => shared += 1,
-                    }
+                    covered_nothing += usize::from(!model_ack(&mut w.sent, at, id, hold));
                     kinds[kind] += named.is_some() as usize;
                 }
                 _ => {}
@@ -940,8 +962,6 @@ mod tests {
                 "a viewer left after a lap of its ring",
                 longest_left.saturating_sub(FRAMES_KEPT),
             ),
-            ("a stream started over", restarted),
-            ("an ack named a number two open frames shared", shared),
             ("an ack covered nothing", covered_nothing),
             ("a frame left the ring with no ack", fell_open),
             ("a frame was acked by a later one", later),
