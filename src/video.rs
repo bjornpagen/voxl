@@ -357,16 +357,18 @@ impl Stream {
         let (job_tx, job_rx) = mpsc::sync_channel::<Job>(1);
         // One picture goes round, so no more than one comes back at once.
         let (ret_tx, ret_rx) = mpsc::sync_channel::<Returned>(1);
-        let layout = hub.stripes.lock().clone();
+        // The stripes the hub's hello names, in the types a header names a stripe by.
+        let layout = Layout::of(&hub.stripes.lock())
+            .ok_or("the hub's stripes do not fit a video message's header")?;
         let mut stripes = Vec::new();
-        for &(y, sh) in &layout {
+        for (y, sh) in layout.rows() {
             let ecfg = EncoderConfig {
                 pictures: Pictures {
                     width: w,
                     height: sh,
                     fps: cfg.fps,
                     preset: cfg.preset.clone(),
-                    threads: (cfg.threads / layout.len() as u32).max(1),
+                    threads: (cfg.threads / u32::from(layout.count)).max(1),
                     debug: cfg.debug,
                 },
                 crf: cfg.crf,
@@ -384,9 +386,13 @@ impl Stream {
             configured: cfg.crf,
             paintover: cfg.paintover_crf,
         };
-        let (fps, debug) = (cfg.fps, cfg.debug);
+        let frames = Frames {
+            layout,
+            fps: cfg.fps,
+        };
+        let debug = cfg.debug;
         let encode = encoder_thread(hub.clone(), move || {
-            encode_loop(stripes, job_rx, ret_tx, hub, fps, crfs, debug)
+            encode_loop(stripes, frames, job_rx, ret_tx, hub, crfs, debug)
         });
         Ok(Stream {
             job_tx,
@@ -534,7 +540,7 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Capturer, String> {
         cfg.preset,
         cfg.threads
     );
-    *hub.stripes.lock() = stripe_layout(u32::from(rows), cfg.stripes);
+    *hub.stripes.lock() = stripe_layout(rows, cfg.stripes).rows().collect();
     #[cfg(target_os = "macos")]
     {
         let resizing = hub.resize_max.lock().is_some();
@@ -1459,17 +1465,67 @@ pub fn frame_of(m: &[u8]) -> Option<u32> {
 /// x264 pays ~9 ms of CPU per 2560x1600 frame even when nothing changed, and sliced
 /// threading triples that; independent single-threaded stripes are encoded in
 /// parallel (low latency) and only when they changed (low CPU).
-fn stripe_layout(height: u32, n: u32) -> Vec<(u32, u32)> {
+fn stripe_layout(height: u16, n: u32) -> Layout {
     let n = n.clamp(1, 16);
-    let each = (height.div_ceil(n) + 15) & !15;
-    let mut v = Vec::new();
-    let mut y = 0;
+    let each = (u32::from(height).div_ceil(n) + 15) & !15;
+    let mut stripes = Vec::new();
+    let (mut y, mut count) = (0, 0);
     while y < height {
-        let h = each.min(height - y);
-        v.push((y, h));
-        y += h;
+        let left = height - y;
+        // `each` rows, or what is left of the screen: all of it when `each` is past 16 bits.
+        let h = u16::try_from(each).map_or(left, |each| each.min(left));
+        stripes.push(Place {
+            stripe: count,
+            y,
+            h,
+        });
+        (y, count) = (y + h, count + 1);
     }
-    v
+    Layout { stripes, count }
+}
+
+/// A screen cut into stripes, in the types a video message's header names a stripe by:
+/// `stripe_layout` cuts at most 16 (`--stripes` is clamped to 1..=16), so a stripe's
+/// number and their count are 8-bit, and its screen has at most 65,535 rows, so a top row
+/// is 16-bit.
+struct Layout {
+    stripes: Vec<Place>,
+    count: u8,
+}
+
+/// One stripe of a layout: its number from the top, its top row and how many rows it has.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Place {
+    stripe: u8,
+    y: u16,
+    h: u16,
+}
+
+impl Layout {
+    /// The stripes `rows` names, (top row, rows) top to bottom, if each fits a header:
+    /// at most 16, each with its top row and its rows in 16 bits.
+    fn of(rows: &[(u32, u32)]) -> Option<Layout> {
+        let stripes = rows
+            .iter()
+            .enumerate()
+            .map(|(i, &(y, h))| {
+                Some(Place {
+                    stripe: u8::try_from(i).ok()?,
+                    y: u16::try_from(y).ok()?,
+                    h: u16::try_from(h).ok()?,
+                })
+            })
+            .collect::<Option<Vec<Place>>>()?;
+        let count = u8::try_from(stripes.len()).ok().filter(|&n| n <= 16)?;
+        Some(Layout { stripes, count })
+    }
+
+    /// (top row, rows) of each stripe, top to bottom.
+    fn rows(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.stripes
+            .iter()
+            .map(|p| (u32::from(p.y), u32::from(p.h)))
+    }
 }
 
 struct Stripe {
@@ -2006,6 +2062,13 @@ fn stripe_worker(
     }
 }
 
+/// How a stream's frames are cut and paced: its stripes' layout, and the frames a second
+/// the frame budget and a keyframe's boost are counted in.
+struct Frames {
+    layout: Layout,
+    fps: Fps,
+}
+
 /// More frames than this in flight to a viewer, and it is closed (it stops watching, and is
 /// sent the close once): upstream's guess (its first commit), never measured; 10 s of
 /// frames at 60 a second. The flow check keeps a viewer that holds the capture to at most
@@ -2044,14 +2107,15 @@ impl Drop for Woken {
 
 fn encode_loop(
     stripes_in: Vec<Stripe>,
+    frames: Frames,
     rx: mpsc::Receiver<Job>,
     ret: mpsc::SyncSender<Returned>,
     hub: Arc<Hub>,
-    fps: Fps,
     crfs: Crfs,
     debug: Debugging,
 ) {
     let debug_stripes = debug.stripes;
+    let fps = frames.fps;
     // Geometry stays here; encoders move to their workers.
     let stripes: Vec<(usize, usize)> = stripes_in.iter().map(|s| (s.y, s.h)).collect();
     // Persistent per-stripe workers keep each encoder's state warm in one core's cache.
@@ -2063,7 +2127,7 @@ fn encode_loop(
         move |job| own.code(job),
         coders.map(|c| move |rx, done| stripe_worker(c, rx, done)),
     );
-    if let Err(Gone(i)) = encode_frames(&mut crew, &stripes, fps, rx, ret, &hub) {
+    if let Err(Gone(i)) = encode_frames(&mut crew, &stripes, &frames, rx, ret, &hub) {
         log::error!("stripe {i}'s encoder is gone");
     }
 }
@@ -2073,11 +2137,13 @@ fn encode_loop(
 fn encode_frames(
     crew: &mut Crew,
     stripes: &[(usize, usize)],
-    fps: Fps,
+    frames: &Frames,
     rx: mpsc::Receiver<Job>,
     ret: mpsc::SyncSender<Returned>,
     hub: &Hub,
 ) -> Result<(), Gone> {
+    let Frames { layout, fps } = frames;
+    let fps = *fps;
     let epoch = Instant::now();
     let mut frame_id: u32 = 0;
     let n = stripes.len();
@@ -2148,20 +2214,21 @@ fn encode_frames(
             home(back);
             continue;
         };
-        let nparts = out.parts() as u8;
+        let nparts = u8::try_from(out.parts()).expect("a frame's parts are some of its stripes");
         let enc_us = t0.elapsed().as_micros() as u64;
         frame_id = frame_id.wrapping_add(1);
         let pipe = Pipe::of(job.captured.damage.elapsed());
         msgs.extend(out.take_parts().map(|(i, key, mut out)| {
+            let place = layout.stripes[i];
             let header = Header {
                 key,
                 sharpens,
                 frame: frame_id,
                 pipe,
-                stripe: i as u8,
-                stripes: n as u8,
+                stripe: place.stripe,
+                stripes: layout.count,
                 parts: nparts,
-                y: stripes[i].0 as u16,
+                y: place.y,
             };
             out[..Header::LEN].copy_from_slice(&header.bytes());
             out.freeze()
@@ -2448,10 +2515,13 @@ mod tests {
             move || {
                 encode_loop(
                     vec![stripe],
+                    Frames {
+                        layout: stripe_layout(h as u16, 1),
+                        fps: Fps::new(60).unwrap(),
+                    },
                     job_rx,
                     ret_tx,
                     hub,
-                    Fps::new(60).unwrap(),
                     Crfs {
                         configured: 23.0,
                         paintover: 18.0,
@@ -2569,7 +2639,7 @@ mod tests {
                         stripes: 1,
                         debug: Debugging::read(|_| None).0,
                     };
-                    *hub.stripes.lock() = stripe_layout(h, stripes);
+                    *hub.stripes.lock() = stripe_layout(h as u16, stripes).rows().collect();
                     let s = Stream::new(&cfg, &hub, w, h).unwrap();
                     let next = super::Frame::Motion {
                         band: bands[0],
@@ -3282,8 +3352,8 @@ mod tests {
         for case in 0..300 {
             let width = 16 + g.below(80) as usize;
             let height = 16 + g.below(200) as usize;
-            let layout: Vec<(usize, usize)> = stripe_layout(height as u32, 1 + g.below(6) as u32)
-                .into_iter()
+            let layout: Vec<(usize, usize)> = stripe_layout(height as u16, 1 + g.below(6) as u32)
+                .rows()
                 .map(|(y, h)| (y as usize, h as usize))
                 .collect();
             let n = layout.len();
@@ -3601,8 +3671,8 @@ mod tests {
         for case in 0..40 {
             let width = 16 * (2 + g.below(10) as usize);
             let height = 16 * (2 + g.below(10) as usize);
-            let layout: Vec<(usize, usize)> = stripe_layout(height as u32, 1 + g.below(4) as u32)
-                .into_iter()
+            let layout: Vec<(usize, usize)> = stripe_layout(height as u16, 1 + g.below(4) as u32)
+                .rows()
                 .map(|(y, h)| (y as usize, h as usize))
                 .collect();
             let n = layout.len();
@@ -3718,15 +3788,15 @@ mod tests {
             rng as usize % n
         };
         for stripes in 1..=3 {
-            let layout = stripe_layout(h as u32, stripes);
-            let mut coders = layout.iter().map(|&(y, sh)| {
+            let layout = stripe_layout(h as u16, stripes);
+            let mut coders = layout.rows().map(|(y, sh)| {
                 let cfg = EncoderConfig {
                     pictures: Pictures {
                         width: w as u32,
                         height: sh,
                         fps: Fps::new(60).unwrap(),
                         preset: Preset::parse("ultrafast").unwrap(),
-                        threads: (4 / layout.len() as u32).max(1),
+                        threads: (4 / u32::from(layout.count)).max(1),
                         debug: Debugging::read(|_| None).0,
                     },
                     crf: 24.0,
@@ -3746,8 +3816,8 @@ mod tests {
                 coders.map(|c| move |rx, done| stripe_worker(c, rx, done)),
             );
             let geometry: Vec<(usize, usize)> = layout
-                .iter()
-                .map(|&(y, sh)| (y as usize, sh as usize))
+                .rows()
+                .map(|(y, sh)| (y as usize, sh as usize))
                 .collect();
             let hub = Hub::new();
             let (tx, mut socket) = tokio::sync::mpsc::unbounded_channel();
@@ -3763,8 +3833,11 @@ mod tests {
                 .name("encode".into())
                 .spawn(move || {
                     let mut crew = crew;
-                    let fps = Fps::new(60).unwrap();
-                    encode_frames(&mut crew, &geometry, fps, job_rx, ret_tx, &encoding).unwrap()
+                    let paced = Frames {
+                        layout,
+                        fps: Fps::new(60).unwrap(),
+                    };
+                    encode_frames(&mut crew, &geometry, &paced, job_rx, ret_tx, &encoding).unwrap()
                 })
                 .unwrap();
             // Bands of block rows, each with a map of the blocks in it that changed,
@@ -4093,8 +4166,9 @@ mod tests {
         for case in 0..400 {
             let width = 16 + g.below(40) as usize;
             let height = 16 + g.below(160) as usize;
-            let stripes: Vec<(usize, usize)> = stripe_layout(height as u32, 1 + g.below(6) as u32)
-                .into_iter()
+            let layout = stripe_layout(height as u16, 1 + g.below(6) as u32);
+            let stripes: Vec<(usize, usize)> = layout
+                .rows()
                 .map(|(y, h)| (y as usize, h as usize))
                 .collect();
             let n = stripes.len();
@@ -4181,10 +4255,13 @@ mod tests {
             let (ended_tx, ended) = mpsc::channel();
             let encode = encoder_thread(hub.clone(), {
                 let hub = hub.clone();
-                let fps = Fps::new(60).unwrap();
+                let paced = Frames {
+                    layout,
+                    fps: Fps::new(60).unwrap(),
+                };
                 move || {
                     let mut crew = crew;
-                    let r = encode_frames(&mut crew, &stripes, fps, rx, ret, &hub);
+                    let r = encode_frames(&mut crew, &stripes, &paced, rx, ret, &hub);
                     drop(crew);
                     let _ = ended_tx.send(r);
                 }
@@ -4280,8 +4357,9 @@ mod tests {
         let mut reached = [0; 3];
         for case in 0..300 {
             let height = 16 * (1 + g.below(12) as usize);
-            let stripes: Vec<(usize, usize)> = stripe_layout(height as u32, 1 + g.below(4) as u32)
-                .into_iter()
+            let layout = stripe_layout(height as u16, 1 + g.below(4) as u32);
+            let stripes: Vec<(usize, usize)> = layout
+                .rows()
                 .map(|(y, h)| (y as usize, h as usize))
                 .collect();
             let n = stripes.len();
@@ -4348,10 +4426,14 @@ mod tests {
             let (ended_tx, ended) = mpsc::channel();
             let encode = encoder_thread(hub.clone(), {
                 let (hub, stripes) = (hub.clone(), stripes.clone());
-                let fps = Fps::new(60).unwrap();
+                let paced = Frames {
+                    layout,
+                    fps: Fps::new(60).unwrap(),
+                };
                 move || {
                     let mut crew = crew;
-                    let _ = ended_tx.send(encode_frames(&mut crew, &stripes, fps, rx, ret, &hub));
+                    let _ =
+                        ended_tx.send(encode_frames(&mut crew, &stripes, &paced, rx, ret, &hub));
                 }
             });
             // The model: each stripe's parts so far, and the frames that put one out.
@@ -4501,6 +4583,86 @@ mod tests {
         }
     }
 
+    /// Every `--stripes` a layout can be asked for: none, each of 1 to 16, more, and the
+    /// most a flag holds.
+    const ASKED: [u32; 20] = [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        64,
+        u32::MAX,
+    ];
+
+    /// For every height a screen can have and every count asked: the stripes cover the
+    /// screen top to bottom, numbered from 0, as many as asked within 1 to 16 or fewer, all
+    /// as tall, a whole number of 16-row blocks, but the last.
+    #[test]
+    fn a_layout_cuts_the_screen_into_at_most_16_stripes() {
+        for height in 0..=u16::MAX {
+            for n in ASKED {
+                let layout = stripe_layout(height, n);
+                assert_eq!(usize::from(layout.count), layout.stripes.len());
+                assert!(u32::from(layout.count) <= n.clamp(1, 16));
+                assert_eq!(layout.count == 0, height == 0);
+                let mut top = 0;
+                for (i, p) in layout.stripes.iter().enumerate() {
+                    assert_eq!((usize::from(p.stripe), p.y), (i, top), "{height} rows, {n}");
+                    let last = i + 1 == layout.stripes.len();
+                    assert!(last || (p.h % 16 == 0 && p.h == layout.stripes[0].h));
+                    assert!(p.h > 0);
+                    top += p.h;
+                }
+                assert_eq!(top, height);
+            }
+        }
+    }
+
+    /// The oracle: `stripe_layout` before its stripes were typed.
+    fn old_stripe_layout(height: u32, n: u32) -> Vec<(u32, u32)> {
+        let n = n.clamp(1, 16);
+        let each = (height.div_ceil(n) + 15) & !15;
+        let mut v = Vec::new();
+        let mut y = 0;
+        while y < height {
+            let h = each.min(height - y);
+            v.push((y, h));
+            y += h;
+        }
+        v
+    }
+
+    /// For every height and count, the layout is the old one, and a header's stripe fields
+    /// are what the encode loop's casts made of it (`i as u8`, `n as u8`, `y as u16`).
+    #[test]
+    fn a_layout_is_the_old_one_in_the_headers_types() {
+        for height in 0..=u16::MAX {
+            for n in ASKED {
+                let old = old_stripe_layout(u32::from(height), n);
+                let new = stripe_layout(height, n);
+                assert_eq!(new.rows().collect::<Vec<_>>(), old);
+                assert_eq!(new.count, old.len() as u8);
+                for (i, p) in new.stripes.iter().enumerate() {
+                    assert_eq!((p.stripe, p.y), (i as u8, old[i].0 as u16));
+                }
+            }
+        }
+    }
+
     /// One case of web/src/video-header.json.
     #[derive(serde::Deserialize)]
     struct Case {
@@ -4596,10 +4758,13 @@ mod tests {
             move || {
                 encode_loop(
                     vec![stripe],
+                    Frames {
+                        layout: stripe_layout(h as u16, 1),
+                        fps: Fps::new(60).unwrap(),
+                    },
                     job_rx,
                     ret_tx,
                     hub,
-                    Fps::new(60).unwrap(),
                     Crfs {
                         configured: 23.0,
                         paintover: 18.0,
@@ -4829,7 +4994,7 @@ mod tests {
         viewer.watch();
         // The capture loop planned its keyframe: the first frame played is one.
         viewer.keyframe_planned();
-        *hub.stripes.lock() = stripe_layout(h as u32, cfg.stripes);
+        *hub.stripes.lock() = stripe_layout(h as u16, cfg.stripes).rows().collect();
         let mut stream = Stream::new(&cfg, &hub, w as u32, h as u32).unwrap();
         let (cols, rows) = (w.div_ceil(16), h.div_ceil(16));
         let mut refiner = Refiner::new(cols * rows, cols, Instant::now());
