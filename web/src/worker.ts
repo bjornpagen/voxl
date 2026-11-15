@@ -28,10 +28,18 @@ let wantAudio = false;
 
 // The screen arrives as independent H.264 stripes, one decoder each. A frame is a
 // set of stripe updates sharing an id; frames are presented whole and in order.
+/**
+ * Why a stripe decodes or not. It decodes with its decoder; or the server owes it a
+ * keyframe, which every viewer that starts watching (after a hello or an open) is sent and
+ * which re-keys every stripe; or its decoder broke and it has asked for one, once. Only a
+ * broken stripe asks: a keyframe owed is already on its way.
+ */
+type Decoding =
+	| { s: 'decoding'; dec: VideoDecoder; codec: string }
+	| { s: 'owed' }
+	| { s: 'broken' };
 interface StripeState {
-	dec: VideoDecoder | null;
-	codec: string | null;
-	waitingKey: boolean;
+	d: Decoding;
 	ts: number;
 	/** Decoder timestamp -> frame id. */
 	ids: Map<number, number>;
@@ -48,7 +56,6 @@ const stripes: StripeState[] = [];
 const frames = new Map<number, PendingFrame>();
 /** Frame ids awaiting presentation, oldest first. */
 const order: number[] = [];
-let kfRequested = 0;
 const st = {
 	frames: 0,
 	bytes: 0,
@@ -147,9 +154,9 @@ function onText(s: string) {
 
 function resetDecoder() {
 	for (const sd of stripes)
-		if (sd.dec && sd.dec.state !== 'closed') {
+		if (sd.d.s === 'decoding' && sd.d.dec.state !== 'closed') {
 			try {
-				sd.dec.close();
+				sd.d.dec.close();
 			} catch {}
 		}
 	stripes.length = 0;
@@ -158,12 +165,26 @@ function resetDecoder() {
 	order.length = 0;
 }
 
-function requestKeyframe() {
-	const now = performance.now();
-	if (now - kfRequested > 500) {
-		kfRequested = now;
-		send(cmd.keyframe);
+/**
+ * Stripe `i`'s decoder broke: what it was decoding never comes out, so the frames waiting
+ * for it go without it, and it asks for a keyframe, once.
+ */
+function broke(i: number, why: string) {
+	const sd = stripeState(i);
+	post({ t: 'log', s: `stripe ${i} ${why}` });
+	if (sd.d.s === 'decoding' && sd.d.dec.state !== 'closed') {
+		try {
+			sd.d.dec.close();
+		} catch {}
 	}
+	for (const id of sd.ids.values()) {
+		const f = frames.get(id);
+		if (f) f.need--;
+	}
+	sd.ids.clear();
+	if (sd.d.s !== 'broken') send(cmd.keyframe);
+	sd.d = { s: 'broken' };
+	flush();
 }
 
 const hex2 = (x: number) => x.toString(16).padStart(2, '0');
@@ -187,9 +208,7 @@ function stripeState(i: number): StripeState {
 	return (
 		stripes[i] ||
 		(stripes[i] = {
-			dec: null,
-			codec: null,
-			waitingKey: true,
+			d: { s: 'owed' },
 			ts: 0,
 			ids: new Map(),
 		})
@@ -211,9 +230,10 @@ function makeDecoder(i: number, codec: string): VideoDecoder {
 			flush();
 		},
 		error: (e) => {
-			post({ t: 'log', s: `stripe ${i} decoder error: ${e.message}` });
-			resetDecoder();
-			requestKeyframe();
+			// A decoder this stripe has since replaced or let go of breaks nothing.
+			const d = stripeState(i).d;
+			if (d.s === 'decoding' && d.dec === dec)
+				broke(i, `decoder error: ${e.message}`);
 		},
 	});
 	dec.configure({
@@ -264,38 +284,38 @@ function onVideo(b: Uint8Array) {
 	}
 	f.arrived = performance.now();
 	const sd = stripeState(h.stripe);
-	if (sd.waitingKey && !h.key) {
-		f.need--;
-		st.dropped++;
-		requestKeyframe();
-		flush();
-		return;
-	}
 	if (h.key) {
 		const codec = codecFromSps(data) || 'avc1.640034';
-		if (!sd.dec || sd.dec.state === 'closed' || codec !== sd.codec) {
-			if (sd.dec && sd.dec.state !== 'closed') {
+		const d = sd.d;
+		if (d.s !== 'decoding' || d.dec.state === 'closed' || codec !== d.codec) {
+			if (d.s === 'decoding' && d.dec.state !== 'closed') {
 				try {
-					sd.dec.close();
+					d.dec.close();
 				} catch {}
 			}
-			sd.codec = codec;
 			sd.ids.clear();
+			// The keyframe answers whatever this stripe waited for.
+			sd.d = { s: 'owed' };
 			try {
-				sd.dec = makeDecoder(h.stripe, codec);
+				sd.d = { s: 'decoding', dec: makeDecoder(h.stripe, codec), codec };
 			} catch (e) {
-				post({ t: 'log', s: 'configure failed ' + e });
 				f.need--;
-				flush();
+				broke(h.stripe, 'configure failed ' + e);
 				return;
 			}
 		}
-		sd.waitingKey = false;
+	}
+	const d = sd.d;
+	if (d.s !== 'decoding') {
+		f.need--;
+		st.dropped++;
+		flush();
+		return;
 	}
 	const ts = ++sd.ts;
 	sd.ids.set(ts, h.frame);
 	try {
-		sd.dec!.decode(
+		d.dec.decode(
 			new EncodedVideoChunk({
 				type: h.key ? 'key' : 'delta',
 				timestamp: ts,
@@ -303,9 +323,7 @@ function onVideo(b: Uint8Array) {
 			})
 		);
 	} catch (e) {
-		post({ t: 'log', s: 'decode threw ' + e });
-		resetDecoder();
-		requestKeyframe();
+		broke(h.stripe, 'decode threw ' + e);
 	}
 }
 
@@ -353,13 +371,14 @@ setInterval(() => {
 	const now = performance.now();
 	const dt = (now - st.lastReport) / 1000;
 	const n = st.frames;
+	const first = stripes[0]?.d;
 	const stats: Stats = {
 		t: 'stats',
 		fps: n / dt,
 		kbps: (st.bytes * 8) / 1000 / dt,
 		decodeMs: n ? st.decodeMs / n : 0,
 		pipeMs: n ? st.pipeMs / n : 0,
-		codec: stripes[0]?.codec ?? null,
+		codec: first?.s === 'decoding' ? first.codec : null,
 		stripes: layout.length,
 		dropped: st.dropped,
 		queue: order.length,
@@ -391,7 +410,6 @@ self.addEventListener('message', (e: MessageEvent<ToWorker>) => {
 		case 'video':
 			if (wantVideo !== m.on) {
 				wantVideo = m.on;
-				if (m.on) resetDecoder();
 				send(cmd.video(m.on));
 			}
 			break;
