@@ -264,10 +264,12 @@ pub enum Viewer {
     /// It waits for a keyframe, and none has been planned for it, and nothing is on its way
     /// to it: the capture loop plans one.
     Waiting,
-    /// It waits for a keyframe, but frames are still on their way to it: it asked for one
-    /// with frames on their way, or its path stalled beside others' and it was left behind.
-    /// It is sent nothing, and wants its keyframe once all of them have come back, so that
-    /// no keyframe goes into a path that is still clogged.
+    /// Its path stalled beside others' and it was left behind (`falls_behind`): it waits
+    /// for a keyframe, but frames are still on their way to it. It is sent nothing, and
+    /// wants its keyframe once all of them have come back, so that no keyframe goes into a
+    /// path that is still clogged. A viewer that asks for a keyframe is not left behind: it
+    /// may have dropped the frames on their way (a decoder that failed forgets what it has
+    /// not acknowledged), and then nothing would ever bring them back.
     Behind,
     /// A keyframe has been planned for it: it starts on that keyframe if it comes out
     /// whole, and waits again if it does not. One still `Waiting` is not started by it, as
@@ -289,17 +291,12 @@ pub enum Takes {
     Close,
 }
 
-/// What needing a keyframe makes of a viewer with `inflight` on its way: one that watches
-/// waits for one, and wants it now if nothing is on its way, else once all of it is back.
-fn asked(viewer: Viewer, inflight: &VecDeque<Inflight>) -> Viewer {
-    match (viewer, inflight.is_empty()) {
-        (Viewer::NotWatching, _) => Viewer::NotWatching,
-        (Viewer::Waiting | Viewer::Behind | Viewer::Promised | Viewer::Started, true) => {
-            Viewer::Waiting
-        }
-        (Viewer::Waiting | Viewer::Behind | Viewer::Promised | Viewer::Started, false) => {
-            Viewer::Behind
-        }
+/// What asking for a keyframe makes of a viewer: one that watches wants one, at once,
+/// whatever is on its way.
+fn asked(viewer: Viewer) -> Viewer {
+    match viewer {
+        Viewer::NotWatching => Viewer::NotWatching,
+        Viewer::Waiting | Viewer::Behind | Viewer::Promised | Viewer::Started => Viewer::Waiting,
     }
 }
 
@@ -384,10 +381,10 @@ impl Client {
     }
 
     /// It asks for a keyframe (`kf`, or a hello after a failed display switch): if it
-    /// watches, it waits for one, once what is on its way has come back.
+    /// watches, it wants one at once, whatever is on its way.
     pub fn ask_keyframe(&self) {
         let mut v = self.viewing.lock();
-        v.viewer = asked(v.viewer, &v.inflight);
+        v.viewer = asked(v.viewer);
     }
 
     /// The stream starts over for it at `now` (it is rebuilt): if it watches, it waits for a
@@ -395,7 +392,7 @@ impl Client {
     pub fn start_over(&self, now: Instant) {
         let mut v = self.viewing.lock();
         v.forget(now);
-        v.viewer = asked(v.viewer, &v.inflight);
+        v.viewer = asked(v.viewer);
     }
 
     /// At `now` a capture goes to the viewers that have room. One that has started and
@@ -435,7 +432,7 @@ impl Client {
                 v.viewer = Viewer::Started;
                 v.forget(now);
             }
-            (Viewer::Promised, false) => v.viewer = asked(v.viewer, &v.inflight),
+            (Viewer::Promised, false) => v.viewer = Viewer::Waiting,
             (Viewer::NotWatching | Viewer::Waiting | Viewer::Behind | Viewer::Started, _) => {}
         }
     }
@@ -958,11 +955,10 @@ mod tests {
         let mut m = before.clone();
         let c = &mut m.c;
         let (mut planned, mut sent) = (false, vec![]);
-        // Needing a keyframe: wanting it now with nothing in flight, else once it is back.
-        let asked = |(v, n): (Viewer, usize)| match (v, n) {
-            (NotWatching, _) => (NotWatching, n),
-            (_, 0) => (Waiting, 0),
-            (_, n) => (Behind, n),
+        // Asking for a keyframe: one that watches wants it at once.
+        let asked = |(v, n): (Viewer, usize)| match v {
+            NotWatching => (NotWatching, n),
+            Waiting | Behind | Promised | Started => (Waiting, n),
         };
         match step {
             Step::Watch(i) | Step::Record(i) => c[i] = (Waiting, 0),
@@ -1161,6 +1157,8 @@ mod tests {
         let mut seen = std::collections::HashSet::from([start.clone()]);
         let mut frontier = vec![start];
         let mut steps = 0;
+        // Viewers that asked for a keyframe with frames on their way.
+        let mut asked_with_frames = 0;
         for _depth in 0..12 {
             let mut next = vec![];
             for before in frontier {
@@ -1191,6 +1189,15 @@ mod tests {
                         sent.iter().all(|&i| after.c[i].0 == Viewer::Started),
                         "{what}"
                     );
+                    // A viewer that asks for a keyframe is promised one by the next capture,
+                    // whatever is on its way.
+                    if let (Step::AskKeyframe(i), true) = (step, applies(&after, Step::Capture)) {
+                        let (planned, _, then, _) = new_step(&hub, &after, Step::Capture);
+                        if after.c[i].0 != Viewer::NotWatching {
+                            assert!(planned && then.c[i].0 == Viewer::Promised, "{what}");
+                            asked_with_frames += usize::from(after.c[i].1 > 0);
+                        }
+                    }
                     if seen.insert(after.clone()) {
                         next.push(after);
                     }
@@ -1231,7 +1238,7 @@ mod tests {
         let reached: std::collections::HashSet<Viewer> =
             seen.iter().flat_map(|m| m.c.map(|c| c.0)).collect();
         assert_eq!(reached.len(), 5, "{reached:?}");
-        assert!(steps > 0);
+        assert!(steps > 0 && asked_with_frames > 0, "{asked_with_frames}");
     }
 
     /// What a client's window says at `at`: what its path carries, what is on its way,

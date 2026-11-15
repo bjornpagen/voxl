@@ -7215,7 +7215,6 @@ mod tests {
     /// decoder fails on one frame between 5 and 15 s in. Alone, or beside a viewer on
     /// another path; paths of 1 to 100 Mbit/s and 2 to 300 ms.
     #[test]
-    #[ignore = "fails until a viewer that asks for a keyframe waits at once (the next commit): case 0, one viewer at 72 Mbit/s, 83 ms, a screen that changes every 1.1 s, no keyframe in the 20 s after its kf"]
     fn a_viewer_whose_decoder_fails_gets_a_keyframe() {
         let mut rng = Xorshift::new(0x2F2E_9A0C_5B17_D3E1);
         let mut next = |n: u64| rng.below(n);
