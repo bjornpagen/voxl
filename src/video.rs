@@ -354,8 +354,7 @@ impl Stream {
                 y: y as usize,
                 h: sh as usize,
                 enc: Encoder::new(&ecfg)?,
-                applied_kbps: 0,
-                applied_crf: -1.0,
+                applied: None,
             });
         }
         let hub = hub.clone();
@@ -1404,8 +1403,37 @@ struct Stripe {
     y: usize,
     h: usize,
     enc: Encoder,
-    applied_kbps: u32,
-    applied_crf: f32,
+    /// The rate the encoder was last set to for a frame that isn't a keyframe, while it
+    /// holds: none before the first such frame, or after a keyframe's boost or a fresh
+    /// encoder, so the next one sets it.
+    applied: Option<Applied>,
+}
+
+/// The CRF and cap a stripe's encoder was set to.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Applied {
+    crf: f32,
+    kbps: u32,
+}
+
+/// How far a stripe's cap may move, as a share of the one set, before x264 is told:
+/// each change reconfigures the encoder. Upstream's guess, unmeasured. At none, every
+/// wobble of the frame budget reconfigures x264; at twice this, a frame may be coded
+/// under a cap 8% off its share of the budget.
+const CAP_SLACK: f64 = 0.04;
+
+impl Applied {
+    /// The rate to set before a frame at `crf` under `cap`, unless the one set (`was`)
+    /// still holds: the same CRF, and a cap within CAP_SLACK of it.
+    fn next(was: Option<Applied>, crf: f32, cap: u32) -> Option<Applied> {
+        let holds = |a: Applied| {
+            a.crf == crf && (cap as f64 - a.kbps as f64).abs() <= a.kbps as f64 * CAP_SLACK
+        };
+        match was {
+            Some(a) if holds(a) => None,
+            Some(_) | None => Some(Applied { crf, kbps: cap }),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1679,15 +1707,10 @@ fn stripe_worker(
             // steady-state frame budget (up to ~8 frames' worth at 4x the cap).
             let boost = job.cap.saturating_mul(4).max(16_000);
             s.enc.set_rate_buf(asked, boost, boost / fps.get() * 8);
-            s.applied_kbps = 0;
-        } else {
-            let moved = s.applied_kbps == 0
-                || (job.cap as f64 - s.applied_kbps as f64).abs() > s.applied_kbps as f64 * 0.04;
-            if crf != s.applied_crf || moved {
-                s.enc.set_rate(crf, job.cap);
-                s.applied_crf = crf;
-                s.applied_kbps = job.cap;
-            }
+            s.applied = None;
+        } else if let Some(rate) = Applied::next(s.applied, crf, job.cap) {
+            s.enc.set_rate(rate.crf, rate.kbps);
+            s.applied = Some(rate);
         }
         let suv = buf.stride_uv();
         let planes = Planes {
@@ -2193,8 +2216,7 @@ mod tests {
             y: 0,
             h,
             enc: Encoder::new(&ecfg).unwrap(),
-            applied_kbps: 0,
-            applied_crf: -1.0,
+            applied: None,
         };
         let (job_tx, job_rx) = mpsc::sync_channel::<Job>(1);
         let (ret_tx, _ret_rx) = mpsc::channel::<Returned>();
@@ -3229,6 +3251,78 @@ mod tests {
         );
     }
 
+    /// The rate a stripe last set as one optional value, against the cap of 0 and CRF of
+    /// -1 it replaces (the oracle: the parent's worker, as it was): over generated runs of
+    /// keyframes, frames at a CRF (asked, or lowered for motion) under a cap of at least
+    /// 1 kbit/s (the share is never less), and reopened encoders, x264 is set to the
+    /// same rates before the same frames.
+    #[test]
+    fn a_stripe_sets_its_rate_when_it_moves() {
+        let mut g = Gen(0x94D049BB133111EB);
+        // Frames that kept a rate, that set one, and that moved the cap onto the slack's edge.
+        let mut reached = [0; 3];
+        for case in 0..2_000 {
+            let (mut applied_kbps, mut applied_crf) = (0u32, -1.0f32);
+            let mut applied: Option<Applied> = None;
+            let mut cap = 1 + g.below(40_000) as u32;
+            let mut crf = 24.0;
+            for frame in 0..200 {
+                match g.below(20) {
+                    // A keyframe's boost, or a reopened encoder: nothing set holds.
+                    0 | 1 => {
+                        applied_kbps = 0;
+                        applied = None;
+                    }
+                    _ => {
+                        // Caps wobble with the budget, and sometimes jump; CRFs step.
+                        cap = match g.below(6) {
+                            0 => 1 + g.below(40_000) as u32,
+                            // Onto the edge of the slack, or one past it.
+                            1 if applied_kbps % 25 == 0 && applied_kbps > 0 => {
+                                let edge = applied_kbps / 25 + g.below(2) as u32;
+                                match g.below(2) {
+                                    0 => applied_kbps + edge,
+                                    _ => applied_kbps - edge.min(applied_kbps - 1),
+                                }
+                            }
+                            _ => {
+                                let step = g.below(cap as u64 / 10 + 2) as u32;
+                                match g.below(2) {
+                                    0 => cap + step,
+                                    _ => cap - step.min(cap - 1),
+                                }
+                            }
+                        };
+                        if g.below(8) == 0 {
+                            crf = 12.0 + g.below(20) as f32;
+                        }
+                        let moved = applied_kbps == 0
+                            || (cap as f64 - applied_kbps as f64).abs()
+                                > applied_kbps as f64 * 0.04;
+                        let old = (crf != applied_crf || moved).then(|| {
+                            applied_crf = crf;
+                            applied_kbps = cap;
+                            (crf, cap)
+                        });
+                        let new = Applied::next(applied, crf, cap).map(|rate| {
+                            applied = Some(rate);
+                            (rate.crf, rate.kbps)
+                        });
+                        assert_eq!(new, old, "case {case} frame {frame}");
+                        reached[usize::from(new.is_some())] += 1;
+                        reached[2] += usize::from(
+                            (cap as f64 - applied_kbps as f64).abs() == applied_kbps as f64 * 0.04,
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            reached.iter().all(|&r| r >= 1000),
+            "too few cases reached: {reached:?}"
+        );
+    }
+
     /// How a fake stripe worker ends.
     #[derive(Clone, Copy, Debug)]
     enum End {
@@ -3698,8 +3792,7 @@ mod tests {
             y: 0,
             h,
             enc: Encoder::new(&ecfg).unwrap(),
-            applied_kbps: 0,
-            applied_crf: -1.0,
+            applied: None,
         };
         let (job_tx, job_rx) = mpsc::sync_channel::<Job>(1);
         let (ret_tx, _ret_rx) = mpsc::channel::<Returned>();
