@@ -302,8 +302,8 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
     log::info!("client {} disconnected", client.id);
 }
 
-fn num<T: std::str::FromStr>(it: &mut std::str::Split<'_, char>) -> Option<T> {
-    it.next()?.trim().parse().ok()
+fn num<T: std::str::FromStr>(field: &str) -> Option<T> {
+    field.trim().parse().ok()
 }
 
 /// A button the viewer's pointer has, which a command names by X's number for it.
@@ -460,10 +460,17 @@ enum Command {
 }
 
 impl Command {
-    /// The command `t` is, if it is one this server knows, well formed.
+    /// The command `t` is, if it is one this server knows, well formed. One rule for all
+    /// of them: a command is its name and exactly the fields its pattern names, the line
+    /// split at every comma, so a field more or a field fewer is no command, as a
+    /// malformed one is. A clipboard's one field is its text, the rest of the line, commas
+    /// and all.
     fn parse(t: &str) -> Option<Command> {
-        let (name, rest) = t.split_once(',').unwrap_or((t, ""));
-        let mut it = rest.split(',');
+        let (name, fields): (&str, Vec<&str>) = match t.split_once(',') {
+            Some(("c", text)) => return Some(Command::Clipboard(text.to_string())),
+            Some((name, rest)) => (name, rest.split(',').collect()),
+            None => (t, vec![]),
+        };
         let flag = |v: &str| match v {
             "1" => Some(true),
             "0" => Some(false),
@@ -475,49 +482,49 @@ impl Command {
             "0" => Some(KeyAct::Up),
             _ => None,
         };
-        Some(match name {
-            "a" => Command::Ack {
-                frame: num(&mut it)?,
-                hold: crate::hub::Hold::parse(it.next()),
+        Some(match (name, fields.as_slice()) {
+            ("a", [frame]) => Command::Ack {
+                frame: num(frame)?,
+                hold: crate::hub::Hold::Unsaid,
             },
-            "m" => Command::Move {
-                x: num(&mut it)?,
-                y: num(&mut it)?,
+            ("a", [frame, hold]) => Command::Ack {
+                frame: num(frame)?,
+                hold: crate::hub::Hold::parse(hold),
             },
-            "b" => Command::Button {
-                button: Button::parse(it.next()?)?,
-                down: flag(it.next()?)?,
+            ("m", [x, y]) => Command::Move {
+                x: num(x)?,
+                y: num(y)?,
             },
-            "s" => Command::Scroll {
-                dx: Notches::parse(it.next()?)?,
-                dy: Notches::parse(it.next()?)?,
+            ("b", [button, down]) => Command::Button {
+                button: Button::parse(button)?,
+                down: flag(down)?,
             },
-            "sp" => {
-                let (dx, dy) = rest.split_once(',')?;
-                Command::ScrollPx {
-                    dx: Pixels::parse(dx)?,
-                    dy: Pixels::parse(dy)?,
-                }
-            }
-            "k" => Command::Key {
-                keysym: num(&mut it)?,
-                act: key(it.next()?)?,
+            ("s", [dx, dy]) => Command::Scroll {
+                dx: Notches::parse(dx)?,
+                dy: Notches::parse(dy)?,
             },
-            "r" => Command::ReleaseAll,
-            "c" => Command::Clipboard(rest.to_string()),
-            "v" => Command::Video(flag(rest)?),
-            "au" => Command::Audio(flag(rest)?),
-            "mi" => Command::Mic(flag(rest)?),
-            "sz" => Command::Resize {
-                w: num(&mut it)?,
-                h: num(&mut it)?,
+            ("sp", [dx, dy]) => Command::ScrollPx {
+                dx: Pixels::parse(dx)?,
+                dy: Pixels::parse(dy)?,
             },
-            "kf" => Command::Keyframe,
-            "po" => Command::Pong {
-                token: crate::hub::Token::parse(it.next()?)?,
+            ("k", [keysym, act]) => Command::Key {
+                keysym: num(keysym)?,
+                act: key(act)?,
+            },
+            ("r", []) => Command::ReleaseAll,
+            ("v", [on]) => Command::Video(flag(on)?),
+            ("au", [on]) => Command::Audio(flag(on)?),
+            ("mi", [on]) => Command::Mic(flag(on)?),
+            ("sz", [w, h]) => Command::Resize {
+                w: num(w)?,
+                h: num(h)?,
+            },
+            ("kf", []) => Command::Keyframe,
+            ("po", [token]) => Command::Pong {
+                token: crate::hub::Token::parse(token)?,
             },
             #[cfg(target_os = "macos")]
-            "ds" => Command::Display(rest.parse().ok()?),
+            ("ds", [id]) => Command::Display(id.parse().ok()?),
             _ => return None,
         })
     }
@@ -648,6 +655,7 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hub::Hold;
     use std::time::Duration;
 
     /// Every command the web client sends (web/src/protocol.ts), with arguments.
@@ -827,6 +835,66 @@ mod tests {
             "v,2", "v", "a", "a,x", "k,65", "k,65,3", "b,1,7", "sp,1", "po,-1", "zz,1",
         ] {
             assert!(Command::parse(c).is_none(), "{c} parsed");
+        }
+    }
+
+    /// How many fields each command has, written apart from `parse`: an ack's hold is the
+    /// one field that may be left out. A clipboard is not here: its one field is the rest
+    /// of the line, commas and all.
+    fn fields_of(name: &str) -> &'static [usize] {
+        match name {
+            "a" => &[1, 2],
+            "m" | "b" | "s" | "sp" | "k" | "sz" => &[2],
+            "v" | "au" | "mi" | "po" | "ds" => &[1],
+            "r" | "kf" => &[0],
+            _ => &[],
+        }
+    }
+
+    /// One rule for every command: its name and exactly its fields. Each command the web
+    /// client sends, with none to four well-formed fields (its own, then copies of its
+    /// last), parses exactly when that is a count `fields_of` gives it; an ack without its
+    /// hold is `Unsaid`, and with it, the hold as the field says. A clipboard takes one
+    /// field or more, and its text is all of them, commas and all.
+    #[test]
+    fn a_command_is_exactly_its_fields() {
+        for c in ALL {
+            let (name, own) = match c.split_once(',') {
+                Some((name, rest)) => (name, rest.split(',').collect()),
+                None => (*c, vec![]),
+            };
+            if name == "ds" && !cfg!(target_os = "macos") {
+                continue;
+            }
+            let last = own.last().copied().unwrap_or("1");
+            for count in 0..=4 {
+                let fields: Vec<&str> = own
+                    .iter()
+                    .copied()
+                    .chain(std::iter::repeat(last))
+                    .take(count)
+                    .collect();
+                let line = [name]
+                    .iter()
+                    .chain(&fields)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let parsed = Command::parse(&line);
+                let has = match name {
+                    "c" => count >= 1,
+                    name => fields_of(name).contains(&count),
+                };
+                assert_eq!(parsed.is_some(), has, "{line}");
+                match parsed {
+                    Some(Command::Ack { hold, .. }) => {
+                        let said = fields.get(1).map_or(Hold::Unsaid, |f| Hold::parse(f));
+                        assert_eq!(hold, said, "{line}");
+                    }
+                    Some(Command::Clipboard(text)) => assert_eq!(text, fields.join(","), "{line}"),
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -1079,7 +1147,8 @@ mod tests {
         let mut out = vec![];
         for _ in 0..200_000 {
             let mut line = NAMES[next() as usize % NAMES.len()].to_string();
-            for _ in 0..next() % 5 {
+            // Two fields most often, the most any command has; none to four.
+            for _ in 0..[0, 1, 1, 2, 2, 2, 3, 4][next() as usize % 8] {
                 let r = next();
                 // Half a digit (a flag, a button, a small count), a quarter an edge, and
                 // the rest an integer or a float of any size, or any f64 at all.
@@ -1098,6 +1167,10 @@ mod tests {
                 continue;
             };
             let said: Vec<&str> = line.split(',').skip(1).collect();
+            let name = line.split(',').next().expect("a line has a name");
+            if name != "c" && !fields_of(name).contains(&said.len()) {
+                out.push(format!("{line}: {} fields", said.len()));
+            }
             let int = |i: usize| said[i].trim().parse::<i128>().ok();
             let float = |i: usize| said[i].trim().parse::<f64>().ok();
             let (kind, as_said) = match &c {

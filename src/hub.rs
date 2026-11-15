@@ -35,11 +35,8 @@ pub enum Hold {
 }
 
 impl Hold {
-    /// From the field in milliseconds, if the ack has one.
-    pub fn parse(field: Option<&str>) -> Hold {
-        let Some(field) = field else {
-            return Hold::Unsaid;
-        };
+    /// From the ack's hold field, in milliseconds. An ack without one is `Unsaid`.
+    pub fn parse(field: &str) -> Hold {
         field
             .trim()
             .parse::<f64>()
@@ -582,13 +579,9 @@ mod tests {
             "", "x", "NaN", "inf", "-inf", "-1", "-0.001", "1e30", "1e400",
         ];
         for field in unreadable {
-            assert_eq!(Hold::parse(Some(field)), Hold::Unreadable, "{field:?}");
+            assert_eq!(Hold::parse(field), Hold::Unreadable, "{field:?}");
         }
-        assert_eq!(Hold::parse(None), Hold::Unsaid);
-        assert_eq!(
-            Hold::parse(Some(" 3.5")),
-            Hold::Said(Duration::from_micros(3500))
-        );
+        assert_eq!(Hold::parse(" 3.5"), Hold::Said(Duration::from_micros(3500)));
 
         let hub = Hub::new();
         let (c, twin) = (
