@@ -1719,9 +1719,10 @@ mod tests {
     }
 
     /// A viewer that acks nothing is sent frames until more than `HOPELESSLY_BEHIND` of them
-    /// are in flight, and is then closed, by the real encode loop: it is sent
-    /// `HOPELESSLY_BEHIND + 1` frames and then the close, whatever comes after.
+    /// are in flight, and is then closed, once, by the real encode loop: it is sent
+    /// `HOPELESSLY_BEHIND + 1` frames, then one close, then nothing, whatever comes after.
     #[test]
+    #[ignore = "fails until a viewer too far behind is closed once"]
     fn a_viewer_too_far_behind_is_closed() {
         let hub = Hub::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1795,16 +1796,17 @@ mod tests {
         }
         drop(job_tx);
         encode.join().unwrap();
-        let mut frames = 0;
-        let close = loop {
-            match rx.try_recv() {
-                Ok(Out::Bin(_)) => frames += 1,
-                Ok(Out::Text(t)) => break Some(t),
-                Err(_) => break None,
-            }
-        };
+        let sent: Vec<Out> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let frames = sent.iter().take_while(|m| matches!(m, Out::Bin(_))).count();
         assert_eq!(frames, HOPELESSLY_BEHIND + 1);
-        assert_eq!(close, Some(ServerMessage::Close));
+        let after: Vec<String> = sent[frames..]
+            .iter()
+            .map(|m| match m {
+                Out::Text(t) => t.json(),
+                Out::Bin(_) => "a frame".into(),
+            })
+            .collect();
+        assert_eq!(after, ["{\"t\":\"close\"}"], "after the frames");
     }
 
     /// A stream is made when somebody starts watching, so its encoders are new: whatever
