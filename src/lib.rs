@@ -206,7 +206,6 @@ async fn serve(a: HashMap<String, String>) {
         crf: range_max(a.get("crf"), 24.0) as f32,
         bounds,
         paintover_crf: range_max(a.get("paintover-crf"), 16.0) as f32,
-        paintover_burst: range_max(a.get("paintover-burst"), 3.0) as u32,
         paintover_delay_ms: range_max(a.get("paintover-delay-ms"), 150.0) as u64,
         stripes: range_max(a.get("stripes"), 1.0) as u32,
         // Opt-in: one thread unless a frame would miss the frame budget. x264's sliced

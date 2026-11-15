@@ -26,7 +26,6 @@ pub struct VideoConfig {
     /// What the stream is steered between (`--min-kbps`, `--max-kbps`).
     pub bounds: Bounds,
     pub paintover_crf: f32,
-    pub paintover_burst: u32,
     pub paintover_delay_ms: u64,
     pub coalesce: Duration,
     pub stripes: u32,
@@ -149,16 +148,12 @@ impl Crfs {
 
 /// What a capture is sent as, decided before a buffer is taken for it.
 enum Plan {
-    /// A keyframe. `pass`: it goes out in place of a due sharpening pass.
-    Key { pass: Option<Pass> },
+    /// A keyframe, and what it is to sharpening.
+    Key(Keyframe),
     /// Something moved in this band.
     Motion(Band),
     /// The screen is still and a pass is due: these pending blocks.
-    Sharpen {
-        pass: Pass,
-        map: Vec<u8>,
-        band: Band,
-    },
+    Sharpen { map: Vec<u8>, band: Band },
 }
 
 /// Blocks a frame sharpens, as the Refiner saw them when the frame was captured.
@@ -536,14 +531,13 @@ impl Refiner {
     }
 }
 
-/// When the next sharpening pass may go. Passes come in bursts of `burst`, the first once
-/// the screen has been still for `delay`, the next that long after a burst that left
-/// blocks pending, until none are.
+/// When the next sharpening pass may go: once the screen has been still for `delay`, and
+/// from then on with every capture, until nothing is pending. A pass spends what the frame
+/// budget allows, as any frame does, so passes one after another send what the target
+/// carries and no more.
 #[derive(Debug, PartialEq)]
 struct Sharpening {
-    /// Passes in a burst (`--paintover-burst`; 0 turns sharpening off).
-    burst: u32,
-    /// Stillness before a burst (`--paintover-delay-ms`).
+    /// Stillness before the first pass (`--paintover-delay-ms`).
     delay: Duration,
     state: Schedule,
 }
@@ -551,67 +545,48 @@ struct Sharpening {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Schedule {
     Idle,
-    /// `left` passes of this burst remain; the next is due at `at`.
-    Burst {
-        left: u32,
-        at: Instant,
-    },
+    /// Something moved: passes are due from this instant on.
+    From(Instant),
 }
 
-/// A sharpening pass that is due. Only `Sharpening::due` makes one, so going out is
-/// always a pass of a burst.
-#[derive(Debug, PartialEq)]
-struct Pass {
-    left: u32,
-    at: Instant,
+/// What a keyframe is to sharpening.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Keyframe {
+    /// For a viewer or a decoder that needs one: every block at keyframe quality, to be
+    /// sharpened once the screen has been still for the delay.
+    Fresh,
+    /// In place of a due pass: coded at paint-over quality and sharpening every block,
+    /// and passes go on.
+    Pass,
 }
 
 /// When a sharpening pass is due.
 #[derive(Debug, PartialEq)]
 enum Due {
-    Now(Pass),
+    Now,
     In(Duration),
     Never,
 }
 
 impl Sharpening {
-    fn new(burst: u32, delay: Duration) -> Self {
+    fn new(delay: Duration) -> Self {
         Sharpening {
-            burst,
             delay,
             state: Schedule::Idle,
         }
     }
-    /// Something moved: a burst once the screen has been still for `delay`.
+    /// Something moved: passes once the screen has been still for `delay`.
     fn on_motion(&mut self, now: Instant) {
-        self.state = match self.burst {
-            0 => Schedule::Idle,
-            left => Schedule::Burst {
-                left,
-                at: now + self.delay,
-            },
-        };
-    }
-    /// A due pass went out. The last of a burst schedules the next burst `delay` later:
-    /// if that one finds nothing pending, it ends there.
-    fn on_pass(&mut self, pass: Pass, now: Instant) {
-        if pass.left > 1 {
-            self.state = Schedule::Burst {
-                left: pass.left - 1,
-                at: pass.at,
-            };
-        } else {
-            self.on_motion(now);
-        }
+        self.state = Schedule::From(now + self.delay);
     }
     /// A keyframe went out, every block of it at keyframe quality. In place of a due
-    /// pass it is that pass. Otherwise it is, to the schedule, what motion is: the
-    /// Refiner counts every block as changed at `now`, so a burst follows once the
-    /// screen has been still for `delay`, though nothing on it moved.
-    fn on_key(&mut self, pass: Option<Pass>, now: Instant) {
-        match pass {
-            Some(pass) => self.on_pass(pass, now),
-            None => self.on_motion(now),
+    /// pass it is that pass, and passes go on. Otherwise it is, to the schedule, what
+    /// motion is: the Refiner counts every block as changed at `now`, so passes follow
+    /// once the screen has been still for `delay`, though nothing on it moved.
+    fn on_key(&mut self, key: Keyframe, now: Instant) {
+        match key {
+            Keyframe::Pass => {}
+            Keyframe::Fresh => self.on_motion(now),
         }
     }
     fn on_nothing_pending(&mut self) {
@@ -620,8 +595,8 @@ impl Sharpening {
     fn due(&self, now: Instant) -> Due {
         match self.state {
             Schedule::Idle => Due::Never,
-            Schedule::Burst { left, at } if now >= at => Due::Now(Pass { left, at }),
-            Schedule::Burst { at, .. } => Due::In(at - now),
+            Schedule::From(at) if now >= at => Due::Now,
+            Schedule::From(at) => Due::In(at - now),
         }
     }
 }
@@ -654,7 +629,7 @@ fn capture_loop(
     let interval_ms = interval.as_secs_f64() * 1000.0;
     let mut last_capture = Instant::now() - interval;
     let paintover_delay = Duration::from_millis(cfg.paintover_delay_ms);
-    let mut sharpening = Sharpening::new(cfg.paintover_burst, paintover_delay);
+    let mut sharpening = Sharpening::new(paintover_delay);
     let mut rc = RateCtl::new(cfg.bounds, hub.target());
     hub.set_target(rc.target);
     let mut had_clients = false;
@@ -731,7 +706,7 @@ fn capture_loop(
         let due = sharpening.due(now);
         if !cap.damaged && !want_key {
             match &due {
-                Due::Now(_) => {}
+                Due::Now => {}
                 Due::In(wait) => {
                     wait_any(
                         &[cap.fd(), hub.waker.waitable()],
@@ -821,13 +796,13 @@ fn capture_loop(
         };
         // What this capture is sent as, decided once, before a buffer is taken.
         let plan = match (want_key, band, due) {
-            (true, Some(_), Due::Now(_) | Due::In(_) | Due::Never) => Plan::Key { pass: None },
-            (true, None, Due::Now(pass)) => Plan::Key { pass: Some(pass) },
-            (true, None, Due::In(_) | Due::Never) => Plan::Key { pass: None },
-            (false, Some(moved), Due::Now(_) | Due::In(_) | Due::Never) => Plan::Motion(moved),
+            (true, Some(_), Due::Now | Due::In(_) | Due::Never) => Plan::Key(Keyframe::Fresh),
+            (true, None, Due::Now) => Plan::Key(Keyframe::Pass),
+            (true, None, Due::In(_) | Due::Never) => Plan::Key(Keyframe::Fresh),
+            (false, Some(moved), Due::Now | Due::In(_) | Due::Never) => Plan::Motion(moved),
             // Sharpen only what was sent at motion quality; nothing pending, nothing to send.
-            (false, None, Due::Now(pass)) => match refiner.pending_map() {
-                Some((map, band)) => Plan::Sharpen { pass, map, band },
+            (false, None, Due::Now) => match refiner.pending_map() {
+                Some((map, band)) => Plan::Sharpen { map, band },
                 None => {
                     sharpening.on_nothing_pending();
                     continue;
@@ -860,23 +835,25 @@ fn capture_loop(
 
         // Each plan is one input to the sharpening schedule.
         let frame = match plan {
-            Plan::Key { pass } => {
+            Plan::Key(keyframe) => {
                 // Every block goes out at keyframe quality, which the rate cap squeezes:
                 // all of it is pending. In place of a pass the keyframe is coded at
                 // paint-over quality, and what comes back as asked is sharp.
                 refiner.mark_all(t0);
-                let blocks = pass.as_ref().map(|_| refiner.every_block(t0));
-                if blocks.is_some() {
-                    hub.stats.paintovers.fetch_add(1, Ordering::Relaxed);
-                }
-                sharpening.on_key(pass, t0);
+                let blocks = match keyframe {
+                    Keyframe::Pass => {
+                        hub.stats.paintovers.fetch_add(1, Ordering::Relaxed);
+                        Some(refiner.every_block(t0))
+                    }
+                    Keyframe::Fresh => None,
+                };
+                sharpening.on_key(keyframe, t0);
                 for c in &clients {
                     c.needs_keyframe.store(false, Ordering::Relaxed);
                 }
                 Frame::Key { blocks }
             }
-            Plan::Sharpen { pass, map, band } => {
-                sharpening.on_pass(pass, t0);
+            Plan::Sharpen { map, band } => {
                 hub.stats.paintovers.fetch_add(1, Ordering::Relaxed);
                 Frame::Sharpen {
                     band,
@@ -1857,19 +1834,15 @@ mod tests {
         assert_eq!(r.pending_map().map(|p| p.0), Some(vec![1, 1]));
     }
 
-    /// The sharpening schedule against the counter and instant it replaces, over a long
-    /// run of motion, passes and empty pending maps at stated times: the same pass is
-    /// due at the same moment in both, and the three rules hold.
+    /// The sharpening schedule against a model of it (when passes are due from, if they
+    /// are), over a long run of motion, passes, keyframes and empty pending maps at stated
+    /// times: a pass is due at the same moments in both, and the rules hold.
     #[test]
-    fn sharpening_comes_in_bursts_until_nothing_is_pending() {
-        struct Model {
-            left: u32,
-            at: Instant,
-        }
-        let (burst, delay) = (3, Duration::from_millis(150));
+    fn sharpening_goes_on_until_nothing_is_pending() {
+        let delay = Duration::from_millis(150);
         let t0 = Instant::now();
-        let mut s = Sharpening::new(burst, delay);
-        let mut m = Model { left: 0, at: t0 };
+        let mut s = Sharpening::new(delay);
+        let mut from: Option<Instant> = None;
         let mut rng = 0x2545F4914F6CDD1Du64;
         let mut next = |n: u64| {
             rng ^= rng << 13;
@@ -1880,9 +1853,9 @@ mod tests {
         let mut now = t0;
         for _ in 0..20_000 {
             now += Duration::from_millis(next(120));
-            let model_due = m.left > 0 && now >= m.at;
+            let model_due = from.is_some_and(|at| now >= at);
             assert_eq!(
-                matches!(s.due(now), Due::Now(_)),
+                matches!(s.due(now), Due::Now),
                 model_due,
                 "due at {:?}",
                 now - t0
@@ -1890,25 +1863,28 @@ mod tests {
             match next(10) {
                 0..=2 => {
                     s.on_motion(now);
-                    (m.left, m.at) = (burst, now + delay);
+                    from = Some(now + delay);
                     // Motion always restarts the wait.
                     assert_eq!(s.due(now), Due::In(delay));
                 }
-                3..=7 if model_due => {
-                    let Due::Now(pass) = s.due(now) else {
-                        panic!("the model says a pass is due at {:?}", now - t0)
+                3 => {
+                    // A keyframe: in place of a due pass it is that pass, else motion.
+                    let key = match s.due(now) {
+                        Due::Now => Keyframe::Pass,
+                        Due::In(_) | Due::Never => Keyframe::Fresh,
                     };
-                    s.on_pass(pass, now);
-                    m.left -= 1;
-                    if m.left == 0 {
-                        (m.left, m.at) = (burst, now + delay);
-                        // A burst that ends is followed by another one delay later.
-                        assert_eq!(s.due(now), Due::In(delay));
+                    s.on_key(key, now);
+                    if !model_due {
+                        from = Some(now + delay);
                     }
+                }
+                4..=7 if model_due => {
+                    // A pass went out: the next one is due at once.
+                    assert_eq!(s.due(now), Due::Now);
                 }
                 8 if model_due => {
                     s.on_nothing_pending();
-                    m.left = 0;
+                    from = None;
                     // Nothing pending always ends in Idle.
                     assert_eq!(s.due(now), Due::Never);
                 }
@@ -1918,36 +1894,26 @@ mod tests {
     }
 
     /// A viewer joining a still screen gets a keyframe, every block at keyframe quality,
-    /// with nothing on screen moving: a burst sharpens it the paint-over delay after the
-    /// keyframe, as after motion. A keyframe in place of a due pass is that pass.
+    /// with nothing on screen moving: passes sharpen it from the paint-over delay after
+    /// the keyframe, as after motion. A keyframe in place of a due pass is that pass, and
+    /// passes go on.
     #[test]
     fn a_keyframe_on_a_still_screen_is_sharpened() {
-        let (burst, delay) = (3, Duration::from_millis(150));
+        let delay = Duration::from_millis(150);
         let t0 = Instant::now();
         let ms = |n| t0 + Duration::from_millis(n);
-        let mut s = Sharpening::new(burst, delay);
+        let mut s = Sharpening::new(delay);
         assert_eq!(s.due(ms(0)), Due::Never, "a still screen, all of it sharp");
-        s.on_key(None, ms(1000));
+        s.on_key(Keyframe::Fresh, ms(1000));
         assert_eq!(s.due(ms(1149)), Due::In(Duration::from_millis(1)));
-        let Due::Now(pass) = s.due(ms(1150)) else {
-            panic!("no pass due at the keyframe plus the delay")
-        };
         assert_eq!(
-            pass,
-            Pass {
-                left: burst,
-                at: ms(1150)
-            }
+            s.due(ms(1150)),
+            Due::Now,
+            "a pass at the keyframe plus the delay"
         );
-        // A keyframe goes out in place of that pass: the burst goes on at once.
-        s.on_key(Some(pass), ms(1160));
-        assert_eq!(
-            s.due(ms(1160)),
-            Due::Now(Pass {
-                left: burst - 1,
-                at: ms(1150)
-            })
-        );
+        // A keyframe goes out in place of that pass: passes go on at once.
+        s.on_key(Keyframe::Pass, ms(1160));
+        assert_eq!(s.due(ms(1160)), Due::Now);
     }
 
     /// Once the screen goes still the paint-overs show x264 forgetting the drag, so the
