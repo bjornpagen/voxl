@@ -1810,7 +1810,7 @@ impl StripeOut {
         match bytes.len() {
             Header::LEN => StripeOut::Empty,
             _ => StripeOut::Sent {
-                key: e.keyframe,
+                key: e.keyframe(),
                 quality: e.quality(crf, before),
                 bytes,
                 coded,
@@ -1927,10 +1927,15 @@ impl MotionQuality {
     /// motion frame (not a paint-over).
     fn note(&mut self, e: &Encoded, crf: f32, size: Option<MotionSize>) {
         // A keyframe's QP isn't picked from the complexity estimate.
-        let (false, Some(qp)) = (e.keyframe, e.qp) else {
+        let Encoded::Picture {
+            keyframe: false,
+            qp,
+            crf_avg,
+        } = *e
+        else {
             return;
         };
-        self.observe(crf, qp, e);
+        self.observe(crf, qp, crf_avg);
         // Small updates cost more per macroblock (headers, a cursor's edges) and never
         // get x264's QP up; only big ones tell what kind of motion this is.
         if let Some(m) = size.filter(|m| m.changed * 16 >= m.mbs) {
@@ -1943,13 +1948,13 @@ impl MotionQuality {
     /// x264 starts from QP0 = `crf` + complexity. VBV may raise that before the frame
     /// (to `qp`) and row by row within it (to an average x264 doesn't report), never
     /// below QP0 or, with a VBV buffer over 1.1 frames, below the frame's starting QP,
-    /// and `e.crf_avg` is `crf` + average - QP0. So the complexity lies between
-    /// `qp - e.crf_avg` (no row raised) and `qp - crf` (nothing raised before the
+    /// and `crf_avg` is `crf` + average - QP0. So the complexity lies between
+    /// `qp - crf_avg` (no row raised) and `qp - crf` (nothing raised before the
     /// frame), give or take the rounding of `qp`: one value when VBV stayed out, a range
     /// when it didn't. Then the last estimate is kept while it fits, else moved to the
     /// nearest end, so a frame VBV squeezed doesn't throw away what earlier frames showed.
-    fn observe(&mut self, crf: f32, qp: f32, e: &Encoded) {
-        let lo = qp - 0.5 - e.crf_avg;
+    fn observe(&mut self, crf: f32, qp: f32, crf_avg: f32) {
+        let lo = qp - 0.5 - crf_avg;
         let hi = qp + 0.5 - crf;
         self.complexity = if hi - lo < 1.25 {
             (lo + hi) / 2.0
@@ -2956,7 +2961,17 @@ mod tests {
     }
 
     fn qp(f: &Frame) -> f32 {
-        f.e.qp.unwrap()
+        match f.e {
+            Encoded::Picture { qp, .. } => qp,
+            Encoded::Nothing => panic!("x264 put nothing out"),
+        }
+    }
+
+    fn crf_avg(f: &Frame) -> f32 {
+        match f.e {
+            Encoded::Picture { crf_avg, .. } => crf_avg,
+            Encoded::Nothing => panic!("x264 put nothing out"),
+        }
     }
 
     #[test]
@@ -2992,7 +3007,7 @@ mod tests {
         let capped = Run::new(true, crf, Some(Kbps::new(20_000.0))).motion(Scene::Drag);
         let start_qp_says = capped
             .iter()
-            .map(|f| qp(f) - f.e.crf_avg)
+            .map(|f| qp(f) - crf_avg(f))
             .fold(f32::MAX, f32::min);
         assert!(
             start_qp_says < complexity - 4.0,
@@ -3602,28 +3617,32 @@ mod tests {
                             0 => 0,
                             _ => 1 + g.below(64) as usize,
                         };
-                        let e = match len {
-                            // What x264 leaves of a picture it put nothing out for.
-                            0 => Encoded {
-                                keyframe: false,
-                                qp: None,
-                                crf_avg: 0.0,
-                            },
-                            _ => Encoded {
-                                keyframe: g.below(3) != 0,
-                                qp: Some(crf),
-                                crf_avg: crf + (g.below(40) as f32 - 10.0) / 10.0,
+                        // A picture x264 put out: whether it is a keyframe, and its CRF
+                        // average.
+                        let picture = (len > 0).then(|| {
+                            let keyframe = g.below(3) != 0;
+                            (keyframe, crf + (g.below(40) as f32 - 10.0) / 10.0)
+                        });
+                        let e = match picture {
+                            None => Encoded::Nothing,
+                            Some((keyframe, crf_avg)) => Encoded::Picture {
+                                keyframe,
+                                qp: crf,
+                                crf_avg,
                             },
                         };
                         let mut bytes = BytesMut::zeroed(Header::LEN);
                         bytes.extend(g.bytes(len));
                         // After a frame x264 started at its CRF, as this one: a predicted
                         // frame the cap left at the CRF is as asked, a keyframe never.
-                        sharp &= len == 0 || (!e.keyframe && e.crf_avg < crf + 0.5);
-                        all_key &= len > 0 && e.keyframe;
+                        sharp &= match picture {
+                            None => true,
+                            Some((keyframe, crf_avg)) => !keyframe && crf_avg < crf + 0.5,
+                        };
+                        all_key &= picture.is_some_and(|(keyframe, _)| keyframe);
                         empty |= len == 0;
-                        if len > 0 {
-                            parts.push((i, e.keyframe, bytes.clone()));
+                        if let Some((keyframe, _)) = picture {
+                            parts.push((i, keyframe, bytes.clone()));
                         }
                         let at = Instant::now();
                         let coded = Coded {

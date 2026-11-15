@@ -319,12 +319,16 @@ impl Encoder {
                     pic_out.i_pts
                 );
             }
-            Ok(Encoded {
-                keyframe: pic_out.b_keyframe != 0,
-                // Undocumented as an output, but x264 has filled it in for years and
-                // FFmpeg's libx264 wrapper reads it the same way.
-                qp: (pic_out.i_qpplus1 > 0).then(|| (pic_out.i_qpplus1 - 1) as f32),
-                crf_avg: pic_out.prop.f_crf_avg as f32,
+            Ok(match size {
+                0 => Encoded::Nothing,
+                _ => Encoded::Picture {
+                    keyframe: pic_out.b_keyframe != 0,
+                    // Undocumented as an output, but x264 sets it on every frame it puts
+                    // out (encoder.c, `pic_out->i_qpplus1 = i_global_qp + 1`), and
+                    // FFmpeg's libx264 wrapper reads it the same way.
+                    qp: (pic_out.i_qpplus1 - 1) as f32,
+                    crf_avg: pic_out.prop.f_crf_avg as f32,
+                },
             })
         }
     }
@@ -338,14 +342,19 @@ fn vbv_buffer_kbit(max_kbps: u32, fps: Fps) -> u32 {
 }
 
 /// What x264 made of one picture.
-pub struct Encoded {
-    pub keyframe: bool,
-    /// The QP x264 started the frame at, rounded (None if x264 didn't say). VBV may
-    /// have raised rows of the frame above it; x264 doesn't report the average.
-    pub qp: Option<f32>,
-    /// x264's "average effective CRF": the CRF the frame was encoded with plus what VBV
-    /// added to its average QP, before the frame and within it.
-    pub crf_avg: f32,
+pub enum Encoded {
+    /// x264 put nothing out for it.
+    Nothing,
+    /// A frame.
+    Picture {
+        keyframe: bool,
+        /// The QP x264 started the frame at, rounded. VBV may have raised rows of the
+        /// frame above it; x264 doesn't report the average.
+        qp: f32,
+        /// x264's "average effective CRF": the CRF the frame was encoded with plus what
+        /// VBV added to its average QP, before the frame and within it.
+        crf_avg: f32,
+    },
 }
 
 /// Whether x264 coded a frame at the CRF it was asked for.
@@ -370,7 +379,7 @@ pub enum Quality {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Settling {
     /// Nothing to go by: the encoder is new, the last frame was a keyframe (whose own
-    /// intra cost x264 blurs into the frames after it), or no frame came out.
+    /// intra cost x264 blurs into the frames after it), or x264 put nothing out.
     Unknown,
     /// The last frame was predicted, and x264 started it this many QP over its CRF.
     Over(f32),
@@ -397,13 +406,16 @@ impl Encoded {
     /// of 2,503 sharpening frames read `crf` exactly, and a quarter of a step or a whole one
     /// sharpened a page, a flick and a scroll in the same time as half a step.
     pub fn quality(&self, crf: f32, before: Settling) -> Quality {
-        match (self.keyframe, self.qp, before) {
-            (false, Some(qp), Settling::Over(over))
-                if qp - crf >= over && self.crf_avg < crf + 0.5 =>
-            {
-                Quality::AsAsked
-            }
-            (false | true, Some(_) | None, Settling::Unknown | Settling::Over(_)) => {
+        match (self, before) {
+            (
+                Encoded::Picture {
+                    keyframe: false,
+                    qp,
+                    crf_avg,
+                },
+                Settling::Over(over),
+            ) if qp - crf >= over && *crf_avg < crf + 0.5 => Quality::AsAsked,
+            (Encoded::Nothing | Encoded::Picture { .. }, Settling::Unknown | Settling::Over(_)) => {
                 Quality::Coarser
             }
         }
@@ -411,9 +423,21 @@ impl Encoded {
 
     /// Where this frame, coded at `crf`, leaves x264's QP for the next one.
     pub fn settling(&self, crf: f32) -> Settling {
-        match (self.keyframe, self.qp) {
-            (false, Some(qp)) => Settling::Over(qp - crf),
-            (true, Some(_) | None) | (false, None) => Settling::Unknown,
+        match self {
+            Encoded::Picture {
+                keyframe: false,
+                qp,
+                ..
+            } => Settling::Over(qp - crf),
+            Encoded::Picture { keyframe: true, .. } | Encoded::Nothing => Settling::Unknown,
+        }
+    }
+
+    /// Whether it is a keyframe.
+    pub fn keyframe(&self) -> bool {
+        match self {
+            Encoded::Picture { keyframe, .. } => *keyframe,
+            Encoded::Nothing => false,
         }
     }
 }
@@ -635,6 +659,86 @@ mod tests {
         }
     }
 
+    /// The judgement as it was while `Encoded` held `qp: Option<f32>`: the oracle for
+    /// giving it two cases, deleted in the commit after that one.
+    struct Old {
+        keyframe: bool,
+        qp: Option<f32>,
+        crf_avg: f32,
+    }
+
+    impl Old {
+        fn quality(&self, crf: f32, before: Settling) -> Quality {
+            match (self.keyframe, self.qp, before) {
+                (false, Some(qp), Settling::Over(over))
+                    if qp - crf >= over && self.crf_avg < crf + 0.5 =>
+                {
+                    Quality::AsAsked
+                }
+                (false | true, Some(_) | None, Settling::Unknown | Settling::Over(_)) => {
+                    Quality::Coarser
+                }
+            }
+        }
+
+        fn settling(&self, crf: f32) -> Settling {
+            match (self.keyframe, self.qp) {
+                (false, Some(qp)) => Settling::Over(qp - crf),
+                (true, Some(_) | None) | (false, None) => Settling::Unknown,
+            }
+        }
+    }
+
+    /// Over 200,000 frames as x264 can put them out, a frame with its QP or nothing (which
+    /// read as a zeroed picture: no keyframe, no QP, a crf_avg of 0), the judgement, where
+    /// it leaves x264 and whether it is a keyframe are what they were.
+    #[test]
+    fn encoded_in_two_cases_judges_as_before() {
+        let mut rng = 0x9E3779B97F4A7C15u64;
+        let mut next = |n: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % n
+        };
+        for _ in 0..200_000 {
+            let crf = 10.0 + next(20) as f32;
+            let before = match next(3) {
+                0 => Settling::Unknown,
+                _ => Settling::Over(next(40) as f32 - 20.0),
+            };
+            let (old, new) = match next(10) {
+                0 => (
+                    Old {
+                        keyframe: false,
+                        qp: None,
+                        crf_avg: 0.0,
+                    },
+                    Encoded::Nothing,
+                ),
+                _ => {
+                    let (keyframe, qp) = (next(4) == 0, next(52) as f32);
+                    let crf_avg = crf + next(40) as f32 / 10.0 - 1.0;
+                    (
+                        Old {
+                            keyframe,
+                            qp: Some(qp),
+                            crf_avg,
+                        },
+                        Encoded::Picture {
+                            keyframe,
+                            qp,
+                            crf_avg,
+                        },
+                    )
+                }
+            };
+            assert_eq!(new.quality(crf, before), old.quality(crf, before));
+            assert_eq!(new.settling(crf), old.settling(crf));
+            assert_eq!(new.keyframe(), old.keyframe);
+        }
+    }
+
     /// Passes over a still picture after a keyframe, or a keyframe and a scroll, that the
     /// cap leaves alone (uncapped: `crf_avg` reads the CRF on every one, so the cap cannot
     /// tell them apart). The frame after a keyframe never counts; a pass that counts is one
@@ -684,7 +788,7 @@ mod tests {
                 (e.quality(crf, before), e.settling(crf), e)
             };
             let (_, mut settling, key) = code(&mut enc, 0, key_crf, Settling::Unknown);
-            assert!(key.keyframe);
+            assert!(key.keyframe());
             // The frame after the keyframe, a row of scrolling or the first pass.
             let mut after_key = None;
             for row in 1..=scroll {
@@ -704,15 +808,14 @@ mod tests {
             let mut rest = None;
             for _ in 0..40 {
                 let (quality, now, e) = code(&mut enc, scroll * 30, crf, settling);
-                assert!(
-                    (e.crf_avg - crf).abs() < 0.01,
-                    "uncapped, crf_avg {}",
-                    e.crf_avg
-                );
+                let Encoded::Picture { qp, crf_avg, .. } = e else {
+                    panic!("x264 put nothing out")
+                };
+                assert!((crf_avg - crf).abs() < 0.01, "uncapped, crf_avg {crf_avg}");
                 settling = now;
                 match quality {
                     Quality::AsAsked => {
-                        rest = e.qp;
+                        rest = Some(qp);
                         break;
                     }
                     Quality::Coarser => coming_down += 1,
@@ -724,7 +827,9 @@ mod tests {
             for _ in 0..6 {
                 let (_, now, e) = code(&mut enc, scroll * 30, crf, settling);
                 settling = now;
-                let qp = e.qp.unwrap();
+                let Encoded::Picture { qp, .. } = e else {
+                    panic!("x264 put nothing out")
+                };
                 assert!(
                     qp >= rest - 1.0,
                     "counted at QP {rest}, x264 went on to {qp}"
