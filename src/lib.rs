@@ -73,18 +73,31 @@ fn range_max(v: Option<&String>, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
-/// `--max-kbps`, or Selkies' `--video-bitrate` (of a range, the upper bound): the most
-/// the stream is steered to, in whole kbit/s; 30000 when not given. 0 is no ceiling: the
-/// target goes as high as the viewers' paths carry, and encoders open without a rate cap.
+/// A rate flag's value in whole kbit/s: a number, or a Selkies range of two numbers from
+/// low to high, whose upper bound is the rate. Anything else is no rate.
+fn whole_kbps(v: &str) -> Option<u32> {
+    let whole = |s: &str| s.trim().parse::<u32>().ok();
+    match v.split_once('-') {
+        None => whole(v),
+        Some((low, high)) => whole(low)
+            .zip(whole(high))
+            .and_then(|(low, high)| (low <= high).then_some(high)),
+    }
+}
+
+/// `--max-kbps`, or Selkies' `--video-bitrate`: the most the stream is steered to, in
+/// whole kbit/s; 30000 when not given. 0 is no ceiling: the target goes as high as the
+/// viewers' paths carry, and encoders open without a rate cap.
 fn ceiling(v: Option<&String>) -> Result<Option<path::Kbps>, String> {
     let Some(v) = v else {
         return Ok(Some(path::Kbps::new(30000.0)));
     };
-    let upper = v.rsplit_once('-').map_or(v.as_str(), |(_, upper)| upper);
-    match upper.trim().parse::<u32>() {
-        Ok(0) => Ok(None),
-        Ok(kbps) => Ok(Some(path::Kbps::new(kbps as f64))),
-        Err(_) => Err(format!("--max-kbps {v:?}: not a whole number of kbit/s")),
+    match whole_kbps(v) {
+        Some(0) => Ok(None),
+        Some(kbps) => Ok(Some(path::Kbps::new(kbps as f64))),
+        None => Err(format!(
+            "--max-kbps {v:?}: not a whole number of kbit/s, or a range of two from low to high"
+        )),
     }
 }
 
@@ -512,6 +525,20 @@ mod tests {
             "true",
         ] {
             assert!(ceiling(Some(&flag.into())).is_err(), "{flag:?} parsed");
+        }
+    }
+
+    /// A range is two whole numbers from low to high. A leading `-` is no range with
+    /// nothing before it (`--max-kbps -5` reaches the parse: it does not start with `--`),
+    /// a lower bound is read, and a range has two ends. (RED's finding 19.)
+    #[test]
+    fn a_ceiling_that_is_not_a_rate_starts_nothing() {
+        for flag in ["-5", "-0", "fast-12000", "1-2-3", "12000-8000"] {
+            assert!(
+                ceiling(Some(&flag.into())).is_err(),
+                "{flag:?} parsed as {:?}",
+                ceiling(Some(&flag.into()))
+            );
         }
     }
 }
