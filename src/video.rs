@@ -29,6 +29,7 @@ pub struct VideoConfig {
     pub bounds: Bounds,
     pub paintover_crf: f32,
     pub paintover_delay_ms: u64,
+    /// How long the drawing must have been quiet before it is captured (`--coalesce-us`).
     pub coalesce: Duration,
     pub stripes: u32,
     /// The debugging variables (`VOXL_*`), read when voxl started.
@@ -854,7 +855,8 @@ enum Wait {
     /// The rest of the least interval since the capture that gates this one (`Captured`),
     /// or what the capture it holds back is woken by (`Next::interval_ends`).
     Interval { rest: Duration, next: Next },
-    /// The rest of the coalesce window, whatever happens.
+    /// The drawing, until it has been quiet long enough or the frame's deadline comes,
+    /// in this long: damage (which may push the quiet on), or a wake, or that time.
     Settle(Duration),
     /// The flow gate: an ack, a viewer going or a keyframe asked for (a wake), or damage
     /// to take in, or in this long, when the viewer it holds for will have stalled.
@@ -879,16 +881,16 @@ impl Wait {
             On::Event => wait_any([cap.fd(), hub.waker.waitable()], timeout),
             On::Wake => wait_any([hub.waker.waitable()], timeout),
         };
-        self.through(poll, std::thread::sleep);
+        self.through(poll);
     }
 
-    /// The wait, made through `poll` (until its time, or with no limit) or `sleep`.
-    fn through(self, poll: impl FnOnce(On, Option<Duration>), sleep: impl FnOnce(Duration)) {
+    /// The wait, made through `poll`: until its time, or with no limit.
+    fn through(self, poll: impl FnOnce(On, Option<Duration>)) {
         match self {
             Wait::Change => poll(On::Event, None),
             Wait::Pass(due) => poll(On::Event, Some(due)),
             Wait::Interval { rest, next } => poll(next.interval_ends(), Some(rest)),
-            Wait::Settle(rest) => sleep(rest),
+            Wait::Settle(rest) => poll(On::Event, Some(rest)),
             Wait::Gate(stalls) => poll(On::Event, stalls),
             Wait::Buffer => poll(On::Wake, None),
         }
@@ -902,6 +904,14 @@ enum Key {
     NotWanted,
 }
 
+/// When the areas a capturer holds were drawn: the first since it was last taken, and
+/// the latest.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Drawing {
+    pub first: Instant,
+    pub last: Instant,
+}
+
 /// What changed on screen since the last capture, as each platform's capturer holds it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Damage {
@@ -909,9 +919,9 @@ pub(crate) enum Damage {
     /// To be captured though no area was reported: a new capturer, or the screen grabbed
     /// whole for a new stream.
     Unreported,
-    /// Rows `y0..y1` drawn, the first of them at `since`.
+    /// Rows `y0..y1` drawn, over `drawing`.
     Rows {
-        since: Instant,
+        drawing: Drawing,
         y0: u32,
         y1: u32,
     },
@@ -921,13 +931,19 @@ impl Damage {
     /// Rows `top..bot` were drawn at `now`.
     pub(crate) fn add(&mut self, top: u32, bot: u32, now: Instant) {
         *self = match *self {
-            Damage::Rows { since, y0, y1 } => Damage::Rows {
-                since,
+            Damage::Rows { drawing, y0, y1 } => Damage::Rows {
+                drawing: Drawing {
+                    first: drawing.first,
+                    last: now,
+                },
                 y0: y0.min(top),
                 y1: y1.max(bot),
             },
             Damage::None | Damage::Unreported => Damage::Rows {
-                since: now,
+                drawing: Drawing {
+                    first: now,
+                    last: now,
+                },
                 y0: top,
                 y1: bot,
             },
@@ -1019,8 +1035,12 @@ struct Look<B> {
     captured: Captured,
     /// The least time between two captures.
     min_interval: Duration,
-    /// How long damage may settle before it is captured (`--coalesce-us`).
-    coalesce: Duration,
+    /// How long the drawing must have been quiet before it is captured (`--coalesce-us`).
+    quiet: Duration,
+    /// The frame's deadline: the longest a capture waits for the drawing to go quiet,
+    /// from its first damage. One frame interval, so a screen that never stops drawing
+    /// is still captured at the frame rate.
+    deadline: Duration,
     gate: Gated,
     buffer: Buffer<B>,
     in_flight: InFlight,
@@ -1036,7 +1056,8 @@ fn step<B>(look: Look<B>) -> Step<B> {
         now,
         captured,
         min_interval,
-        coalesce,
+        quiet,
+        deadline,
         gate,
         buffer,
         in_flight,
@@ -1065,12 +1086,13 @@ fn step<B>(look: Look<B>) -> Step<B> {
         let rest = min_interval - since;
         return Step::Wait(Wait::Interval { rest, next }, buffer);
     }
-    // Apps present a frame as a burst of puts; give the burst a moment to land so
-    // the capture holds one whole frame instead of its first tiles.
-    if let Damage::Rows { since, .. } = damage {
-        let settled = now.saturating_duration_since(since);
-        if settled < coalesce {
-            return Step::Wait(Wait::Settle(coalesce - settled), buffer);
+    // An app that presents a frame as a burst of puts is still drawing it until the puts
+    // stop: capture once the drawing has been quiet for `quiet`, or at the frame's
+    // deadline, whichever comes first.
+    if let Damage::Rows { drawing, .. } = damage {
+        let at = (drawing.last + quiet).min(drawing.first + deadline);
+        if now < at {
+            return Step::Wait(Wait::Settle(at - now), buffer);
         }
     }
     // A keyframe is not held by the gate.
@@ -1381,7 +1403,8 @@ fn capture_loop(cap: &mut impl Capture, cfg: VideoConfig, hub: Arc<Hub>) -> Resu
             now,
             captured,
             min_interval,
-            coalesce: cfg.coalesce,
+            quiet: cfg.coalesce,
+            deadline: interval,
             gate: Gated::ask(&viewers, interval_ms, now),
             buffer: std::mem::replace(&mut s.buf, Buffer::Away),
             in_flight: InFlight::of(viewers.iter().map(|(c, _)| c.backlog(now))),
@@ -1401,7 +1424,7 @@ fn capture_loop(cap: &mut impl Capture, cfg: VideoConfig, hub: Arc<Hub>) -> Resu
 
         let t0 = Instant::now();
         let origin = match *cap.damage() {
-            Damage::Rows { since, .. } => since,
+            Damage::Rows { drawing, .. } => drawing.first,
             Damage::None | Damage::Unreported => t0,
         };
         hub.stats
@@ -3286,7 +3309,8 @@ mod tests {
                 now,
                 captured: Captured::new(now - Duration::from_secs(1)),
                 min_interval: ms(14),
-                coalesce: ms(2),
+                quiet: ms(2),
+                deadline: ms(16),
                 gate: Gated::Open,
                 buffer,
                 in_flight: InFlight::Nothing,
@@ -5823,7 +5847,7 @@ mod tests {
     /// a round trip that serves in order, and a viewer that acknowledges each frame as it
     /// arrives; keystrokes come at generated instants. Over 300 generated paths from
     /// 100 kbit/s to 40 Mbit/s and round trips to 600 ms, passes to 40 KB, keystrokes'
-    /// frames to 4 KB, encodes of 1 to 30 ms and coalesce windows to 4 ms, 30 s each.
+    /// frames to 4 KB, encodes of 1 to 30 ms and quiet windows to 4 ms, 30 s each.
     #[test]
     fn a_keystroke_waits_behind_one_pass_at_most() {
         let mut seed = 0x2545_F491_4F6C_DD1Du64;
@@ -5849,8 +5873,9 @@ mod tests {
             let pass_bytes = 200 + next(40_000);
             let key_bytes = 200 + next(4000);
             let encode = us(1000 + next(29_000));
-            let coalesce = us(next(4000));
-            let min_interval = Duration::from_secs_f64(1.0 / 60.0).mul_f64(MIN_INTERVAL_SHARE);
+            let quiet = us(next(4000));
+            let interval = Duration::from_secs_f64(1.0 / 60.0);
+            let min_interval = interval.mul_f64(MIN_INTERVAL_SHARE);
             let crossing = |bytes: u64| us(bytes * 8_000_000 / bps);
             let t0 = Instant::now() + Duration::from_secs(10);
             let end = t0 + Duration::from_secs(30);
@@ -5890,13 +5915,7 @@ mod tests {
                         keys.push_front(key);
                         break;
                     }
-                    if damage == Damage::None {
-                        damage = Damage::Rows {
-                            since: key,
-                            y0: 0,
-                            y1: 16,
-                        };
-                    }
+                    damage.add(0, 16, key);
                 }
                 let unacked: Vec<&Sent> = sent.iter().filter(|f| f.acked > now).collect();
                 let backlog = unacked.first().zip(unacked.last()).map(|(o, n)| Backlog {
@@ -5915,7 +5934,8 @@ mod tests {
                     now,
                     captured,
                     min_interval,
-                    coalesce,
+                    quiet,
+                    deadline: interval,
                     gate: Gated::Open,
                     buffer: match encoder {
                         None => Buffer::Home(()),
@@ -5959,7 +5979,7 @@ mod tests {
                         On::Event => woken.chain(damaged).chain([now + rest]).min(),
                         On::Wake => woken.chain([now + rest]).min(),
                     },
-                    Wait::Settle(rest) => Some(now + rest),
+                    Wait::Settle(rest) => woken.chain(damaged).chain([now + rest]).min(),
                     Wait::Buffer => woken.min(),
                 }
                 .unwrap_or(end);
@@ -5983,7 +6003,8 @@ mod tests {
         due: Due,
         captured: Captured,
         min_interval: Duration,
-        coalesce: Duration,
+        quiet: Duration,
+        deadline: Duration,
         gate: Gated,
         home: bool,
         in_flight: InFlight,
@@ -6012,7 +6033,8 @@ mod tests {
                 now: self.now,
                 captured: self.captured,
                 min_interval: self.min_interval,
-                coalesce: self.coalesce,
+                quiet: self.quiet,
+                deadline: self.deadline,
                 gate: self.gate,
                 buffer: self.buffer(),
                 in_flight: self.in_flight,
@@ -6020,13 +6042,14 @@ mod tests {
         }
     }
 
-    /// How many looks `each_case` makes: four frame rates, three coalesce windows, six
+    /// How many looks `each_case` makes: four frame rates, three quiet windows, 18
     /// damages, 28 pairs of times since the last change and the last capture, nine dues,
     /// seven answers of the gate, and 32 ways for the rest.
-    const CASES: usize = 4 * 3 * 6 * 28 * 9 * 7 * 32;
+    const CASES: usize = 4 * 3 * 18 * 28 * 9 * 7 * 32;
 
-    /// Every look over a discretised domain: each state the capturer's damage takes, at
-    /// four times since it came either side of three coalesce windows; four frame rates,
+    /// Every look over a discretised domain: each state the capturer's damage takes, its
+    /// latest area at four times either side of three quiet windows, and its first at that
+    /// time or at three either side of the frame's deadline; four frame rates,
     /// at seven times since the last change and since the last capture (no longer ago than
     /// the change), either side of the least interval and its rounding to whole
     /// milliseconds; seven waits for a pass, a pass due and none; a
@@ -6086,17 +6109,27 @@ mod tests {
                 min_interval + ns(1),
                 Duration::from_secs(5),
             ];
-            for coalesce in [ns(0), ms(2), ms(8)] {
-                let settled = [
-                    ns(0),
-                    coalesce.saturating_sub(ns(1)),
-                    coalesce,
-                    coalesce + ms(1),
-                ];
+            let deadline = interval;
+            for quiet in [ns(0), ms(2), ms(8)] {
+                let quiets = [ns(0), quiet.saturating_sub(ns(1)), quiet, quiet + ms(1)];
+                // The first area came with the latest, or before it, either side of the
+                // deadline.
+                let spans = quiets.into_iter().flat_map(|last| {
+                    [
+                        last,
+                        deadline.saturating_sub(ns(1)),
+                        deadline,
+                        deadline + ms(1),
+                    ]
+                    .map(move |first| (first.max(last), last))
+                });
                 let damages = [Damage::None, Damage::Unreported]
                     .into_iter()
-                    .chain(settled.map(|e| Damage::Rows {
-                        since: now - e,
+                    .chain(spans.map(|(first, last)| Damage::Rows {
+                        drawing: super::Drawing {
+                            first: now - first,
+                            last: now - last,
+                        },
                         y0: 16,
                         y1: 48,
                     }));
@@ -6122,7 +6155,8 @@ mod tests {
                             due,
                             captured,
                             min_interval,
-                            coalesce,
+                            quiet,
+                            deadline,
                             gate,
                             home: bit(1),
                             in_flight: match bit(4) {
@@ -6146,9 +6180,10 @@ mod tests {
     /// encoder holds the buffer or a viewer has frames to acknowledge), for the pass due,
     /// or for the viewers' acks until the newest frame has had `STALLED`, or else for a
     /// change; the rest of the least interval
-    /// since the last capture; the rest of the coalesce window; the flow gate. The gate
-    /// is asked only when nothing before it holds the capture and no keyframe is wanted.
-    /// Checked over every look of `each_case`.
+    /// since the last capture; the drawing, while it has been quiet less than the quiet
+    /// window and the frame's deadline is still to come, until the first of the two; the
+    /// flow gate. The gate is asked only when nothing before it holds the capture and no
+    /// keyframe is wanted. Checked over every look of `each_case`.
     #[test]
     fn a_capture_waits_only_for_what_holds_it() {
         let cases = each_case(|c| {
@@ -6163,12 +6198,22 @@ mod tests {
             };
             let since = c.now - after;
             let early = (since < c.min_interval).then(|| c.min_interval - since);
+            // What is left of the quiet window since the latest area, and of the deadline
+            // since the first: the drawing holds the capture while both are.
+            let left = |window: Duration, since: Instant| {
+                window
+                    .checked_sub(c.now - since)
+                    .filter(|left| !left.is_zero())
+            };
             let settling = match c.damage {
-                Damage::Rows { since, .. } => Some(c.now - since),
+                Damage::Rows { drawing, .. } => {
+                    match (left(c.quiet, drawing.last), left(c.deadline, drawing.first)) {
+                        (Some(quiet), Some(deadline)) => Some(quiet.min(deadline)),
+                        (None, _) | (_, None) => None,
+                    }
+                }
                 Damage::None | Damage::Unreported => None,
-            }
-            .filter(|&settled| settled < c.coalesce)
-            .map(|settled| c.coalesce - settled);
+            };
             let gate_asked = !still && early.is_none() && settling.is_none() && !c.want_key;
             // A wait leaves the buffer where it was; a capture takes it.
             let wait = |w| Step::Wait(w, c.buffer());
@@ -6203,8 +6248,8 @@ mod tests {
     /// a wake, with no limit; a pass on damage or a wake, or once due; the interval before
     /// a change only on a wake, before a pass on damage too, or once over; the gate on
     /// damage or a wake, or once the viewer it holds for will have stalled, with no limit
-    /// when every viewer has; a buffer only on a wake, with no limit; the coalesce window
-    /// as a sleep of exactly its rest. Over every wait `step` makes in `each_case`.
+    /// when every viewer has; a buffer only on a wake, with no limit; the drawing on damage
+    /// or a wake, or once quiet or due. Over every wait `step` makes in `each_case`.
     #[test]
     fn a_wait_wakes_on_what_it_waits_for() {
         let mut waits = 0;
@@ -6213,26 +6258,171 @@ mod tests {
                 return;
             };
             waits += 1;
-            let (mut polled, mut slept) = (None, None);
-            wait.through(|on, t| polled = Some((on, t)), |t| slept = Some(t));
+            let mut polled = None;
+            wait.through(|on, t| polled = Some((on, t)));
             let want = match wait {
-                Wait::Change => (Some((On::Event, None)), None),
-                Wait::Pass(due) => (Some((On::Event, Some(due))), None),
+                Wait::Change => (On::Event, None),
+                Wait::Pass(due) => (On::Event, Some(due)),
                 Wait::Interval {
                     rest,
                     next: Next::Change,
-                } => (Some((On::Wake, Some(rest))), None),
+                } => (On::Wake, Some(rest)),
                 Wait::Interval {
                     rest,
                     next: Next::Pass,
-                } => (Some((On::Event, Some(rest))), None),
-                Wait::Settle(rest) => (None, Some(rest)),
-                Wait::Gate(stalls) => (Some((On::Event, stalls)), None),
-                Wait::Buffer => (Some((On::Wake, None)), None),
+                } => (On::Event, Some(rest)),
+                Wait::Settle(rest) => (On::Event, Some(rest)),
+                Wait::Gate(stalls) => (On::Event, stalls),
+                Wait::Buffer => (On::Wake, None),
             };
-            assert_eq!((polled, slept), want, "{wait:?}");
+            assert_eq!(polled, Some(want), "{wait:?}");
         });
         assert!(waits > 0);
+    }
+
+    /// The capture loop over a timeline of puts, against the rule written apart: from the
+    /// first damage it captures at the first instant at which the drawing has been quiet
+    /// for the quiet window, or a frame interval has passed since that first damage, and
+    /// at that instant, the waits being exact. So a burst whose puts come
+    /// closer together than the window is captured whole, once it ends, unless it outlasts
+    /// the frame. Over generated timelines (one to three bursts of one to eight puts, 0 to
+    /// 3 ms apart, the bursts 0 to 30 ms apart) at three quiet windows and four frame
+    /// rates. A put wakes the loop only through a wait that wakes on damage.
+    #[test]
+    fn a_capture_waits_for_the_drawing_to_go_quiet_or_its_deadline() {
+        struct Rng(u64);
+        impl Rng {
+            fn range(&mut self, lo: u64, hi: u64) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                lo + self.0 % (hi - lo)
+            }
+        }
+        let us = Duration::from_micros;
+        let t0 = Instant::now() + Duration::from_secs(10);
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let mut timelines = 0;
+        for fps in [30u64, 60, 120, 144] {
+            let deadline = us(1_000_000 / fps);
+            for quiet in [us(0), us(1000), us(3000)] {
+                for _ in 0..2000 {
+                    // Puts, as microseconds after t0, in order.
+                    let mut puts = Vec::new();
+                    let mut t = 0;
+                    for _ in 0..rng.range(1, 4) {
+                        for _ in 0..rng.range(1, 9) {
+                            puts.push(t);
+                            t += rng.range(0, 3001);
+                        }
+                        t += rng.range(0, 30_001);
+                    }
+                    // The rule: the first instant from the first put at which the latest
+                    // put so far is a quiet window old, or the deadline has come.
+                    let window = quiet.as_micros() as u64;
+                    let rule = puts
+                        .iter()
+                        .map(|&p| p + window)
+                        .filter(|&end| !puts.iter().any(|&p| p > end - window && p <= end))
+                        .chain([puts[0] + deadline.as_micros() as u64])
+                        .min()
+                        .expect("the deadline");
+                    // The loop: it looks at the first put, and again whenever a wait ends.
+                    let (mut now, mut seen) = (puts[0], 1);
+                    while seen < puts.len() && puts[seen] <= now {
+                        seen += 1;
+                    }
+                    let mut looks = 0;
+                    let captured = loop {
+                        looks += 1;
+                        assert!(looks < 1000, "the loop never captures: puts {puts:?}");
+                        let look = Look {
+                            key: Key::NotWanted,
+                            damage: Damage::Rows {
+                                drawing: super::Drawing {
+                                    first: t0 + us(puts[0]),
+                                    last: t0 + us(puts[seen - 1]),
+                                },
+                                y0: 0,
+                                y1: 16,
+                            },
+                            due: Due::Never,
+                            now: t0 + us(now),
+                            captured: Captured::new(t0 - Duration::from_secs(1)),
+                            min_interval: deadline.mul_f64(MIN_INTERVAL_SHARE),
+                            quiet,
+                            deadline,
+                            gate: Gated::Open,
+                            buffer: Buffer::Home(()),
+                            in_flight: InFlight::Nothing,
+                        };
+                        match step(look) {
+                            Step::Capture(_, ()) => break now,
+                            Step::Wait(wait, _) => {
+                                let mut polled = None;
+                                wait.through(|on, t| polled = Some((on, t)));
+                                let Some((on, Some(t))) = polled else {
+                                    panic!("{polled:?}: the drawing waits for a time");
+                                };
+                                let over = now + t.as_micros() as u64;
+                                now = match (on, puts.get(seen)) {
+                                    (On::Event, Some(&put)) if put <= over => put,
+                                    (On::Event | On::Wake, _) => over,
+                                };
+                                while seen < puts.len() && puts[seen] <= now {
+                                    seen += 1;
+                                }
+                            }
+                        }
+                    };
+                    assert_eq!(
+                        captured, rule,
+                        "captured at {captured} us, the rule says {rule}: {fps} fps, quiet \
+                         {quiet:?}, puts {puts:?}"
+                    );
+                    timelines += 1;
+                }
+            }
+        }
+        assert_eq!(timelines, 4 * 3 * 2000);
+    }
+
+    /// However many areas come, and however far apart, the drawing runs from the first
+    /// to the latest, whether the capturer held nothing or had been marked. Over
+    /// generated runs of one to 64 areas, 0 to 20 ms apart, added as a capturer adds them.
+    #[test]
+    fn a_drawing_runs_from_its_first_area_to_its_latest() {
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let t0 = Instant::now() + Duration::from_secs(10);
+        for _ in 0..10_000 {
+            let mut next = || {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x
+            };
+            let n = 1 + next() % 64;
+            let mut at = t0;
+            let mut areas = Vec::new();
+            for _ in 0..n {
+                at += Duration::from_micros(next() % 20_001);
+                areas.push(at);
+            }
+            let mut damage = match next() % 2 {
+                0 => Damage::None,
+                _ => Damage::Unreported,
+            };
+            for &at in &areas {
+                damage.add(0, 16, at);
+            }
+            let Damage::Rows { drawing, .. } = damage else {
+                panic!("{damage:?}: areas came");
+            };
+            assert_eq!(
+                (drawing.first, drawing.last),
+                (areas[0], areas[areas.len() - 1])
+            );
+        }
     }
 
     /// A capture is a keyframe while one is wanted, in place of a due pass when nothing
@@ -6282,9 +6472,9 @@ mod tests {
     /// The capturer's damage, against what was drawn: over every sequence of five events
     /// from a new capturer (rows drawn at three places, the screen marked to capture, a
     /// take), damage is due exactly when something was drawn or marked since the last
-    /// take; it has rows exactly when rows were drawn, since the first of them, spanning
-    /// them all; and a take returns those rows widened to even rows within the picture,
-    /// and leaves nothing.
+    /// take; it has rows exactly when rows were drawn, from the first of them to the
+    /// latest, spanning them all; and a take returns those rows widened to even rows
+    /// within the picture, and leaves nothing.
     #[test]
     fn damage_is_what_was_drawn_since_the_take() {
         let t0 = Instant::now();
@@ -6292,9 +6482,9 @@ mod tests {
         let rows = [(0, 1), (17, 48), (90, 101)];
         for seq in 0..5u32.pow(5) {
             let mut damage = Damage::Unreported;
-            // Since the last take: when rows were first drawn and which, and whether
-            // anything at all is due (a new capturer is).
-            let mut drawn: Option<(Instant, u32, u32)> = None;
+            // Since the last take: when rows were first and last drawn and which, and
+            // whether anything at all is due (a new capturer is).
+            let mut drawn: Option<(Instant, Instant, u32, u32)> = None;
             let mut due: bool;
             for i in 0..5 {
                 let now = t0 + Duration::from_millis(i as u64);
@@ -6303,8 +6493,8 @@ mod tests {
                         let (top, bot) = rows[r as usize];
                         damage.add(top, bot, now);
                         drawn = Some(match drawn {
-                            Some((since, a, b)) => (since, a.min(top), b.max(bot)),
-                            None => (now, top, bot),
+                            Some((first, _, a, b)) => (first, now, a.min(top), b.max(bot)),
+                            None => (now, now, top, bot),
                         });
                         due = true;
                     }
@@ -6314,14 +6504,18 @@ mod tests {
                     }
                     _ => {
                         let band = damage.take(height).map(|b| (b.y0, b.y1));
-                        let want = drawn.map(|(_, a, b)| (a & !1, ((b + 1) & !1).min(height)));
+                        let want = drawn.map(|(_, _, a, b)| (a & !1, ((b + 1) & !1).min(height)));
                         assert_eq!(band, want, "sequence {seq}, event {i}");
                         assert_eq!(damage, Damage::None);
                         (drawn, due) = (None, false);
                     }
                 }
                 let want = match (drawn, due) {
-                    (Some((since, y0, y1)), _) => Damage::Rows { since, y0, y1 },
+                    (Some((first, last, y0, y1)), _) => Damage::Rows {
+                        drawing: super::Drawing { first, last },
+                        y0,
+                        y1,
+                    },
                     (None, true) => Damage::Unreported,
                     (None, false) => Damage::None,
                 };
@@ -6348,7 +6542,7 @@ mod tests {
             };
             waits[usize::from(next == Next::Pass)] += 1;
             let mut polled = None;
-            wait.through(|on, _| polled = Some(on), |_| {});
+            wait.through(|on, _| polled = Some(on));
             assert_eq!(polled, Some(on), "waiting out the interval for {next:?}");
         });
         assert!(waits.iter().all(|&n| n > 0), "unreached: {waits:?}");
