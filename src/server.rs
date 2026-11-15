@@ -537,6 +537,8 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
                 if let Err(e) = result {
                     log::warn!("display switch: {e}");
                 }
+                // A hello resets the page's decoders: it waits for a keyframe, as after `kf`.
+                c.started.store(false, Ordering::Relaxed);
                 c.needs_keyframe.store(true, Ordering::Relaxed);
                 c.send(Out::Text(s.hub.hello()));
                 s.hub.wake();
