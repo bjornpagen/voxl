@@ -296,6 +296,11 @@ impl Wake {
     }
 }
 
+/// Blocks until one of `w` is ready.
+pub fn wait_event(w: &[Waitable]) {
+    wait_any(w, -1)
+}
+
 /// Blocks until one of `w` is ready or `timeout_ms` passes (negative: no timeout).
 pub fn wait_any(w: &[Waitable], timeout_ms: i32) {
     #[cfg(unix)]

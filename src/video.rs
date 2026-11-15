@@ -3,7 +3,7 @@
 use crate::capture::{Band, Capturer};
 use crate::convert::I420;
 use crate::encoder::{Encoded, Encoder, EncoderConfig, Pictures, Planes, Quality};
-use crate::hub::wait_any;
+use crate::hub::{wait_any, wait_event};
 use crate::hub::{Hub, Inflight, Out};
 use crate::path::{Capacity, Kbps};
 use crate::rate::{Bounds, FrameBudget, RateCtl, RTT_GUESS_MS};
@@ -608,18 +608,28 @@ enum Encoding {
     Busy,
 }
 
-/// Nothing moved and no keyframe is wanted: how long to wait for damage or a wake before
-/// looking again, or None to capture a pass now. A pass goes only to an idle encoder.
-/// Queued behind a frame being encoded it would hold the next keystroke back by two
-/// encodes; this way motion that comes meanwhile takes the free buffer and waits for one
-/// at most. A buffer coming home wakes the wait.
-fn still_wait(due: &Due, encoding: Encoding) -> Option<Duration> {
+/// When the capture loop looks again, with nothing moved and no keyframe wanted.
+#[derive(Debug, PartialEq)]
+enum Look {
+    /// A pass is due and the encoder idle: capture it now.
+    Now,
+    /// When the next pass is due, or sooner if something happens.
+    In(Duration),
+    /// When something happens. Everything the loop answers wakes it: damage, a viewer's
+    /// command or ack, a viewer leaving, a screenshot or recording asked for, a buffer
+    /// coming home from the encoder. So nothing needs a tick.
+    OnWake,
+}
+
+/// Nothing moved and no keyframe is wanted: when to look again. A pass goes only to an
+/// idle encoder. Queued behind a frame being encoded it would hold the next keystroke
+/// back by two encodes; this way motion that comes meanwhile takes the free buffer and
+/// waits for one at most.
+fn still_wait(due: &Due, encoding: Encoding) -> Look {
     match (due, encoding) {
-        (Due::Now, Encoding::Idle) => None,
-        (Due::Now, Encoding::Busy) | (Due::Never, Encoding::Idle | Encoding::Busy) => {
-            Some(Duration::from_millis(100))
-        }
-        (Due::In(wait), Encoding::Idle | Encoding::Busy) => Some(*wait + Duration::from_millis(1)),
+        (Due::Now, Encoding::Idle) => Look::Now,
+        (Due::Now, Encoding::Busy) | (Due::Never, Encoding::Idle | Encoding::Busy) => Look::OnWake,
+        (Due::In(wait), Encoding::Idle | Encoding::Busy) => Look::In(*wait),
     }
 }
 
@@ -707,7 +717,7 @@ fn capture_loop(
             // The target stands: a viewer that hid its tab comes back over the same
             // path, and one on a new path starts from what its own acks say.
             had_clients = false;
-            wait_any(&[cap.fd(), hub.waker.waitable()], 500);
+            wait_event(&[cap.fd(), hub.waker.waitable()]);
             continue;
         }
         let capacity = rc.update(&hub, &clients);
@@ -731,9 +741,17 @@ fn capture_loop(
                 true => Encoding::Idle,
                 false => Encoding::Busy,
             };
-            if let Some(wait) = still_wait(&due, encoding) {
-                wait_any(&[cap.fd(), hub.waker.waitable()], wait.as_millis() as i32);
-                continue;
+            match still_wait(&due, encoding) {
+                Look::Now => {}
+                Look::In(wait) => {
+                    let ms = wait.as_micros().div_ceil(1000) as i32;
+                    wait_any(&[cap.fd(), hub.waker.waitable()], ms);
+                    continue;
+                }
+                Look::OnWake => {
+                    wait_event(&[cap.fd(), hub.waker.waitable()]);
+                    continue;
+                }
             }
         }
         let since = now.saturating_duration_since(last_capture);
@@ -1935,15 +1953,18 @@ mod tests {
     }
 
     /// With nothing moved, a due pass is captured only while the encoder holds nothing, so
-    /// a keystroke that comes during it never waits behind a queued pass; otherwise the
-    /// loop waits, as for the wait before a burst.
+    /// a keystroke that comes during it never waits behind a queued pass; with the encoder
+    /// busy, or nothing due, the loop waits for a wake; a pass due later, until then.
     #[test]
     fn a_pass_goes_only_to_an_idle_encoder() {
         let ms = Duration::from_millis;
-        assert_eq!(still_wait(&Due::Now, Encoding::Idle), None);
-        assert_eq!(still_wait(&Due::Now, Encoding::Busy), Some(ms(100)));
-        assert_eq!(still_wait(&Due::Never, Encoding::Idle), Some(ms(100)));
-        assert_eq!(still_wait(&Due::In(ms(40)), Encoding::Busy), Some(ms(41)));
+        assert_eq!(still_wait(&Due::Now, Encoding::Idle), Look::Now);
+        assert_eq!(still_wait(&Due::Now, Encoding::Busy), Look::OnWake);
+        assert_eq!(still_wait(&Due::Never, Encoding::Idle), Look::OnWake);
+        assert_eq!(
+            still_wait(&Due::In(ms(40)), Encoding::Busy),
+            Look::In(ms(40))
+        );
     }
 
     /// Once the screen goes still the paint-overs show x264 forgetting the drag, so the
