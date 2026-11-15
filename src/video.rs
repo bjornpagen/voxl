@@ -531,9 +531,7 @@ fn flow_ok(hub: &Hub, interval_ms: f64) -> bool {
                 n,
                 age
             );
-            c.inflight.lock().clear();
-            c.needs_keyframe.store(true, Ordering::Relaxed);
-            c.started.store(false, Ordering::Relaxed);
+            c.start_over();
             continue;
         }
         if n >= max_n || age > max_age {
@@ -865,9 +863,7 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
             continue;
         };
         let capacity = rc.update(&hub, &clients);
-        let want_key = clients
-            .iter()
-            .any(|c| c.needs_keyframe.load(Ordering::Relaxed));
+        let want_key = clients.iter().any(|c| c.wants_keyframe());
         // One reading of the clock for every decision before the capture; the capture
         // itself is stamped `t0` below, after any wait for a buffer.
         let now = Instant::now();
@@ -1005,7 +1001,7 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
                 };
                 sharpening.on_key(keyframe, t0);
                 for c in &clients {
-                    c.needs_keyframe.store(false, Ordering::Relaxed);
+                    c.keyframe_planned();
                 }
                 Frame::Key { blocks }
             }
@@ -1471,15 +1467,8 @@ fn encode_loop(
             .collect();
         let now = Instant::now();
         for c in hub.video_clients() {
-            if !c.started.load(Ordering::Relaxed) {
-                // It starts on a keyframe sent after one was planned for it. One that still
-                // asks for one joined after this frame was planned: it may be a viewer of
-                // the stream that replaces this one, and waits for its own.
-                if !all_key || c.needs_keyframe.load(Ordering::Relaxed) {
-                    continue;
-                }
-                c.started.store(true, Ordering::Relaxed);
-                c.inflight.lock().clear();
+            if !c.takes(all_key) {
+                continue;
             }
             {
                 let mut q = c.inflight.lock();
@@ -1745,9 +1734,10 @@ mod tests {
                     let hub = Hub::new();
                     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
                     let viewer = hub.add_client(tx);
-                    viewer.video.store(true, Ordering::Relaxed);
-                    viewer.needs_keyframe.store(false, Ordering::Relaxed);
-                    viewer.started.store(true, Ordering::Relaxed);
+                    // A viewer that has started, whatever the stream sends first.
+                    viewer.watch();
+                    viewer.keyframe_planned();
+                    assert!(viewer.takes(true));
                     let cfg = VideoConfig {
                         display: None,
                         #[cfg(target_os = "macos")]
@@ -2472,7 +2462,7 @@ mod tests {
         let watch = || {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let c = hub.add_client(tx);
-            c.video.store(true, Ordering::Relaxed);
+            c.watch();
             (c, rx)
         };
         let (w, h) = (64, 64);
@@ -2517,7 +2507,7 @@ mod tests {
         // A page joins; the capture loop plans its keyframe and clears its request.
         let (_page, _page_rx) = watch();
         for c in hub.video_clients() {
-            c.needs_keyframe.store(false, Ordering::Relaxed);
+            c.keyframe_planned();
         }
         let key = Job {
             buf: Box::new(I420::new(w, h)),

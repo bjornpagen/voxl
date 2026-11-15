@@ -176,7 +176,7 @@ async fn stats(State(s): State<AppState>) -> Response {
         .iter()
         .map(|c| {
             let (n, age) = c.backlog();
-            serde_json::json!({"id": c.id, "video": c.video.load(Ordering::Relaxed), "inflight": n, "oldest_ms": age,
+            serde_json::json!({"id": c.id, "video": c.watching(), "inflight": n, "oldest_ms": age,
                 "min_rtt_ms": c.min_rtt_ms.load(Ordering::Relaxed), "queue_ms": c.queue_ms() as u64, "capacity_kbps": c.capacity().map(|k| k.get() as u64),
                 "client_ms": (*c.client_ms.lock() * 10.0).round() / 10.0})
         })
@@ -538,8 +538,7 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
                     log::warn!("display switch: {e}");
                 }
                 // A hello resets the page's decoders: it waits for a keyframe, as after `kf`.
-                c.started.store(false, Ordering::Relaxed);
-                c.needs_keyframe.store(true, Ordering::Relaxed);
+                c.ask_keyframe();
                 c.send(Out::Text(s.hub.hello()));
                 s.hub.wake();
             }
@@ -557,11 +556,10 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
             crate::desktop::ClipContent::Text(text),
         )),
         Command::Video(on) => {
-            c.video.store(on, Ordering::Relaxed);
             if on {
-                c.inflight.lock().clear();
-                c.started.store(false, Ordering::Relaxed);
-                c.needs_keyframe.store(true, Ordering::Relaxed);
+                c.watch();
+            } else {
+                c.stop_watching();
             }
             s.hub.wake();
         }
@@ -598,8 +596,7 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
             }
         }
         Command::Keyframe => {
-            c.started.store(false, Ordering::Relaxed);
-            c.needs_keyframe.store(true, Ordering::Relaxed);
+            c.ask_keyframe();
             s.hub.wake();
         }
         Command::Pong { token } => {

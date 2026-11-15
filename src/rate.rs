@@ -2,7 +2,6 @@
 
 use crate::hub::Hub;
 use crate::path::{Bits, Capacity, Kbps};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -94,7 +93,7 @@ impl RateCtl {
     pub fn update(&mut self, hub: &Hub, clients: &[Arc<crate::hub::Client>]) -> Capacity {
         let paths: Vec<PathNow> = clients
             .iter()
-            .filter(|c| c.started.load(Ordering::Relaxed))
+            .filter(|c| c.started())
             .map(|c| {
                 let (_, age) = c.backlog();
                 let rtt = c.rtt_ms().unwrap_or(RTT_GUESS_MS) as f64;
