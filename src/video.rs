@@ -118,7 +118,6 @@ impl Header {
 
 struct Job {
     buf: Box<I420>,
-    idx: usize,
     frame: Frame,
     /// The bitrate the stream is steered to, and what the viewers' paths are known to
     /// carry (None: not yet), as the rate controller had them when the frame was captured.
@@ -266,7 +265,6 @@ struct Sharpen {
 /// A buffer back from the encoder, with the blocks it sharpened if it came out at
 /// paint-over quality.
 struct Returned {
-    idx: usize,
     buf: Box<I420>,
     sharpened: Option<Sharpen>,
 }
@@ -281,18 +279,24 @@ fn union(a: Option<Band>, b: Band) -> Band {
     }
 }
 
-/// What the viewers watching are sent: the encoders, and the two buffers captures are
+/// What the viewers watching are sent: the encoders, and the buffer captures are
 /// converted into for them. There is one only while somebody watches.
+///
+/// One buffer, since a capture goes only to an idle encoder (`step`): a second, filled
+/// while the encoder codes the first, only queued a frame behind it, and converted every
+/// band twice, once into each.
 struct Stream {
     /// Dropped first (fields drop in order), which ends the encode loop once it has sent
     /// what it was given.
     job_tx: mpsc::SyncSender<Job>,
     ret_rx: mpsc::Receiver<Returned>,
-    slots: [Slot; 2],
-    /// The slot the next capture is converted into.
-    next: usize,
     /// The threads a capture is converted on.
     rows: crate::convert::Rows,
+    /// None while the encoder holds it.
+    buf: Option<Box<I420>>,
+    /// The rows that changed on screen since the buffer was last converted into: the
+    /// whole screen, until the first capture.
+    pending: Option<Band>,
     /// Dropped last: waits until the encode loop has stopped.
     _encode: Stopped,
 }
@@ -322,18 +326,9 @@ impl Drop for Stopped {
     }
 }
 
-/// One of the two buffers a capture is converted into: the encoder reads one while the
-/// next capture is converted into the other.
-struct Slot {
-    /// None while the encoder holds it.
-    buf: Option<Box<I420>>,
-    /// The rows that changed on screen since it was last converted into.
-    pending: Option<Band>,
-}
-
 impl Stream {
     /// The encoders for a screen of `w` x `h`, one for each stripe the hub's hello names,
-    /// on their thread, and two buffers that hold nothing of it yet.
+    /// on their thread, and the buffer, which holds nothing of it yet.
     fn new(cfg: &VideoConfig, hub: &Arc<Hub>, w: u32, h: u32) -> Result<Self, String> {
         log::info!("streaming");
         let (job_tx, job_rx) = mpsc::sync_channel::<Job>(1);
@@ -370,33 +365,31 @@ impl Stream {
         let encode = Stopped::spawn("encode", move || {
             encode_loop(stripes, job_rx, ret_tx, hub, fps, crfs, debug)
         });
-        let slot = || Slot {
-            buf: Some(Box::new(I420::new(w as usize, h as usize))),
-            pending: Some(Band { y0: 0, y1: h }),
-        };
         Ok(Stream {
             job_tx,
             ret_rx,
-            slots: [slot(), slot()],
-            next: 0,
+            buf: Some(Box::new(I420::new(w as usize, h as usize))),
+            pending: Some(Band { y0: 0, y1: h }),
             rows: crate::convert::Rows::new(cfg.convert_threads),
             _encode: encode,
         })
     }
 
-    /// A buffer the encoder is done with: back in its slot, and the blocks it sharpened
-    /// are sharp.
+    /// The buffer the encoder is done with: back home, and the blocks it sharpened are
+    /// sharp.
     fn returned(&mut self, r: Returned, refiner: &mut Refiner) {
-        self.slots[r.idx].buf = Some(r.buf);
+        self.buf = Some(r.buf);
         if let Some(sharp) = r.sharpened {
             refiner.sharpened(&sharp.map, sharp.at);
         }
     }
 
-    /// How many buffers the encoder holds.
+    /// Whether the encoder holds the buffer.
     fn encoding(&self) -> Encoding {
-        let home = |i: usize| self.slots[i].buf.is_some();
-        Encoding::of(home(self.next), home(1 - self.next))
+        match self.buf {
+            Some(_) => Encoding::Idle,
+            None => Encoding::Busy,
+        }
     }
 }
 
@@ -960,24 +953,11 @@ enum Gated {
     },
 }
 
-/// How many of the capture loop's two buffers the encoder holds. It gives them back in
-/// the order it got them, so while it holds one, the next capture's is home.
+/// Whether the encoder holds the capture loop's buffer.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Encoding {
     Idle,
     Busy,
-    Full,
-}
-
-impl Encoding {
-    /// Whether the next capture's buffer and the other one are home.
-    fn of(next: bool, other: bool) -> Self {
-        match (next, other) {
-            (true, true) => Encoding::Idle,
-            (true, false) => Encoding::Busy,
-            (false, _) => Encoding::Full,
-        }
-    }
 }
 
 /// What the capture loop knows when it looks, while somebody watches.
@@ -999,14 +979,12 @@ struct Look {
 /// stalled viewers it finds.
 fn step(look: &Look, gate: impl FnOnce() -> Gated) -> Step {
     if let (Damage::None, Key::NotWanted) = (look.damage, look.key) {
-        // Nothing moved and no keyframe is wanted. A pass goes only to an idle encoder:
-        // queued behind a frame being encoded it would hold the next keystroke back by
-        // two encodes, and this way motion that comes meanwhile takes the free buffer.
+        // Nothing moved and no keyframe is wanted. A pass goes only to an idle encoder,
+        // as every capture does (below); until then a change may come, and with it the
+        // capture is motion's.
         match (look.due, look.encoding) {
             (Due::Now, Encoding::Idle) => {}
-            (Due::Now, Encoding::Busy | Encoding::Full) | (Due::Never, _) => {
-                return Step::Wait(Wait::Change)
-            }
+            (Due::Now, Encoding::Busy) | (Due::Never, _) => return Step::Wait(Wait::Change),
             (Due::In(due), _) => return Step::Wait(Wait::Pass(due)),
         }
     }
@@ -1028,9 +1006,12 @@ fn step(look: &Look, gate: impl FnOnce() -> Gated) -> Step {
             return Step::Wait(Wait::Gate(until - look.now));
         }
     }
+    // A capture goes only to an idle encoder. One made while it codes the frame before
+    // would wait for it, a whole encode older by the time it is coded; made once it is
+    // done, it holds what changed meanwhile, and goes at once.
     match look.encoding {
-        Encoding::Idle | Encoding::Busy => Step::Capture,
-        Encoding::Full => Step::Wait(Wait::Buffer),
+        Encoding::Idle => Step::Capture,
+        Encoding::Busy => Step::Wait(Wait::Buffer),
     }
 }
 
@@ -1250,17 +1231,11 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
             }
             Planned::Empty => continue,
         };
-        let idx = s.next;
-        let slot = &mut s.slots[idx];
-        let mut buf = slot.buf.take().unwrap();
-        let todo = match (slot.pending.take(), band) {
+        let mut buf = s.buf.take().unwrap();
+        let todo = match (s.pending.take(), band) {
             (p, Some(b)) => Some(union(p, b)),
             (p, None) => p,
         };
-        if let Some(b) = band {
-            let other = &mut s.slots[1 - idx].pending;
-            *other = Some(union(*other, b));
-        }
         if let Some(t) = todo {
             cap.convert(&mut buf, t.y0 as usize, t.y1 as usize, &s.rows);
         }
@@ -1334,11 +1309,9 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
             }
         };
         last_capture = t0;
-        s.next = 1 - idx;
         if s.job_tx
             .send(Job {
                 buf,
-                idx,
                 frame,
                 target: rc.target,
                 capacity,
@@ -1693,7 +1666,6 @@ fn encode_loop(
             .collect();
         if !selected.iter().any(|&x| x) {
             let _ = ret.send(Returned {
-                idx: job.idx,
                 buf: job.buf,
                 sharpened: None,
             });
@@ -1750,7 +1722,6 @@ fn encode_loop(
         let sharpens = job.frame.sharpens();
         let (sharpened, starts) = job.frame.into_parts();
         let _ = ret.send(Returned {
-            idx: job.idx,
             buf: job.buf,
             sharpened: sharpened.filter(|_| sharp),
         });
@@ -2097,7 +2068,6 @@ mod tests {
             job_tx
                 .send(Job {
                     buf: Box::new(I420::new(w, h)),
-                    idx: 0,
                     frame,
                     target: Kbps::new(8000.0),
                     capacity: None,
@@ -2195,11 +2165,10 @@ mod tests {
                         band: bands[0],
                         dirty: Arc::new(vec![1u8; blocks]),
                     };
-                    for (idx, frame) in [frame, next].into_iter().enumerate() {
+                    for frame in [frame, next] {
                         s.job_tx
                             .send(Job {
                                 buf: Box::new(I420::new(w as usize, h as usize)),
-                                idx,
                                 frame,
                                 target: Kbps::new(8000.0),
                                 capacity: None,
@@ -2970,7 +2939,6 @@ mod tests {
             .collect();
         let key = Job {
             buf: Box::new(I420::new(w, h)),
-            idx: 0,
             frame: super::Frame::Key {
                 blocks: None,
                 starts,
@@ -3258,18 +3226,16 @@ mod tests {
                     glyph.fill(if ink { 30 } else { 235 });
                 }
             }
-            let idx = n % 2;
-            while stream.slots[idx].buf.is_none() {
+            while stream.buf.is_none() {
                 let r = stream.ret_rx.recv().unwrap();
                 stream.returned(r, &mut refiner);
             }
-            let mut buf = stream.slots[idx].buf.take().unwrap();
+            let mut buf = stream.buf.take().unwrap();
             crate::convert::convert_band(&screen, w * 4, &mut buf, y0, y1, &stream.rows);
             stream
                 .job_tx
                 .send(Job {
                     buf,
-                    idx,
                     frame,
                     target: Kbps::new(6000.0),
                     capacity: None,
@@ -3504,8 +3470,8 @@ mod tests {
 
     /// One look, as the capture loop reads it: the capturer's damage as its two fields,
     /// whether a viewer wants a keyframe, the pass due, the last capture, the pacing, the
-    /// gate, which of the two buffers are home, the area the damage comes to when taken,
-    /// and the blocks pending.
+    /// gate, whether the buffer is home, the area the damage comes to when taken, and the
+    /// blocks pending.
     #[derive(Clone, Copy)]
     struct StepCase<'a> {
         damaged: bool,
@@ -3517,8 +3483,7 @@ mod tests {
         min_interval: Duration,
         coalesce: Duration,
         gate: Gated,
-        next_home: bool,
-        other_home: bool,
+        home: bool,
         band: Option<Band>,
         refiner: &'a Refiner,
     }
@@ -3539,22 +3504,25 @@ mod tests {
                 last_capture: self.last_capture,
                 min_interval: self.min_interval,
                 coalesce: self.coalesce,
-                encoding: Encoding::of(self.next_home, self.other_home),
+                encoding: match self.home {
+                    true => Encoding::Idle,
+                    false => Encoding::Busy,
+                },
             }
         }
     }
 
     /// How many looks `each_case` makes: four frame rates, three coalesce windows, six
     /// damages, seven times since the last capture, nine dues, six answers of the gate,
-    /// and 32 ways for the rest.
-    const CASES: usize = 4 * 3 * 6 * 7 * 9 * 6 * 32;
+    /// and 16 ways for the rest.
+    const CASES: usize = 4 * 3 * 6 * 7 * 9 * 6 * 16;
 
     /// Every look over a discretised domain: each state the capturer's damage takes, at
     /// four times since it came either side of three coalesce windows; four frame rates,
     /// at seven times since the last capture either side of the least interval and its
     /// rounding to whole milliseconds; seven waits for a pass, a pass due and none; a
     /// keyframe wanted or not; the gate open, or holding until a viewer stalls now, either
-    /// side of a millisecond or seconds away; each buffer home or out; damage that came to
+    /// side of a millisecond or seconds away; the buffer home or out; damage that came to
     /// an area or to none; and blocks pending or none.
     fn each_case(mut check: impl FnMut(StepCase)) -> usize {
         let ns = Duration::from_nanos;
@@ -3620,7 +3588,7 @@ mod tests {
                         .into_iter()
                         .flat_map(move |s| dues.clone().map(move |due| (d, s, due)))
                 }) {
-                    for (case, gate) in (0..32).flat_map(|case| gates.map(move |g| (case, g))) {
+                    for (case, gate) in (0..16).flat_map(|case| gates.map(move |g| (case, g))) {
                         let bit = |i: u32| case >> i & 1 == 1;
                         check(StepCase {
                             damaged,
@@ -3632,10 +3600,9 @@ mod tests {
                             min_interval,
                             coalesce,
                             gate,
-                            next_home: bit(1),
-                            other_home: bit(2),
-                            band: bit(3).then_some(Band { y0: 16, y1: 48 }),
-                            refiner: if bit(4) { &pending } else { &sharp },
+                            home: bit(1),
+                            band: bit(2).then_some(Band { y0: 16, y1: 48 }),
+                            refiner: if bit(3) { &pending } else { &sharp },
                         });
                         cases += 1;
                     }
@@ -3646,8 +3613,9 @@ mod tests {
     }
 
     /// A look waits for the first of these that holds it, and only for that, else it
-    /// captures if its buffer is home, or waits for the buffer: a still screen (nothing damaged, no
-    /// keyframe wanted, and no pass due, or one due while the encoder holds a buffer),
+    /// captures if the encoder is idle, or waits for the buffer to come home: a still
+    /// screen (nothing damaged, no keyframe wanted, and no pass due, or one due while the
+    /// encoder holds the buffer),
     /// for the pass due or, with none due, for a change; the rest of the least interval
     /// since the last capture; the rest of the coalesce window; the flow gate. The gate
     /// is asked only when nothing before it holds the capture and no keyframe is wanted.
@@ -3662,7 +3630,7 @@ mod tests {
                 c.gate
             });
             // A due pass goes only to an idle encoder.
-            let pass_goes = c.due == Due::Now && c.next_home && c.other_home;
+            let pass_goes = c.due == Due::Now && c.home;
             let still = !(c.damaged || c.want_key || pass_goes);
             let since = c.now - c.last_capture;
             let early = (since < c.min_interval).then(|| c.min_interval - since);
@@ -3680,7 +3648,7 @@ mod tests {
                 }),
                 (false, Some(rest), _) => Step::Wait(Wait::Interval(rest)),
                 (false, None, Some(rest)) => Step::Wait(Wait::Settle(rest)),
-                (false, None, None) => match (gate_asked, c.gate, c.next_home) {
+                (false, None, None) => match (gate_asked, c.gate, c.home) {
                     (true, Gated::Held { until }, _) => Step::Wait(Wait::Gate(until - c.now)),
                     (_, _, true) => Step::Capture,
                     (_, _, false) => Step::Wait(Wait::Buffer),
@@ -3689,8 +3657,8 @@ mod tests {
             assert_eq!(
                 got, want,
                 "still {still}, early {early:?}, settling {settling:?}, gate asked \
-                 {gate_asked} and {:?}, buffers home {} {}",
-                c.gate, c.next_home, c.other_home
+                 {gate_asked} and {:?}, buffer home {}",
+                c.gate, c.home
             );
         });
         assert_eq!(cases, CASES);
