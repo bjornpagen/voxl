@@ -5003,37 +5003,303 @@ mod tests {
         false
     }
 
-    /// A frame in steady state allocates nothing, whatever it is: the capture loop's
-    /// conversion of its band into a buffer, the encode loop, the stripe workers and the
-    /// hand-off of its messages to a viewer. The oracle is the allocator itself: it
-    /// counts every allocation the process makes while frames go through.
-    ///
-    /// The stream is the one a viewer starts, at the defaults, with one viewer; the test
-    /// plays the capture loop (with no X server it cannot grab, so it draws) and the
-    /// viewer's socket task. First every kind of frame goes through, which brings every
-    /// buffer the stream keeps to its size. Then a generated run of frames (each kind,
-    /// bands of any height, block maps of any shape, keyframes among them) is counted.
-    /// The maps the test hands the encode loop are made before the count, so what is
-    /// counted is the pipeline's. What the capture loop does before it converts (taking
-    /// the damage and the block map, sharpening's bookkeeping, the flow gate and the rate)
-    /// needs an X server and is not run here. x264 and libyuv are C: what they allocate
-    /// goes through C's malloc, which this allocator does not see.
+    /// The screen a test draws on, shared by the test and the capture it hands the loop.
     #[cfg(target_os = "linux")]
-    #[test]
-    #[ignore = "frames allocate on main: the conversion's threads (split_rows), started per \
-                capture; 40 B once in 120 frames on the test's own thread, which plays the \
-                capture loop and the viewer"]
-    fn a_steady_state_frame_allocates_nothing() {
-        if !in_a_process_of_its_own("video::tests::a_steady_state_frame_allocates_nothing") {
-            return;
+    struct Canvas {
+        w: u32,
+        h: u32,
+        drawn: parking_lot::Mutex<Drawn>,
+        /// Readable when something was drawn: the capture's fd.
+        news: crate::hub::Wake,
+    }
+
+    #[cfg(target_os = "linux")]
+    struct Drawn {
+        bgrx: Vec<u8>,
+        /// The rows drawn since the capture last took in what was drawn.
+        rows: Option<(u32, u32)>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Canvas {
+        /// Text in rows `y0..y1` as it stands `n` steps into a scroll of 3 px a step.
+        fn draw(&self, y0: u32, y1: u32, n: usize) {
+            let mut d = self.drawn.lock();
+            let w = self.w as usize;
+            for (y, row) in d
+                .bgrx
+                .chunks_exact_mut(w * 4)
+                .enumerate()
+                .take(y1 as usize)
+                .skip(y0 as usize)
+            {
+                let (line, within) = ((y + 3 * n) / 18, (y + 3 * n) % 18);
+                for (x, glyph) in row.chunks_mut(9 * 4).enumerate() {
+                    let ink = within < 12 && (x * 2654435761 + line * 40503) >> 7 & 1 == 1;
+                    glyph.fill(if ink { 30 } else { 235 });
+                }
+            }
+            d.rows = Some(match d.rows {
+                None => (y0, y1),
+                Some((a, b)) => (a.min(y0), b.max(y1)),
+            });
+            drop(d);
+            self.news.signal();
         }
-        let (w, h) = (1024usize, 768usize);
+    }
+
+    /// The loop's capture of a `Canvas`: it keeps damage as the X11 capturer does
+    /// (capture.rs: `pump`, `take_damage`, `take_mb_map`, the same lines, and the same
+    /// `Damage`), over pixels the test draws, read in place as from Xvfb's framebuffer.
+    #[cfg(target_os = "linux")]
+    struct Drawing {
+        canvas: Arc<Canvas>,
+        damage: Damage,
+        mb_dirty: Vec<u8>,
+        mb_cols: usize,
+        changes: Vec<(u32, u32, u32, u32)>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Capture for Drawing {
+        fn size(&self) -> (u32, u32) {
+            (self.canvas.w, self.canvas.h)
+        }
+        fn fd(&self) -> Waitable<'_> {
+            self.canvas.news.waitable()
+        }
+        fn pump(&mut self) -> Result<(), String> {
+            self.canvas.news.drain();
+            let Some((top, bot)) = self.canvas.drawn.lock().rows.take() else {
+                return Ok(());
+            };
+            for row in (top as usize / 16)..(bot as usize).div_ceil(16) {
+                self.mb_dirty[row * self.mb_cols..(row + 1) * self.mb_cols].fill(1);
+            }
+            self.changes.push((0, top, self.canvas.w, bot));
+            self.damage.add(top, bot, Instant::now());
+            Ok(())
+        }
+        fn needs_rebuild(&self) -> bool {
+            false
+        }
+        fn changes(&mut self) -> &mut Vec<(u32, u32, u32, u32)> {
+            &mut self.changes
+        }
+        fn damage(&mut self) -> &mut Damage {
+            &mut self.damage
+        }
+        fn take_damage(&mut self) -> Result<Option<Band>, String> {
+            Ok(self.damage.take(self.canvas.h))
+        }
+        fn take_mb_map(&mut self) -> Vec<u8> {
+            let n = self.mb_dirty.len();
+            std::mem::replace(&mut self.mb_dirty, vec![0; n])
+        }
+        fn full(&self) -> Band {
+            Band {
+                y0: 0,
+                y1: self.canvas.h,
+            }
+        }
+        fn grab(&mut self, _band: Band) -> Result<(), String> {
+            Ok(())
+        }
+        fn convert(&self, dst: &mut I420, y0: usize, y1: usize, threads: usize) {
+            let d = self.canvas.drawn.lock();
+            let stride = self.canvas.w as usize * 4;
+            crate::convert::convert_band(&d.bgrx, stride, dst, y0, y1, threads);
+        }
+        fn snapshot(&mut self) -> Result<Vec<u8>, String> {
+            Ok(self.canvas.drawn.lock().bgrx.clone())
+        }
+        fn bgrx(&self) -> Option<(&[u8], usize)> {
+            None
+        }
+    }
+
+    /// What the stream's threads allocated over a steady run, by thread.
+    #[cfg(target_os = "linux")]
+    struct Counted {
+        threads: Vec<counting::Thread>,
+        /// Allocations by threads past the counting table.
+        others: usize,
+        /// The frames the run sent.
+        frames: usize,
+        /// The test's own thread: the viewer, not counted.
+        viewer: [u8; 16],
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Counted {
+        /// The stream's threads named so.
+        fn named(&self, name: impl Fn(&str) -> bool) -> impl Iterator<Item = &counting::Thread> {
+            self.threads
+                .iter()
+                .filter(move |t| t.name != self.viewer && name(&thread(t)))
+        }
+
+        /// How many allocations the threads named so made of the sizes `sizes`.
+        fn of(&self, name: impl Fn(&str) -> bool, sizes: &[usize]) -> usize {
+            self.named(name)
+                .flat_map(|t| t.sizes.iter().flatten())
+                .filter(|(size, _)| sizes.contains(size))
+                .map(|(_, n)| n)
+                .sum()
+        }
+
+        /// Every thread's allocations, a frame, with their sizes.
+        fn said(&self) -> String {
+            let said: Vec<String> = self
+                .threads
+                .iter()
+                .map(|t| {
+                    let sizes: Vec<String> = t
+                        .sizes
+                        .iter()
+                        .flatten()
+                        .map(|(size, n)| format!("{size} B x {n}"))
+                        .collect();
+                    format!(
+                        "{}: {:.2} a frame ({})",
+                        thread(t),
+                        t.allocations as f64 / self.frames as f64,
+                        sizes.join(", ")
+                    )
+                })
+                .collect();
+            format!(
+                "{} frames; by thread (the viewer is this test's own):\n{}\nand {} times on \
+                 threads past the table",
+                self.frames,
+                said.join("\n"),
+                self.others
+            )
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn thread(t: &counting::Thread) -> String {
+        String::from_utf8_lossy(&t.name)
+            .trim_end_matches('\0')
+            .to_owned()
+    }
+
+    /// The capture loop's allocations a frame that are known and owned, by the sizes they
+    /// take on the run's 1024x768 screen with one viewer. Each owner's test is ignored until
+    /// its site is gone.
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy)]
+    enum Site {
+        /// `hub.viewers()`, the loop's one read of the viewers, which the flow gate asks:
+        /// room for four of its pairs; and a keyframe's `starts`, the viewers it is
+        /// promised to: four `Arc`s' room.
+        ViewerList,
+        /// `RateCtl::update`'s `Vec<PathNow>`: four of rate.rs's 32-byte `PathNow`.
+        RatePaths,
+        /// `wait_any`'s `Vec<PollFd>`, for one fd or two.
+        PollList,
+        /// `take_mb_map` and the refiner's maps (a byte a 16x16 block), and the `Arc`s
+        /// they are handed on in.
+        BlockMaps,
+        /// `split_rows`' scoped threads, started per capture: the sizes of what starting
+        /// one allocates that no other site takes (its other three, 8, 40 and 64 bytes, are
+        /// the poll list's, the maps' `Arc`'s and the viewer list's too). A run that converts
+        /// on one thread starts none.
+        Conversion,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Site {
+        const ALL: [Site; 5] = [
+            Site::ViewerList,
+            Site::RatePaths,
+            Site::PollList,
+            Site::BlockMaps,
+            Site::Conversion,
+        ];
+
+        fn sizes(self) -> Vec<usize> {
+            use std::mem::size_of;
+            match self {
+                Site::ViewerList => vec![
+                    4 * size_of::<(Arc<crate::hub::Client>, crate::hub::Viewer)>(),
+                    4 * size_of::<Arc<crate::hub::Client>>(),
+                ],
+                Site::RatePaths => vec![4 * 32],
+                Site::PollList => vec![
+                    size_of::<nix::poll::PollFd<'static>>(),
+                    2 * size_of::<nix::poll::PollFd<'static>>(),
+                ],
+                Site::BlockMaps => vec![
+                    (1024 / 16) * (768 / 16),
+                    2 * size_of::<usize>() + size_of::<Vec<u8>>(),
+                ],
+                Site::Conversion => vec![48, 24],
+            }
+        }
+    }
+
+    /// A thread parks on a parking_lot condition variable, surely: it says it is ready under
+    /// the lock and waits, and is told to go only once the lock is free, which waiting frees.
+    #[cfg(target_os = "linux")]
+    fn parked_once() {
+        let state = Arc::new((
+            parking_lot::Mutex::new((false, false)),
+            parking_lot::Condvar::new(),
+        ));
+        let waiter = {
+            let state = state.clone();
+            std::thread::spawn(move || {
+                let (lock, cv) = &*state;
+                let mut s = lock.lock();
+                s.0 = true;
+                while !s.1 {
+                    cv.wait(&mut s);
+                }
+            })
+        };
+        let (lock, cv) = &*state;
+        loop {
+            let mut s = lock.lock();
+            if s.0 {
+                s.1 = true;
+                cv.notify_one();
+                break;
+            }
+        }
+        waiter.join().unwrap();
+    }
+
+    /// A steady run of the capture loop, its stream and one viewer, counted: in a process
+    /// of its own (see `in_a_process_of_its_own`), so None in the first.
+    ///
+    /// The loop runs as `spawn` runs it, on its own thread, over a 1024x768 screen the test
+    /// draws on (a `Canvas`, captured by a `Drawing` that keeps damage as the X11 capturer
+    /// does, so no X server is needed), at the defaults, with one viewer: the stream it
+    /// makes for that viewer is the one a real viewer gets. The test draws text scrolling
+    /// through rows of any height, asks for keyframes, and lets the screen go still until a
+    /// sharpening pass goes; and plays the viewer, taking each frame's messages, writing
+    /// them as its socket task would, and acknowledging the frame. First each kind of step
+    /// goes through 24 times, which brings every buffer the stream keeps to its size; then
+    /// 60 generated steps are counted (a keyframe 1 in 30, sharpening 1 in 10). The test's
+    /// own thread is the viewer, and the server's handling of its acks keeps 30 s of them,
+    /// so it is not the stream's.
+    ///
+    /// What it cannot see: x264 and libyuv are C, and allocate with C's malloc, which the
+    /// counting allocator does not count; nor what the X11 capturer does over its socket.
+    #[cfg(target_os = "linux")]
+    fn steady_state(name: &str, convert_threads: usize) -> Option<Counted> {
+        if !in_a_process_of_its_own(name) {
+            return None;
+        }
+        let (w, h) = (1024u32, 768u32);
         let cfg = VideoConfig {
             display: None,
             fps: Fps::new(60).unwrap(),
             preset: Preset::parse("ultrafast").unwrap(),
             threads: 4,
-            convert_threads: 4,
+            convert_threads,
             crf: 24.0,
             bounds: Bounds::new(Kbps::new(2000.0), Some(Kbps::new(30000.0))),
             paintover_crf: 16.0,
@@ -5043,175 +5309,242 @@ mod tests {
             debug: Debugging::read(|_| None).0,
         };
         let hub = Hub::new();
-        let (tx, mut socket) = tokio::sync::mpsc::unbounded_channel();
-        let viewer = hub.add_client(tx);
-        viewer.watch();
-        // The capture loop planned its keyframe: the first frame played is one.
-        viewer.keyframe_planned();
         *hub.stripes.lock() = stripe_layout(h as u16, cfg.stripes).rows().collect();
-        let mut stream = Stream::new(&cfg, &hub, w as u32, h as u32).unwrap();
-        let (cols, rows) = (w.div_ceil(16), h.div_ceil(16));
-        let mut refiner = Refiner::new(cols * rows, cols, Instant::now());
+        let (tx, socket) = tokio::sync::mpsc::unbounded_channel();
+        let client = hub.add_client(tx);
+        client.watch();
+        let canvas = Arc::new(Canvas {
+            w,
+            h,
+            drawn: parking_lot::Mutex::new(Drawn {
+                bgrx: vec![0; (w * h * 4) as usize],
+                rows: None,
+            }),
+            news: crate::hub::Wake::new().unwrap(),
+        });
+        let (cols, rows) = ((w as usize).div_ceil(16), (h as usize).div_ceil(16));
+        let mut drawing = Drawing {
+            canvas: canvas.clone(),
+            damage: Damage::Unreported,
+            mb_dirty: vec![0; cols * rows],
+            mb_cols: cols,
+            changes: Vec::new(),
+        };
+        let capture = {
+            let (cfg, hub) = (cfg.clone(), hub.clone());
+            std::thread::Builder::new()
+                .name("capture".into())
+                .spawn(move || capture_loop(&mut drawing, cfg, hub))
+                .unwrap()
+        };
+        // The viewer: it takes frames until one of the kind waited for, writing each as its
+        // socket task does and acknowledging it.
+        struct Viewer {
+            socket: tokio::sync::mpsc::UnboundedReceiver<Out>,
+            client: Arc<crate::hub::Client>,
+            hub: Arc<Hub>,
+            frames: usize,
+        }
+        impl Viewer {
+            fn until(&mut self, what: fn(&Header) -> bool) {
+                loop {
+                    let Some(Out::Bin(m)) = self.socket.blocking_recv() else {
+                        continue;
+                    };
+                    let Ok(Video::Stripe(header, _)) = Header::read(&m) else {
+                        continue;
+                    };
+                    let now = Instant::now();
+                    self.hub.timeline.written(header.frame, now);
+                    self.client
+                        .on_ack(now, header.frame, crate::hub::Hold::Unsaid);
+                    self.frames += 1;
+                    if what(&header) {
+                        return;
+                    }
+                }
+            }
+        }
+        const ANY: fn(&Header) -> bool = |_| true;
+        const KEY: fn(&Header) -> bool = |header| header.key;
+        const PASS: fn(&Header) -> bool = |header| header.sharpens;
+        let mut viewer = Viewer {
+            socket,
+            client,
+            hub: hub.clone(),
+            frames: 0,
+        };
         let mut rng = 0x2545F4914F6CDD1Du64;
-        let mut next = |n: usize| {
+        let mut next = move |n: u64| {
             rng ^= rng << 13;
             rng ^= rng >> 7;
             rng ^= rng << 17;
-            rng as usize % n
+            rng % n
         };
-        // Bands of block rows, each with a map of the blocks in it that changed.
-        let maps: Vec<(Band, Arc<Vec<u8>>)> = (0..8)
-            .map(|_| {
-                let first = next(rows);
-                let last = first + next(rows - first);
-                let map = (0..cols * rows)
-                    .map(|b| ((first..=last).contains(&(b / cols)) && next(3) > 0) as u8)
-                    .collect();
-                let band = Band {
-                    y0: (first * 16) as u32,
-                    y1: ((last + 1) * 16).min(h) as u32,
-                };
-                (band, Arc::new(map))
-            })
-            .collect();
-        let every = Arc::new(vec![1u8; cols * rows]);
-        let sharpen = |map: &Arc<Vec<u8>>| Sharpen {
-            map: map.clone(),
-            at: Instant::now(),
-        };
-        let mut screen = vec![0u8; w * h * 4];
-        // The viewer the first keyframe was planned for; it starts on it.
-        let mut starts = vec![viewer.clone()];
-        let mut capture = |kind: usize, which: usize, n: usize| {
-            let (band, map) = &maps[which];
-            let frame = match kind {
-                0 => super::Frame::Key {
-                    blocks: None,
-                    starts: std::mem::take(&mut starts),
-                },
-                1 => super::Frame::Key {
-                    blocks: Some(sharpen(&every)),
-                    starts: std::mem::take(&mut starts),
-                },
-                2 => super::Frame::Motion {
-                    band: *band,
-                    dirty: every.clone(),
-                },
-                3 => super::Frame::Motion {
-                    band: *band,
-                    dirty: map.clone(),
-                },
-                4 => super::Frame::Sharpen {
-                    band: *band,
-                    blocks: sharpen(map),
-                },
-                _ => super::Frame::MotionAndSharpen {
-                    band: *band,
-                    dirty: map.clone(),
-                    blocks: sharpen(map),
-                },
-            };
-            // What moved: lines of 9 px glyphs scrolled 3 px a frame through the band.
-            let (y0, y1) = match kind {
-                0 | 1 => (0, h),
-                _ => (band.y0 as usize, band.y1 as usize),
-            };
-            for (y, row) in screen.chunks_exact_mut(w * 4).enumerate().take(y1).skip(y0) {
-                let (line, within) = ((y + 3 * n) / 18, (y + 3 * n) % 18);
-                for (x, glyph) in row.chunks_mut(9 * 4).enumerate() {
-                    let ink = within < 12 && (x * 2654435761 + line * 40503) >> 7 & 1 == 1;
-                    glyph.fill(if ink { 30 } else { 235 });
-                }
+        // A keyframe 1 in 30 steps, sharpening 1 in 10.
+        const STEPS: usize = 60;
+        let kinds: [u64; STEPS] = std::array::from_fn(|_| match next(30) {
+            0 => 0,
+            1..=3 => 1,
+            _ => 2,
+        });
+        // One step: what the test does, and the frame it waits for.
+        let mut step = |kind: u64, n: usize, viewer: &mut Viewer| match kind {
+            // The viewer asks for a keyframe.
+            0 => {
+                viewer.client.ask_keyframe();
+                hub.wake();
+                viewer.until(KEY);
             }
-            // The buffer, once it is home.
-            let mut buf = loop {
-                match std::mem::replace(&mut stream.buf, Buffer::Away) {
-                    Buffer::Home(buf) => break buf,
-                    Buffer::Away => {
-                        let r = stream.ret_rx.recv().unwrap();
-                        stream.returned(r, &mut refiner);
-                    }
-                }
-            };
-            let pic = Arc::get_mut(&mut buf).unwrap();
-            crate::convert::convert_band(&screen, w * 4, pic, y0, y1, cfg.convert_threads);
-            stream
-                .job_tx
-                .send(Job {
-                    buf,
-                    frame,
-                    target: Kbps::new(6000.0),
-                    capacity: None,
-                    captured: CaptureMarks::at(Instant::now()),
-                    marker_ms: None,
-                })
-                .unwrap();
-            // The viewer: its socket task writes what was handed to it, and every frame is
-            // acknowledged as it arrives.
-            while let Ok(m) = socket.try_recv() {
-                let Some(id) = (match &m {
-                    Out::Bin(b) => frame_of(b),
-                    Out::Text(_) => None,
-                }) else {
-                    continue;
+            // Text scrolls through rows of any height, and the screen is then still until
+            // a sharpening pass goes.
+            1 => {
+                let y0 = next(h as u64) as u32;
+                canvas.draw(y0, y0 + 1 + next((h - y0) as u64) as u32, n);
+                viewer.until(ANY);
+                viewer.until(PASS);
+            }
+            // Text scrolls: a line, a block of lines, the whole screen.
+            _ => {
+                let y0 = next(h as u64) as u32;
+                let y1 = match next(3) {
+                    0 => (y0 + 48).min(h),
+                    1 => y0 + 1 + next((h - y0) as u64) as u32,
+                    _ => h,
                 };
-                hub.timeline.written(id, Instant::now());
-                viewer.on_ack(Instant::now(), id, crate::hub::Hold::Unsaid);
+                canvas.draw(y0, y1, n);
+                viewer.until(ANY);
             }
         };
-        // Every kind of frame, over every band, twice: every buffer the stream keeps has
-        // then been as large as these frames make it.
+        viewer.until(KEY);
         let mut n = 0;
-        for _ in 0..2 {
-            for kind in 0..6 {
-                for which in 0..maps.len() {
-                    capture(kind, which, n);
+        for _ in 0..3 {
+            for kind in 0..3 {
+                for _ in 0..8 {
                     n += 1;
+                    step(kind, n, &mut viewer);
                 }
             }
         }
-        // Each kind about thirty times, keyframes four.
-        const COUNTED: usize = 120;
+        // parking_lot makes its table of parked threads (1 KB) the first time any thread
+        // parks: a park now, so the count does not catch the process's first contended
+        // lock.
+        parked_once();
         let test = counting::thread_name();
+        let before = viewer.frames;
         counting::arm();
-        for _ in 0..COUNTED {
-            // A keyframe now and then, as a viewer joining asks for one.
-            let kind = match next(30) {
-                0 => next(2),
-                _ => 2 + next(4),
-            };
-            capture(kind, next(maps.len()), n);
+        for kind in kinds {
             n += 1;
+            step(kind, n, &mut viewer);
         }
         let (threads, others) = counting::disarm();
-        drop(stream);
-        let allocated: Vec<String> = threads
-            .iter()
-            .map(|t| {
-                let name = match t.name == test {
-                    true => "the capture loop and the viewer (this test's thread)".into(),
-                    false => String::from_utf8_lossy(&t.name)
-                        .trim_end_matches('\0')
-                        .to_owned(),
-                };
-                let sizes: Vec<String> = t
-                    .sizes
-                    .iter()
-                    .flatten()
-                    .map(|(size, n)| format!("{size} B x {n}"))
-                    .collect();
-                format!(
-                    "{name}: {:.2} a frame ({})",
-                    t.allocations as f64 / COUNTED as f64,
-                    sizes.join(", ")
-                )
-            })
-            .collect();
-        assert!(
-            allocated.is_empty() && others == 0,
-            "{COUNTED} frames allocated, by thread:\n{}\nand {others} times on threads past the table",
-            allocated.join("\n")
+        let counted = viewer.frames - before;
+        *hub.resize_req.lock() = Some((w, h));
+        hub.wake();
+        capture.join().unwrap().unwrap();
+        Some(Counted {
+            threads,
+            others,
+            frames: counted,
+            viewer: test,
+        })
+    }
+
+    /// A steady-state frame allocates nothing in the capture loop but at the sites whose
+    /// owners' tests below are ignored until they are gone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_steady_state_frame_allocates_nothing_capturing_but_at_known_sites() {
+        let Some(c) = steady_state(
+            "video::tests::a_steady_state_frame_allocates_nothing_capturing_but_at_known_sites",
+            1,
+        ) else {
+            return;
+        };
+        let known: Vec<usize> = Site::ALL.iter().flat_map(|s| s.sizes()).collect();
+        let all: usize = c.named(|t| t == "capture").map(|t| t.allocations).sum();
+        assert_eq!(all, c.of(|t| t == "capture", &known), "{}", c.said());
+    }
+
+    /// The capture loop at one known site: none of its allocations in a steady run. Each
+    /// site but the conversion's is counted with the conversion on one thread, which starts
+    /// no thread whose allocations share their sizes.
+    #[cfg(target_os = "linux")]
+    fn the_capture_loop_allocates_nothing_at(site: Site, test: &str) {
+        let convert_threads = match site {
+            Site::Conversion => 4,
+            Site::ViewerList | Site::RatePaths | Site::PollList | Site::BlockMaps => 1,
+        };
+        let Some(c) = steady_state(test, convert_threads) else {
+            return;
+        };
+        assert_eq!(c.of(|t| t == "capture", &site.sizes()), 0, "{}", c.said());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "FIRST: hub.viewers() in the capture loop, the one read the flow gate asks, \
+                and the viewers a keyframe starts"]
+    fn a_steady_state_frame_takes_no_viewer_list() {
+        the_capture_loop_allocates_nothing_at(
+            Site::ViewerList,
+            "video::tests::a_steady_state_frame_takes_no_viewer_list",
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "RATE: RateCtl::update's Vec<PathNow>, which goes with RateCtl (reply 41, D2)"]
+    fn a_steady_state_frame_makes_no_rate_paths() {
+        the_capture_loop_allocates_nothing_at(
+            Site::RatePaths,
+            "video::tests::a_steady_state_frame_makes_no_rate_paths",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_steady_state_frame_makes_no_poll_list() {
+        the_capture_loop_allocates_nothing_at(
+            Site::PollList,
+            "video::tests::a_steady_state_frame_makes_no_poll_list",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "DIRTY: take_mb_map, the refiner's maps and their Arcs"]
+    fn a_steady_state_frame_makes_no_block_maps() {
+        the_capture_loop_allocates_nothing_at(
+            Site::BlockMaps,
+            "video::tests::a_steady_state_frame_makes_no_block_maps",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "upstream's per-capture threads stay (reply 43): split_rows' scoped threads"]
+    fn a_steady_state_frame_starts_no_conversion_thread() {
+        the_capture_loop_allocates_nothing_at(
+            Site::Conversion,
+            "video::tests::a_steady_state_frame_starts_no_conversion_thread",
+        );
+    }
+
+    /// A steady-state frame allocates nothing in the encode loop or its stripe workers.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "stripe 0's kept x264 output, which grows when a frame outgrows every one \
+                before it: 130 KB once in 66 frames, in some runs"]
+    fn a_steady_state_frame_allocates_nothing_encoding() {
+        let Some(c) = steady_state(
+            "video::tests::a_steady_state_frame_allocates_nothing_encoding",
+            4,
+        ) else {
+            return;
+        };
+        let encoding = |t: &str| t == "encode" || t.starts_with("enc-");
+        assert_eq!(c.named(encoding).count(), 0, "{}", c.said());
     }
 
     /// Recording viewers' frames and acks, and viewers leaving, allocate nothing once they
