@@ -37,6 +37,7 @@ each was due and when it was sent).
 usage: linkviewer.py HOST:PORT SCENARIO OUT [--kbps N] [--rtt MS] [--hold] [--report-hold]
        [--seed N] [--fifo PATH] [--page FILE] [--passive SECS]
        [--keysym K] [--key-hold S] [--key-repeat MS,MS] [--key-delay MS] [--key-stall MS]
+       linkviewer.py --check-header   (the standard library alone; python3 -I runs it)
 """
 
 import argparse
@@ -44,10 +45,40 @@ import asyncio
 import heapq
 import json
 import math
+import os
 import random
+import sys
 import time
 
-import websockets
+# Messages, and the fields they mean, that the server's and the web client's header
+# readers are checked against too.
+HEADER_FIXTURE = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "web", "src", "video-header.json"))
+VIDEO = 0x01  # a video message's type byte
+HEADER_LEN = 16
+
+
+def read_header(m):
+    """The fields this viewer reads from a video message's header (src/video.rs `Header`),
+    None for any other message."""
+    if len(m) <= HEADER_LEN or m[0] != VIDEO:
+        return None
+    return {
+        "key": m[1] & 1 == 1,
+        "sharpens": m[1] & 2 == 2,
+        "frame": int.from_bytes(m[2:6], "big"),
+        "pipe": int.from_bytes(m[6:10], "big"),
+        "parts": m[12],
+    }
+
+
+def check_header():
+    with open(HEADER_FIXTURE) as f:
+        cases = json.load(f)
+    for c in cases:
+        h = read_header(bytes.fromhex(c["header"] + c["picture"]))
+        if h != {field: c[field] for field in h}:
+            sys.exit(f"{c['header']} reads as {h}")
+    print(f"read_header: {len(cases)} messages as {HEADER_FIXTURE} says")
 
 
 def flick(peak_px_s, tau_s, sign):
@@ -181,6 +212,8 @@ async def main():
             with open(a.fifo, "w") as f:
                 f.write(cmd.replace("{page}", a.page) + "\n")
 
+    import websockets
+
     async with websockets.connect(f"ws://{a.hostport}/ws", max_size=None, compression=None) as ws:
 
         async def sender():
@@ -204,12 +237,11 @@ async def main():
                         schedule(at + owd, f"po,{j['s']}")
                     continue
                 at = arrive(len(m))
-                if not m or m[0] != 0x01:
+                h = read_header(m)
+                if h is None:
                     continue
-                fid = int.from_bytes(m[2:6], "big")
-                key, po = m[1] & 1, (m[1] >> 1) & 1
-                parts = m[12]
-                msgs.write(f"{clock():.4f}\t{at:.4f}\t{fid}\t{key}\t{po}\t{len(m)}\t{int.from_bytes(m[6:10], 'big') / 10:.1f}\n")
+                fid, key, parts = h["frame"], h["key"], h["parts"]
+                msgs.write(f"{clock():.4f}\t{at:.4f}\t{fid}\t{key:d}\t{h['sharpens']:d}\t{len(m)}\t{h['pipe'] / 10:.1f}\n")
                 f = frames.setdefault(fid, {"need": parts, "got": 0, "bytes": 0})
                 f["got"] += 1
                 f["bytes"] += len(m)
@@ -271,4 +303,8 @@ async def main():
         f.close()
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--check-header"]:
+        check_header()
+    else:
+        asyncio.run(main())

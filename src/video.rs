@@ -34,6 +34,87 @@ pub struct VideoConfig {
     pub debug: Debugging,
 }
 
+/// What a video message says before its stripe's H.264. The encode loop writes it; the
+/// recorder, web/src/protocol.ts and bench/linkviewer.py read it, and each checks its
+/// reader against web/src/video-header.json: messages, and the fields they mean.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Header {
+    /// This stripe is a keyframe.
+    pub key: bool,
+    /// The frame sharpens what it codes (the bench's "paint-over").
+    pub sharpens: bool,
+    /// The frame's number: every stripe of a frame carries it, and a viewer acks it.
+    pub frame: u32,
+    pub pipe: Pipe,
+    /// This stripe, of `stripes`.
+    pub stripe: u8,
+    pub stripes: u8,
+    /// How many stripes' messages make up the frame.
+    pub parts: u8,
+    /// The stripe's top row.
+    pub y: u16,
+}
+
+/// Capture to send, as a video message carries it: in tenths of a millisecond, at most
+/// `u32::MAX` of them (119 hours).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pipe(u32);
+
+impl Pipe {
+    pub fn of(d: Duration) -> Pipe {
+        Pipe((d.as_micros() / 100).min(u32::MAX as u128) as u32)
+    }
+
+    /// In whole milliseconds, rounded down.
+    pub fn millis(self) -> u64 {
+        self.0 as u64 / 10
+    }
+}
+
+impl Header {
+    /// A stripe's H.264 starts this far into its message.
+    pub const LEN: usize = 16;
+    /// A video message's type byte (`Bin.Video` in web/src/protocol.ts).
+    const VIDEO: u8 = 0x01;
+    /// The flags byte's bits.
+    const KEY: u8 = 1;
+    const SHARPENS: u8 = 2;
+
+    /// Type, flags, frame, pipe, stripe, stripe count, parts in frame, a reserved 0, y.
+    pub fn bytes(&self) -> [u8; Header::LEN] {
+        let mut b = [0; Header::LEN];
+        b[0] = Header::VIDEO;
+        b[1] = if self.key { Header::KEY } else { 0 }
+            | if self.sharpens { Header::SHARPENS } else { 0 };
+        b[2..6].copy_from_slice(&self.frame.to_be_bytes());
+        b[6..10].copy_from_slice(&self.pipe.0.to_be_bytes());
+        b[10] = self.stripe;
+        b[11] = self.stripes;
+        b[12] = self.parts;
+        b[14..16].copy_from_slice(&self.y.to_be_bytes());
+        b
+    }
+
+    /// A video message's header. None for any other message, and for one with nothing
+    /// after its header: the encode loop sends no stripe that coded nothing.
+    pub fn read(m: &[u8]) -> Option<Header> {
+        if m.len() <= Header::LEN || m[0] != Header::VIDEO {
+            return None;
+        }
+        let u32_at = |i: usize| u32::from_be_bytes([m[i], m[i + 1], m[i + 2], m[i + 3]]);
+        Some(Header {
+            key: m[1] & Header::KEY != 0,
+            sharpens: m[1] & Header::SHARPENS != 0,
+            frame: u32_at(2),
+            pipe: Pipe(u32_at(6)),
+            stripe: m[10],
+            stripes: m[11],
+            parts: m[12],
+            y: u16::from_be_bytes([m[14], m[15]]),
+        })
+    }
+}
+
 struct Job {
     buf: Box<I420>,
     idx: usize,
@@ -966,8 +1047,6 @@ struct Stripe {
     applied_crf: f32,
 }
 
-const HDR: usize = 16;
-
 struct SendPtr<T>(*const T);
 unsafe impl<T> Send for SendPtr<T> {}
 impl<T> Clone for SendPtr<T> {
@@ -1140,7 +1219,7 @@ fn stripe_worker(
             stride_uv: suv,
         };
         let mut out = Vec::with_capacity(64 << 10);
-        out.resize(HDR, 0);
+        out.resize(Header::LEN, 0);
         // x264 wants X264_MBINFO_CONSTANT (1) on unchanged macroblocks of this stripe.
         let mut info = job.mb_dirty.as_ref().map(|d| {
             let rows = s.h.div_ceil(16);
@@ -1177,7 +1256,7 @@ fn stripe_worker(
         let result = match r {
             Ok(e) => {
                 let size = matches!(job.coding, Coding::Motion).then(|| MotionSize {
-                    bits: (out.len() - HDR) * 8,
+                    bits: (out.len() - Header::LEN) * 8,
                     changed,
                     mbs: stripe_mbs,
                     crf: asked,
@@ -1309,7 +1388,7 @@ fn encode_loop(
             .enumerate()
             .filter_map(|(i, r)| match r {
                 StripeOut::Sent { key, bytes, .. } => {
-                    (bytes.len() > HDR).then_some((i, key, bytes))
+                    (bytes.len() > Header::LEN).then_some((i, key, bytes))
                 }
                 StripeOut::Failed => None,
             })
@@ -1328,22 +1407,22 @@ fn encode_loop(
             hub.stats.keyframes.fetch_add(1, Ordering::Relaxed);
         }
         frame_id = frame_id.wrapping_add(1);
-        // Server-side pipeline latency (capture -> sent) in 1/10 ms, for client stats.
-        let pipe = (job.captured_at.elapsed().as_micros() / 100).min(u32::MAX as u128) as u32;
+        let pipe = Pipe::of(job.captured_at.elapsed());
         let nparts = parts.len() as u8;
         let msgs: Vec<Bytes> = parts
             .into_iter()
             .map(|(i, key, mut out)| {
-                // type, flags, frame id, pipe, stripe, stripe count, parts in frame, reserved, y
-                out[0] = 0x01;
-                out[1] = (key as u8) | if sharpens { 2 } else { 0 };
-                out[2..6].copy_from_slice(&frame_id.to_be_bytes());
-                out[6..10].copy_from_slice(&pipe.to_be_bytes());
-                out[10] = i as u8;
-                out[11] = n as u8;
-                out[12] = nparts;
-                out[13] = 0;
-                out[14..16].copy_from_slice(&(stripes[i].0 as u16).to_be_bytes());
+                let header = Header {
+                    key,
+                    sharpens,
+                    frame: frame_id,
+                    pipe,
+                    stripe: i as u8,
+                    stripes: n as u8,
+                    parts: nparts,
+                    y: stripes[i].0 as u16,
+                };
+                out[..Header::LEN].copy_from_slice(&header.bytes());
                 Bytes::from(out)
             })
             .collect();
@@ -2087,5 +2166,212 @@ mod tests {
             after <= during / 2.0,
             "correction {after} after the paint-overs, {during} during the drag"
         );
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        /// A number of any size: a random one, shifted right by a random amount.
+        fn any(&mut self) -> u64 {
+            let shift = self.next() % 64;
+            self.next() >> shift
+        }
+    }
+
+    fn random_header(rng: &mut Rng) -> Header {
+        Header {
+            key: rng.next() & 1 == 1,
+            sharpens: rng.next() & 1 == 1,
+            frame: rng.any() as u32,
+            pipe: Pipe(rng.any() as u32),
+            stripe: rng.any() as u8,
+            stripes: rng.any() as u8,
+            parts: rng.any() as u8,
+            y: rng.any() as u16,
+        }
+    }
+
+    #[test]
+    fn a_header_reads_back_as_it_was_written() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..100_000 {
+            let header = random_header(&mut rng);
+            let picture: Vec<u8> = (0..1 + rng.next() % 64).map(|_| rng.next() as u8).collect();
+            let message = [&header.bytes()[..], &picture].concat();
+            assert_eq!(Header::read(&message), Some(header));
+            assert_eq!(&message[Header::LEN..], &picture[..]);
+        }
+    }
+
+    #[test]
+    fn only_a_video_message_with_a_picture_has_a_header() {
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        for _ in 0..100_000 {
+            let header = random_header(&mut rng).bytes();
+            // Its header alone, or any part of it.
+            let cut = (rng.next() % (Header::LEN as u64 + 1)) as usize;
+            assert_eq!(Header::read(&header[..cut]), None);
+            // Another message's type byte, with anything after it.
+            let mut other: Vec<u8> = (0..rng.next() % 64).map(|_| rng.next() as u8).collect();
+            if other.first() == Some(&Header::VIDEO) {
+                other[0] = Header::VIDEO.wrapping_add(1 + (rng.next() % 255) as u8);
+            }
+            assert_eq!(Header::read(&other), None);
+        }
+    }
+
+    #[test]
+    fn a_pipe_is_whole_tenths_of_a_millisecond() {
+        let mut rng = Rng(0x6a09_e667_f3bc_c908);
+        let tenth = Duration::from_micros(100);
+        for _ in 0..100_000 {
+            let d = Duration::from_nanos(rng.any());
+            let Pipe(p) = Pipe::of(d);
+            // As many whole tenths as fit, or as many as a header holds.
+            assert!(tenth * p <= d, "{d:?} as {p}");
+            if p < u32::MAX {
+                assert!(d < tenth * (p + 1), "{d:?} as {p}");
+            }
+            let ms = Pipe(p).millis();
+            assert!(ms * 10 <= p as u64 && p as u64 <= ms * 10 + 9);
+        }
+    }
+
+    /// One case of web/src/video-header.json.
+    #[derive(serde::Deserialize)]
+    struct Case {
+        header: String,
+        picture: String,
+        key: bool,
+        sharpens: bool,
+        frame: u32,
+        pipe: u32,
+        stripe: u8,
+        stripes: u8,
+        parts: u8,
+        y: u16,
+    }
+
+    fn hex(s: &str) -> Vec<u8> {
+        let digits: String = s.split_whitespace().collect();
+        (0..digits.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&digits[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// The messages web/src/protocol.ts and bench/linkviewer.py check their readers against
+    /// are what the server writes and reads.
+    #[test]
+    fn the_header_is_what_the_fixture_says() {
+        let cases: Vec<Case> =
+            serde_json::from_str(include_str!("../web/src/video-header.json")).unwrap();
+        for c in cases {
+            let header = Header {
+                key: c.key,
+                sharpens: c.sharpens,
+                frame: c.frame,
+                pipe: Pipe(c.pipe),
+                stripe: c.stripe,
+                stripes: c.stripes,
+                parts: c.parts,
+                y: c.y,
+            };
+            assert_eq!(header.bytes().to_vec(), hex(&c.header), "{}", c.header);
+            let message = [hex(&c.header), hex(&c.picture)].concat();
+            assert_eq!(Header::read(&message), Some(header), "{}", c.header);
+        }
+    }
+
+    /// The oracle: the header as the encode loop wrote it by hand before `Header`.
+    fn old_write(
+        out: &mut [u8],
+        (key, sharpens): (bool, bool),
+        frame_id: u32,
+        elapsed: Duration,
+        (i, n): (usize, usize),
+        nparts: u8,
+        y: usize,
+    ) {
+        // Server-side pipeline latency (capture -> sent) in 1/10 ms, for client stats.
+        let pipe = (elapsed.as_micros() / 100).min(u32::MAX as u128) as u32;
+        // type, flags, frame id, pipe, stripe, stripe count, parts in frame, reserved, y
+        out[0] = 0x01;
+        out[1] = (key as u8) | if sharpens { 2 } else { 0 };
+        out[2..6].copy_from_slice(&frame_id.to_be_bytes());
+        out[6..10].copy_from_slice(&pipe.to_be_bytes());
+        out[10] = i as u8;
+        out[11] = n as u8;
+        out[12] = nparts;
+        out[13] = 0;
+        out[14..16].copy_from_slice(&(y as u16).to_be_bytes());
+    }
+
+    /// The oracle: what the recorder read from a message by hand before `Header::read`
+    /// (frame, pipe in ms, key, picture), for the messages it took as video.
+    fn old_record(b: &[u8]) -> Option<(u32, u64, bool, &[u8])> {
+        (b.len() > 16 && b[0] == 0x01).then(|| {
+            (
+                u32::from_be_bytes([b[2], b[3], b[4], b[5]]),
+                u32::from_be_bytes([b[6], b[7], b[8], b[9]]) as u64 / 10,
+                b[1] & 1 == 1,
+                &b[16..],
+            )
+        })
+    }
+
+    #[test]
+    fn header_writes_and_reads_as_the_hand_written_code_did() {
+        let mut rng = Rng(0xd1b5_4a32_d192_ed03);
+        for _ in 0..200_000 {
+            // The encode loop's inputs over their whole types, its casts included.
+            let (key, sharpens) = (rng.next() & 1 == 1, rng.next() & 1 == 1);
+            let frame_id = rng.any() as u32;
+            let elapsed = Duration::from_nanos(rng.any());
+            let (i, n, y) = (rng.any() as usize, rng.any() as usize, rng.any() as usize);
+            let nparts = rng.any() as u8;
+            let picture = 1 + (rng.next() % 64) as usize;
+            let mut old: Vec<u8> = (0..Header::LEN + picture)
+                .map(|_| rng.next() as u8)
+                .collect();
+            let mut new = old.clone();
+            old_write(
+                &mut old,
+                (key, sharpens),
+                frame_id,
+                elapsed,
+                (i, n),
+                nparts,
+                y,
+            );
+            let header = Header {
+                key,
+                sharpens,
+                frame: frame_id,
+                pipe: Pipe::of(elapsed),
+                stripe: i as u8,
+                stripes: n as u8,
+                parts: nparts,
+                y: y as u16,
+            };
+            new[..Header::LEN].copy_from_slice(&header.bytes());
+            assert_eq!(new, old);
+        }
+        for _ in 0..200_000 {
+            let mut m: Vec<u8> = (0..rng.next() % 40).map(|_| rng.next() as u8).collect();
+            if rng.next() & 1 == 1 {
+                if let Some(t) = m.first_mut() {
+                    *t = 0x01;
+                }
+            }
+            let new =
+                Header::read(&m).map(|h| (h.frame, h.pipe.millis(), h.key, &m[Header::LEN..]));
+            assert_eq!(new, old_record(&m));
+        }
     }
 }

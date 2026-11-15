@@ -1,6 +1,11 @@
 {
-	// The decode/socket worker.
+	// The decode/socket worker, and the check of its header reader (run by node,
+	// which wants the .ts extension and reads the fixture as JSON).
 	"extends": "./tsconfig.base.json",
-	"compilerOptions": { "lib": ["ES2022", "WebWorker"] },
-	"include": ["src/worker.ts", "src/protocol.ts"]
+	"compilerOptions": {
+		"lib": ["ES2022", "WebWorker"],
+		"allowImportingTsExtensions": true,
+		"resolveJsonModule": true
+	},
+	"include": ["src/worker.ts", "src/protocol.ts", "src/video-header.test.ts"]
 }

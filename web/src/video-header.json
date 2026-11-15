@@ -1,0 +1,38 @@
+[
+	{
+		"header": "01 01 1a2b3c4d 5e6f7081 05 09 07 00 c5d6",
+		"picture": "00 00 00 01 09 f0",
+		"key": true,
+		"sharpens": false,
+		"frame": 439041101,
+		"pipe": 1584361601,
+		"stripe": 5,
+		"stripes": 9,
+		"parts": 7,
+		"y": 50646
+	},
+	{
+		"header": "01 02 fedcba98 80000001 00 01 01 00 0000",
+		"picture": "00 00 00 01 41",
+		"key": false,
+		"sharpens": true,
+		"frame": 4275878552,
+		"pipe": 2147483649,
+		"stripe": 0,
+		"stripes": 1,
+		"parts": 1,
+		"y": 0
+	},
+	{
+		"header": "01 03 00000000 00000000 0f 10 10 00 0640",
+		"picture": "00 00 00 01 65",
+		"key": true,
+		"sharpens": true,
+		"frame": 0,
+		"pipe": 0,
+		"stripe": 15,
+		"stripes": 16,
+		"parts": 16,
+		"y": 1600
+	}
+]

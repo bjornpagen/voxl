@@ -85,7 +85,9 @@ export const cmd = {
 	pong: (token: string) => `po,${token}`,
 } as const;
 
-/** Header of a video message (after the type byte). */
+/** The header of a video message, as src/video.rs's `Header` writes it. Checked
+ * against video-header.json, as the server's and the bench's readers are:
+ * `node web/src/video-header.test.ts`. */
 export interface VideoHeader {
 	key: boolean;
 	frame: number;

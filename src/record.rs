@@ -12,6 +12,7 @@
 
 use crate::hub::{Client, Hub, Out};
 use crate::mp4;
+use crate::video::Header;
 use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -174,25 +175,23 @@ async fn collect(
             _ = &mut deadline => break,
             m = rx.recv() => match m {
                 None => break,
-                Some(Out::Bin(b)) if b.len() > 16 && b[0] == 0x01 => {
+                Some(Out::Bin(b)) => {
+                    let Some(h) = Header::read(&b) else {
+                        continue;
+                    };
                     // Acknowledge at once, so the recorder never holds the stream back.
-                    client.on_ack(
-                        Instant::now(),
-                        u32::from_be_bytes([b[2], b[3], b[4], b[5]]),
-                        crate::hub::Hold::Unsaid,
-                    );
+                    client.on_ack(Instant::now(), h.frame, crate::hub::Hold::Unsaid);
                     hub.wake();
                     if frames.is_empty() {
                         size = (hub.width.load(Ordering::Relaxed), hub.height.load(Ordering::Relaxed));
                     }
                     // Time the frame was captured: now, less the pipeline time in its header.
-                    let pipe = u32::from_be_bytes([b[6], b[7], b[8], b[9]]) as u64 / 10;
-                    let ms = (start.elapsed().as_millis() as u64).saturating_sub(pipe);
+                    let ms = (start.elapsed().as_millis() as u64).saturating_sub(h.pipe.millis());
                     let ms = frames.last().map_or(ms, |l: &mp4::Frame| ms.max(l.ms + 1));
                     frames.push(mp4::Frame {
                         ms,
-                        key: b[1] & 1 == 1,
-                        data: b.slice(16..),
+                        key: h.key,
+                        data: b.slice(Header::LEN..),
                     });
                 }
                 // A capture restart or closed subscription ends this recording.
