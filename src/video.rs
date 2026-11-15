@@ -1519,7 +1519,6 @@ fn encode_loop(
     }
 }
 
-/// Debug: decode the bench loadgen marker at (300,150) and log its age.
 /// CPU time this thread has used, in microseconds.
 #[cfg(unix)]
 fn thread_cpu_us() -> i64 {
@@ -1550,6 +1549,7 @@ fn marker_reading(bgrx: Option<(&[u8], usize)>, marker: Option<Marker>) -> Optio
     }
 }
 
+/// Debug: decode the bench loadgen marker at `at` and log its age.
 fn marker_probe(buf: &[u8], stride: usize, at: Marker, what: &str) -> u32 {
     let mut v: u64 = 0;
     for b in 0..40 {
@@ -1713,7 +1713,7 @@ mod tests {
                         fps: 60,
                         preset: "ultrafast".into(),
                         threads: 1,
-                        debug: Debugging::read(|_| None),
+                        debug: Debugging::read(|_| None).unwrap(),
                     },
                     crf,
                     max_kbps,

@@ -72,25 +72,37 @@ pub enum X264Log {
     Debug,
 }
 
-/// Where on the screen the bench loadgen draws its marker: `VOXL_DEBUG_MARKER=x,y`,
-/// at 300,150 when the value is not two whole numbers.
+/// Where on the screen the bench loadgen draws its marker: `VOXL_DEBUG_MARKER=x,y`, in
+/// whole pixels from the top left.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Marker {
     pub x: usize,
     pub y: usize,
 }
 
+impl Marker {
+    /// `x,y`: two whole numbers around one comma.
+    fn parse(at: &str) -> Option<Marker> {
+        let (x, y) = at.split_once(',')?;
+        Some(Marker {
+            x: x.parse().ok()?,
+            y: y.parse().ok()?,
+        })
+    }
+}
+
 impl Env {
     /// Reads every variable through `var`, which gives a variable's value if it is set:
-    /// `std::env::var_os` for voxl's own environment.
-    pub fn read(var: impl Fn(&str) -> Option<OsString>) -> Env {
+    /// `std::env::var_os` for voxl's own environment. A value voxl cannot take is refused,
+    /// with what it should be (see [`Debugging::read`]).
+    pub fn read(var: impl Fn(&str) -> Option<OsString>) -> Result<Env, String> {
         let text = |name: &str| var(name).and_then(|v| v.into_string().ok());
-        Env {
+        Ok(Env {
             log: Log {
                 filter: text("RUST_LOG").unwrap_or_else(|| "info".into()),
                 style: text("RUST_LOG_STYLE"),
             },
-            debug: Debugging::read(&var),
+            debug: Debugging::read(&var)?,
             #[cfg(target_os = "linux")]
             display: text("DISPLAY"),
             home: text("HOME").or_else(|| text("USERPROFILE")),
@@ -101,16 +113,28 @@ impl Env {
             password: text("VOXL_PASSWORD").or_else(|| text("SELKIES_BASIC_AUTH_PASSWORD")),
             tls_dir: crate::tls::tls_dir(&var),
             runtime_dir: text("XDG_RUNTIME_DIR"),
-        }
+        })
     }
 }
 
 impl Debugging {
-    /// Reads the debugging variables through `var`, as [`Env::read`] does.
-    pub fn read(var: impl Fn(&str) -> Option<OsString>) -> Debugging {
+    /// Reads the debugging variables through `var`, as [`Env::read`] does. A
+    /// `VOXL_DEBUG_MARKER` that is not `x,y` is refused: the marker would be looked for
+    /// where the loadgen did not draw it.
+    pub fn read(var: impl Fn(&str) -> Option<OsString>) -> Result<Debugging, String> {
+        let marker = var("VOXL_DEBUG_MARKER")
+            .map(|at| {
+                at.to_str().and_then(Marker::parse).ok_or_else(|| {
+                    format!(
+                        "VOXL_DEBUG_MARKER={at:?}: not where the bench loadgen's marker is, \
+                         x,y in whole pixels (its clients look at 300,150 unless told)"
+                    )
+                })
+            })
+            .transpose()?;
         let var = |name: &str| var(name).and_then(|v| v.into_string().ok());
         let set = |name| var(name).is_some();
-        Debugging {
+        Ok(Debugging {
             x264_log: match var("VOXL_X264_INFO").as_deref() {
                 None => X264Log::Warning,
                 Some("debug") => X264Log::Debug,
@@ -118,16 +142,110 @@ impl Debugging {
             },
             mb_info: !set("VOXL_NO_MBINFO"),
             direct_fb: !set("VOXL_NO_DIRECT_FB"),
-            marker: var("VOXL_DEBUG_MARKER").map(|at| {
-                let (x, y) = at
-                    .split_once(',')
-                    .and_then(|(x, y)| Some((x.parse().ok()?, y.parse().ok()?)))
-                    .unwrap_or((300, 150));
-                Marker { x, y }
-            }),
+            marker,
             damage: set("VOXL_DEBUG_DAMAGE"),
             corners: set("VOXL_DEBUG_CORNERS"),
             stripes: set("VOXL_DEBUG_STRIPES"),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `x,y` as its definition says it: an optional `+` and digits (how Rust reads a whole
+    /// number), a comma, the same again, and nothing else.
+    fn model(at: &str) -> Option<Marker> {
+        let whole = |t: &str| {
+            let digits = t.strip_prefix('+').unwrap_or(t);
+            (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| digits.parse().unwrap())
+        };
+        match at.split(',').collect::<Vec<_>>()[..] {
+            [x, y] => Some(Marker {
+                x: whole(x)?,
+                y: whole(y)?,
+            }),
+            _ => None,
         }
+    }
+
+    fn marker(at: Option<OsString>) -> Result<Option<Marker>, String> {
+        Debugging::read(|name| at.clone().filter(|_| name == "VOXL_DEBUG_MARKER")).map(|d| d.marker)
+    }
+
+    /// Every value of up to six characters from digits, signs, commas, a space and a
+    /// letter puts the marker where the model says, or is refused: none falls back to a
+    /// place nobody asked for.
+    #[test]
+    fn a_marker_is_where_it_says_or_refused() {
+        const CHARS: [char; 7] = ['0', '7', '+', '-', ',', ' ', 'x'];
+        let mut values = vec![String::new()];
+        for _ in 0..6 {
+            let longer: Vec<String> = values
+                .iter()
+                .filter(|v| v.len() == values.last().unwrap().len())
+                .flat_map(|v| CHARS.map(|c| format!("{v}{c}")))
+                .collect();
+            values.extend(longer);
+        }
+        assert_eq!(values.len(), (7usize.pow(7) - 1) / 6);
+        for at in &values {
+            match (marker(Some(at.into())), model(at)) {
+                (Ok(Some(m)), Some(want)) => assert_eq!(m, want, "{at:?}"),
+                (Err(e), None) => assert!(e.starts_with("VOXL_DEBUG_MARKER="), "{e}"),
+                (read, want) => panic!("{at:?}: read {read:?}, model {want:?}"),
+            }
+        }
+        assert_eq!(marker(None), Ok(None));
+    }
+
+    /// Any place on any screen is read back as it was written, up to the largest whole
+    /// number, and one past it is refused.
+    #[test]
+    fn a_marker_is_read_back() {
+        let mut state = 0u64;
+        for _ in 0..10_000 {
+            // splitmix64, each coordinate cut to a random number of bits
+            let mut next = || {
+                state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                (z >> (z % 64)) as usize
+            };
+            let (x, y) = (next(), next());
+            assert_eq!(
+                marker(Some(format!("{x},{y}").into())),
+                Ok(Some(Marker { x, y }))
+            );
+        }
+        let max = usize::MAX;
+        assert_eq!(
+            marker(Some(format!("{max},{max}").into())),
+            Ok(Some(Marker { x: max, y: max }))
+        );
+        assert!(marker(Some(format!("{max}0,1").into())).is_err());
+        assert!(marker(Some(format!("1,{max}0").into())).is_err());
+    }
+
+    /// A value that is not Unicode is refused, not taken as unset.
+    #[test]
+    fn a_marker_that_is_not_text_is_refused() {
+        #[cfg(unix)]
+        let at = {
+            use std::os::unix::ffi::OsStringExt;
+            OsString::from_vec(b"300,150\xff".to_vec())
+        };
+        #[cfg(windows)]
+        let at = {
+            use std::os::windows::ffi::OsStringExt;
+            let mut wide: Vec<u16> = "300,150".encode_utf16().collect();
+            wide.push(0xd800);
+            OsString::from_wide(&wide)
+        };
+        assert!(marker(Some(at)).is_err());
     }
 }

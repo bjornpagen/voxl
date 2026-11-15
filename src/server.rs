@@ -700,7 +700,7 @@ mod tests {
             index: Bytes::new(),
             favicon: Bytes::new(),
             favicon_type: "image/x-icon",
-            debug: crate::env::Debugging::read(|_| None),
+            debug: crate::env::Debugging::read(|_| None).unwrap(),
         };
         let (tx, _rx) = mpsc::unbounded_channel();
         let client = hub.add_client(tx);
@@ -759,7 +759,7 @@ mod tests {
             index: Bytes::new(),
             favicon: Bytes::new(),
             favicon_type: "image/x-icon",
-            debug: crate::env::Debugging::read(|_| None),
+            debug: crate::env::Debugging::read(|_| None).unwrap(),
         };
         let (tx, _rx) = mpsc::unbounded_channel();
         let client = hub.add_client(tx);
@@ -798,7 +798,7 @@ mod tests {
             index: Bytes::new(),
             favicon: Bytes::new(),
             favicon_type: "image/x-icon",
-            debug: crate::env::Debugging::read(|_| None),
+            debug: crate::env::Debugging::read(|_| None).unwrap(),
         };
         let (tx, _rx) = mpsc::unbounded_channel();
         let client = hub.add_client(tx);
