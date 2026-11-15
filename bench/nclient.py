@@ -35,7 +35,6 @@ async def main():
     seen_per_sec, lat, cur, last = [], [], set(), None
     dec_ms, nbytes, nframes = [], 0, 0
     rlat = []
-    netlat = []
     dps, dcount, dsec0, last_hash = [], 0, None, None
     t_start = None
     async with websockets.connect(url, max_size=None, compression=None) as ws:
@@ -62,7 +61,6 @@ async def main():
                 fid = int.from_bytes(msg[2:4], 'big'); payload = msg[12:]  # past the 12-byte header
             nbytes += len(msg)
             trecv = time.time()
-            if mode == 'voxl' and os.environ.get('NETLAT'): netlat.append((int(trecv*1000) & 0xffffffff) - int.from_bytes(msg[6:10], 'big'))
             td = time.perf_counter()
             if os.environ.get('DUMP'): open(os.environ['DUMP'], 'ab').write(payload)
             frames = ctx.decode(av.Packet(payload))
@@ -106,6 +104,6 @@ async def main():
     el = time.time() - t_start if t_start else 1
     print(json.dumps({"mode": mode, "uniqueFps": {"avg": round(sum(s) / max(len(s), 1), 1), "min": q(s, 0), "p10": q(s, .1), "med": q(s, .5)},
         "latencyMs": {"p50": q(l, .5), "p90": q(l, .9), "p99": q(l, .99), "max": q(l, 1)}, "decodeMs": {"p50": q(d, .5), "p99": q(d, .99)},
-        "recvLatMs": {"p50": q(sorted(rlat), .5), "p90": q(sorted(rlat), .9)}, "netLat": {"p50": q(sorted(netlat), .5), "p90": q(sorted(netlat), .9)}, "distinctFps": {"avg": round(sum(dps)/max(len(dps),1),1), "min": q(sorted(dps),0), "p10": q(sorted(dps),.1), "med": q(sorted(dps),.5)}, "mbps": round(nbytes * 8 / el / 1e6, 2)}))
+        "recvLatMs": {"p50": q(sorted(rlat), .5), "p90": q(sorted(rlat), .9)}, "distinctFps": {"avg": round(sum(dps)/max(len(dps),1),1), "min": q(sorted(dps),0), "p10": q(sorted(dps),.1), "med": q(sorted(dps),.5)}, "mbps": round(nbytes * 8 / el / 1e6, 2)}))
 
 asyncio.run(main())

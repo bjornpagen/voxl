@@ -1329,14 +1329,7 @@ fn encode_loop(
         }
         frame_id = frame_id.wrapping_add(1);
         // Server-side pipeline latency (capture -> sent) in 1/10 ms, for client stats.
-        let mut pipe = (job.captured_at.elapsed().as_micros() / 100).min(u32::MAX as u128) as u32;
-        if job.marker_ms.is_some() {
-            // Debug: wall-clock send time instead of pipeline latency.
-            pipe = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u32;
-        }
+        let pipe = (job.captured_at.elapsed().as_micros() / 100).min(u32::MAX as u128) as u32;
         let nparts = parts.len() as u8;
         let msgs: Vec<Bytes> = parts
             .into_iter()
