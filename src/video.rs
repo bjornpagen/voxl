@@ -1496,7 +1496,7 @@ fn encode_loop(
                 continue;
             }
             {
-                let mut q = c.inflight.lock();
+                let mut q = c.inflight();
                 if q.len() > HOPELESSLY_BEHIND {
                     log::warn!("client {} hopelessly behind; dropping", c.id);
                     drop(q);

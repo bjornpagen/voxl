@@ -188,12 +188,26 @@ enum Viewer {
     Started,
 }
 
+/// What asking for a keyframe makes of a viewer: one that watches waits for one.
+fn asked(viewer: Viewer) -> Viewer {
+    match viewer {
+        Viewer::NotWatching => Viewer::NotWatching,
+        Viewer::Waiting | Viewer::Promised | Viewer::Started => Viewer::Waiting,
+    }
+}
+
+/// What a client is to the stream, and the frames sent to it and not yet acked: under one
+/// lock, so that every change to the two is one step.
+struct Viewing {
+    viewer: Viewer,
+    inflight: VecDeque<Inflight>,
+}
+
 pub struct Client {
     pub id: u64,
     pub tx: mpsc::UnboundedSender<Out>,
-    viewer: Mutex<Viewer>,
+    viewing: Mutex<Viewing>,
     pub audio: AtomicBool,
-    pub inflight: Mutex<VecDeque<Inflight>>,
     /// Smoothed min RTT (ms), from pings.
     pub min_rtt_ms: AtomicU32,
     /// The pings sent to it that it has not answered.
@@ -210,9 +224,15 @@ impl Client {
         let _ = self.tx.send(m);
     }
 
+    /// The frames sent to it and not yet acked, under the lock that also holds what it is
+    /// to the stream.
+    pub fn inflight(&self) -> parking_lot::MappedMutexGuard<'_, VecDeque<Inflight>> {
+        parking_lot::MutexGuard::map(self.viewing.lock(), |v| &mut v.inflight)
+    }
+
     /// Whether it watches: whether it is sent video once it has started.
     pub fn watching(&self) -> bool {
-        match *self.viewer.lock() {
+        match self.viewing.lock().viewer {
             Viewer::NotWatching => false,
             Viewer::Waiting | Viewer::Promised | Viewer::Started => true,
         }
@@ -220,7 +240,7 @@ impl Client {
 
     /// Whether it waits for a keyframe that has not been planned.
     pub fn wants_keyframe(&self) -> bool {
-        match *self.viewer.lock() {
+        match self.viewing.lock().viewer {
             Viewer::Waiting => true,
             Viewer::NotWatching | Viewer::Promised | Viewer::Started => false,
         }
@@ -228,7 +248,7 @@ impl Client {
 
     /// Whether it is sent every frame.
     pub fn started(&self) -> bool {
-        match *self.viewer.lock() {
+        match self.viewing.lock().viewer {
             Viewer::Started => true,
             Viewer::NotWatching | Viewer::Waiting | Viewer::Promised => false,
         }
@@ -237,39 +257,38 @@ impl Client {
     /// It starts watching (`v,1`, or a recording begins): it waits for a keyframe, and acks
     /// for frames sent before no longer apply.
     pub fn watch(&self) {
-        *self.viewer.lock() = Viewer::Waiting;
-        self.inflight.lock().clear();
+        let mut v = self.viewing.lock();
+        v.viewer = Viewer::Waiting;
+        v.inflight.clear();
     }
 
     /// It stops watching (`v,0`).
     pub fn stop_watching(&self) {
-        *self.viewer.lock() = Viewer::NotWatching;
+        self.viewing.lock().viewer = Viewer::NotWatching;
     }
 
     /// It asks for a keyframe (`kf`, or a hello after a failed display switch): if it
     /// watches, it waits for one.
     pub fn ask_keyframe(&self) {
-        let mut v = self.viewer.lock();
-        *v = match *v {
-            Viewer::NotWatching => Viewer::NotWatching,
-            Viewer::Waiting | Viewer::Promised | Viewer::Started => Viewer::Waiting,
-        };
+        let mut v = self.viewing.lock();
+        v.viewer = asked(v.viewer);
     }
 
     /// The stream starts over for it (it is rebuilt, or the client stalled): if it watches,
     /// it waits for a keyframe; acks for frames sent before no longer apply.
     pub fn start_over(&self) {
-        self.ask_keyframe();
-        self.inflight.lock().clear();
+        let mut v = self.viewing.lock();
+        v.viewer = asked(v.viewer);
+        v.inflight.clear();
     }
 
     /// The capture loop planned a keyframe: one waiting for one is promised it. Whether it
     /// was, and so whether that keyframe starts it.
     pub fn keyframe_planned(&self) -> bool {
-        let mut v = self.viewer.lock();
-        match *v {
+        let mut v = self.viewing.lock();
+        match v.viewer {
             Viewer::Waiting => {
-                *v = Viewer::Promised;
+                v.viewer = Viewer::Promised;
                 true
             }
             Viewer::NotWatching | Viewer::Promised | Viewer::Started => false,
@@ -281,13 +300,13 @@ impl Client {
     /// longer apply; one that is not leaves it waiting for another. A client that has since
     /// stopped watching, asked again or started over is what that made it.
     pub fn keyframe_sent(&self, whole: bool) {
-        let mut v = self.viewer.lock();
-        match (*v, whole) {
+        let mut v = self.viewing.lock();
+        match (v.viewer, whole) {
             (Viewer::Promised, true) => {
-                *v = Viewer::Started;
-                self.inflight.lock().clear();
+                v.viewer = Viewer::Started;
+                v.inflight.clear();
             }
-            (Viewer::Promised, false) => *v = Viewer::Waiting,
+            (Viewer::Promised, false) => v.viewer = Viewer::Waiting,
             (Viewer::NotWatching | Viewer::Waiting | Viewer::Started, _) => {}
         }
     }
@@ -296,7 +315,7 @@ impl Client {
     /// client held of the delay is its own time, not the path's, so the delay sample
     /// ends that much earlier.
     pub fn on_ack(&self, now: Instant, id: u32, hold: Hold) {
-        let mut q = self.inflight.lock();
+        let mut q = self.inflight();
         let mut sample = None;
         while let Some(f) = q.front() {
             if wrapping_le(f.id, id) {
@@ -327,7 +346,7 @@ impl Client {
 
     /// Delay queued on the path to this client now (ms).
     pub fn queue_ms(&self) -> f64 {
-        let idle = self.inflight.lock().is_empty();
+        let idle = self.inflight().is_empty();
         self.path.lock().queue_ms(Instant::now(), idle)
     }
 
@@ -346,7 +365,7 @@ impl Client {
 
     /// Frames in flight and age of the oldest unacknowledged one.
     pub fn backlog(&self) -> (usize, u128) {
-        let q = self.inflight.lock();
+        let q = self.inflight();
         (
             q.len(),
             q.front().map(|f| f.sent.elapsed().as_millis()).unwrap_or(0),
@@ -561,9 +580,11 @@ impl Hub {
         let c = Arc::new(Client {
             id: self.next_id.fetch_add(1, Ordering::Relaxed),
             tx,
-            viewer: Mutex::new(Viewer::NotWatching),
+            viewing: Mutex::new(Viewing {
+                viewer: Viewer::NotWatching,
+                inflight: VecDeque::new(),
+            }),
             audio: AtomicBool::new(false),
-            inflight: Mutex::new(VecDeque::new()),
             min_rtt_ms: AtomicU32::new(0),
             pings: Mutex::new(Pings::default()),
             path: Mutex::new(crate::path::PathEst::new(Instant::now())),
@@ -818,9 +839,9 @@ mod tests {
             m.c.iter()
                 .map(|&(viewer, inflight)| {
                     let c = hub.add_client(mpsc::unbounded_channel().0);
-                    *c.viewer.lock() = viewer;
+                    c.viewing.lock().viewer = viewer;
                     for id in 1..=inflight as u32 {
-                        c.inflight.lock().push_back(Inflight {
+                        c.inflight().push_back(Inflight {
                             id,
                             sent: t0,
                             bytes: 1000,
@@ -868,8 +889,8 @@ mod tests {
                 }
                 for v in hub.video_clients() {
                     if v.started() {
-                        let id = v.inflight.lock().back().map_or(1, |f| f.id + 1);
-                        v.inflight.lock().push_back(Inflight {
+                        let id = v.inflight().back().map_or(1, |f| f.id + 1);
+                        v.inflight().push_back(Inflight {
                             id,
                             sent: t0,
                             bytes: 1000,
@@ -880,13 +901,16 @@ mod tests {
                 }
             }
             Step::Ack(i) => {
-                let last = c[i].inflight.lock().back().map(|f| f.id);
+                let last = c[i].inflight().back().map(|f| f.id);
                 if let Some(id) = last {
                     c[i].on_ack(t0 + Duration::from_millis(50), id, Hold::Unsaid);
                 }
             }
         }
-        after.c = [0, 1].map(|i| (*c[i].viewer.lock(), c[i].inflight.lock().len()));
+        after.c = [0, 1].map(|i| {
+            let v = c[i].viewing.lock();
+            (v.viewer, v.inflight.len())
+        });
         after.fresh = rule(m, step).2.fresh;
         let read = [0, 1].map(|i| {
             let c = &c[i];
@@ -1008,7 +1032,7 @@ mod tests {
         hold: Hold,
     ) {
         let sent = t0 + Duration::from_millis(id as u64 * 100);
-        c.inflight.lock().push_back(Inflight {
+        c.inflight().push_back(Inflight {
             id,
             sent,
             bytes,
