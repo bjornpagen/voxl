@@ -2454,4 +2454,90 @@ mod tests {
             assert_eq!(Header::read(&message), Some(header), "{}", c.header);
         }
     }
+
+    /// A viewer that joins while the stream is rebuilt (a resize, a display switch)
+    /// starts on the rebuilt stream. The recorder needs it: it ends a recording at a
+    /// hello once it holds a frame, so a frame of the old stream ahead of the rebuilt
+    /// stream's hello is a recording of one frame, whatever length was asked for.
+    /// Steps, the loops' own: a page joins and the capture loop plans its keyframe and
+    /// clears its request; a resize ends the capture loop, and `encode.join` lets the
+    /// real encode loop send that last job while a recording has just joined; then
+    /// `build`'s `restart_clients` says hello.
+    #[test]
+    #[ignore = "fails until a not-started viewer starts only on a keyframe planned for it"]
+    fn a_viewer_that_joins_while_the_stream_is_rebuilt_starts_on_the_rebuilt_stream() {
+        let hub = Hub::new();
+        let watch = || {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let c = hub.add_client(tx);
+            c.video.store(true, Ordering::Relaxed);
+            (c, rx)
+        };
+        let (w, h) = (64, 64);
+        let ecfg = EncoderConfig {
+            pictures: Pictures {
+                width: w as u32,
+                height: h as u32,
+                fps: 60,
+                preset: Preset::parse("ultrafast").unwrap(),
+                threads: 1,
+                debug: Debugging::read(|_| None).unwrap(),
+            },
+            crf: 23.0,
+            max_kbps: None,
+        };
+        let stripe = Stripe {
+            y: 0,
+            h,
+            enc: Encoder::new(&ecfg).unwrap(),
+            applied_kbps: 0,
+            applied_crf: -1.0,
+        };
+        let (job_tx, job_rx) = mpsc::sync_channel::<Job>(1);
+        let (ret_tx, _ret_rx) = mpsc::channel::<Returned>();
+        let encode = std::thread::spawn({
+            let hub = hub.clone();
+            move || {
+                encode_loop(
+                    vec![stripe],
+                    job_rx,
+                    ret_tx,
+                    hub,
+                    60,
+                    Crfs {
+                        configured: 23.0,
+                        paintover: 18.0,
+                    },
+                    Debugging::read(|_| None).unwrap(),
+                )
+            }
+        });
+        // A page joins; the capture loop plans its keyframe and clears its request.
+        let (_page, _page_rx) = watch();
+        for c in hub.video_clients() {
+            c.needs_keyframe.store(false, Ordering::Relaxed);
+        }
+        let key = Job {
+            buf: Box::new(I420::new(w, h)),
+            idx: 0,
+            frame: super::Frame::Key { blocks: None },
+            target: Kbps::new(8000.0),
+            capacity: Capacity::Unknown,
+            captured_at: Instant::now(),
+            marker_ms: None,
+        };
+        // A resize ends the capture loop, and a recording joins, before the encode loop
+        // has coded that keyframe: it reads the viewers once the frame is coded.
+        let (_recording, mut recording_rx) = watch();
+        job_tx.send(key).unwrap();
+        drop(job_tx);
+        encode.join().unwrap();
+        // build(): the rebuilt stream's hello.
+        hub.restart_clients();
+        assert!(
+            matches!(recording_rx.try_recv().unwrap(), Out::Text(_)),
+            "the recording held a frame of the old stream before the rebuilt stream's \
+             hello, and ends there"
+        );
+    }
 }
