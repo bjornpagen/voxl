@@ -12,7 +12,7 @@
 
 use crate::hub::{Client, Hub, Out, ServerMessage};
 use crate::mp4;
-use crate::video::Header;
+use crate::video::{Header, NotVideo, Video};
 use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -176,8 +176,11 @@ async fn collect(
             m = rx.recv() => match m {
                 None => break,
                 Some(Out::Bin(b)) => {
-                    let Some(h) = Header::read(&b) else {
-                        continue;
+                    let h = match Header::read(&b) {
+                        Ok(Video::Stripe(h, _)) => h,
+                        // Not a picture: the stream sends no empty stripe, and the rest
+                        // is for the viewers.
+                        Ok(Video::Empty(_)) | Err(NotVideo::Other | NotVideo::Short) => continue,
                     };
                     // Acknowledge at once, so the recorder never holds the stream back.
                     client.on_ack(Instant::now(), h.frame, crate::hub::Hold::Unsaid);

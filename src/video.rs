@@ -96,24 +96,47 @@ impl Header {
         b
     }
 
-    /// A video message's header. None for any other message, and for one with nothing
-    /// after its header: the encode loop sends no stripe that coded nothing.
-    pub fn read(m: &[u8]) -> Option<Header> {
-        if m.len() <= Header::LEN || m[0] != Header::VIDEO {
-            return None;
+    /// What message `m` is to a reader of video.
+    pub fn read(m: &[u8]) -> Result<Video<'_>, NotVideo> {
+        match m.split_first_chunk::<{ Header::LEN }>() {
+            _ if m.first() != Some(&Header::VIDEO) => Err(NotVideo::Other),
+            None => Err(NotVideo::Short),
+            Some((b, [])) => Ok(Video::Empty(Header::of(b))),
+            Some((b, picture)) => Ok(Video::Stripe(Header::of(b), picture)),
         }
-        let u32_at = |i: usize| u32::from_be_bytes([m[i], m[i + 1], m[i + 2], m[i + 3]]);
-        Some(Header {
-            key: m[1] & Header::KEY != 0,
-            sharpens: m[1] & Header::SHARPENS != 0,
+    }
+
+    fn of(b: &[u8; Header::LEN]) -> Header {
+        let u32_at = |i: usize| u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+        Header {
+            key: b[1] & Header::KEY != 0,
+            sharpens: b[1] & Header::SHARPENS != 0,
             frame: u32_at(2),
             pipe: Pipe(u32_at(6)),
-            stripe: m[10],
-            stripes: m[11],
-            parts: m[12],
-            y: u16::from_be_bytes([m[14], m[15]]),
-        })
+            stripe: b[10],
+            stripes: b[11],
+            parts: b[12],
+            y: u16::from_be_bytes([b[14], b[15]]),
+        }
     }
+}
+
+/// A video message, read.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Video<'a> {
+    /// A stripe's header, and its H.264 after it.
+    Stripe(Header, &'a [u8]),
+    /// A header with nothing after it. The encode loop sends no stripe that coded nothing.
+    Empty(Header),
+}
+
+/// A message that is not a video message.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NotVideo {
+    /// Another kind: its first byte is not video's type byte, or it has no byte at all.
+    Other,
+    /// Video's type byte, and fewer bytes than a header.
+    Short,
 }
 
 struct Job {
@@ -1421,7 +1444,10 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
 
 /// The number of the frame a video message is part of; None for any other message.
 pub fn frame_of(m: &[u8]) -> Option<u32> {
-    Header::read(m).map(|header| header.frame)
+    match Header::read(m) {
+        Ok(Video::Stripe(header, _) | Video::Empty(header)) => Some(header.frame),
+        Err(NotVideo::Other | NotVideo::Short) => None,
+    }
 }
 
 /// Split the screen into horizontal stripes, each an independent H.264 stream.
@@ -4431,25 +4457,25 @@ mod tests {
             let header = random_header(&mut rng);
             let picture: Vec<u8> = (0..1 + rng.next() % 64).map(|_| rng.next() as u8).collect();
             let message = [&header.bytes()[..], &picture].concat();
-            assert_eq!(Header::read(&message), Some(header));
-            assert_eq!(&message[Header::LEN..], &picture[..]);
+            assert_eq!(Header::read(&message), Ok(Video::Stripe(header, &picture)));
         }
     }
 
     #[test]
-    fn only_a_video_message_with_a_picture_has_a_header() {
+    fn a_header_alone_is_empty_less_is_short_and_another_type_is_not_video() {
         let mut rng = Rng(0x2545_f491_4f6c_dd1d);
         for _ in 0..100_000 {
-            let header = random_header(&mut rng).bytes();
-            // Its header alone, or any part of it.
-            let cut = (rng.next() % (Header::LEN as u64 + 1)) as usize;
-            assert_eq!(Header::read(&header[..cut]), None);
-            // Another message's type byte, with anything after it.
+            let header = random_header(&mut rng);
+            let bytes = header.bytes();
+            assert_eq!(Header::read(&bytes), Ok(Video::Empty(header)));
+            let cut = 1 + (rng.next() % (Header::LEN as u64 - 1)) as usize;
+            assert_eq!(Header::read(&bytes[..cut]), Err(NotVideo::Short));
+            // Another message's type byte, or no byte, with anything after it.
             let mut other: Vec<u8> = (0..rng.next() % 64).map(|_| rng.next() as u8).collect();
             if other.first() == Some(&Header::VIDEO) {
                 other[0] = Header::VIDEO.wrapping_add(1 + (rng.next() % 255) as u8);
             }
-            assert_eq!(Header::read(&other), None);
+            assert_eq!(Header::read(&other), Err(NotVideo::Other));
         }
     }
 
@@ -4467,6 +4493,45 @@ mod tests {
             }
             let ms = Pipe(p).millis();
             assert!(ms * 10 <= p as u64 && p as u64 <= ms * 10 + 9);
+        }
+    }
+
+    /// The oracle: `Header::read` before it said what it found.
+    fn old_read(m: &[u8]) -> Option<Header> {
+        if m.len() <= Header::LEN || m[0] != Header::VIDEO {
+            return None;
+        }
+        let u32_at = |i: usize| u32::from_be_bytes([m[i], m[i + 1], m[i + 2], m[i + 3]]);
+        Some(Header {
+            key: m[1] & Header::KEY != 0,
+            sharpens: m[1] & Header::SHARPENS != 0,
+            frame: u32_at(2),
+            pipe: Pipe(u32_at(6)),
+            stripe: m[10],
+            stripes: m[11],
+            parts: m[12],
+            y: u16::from_be_bytes([m[14], m[15]]),
+        })
+    }
+
+    #[test]
+    fn a_stripe_is_what_the_old_reader_read_and_nothing_else_is() {
+        let mut rng = Rng(0xd1b5_4a32_d192_ed03);
+        for _ in 0..200_000 {
+            let mut m: Vec<u8> = (0..rng.next() % 40).map(|_| rng.next() as u8).collect();
+            if rng.next() & 1 == 1 {
+                if let Some(t) = m.first_mut() {
+                    *t = Header::VIDEO;
+                }
+            }
+            let stripe = match Header::read(&m) {
+                Ok(Video::Stripe(h, picture)) => {
+                    assert_eq!(picture, &m[Header::LEN..]);
+                    Some(h)
+                }
+                Ok(Video::Empty(_)) | Err(NotVideo::Other | NotVideo::Short) => None,
+            };
+            assert_eq!(stripe, old_read(&m));
         }
     }
 
@@ -4511,8 +4576,14 @@ mod tests {
                 y: c.y,
             };
             assert_eq!(header.bytes().to_vec(), hex(&c.header), "{}", c.header);
-            let message = [hex(&c.header), hex(&c.picture)].concat();
-            assert_eq!(Header::read(&message), Some(header), "{}", c.header);
+            let (bytes, picture) = (hex(&c.header), hex(&c.picture));
+            let message = [&bytes[..], &picture].concat();
+            assert_eq!(
+                Header::read(&message),
+                Ok(Video::Stripe(header, &picture)),
+                "{}",
+                c.header
+            );
         }
     }
 
