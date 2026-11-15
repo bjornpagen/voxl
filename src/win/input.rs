@@ -5,6 +5,7 @@
 //! key carries its scan code too, for apps that read those. Scrolling is high
 //! resolution.
 
+use crate::event::{InputEvent, KeyAct};
 use std::collections::HashMap;
 use std::sync::mpsc;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
@@ -12,41 +13,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetSystemMetrics, GetWindowThreadProcessId, SM_CXVIRTUALSCREEN,
     SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WHEEL_DELTA,
 };
-
-/// What a viewer's key did. Its own keyboard decides when a held key repeats.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum KeyAct {
-    Down,
-    /// The viewer's keyboard repeated the key it holds.
-    Repeat,
-    Up,
-}
-
-pub enum InputEvent {
-    /// A desktop pixel, in 16 bits as X's coordinates are; a LONG holds every one.
-    Move {
-        x: i16,
-        y: i16,
-    },
-    Button {
-        button: crate::server::Button,
-        down: bool,
-    },
-    /// Precise scroll in desktop pixels (trackpads, smooth wheels).
-    ScrollPx {
-        dx: f64,
-        dy: f64,
-    },
-    Key {
-        keysym: u32,
-        act: KeyAct,
-    },
-    /// Remote clipboard update, ordered with the key events around it.
-    Clipboard(super::desktop::ClipContent),
-    ReleaseAll,
-    /// Release everything before exit.
-    Shutdown,
-}
 
 /// Modifier keysyms -> virtual key.
 fn modifier(keysym: u32) -> Option<VIRTUAL_KEY> {
@@ -332,8 +298,8 @@ impl Injector {
                 // Desktop pixels -> wheel units (120 per notch); apps that support
                 // high-resolution wheels scroll by fractions of a notch.
                 let k = WHEEL_DELTA as f64 / self.px_per_notch.max(1.0);
-                self.scroll_acc.0 += dx * k;
-                self.scroll_acc.1 -= dy * k;
+                self.scroll_acc.0 += dx.get() * k;
+                self.scroll_acc.1 -= dy.get() * k;
                 let (x, y) = (self.scroll_acc.0.trunc(), self.scroll_acc.1.trunc());
                 self.scroll_acc.0 -= x;
                 self.scroll_acc.1 -= y;

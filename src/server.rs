@@ -1,7 +1,7 @@
 //! HTTP + WebSocket front end. Serves the embedded web client and the media/input socket.
 
+use crate::event::{InputEvent, KeyAct};
 use crate::hub::{Client, Hub, Out};
-use crate::input::{InputEvent, KeyAct};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::header;
@@ -369,12 +369,16 @@ const MAX_SCROLL_PX: f64 = 1_048_576.0;
 /// as a finite distance past the bound does once scaled, and every pixel scroll after it
 /// moves nothing.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Pixels(f64);
+pub struct Pixels(f64);
 
 impl Pixels {
     fn parse(field: &str) -> Option<Pixels> {
         let px: f64 = field.trim().parse().ok()?;
         (px.abs() <= MAX_SCROLL_PX).then_some(Pixels(px))
+    }
+
+    pub fn get(self) -> f64 {
+        self.0
     }
 }
 
@@ -544,7 +548,7 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
         }
         Command::Move { x, y } => input(InputEvent::Move { x, y }),
         Command::Button { button, down } => input(InputEvent::Button { button, down }),
-        Command::ScrollPx { dx, dy } => input(InputEvent::ScrollPx { dx: dx.0, dy: dy.0 }),
+        Command::ScrollPx { dx, dy } => input(InputEvent::ScrollPx { dx, dy }),
         Command::Key { keysym, act } => input(InputEvent::Key { keysym, act }),
         Command::ReleaseAll => input(InputEvent::ReleaseAll),
         Command::Clipboard(text) => input(InputEvent::Clipboard(

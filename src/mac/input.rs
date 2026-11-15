@@ -4,46 +4,10 @@
 //! can't type are sent as Unicode text. Scrolling is pixel-precise.
 
 use super::ffi::*;
+use crate::event::{InputEvent, KeyAct};
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
-
-/// What a viewer's key did. Its own keyboard decides when a held key repeats.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum KeyAct {
-    Down,
-    /// The viewer's keyboard repeated the key it holds.
-    Repeat,
-    Up,
-}
-
-pub enum InputEvent {
-    /// A desktop pixel, in 16 bits as X's coordinates are; a CGFloat holds every one.
-    Move {
-        x: i16,
-        y: i16,
-    },
-    Button {
-        button: crate::server::Button,
-        down: bool,
-    },
-    /// Precise scroll in desktop pixels (trackpads, smooth wheels).
-    ScrollPx {
-        dx: f64,
-        dy: f64,
-    },
-    Key {
-        keysym: u32,
-        act: KeyAct,
-    },
-    /// Remote clipboard update, ordered with the key events around it.
-    Clipboard(super::desktop::ClipContent),
-    ReleaseAll,
-    /// Finish queued input on its original geometry before selecting another display.
-    DisplayBarrier(mpsc::Sender<()>),
-    /// Release everything before exit.
-    Shutdown,
-}
 
 /// Modifier keysyms: virtual key, flag, and the device bit for its side.
 fn modifier(keysym: u32) -> Option<(u16, u64)> {
@@ -298,8 +262,8 @@ impl Injector {
                     .lock()
                     .map(|g| 1.0 / g.scale())
                     .unwrap_or(1.0);
-                self.scroll_acc.0 -= dx * k;
-                self.scroll_acc.1 -= dy * k;
+                self.scroll_acc.0 -= dx.get() * k;
+                self.scroll_acc.1 -= dy.get() * k;
                 let (x, y) = (self.scroll_acc.0.trunc(), self.scroll_acc.1.trunc());
                 if x == 0.0 && y == 0.0 {
                     return;
