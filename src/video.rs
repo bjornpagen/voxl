@@ -1588,40 +1588,11 @@ fn marker_age(ms: u32) -> i64 {
 mod tests {
     use super::*;
 
-    /// The marker's reading as it was written before it was an `Option`: -1 for none.
-    fn old_marker_ms(bgrx: Option<(&[u8], usize)>, marker: Option<Marker>) -> i64 {
-        match (bgrx, marker) {
-            (Some((px, stride)), Some(at)) => old_marker_probe(px, stride, at, "grab"),
-            _ => -1,
-        }
-    }
-
-    fn old_marker_probe(buf: &[u8], stride: usize, at: Marker, what: &str) -> i64 {
-        let mut v: u64 = 0;
-        for b in 0..40 {
-            let x = at.x + (b % 20) * 24 + 12;
-            let y = at.y + (b / 20) * 24 + 12;
-            let i = y * stride + x * 4;
-            if buf[i + 2] > 128 {
-                v |= 1 << b;
-            }
-        }
-        let ms = (v & 0xffffff) as i64;
-        let now = (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64)
-            & 0xffffff;
-        log::info!("marker {} frame {} age {} ms", what, v >> 24, now - ms);
-        ms
-    }
-
-    /// A capture's marker reading is what it was when -1 meant none: the encode loop's
-    /// `>= 0` and `is_some()` agree, and so do the times it logs. Screens are drawn at
-    /// random (a fixed seed) with a marker painted on them, its time sometimes 0 and
-    /// sometimes the largest it can be, with and without the pixels and the variable.
+    /// A capture's marker reading is the time painted on it, and none without the pixels or
+    /// the variable. Screens are drawn at random (a fixed seed) with a marker painted on
+    /// them, its time sometimes 0 and sometimes the largest it can be.
     #[test]
-    fn a_marker_reading_is_what_it_was() {
+    fn a_marker_reading_is_the_time_painted() {
         let mut state = 0u64;
         let mut next = || {
             // splitmix64
@@ -1659,10 +1630,8 @@ mod tests {
                 (Some((&buf[..], stride)), None),
                 (None, None),
             ] {
-                let new = marker_reading(bgrx, marker);
-                assert_eq!(new.map_or(-1, i64::from), old_marker_ms(bgrx, marker));
                 assert_eq!(
-                    new,
+                    marker_reading(bgrx, marker),
                     bgrx.and(marker).map(|_| (painted & 0xff_ffff) as u32),
                     "{at:?} {painted:#x}"
                 );
