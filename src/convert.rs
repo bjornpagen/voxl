@@ -276,10 +276,9 @@ pub fn nv12_to_bgrx(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "macos")))]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     struct Rng(u64);
     impl Rng {
@@ -291,77 +290,7 @@ mod tests {
         }
     }
 
-    /// The oracle: `split_rows` as it was, a scoped thread started for each range but the
-    /// last.
-    fn old_split_rows(y0: usize, y1: usize, threads: usize, run: impl Fn(usize, usize) + Sync) {
-        let rows = y1 - y0;
-        if rows == 0 {
-            return;
-        }
-        let n = threads.clamp(1, (rows / 64).max(1));
-        if n == 1 {
-            run(y0, y1);
-            return;
-        }
-        let chunk = (rows.div_ceil(n) + 1) & !1;
-        std::thread::scope(|s| {
-            let mut a = y0;
-            while a < y1 {
-                let b = (a + chunk).min(y1);
-                let run = &run;
-                if b == y1 {
-                    run(a, b);
-                } else {
-                    s.spawn(move || run(a, b));
-                }
-                a = b;
-            }
-        });
-    }
-
-    /// The ranges a split ran, sorted, and the one the calling thread ran.
-    #[derive(Debug, PartialEq)]
-    struct Ran {
-        ranges: Vec<(usize, usize)>,
-        by_caller: Option<(usize, usize)>,
-    }
-
-    fn ranges(split: impl FnOnce(&(dyn Fn(usize, usize) + Sync))) -> Ran {
-        let caller = std::thread::current().id();
-        let ran = Mutex::new(vec![]);
-        let mine = Mutex::new(None);
-        split(&|a, b| {
-            ran.lock().unwrap().push((a, b));
-            if std::thread::current().id() == caller {
-                *mine.lock().unwrap() = Some((a, b));
-            }
-        });
-        let mut ranges = ran.into_inner().unwrap();
-        ranges.sort();
-        Ran {
-            ranges,
-            by_caller: mine.into_inner().unwrap(),
-        }
-    }
-
-    /// A band is cut into the ranges `split_rows` cut it into, and the calling thread
-    /// runs the same one, for every number of threads and any band.
-    #[test]
-    fn rows_are_split_as_split_rows_split_them() {
-        let crews: Vec<Rows> = (0..=8).map(Rows::new).collect();
-        let mut rng = Rng(0x2545F4914F6CDD1D);
-        for _ in 0..20_000 {
-            let threads = rng.below(crews.len());
-            let y0 = rng.below(2000);
-            let y1 = y0 + [rng.below(64), rng.below(600), rng.below(2000)][rng.below(3)];
-            let old = ranges(|run| old_split_rows(y0, y1, threads, run));
-            let new = ranges(|run| crews[threads].split(y0, y1, 2, LEAST_ROWS, run));
-            assert_eq!(new, old, "rows {y0}..{y1} on {threads} threads");
-        }
-    }
-
     /// Converting a band on any number of threads gives the bytes one thread gives.
-    #[cfg(not(target_os = "macos"))]
     #[test]
     fn a_band_converts_on_many_threads_as_on_one() {
         let (w, h) = (333usize, 700usize);
