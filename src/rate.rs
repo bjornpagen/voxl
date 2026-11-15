@@ -44,6 +44,49 @@ const OVERDUE_MS: f64 = 80.0;
 /// The round trip assumed for a client whose pings haven't been answered yet.
 pub const RTT_GUESS_MS: u32 = 40;
 
+// The controller's numbers. Each was run one step either side (an interval or a change
+// halved and doubled) on rate_tests' model: one simulated link with a rate, a round trip
+// and a queue served in order, at 60 fps, seeded. No rate test fails either side unless
+// the comment says so. The rows, and what they read now:
+// - follow: how long a 40 Mbit/s link that slows to 4 takes to bring the target under
+//   4000 kbit/s (3.8 s); after: a frame's mean wait from then on (16.5 ms);
+// - late 3: the worst wait of a frame under video-like motion on 2.5 to 12 Mbit/s links
+//   with acks up to 3 ms late (0 ms); late 6: the least share of the link that motion
+//   uses with acks up to 6 ms late (0.78);
+// - climb: how long the target takes from the floor to a 30000 kbit/s ceiling on a fast
+//   path (2.2 s, or 3.0 s just after a fall).
+
+/// The controller decides at most this often. Upstream's (e88355c), unmeasured. At 50 ms
+/// late 3 waits 53 ms; at 200 ms follow takes 5.0 s and after is 20.1 ms. With no interval
+/// at all late 6 uses 0.91 of the link, and late 3 waits 41 ms.
+const DECIDE_EVERY: Duration = Duration::from_millis(100);
+/// A queue lowers the target at most this often. Upstream's (e88355c), unmeasured. At
+/// 150 ms follow takes 2.6 s and late 3 waits 33 ms; at 600 ms follow takes 7.4 s, after
+/// is 29.2 ms and late 6 uses 0.67 of the link.
+const LOWER_EVERY: Duration = Duration::from_millis(300);
+/// A queue lowers the target to this share of itself. Upstream's (e88355c), unmeasured.
+/// Half the cut (0.925): follow takes 7.7 s, with 34 cuts where it now takes 18, and after
+/// is 35.6 ms. Twice the cut (0.70): follow takes 1.7 s with 8 cuts, after is 5.7 ms, and
+/// climb from a fall takes 3.2 s.
+const LOWER_TO: f64 = 0.85;
+/// The target rises no sooner than this after a queue lowered it. Upstream's (e88355c),
+/// unmeasured. At 500 ms late 3 waits 34 ms and follow takes 19 cuts; at 2 s late 3 waits
+/// 56 ms, late 6 uses 0.74 of the link, and climb from a fall takes 4.0 s.
+const RAISE_AFTER_LOWER: Duration = Duration::from_secs(1);
+/// While nothing queues the target rises at most this often. Upstream's (e88355c),
+/// unmeasured. At 100 ms (every decision) climb takes 1.1 s; at 400 ms it takes 4.4 s,
+/// and a new viewer is left at the start (`a_new_viewer_is_not_left_at_the_floor` fails).
+const RAISE_EVERY: Duration = Duration::from_millis(200);
+/// Each rise multiplies the target by this. Ours (9c3cfad), in place of upstream's 1.06
+/// when the target began to follow the measured capacity; unmeasured. At 1.125 climb
+/// takes 4.0 s and a new viewer is left at the start (the same test fails); at 1.5 climb
+/// takes 1.2 s. With none (1.0) five rate tests fail, and climb takes 56 s.
+const RAISE_BY: f64 = 1.25;
+/// And adds this, so a target near nothing (`--min-kbps 0`) climbs too. Upstream's
+/// (e88355c), unmeasured. From 1 kbit/s to the cautious start takes 2.6 s: 3.2 s at 50,
+/// 2.0 s at 200. With none it takes 8.0 s, and a new viewer is left at the start.
+const RAISE_STEP: Kbps = Kbps::new(100.0);
+
 /// What the target may be: never under a floor, and never over a ceiling if there is
 /// one. Where the two cross, the ceiling wins: it is the most a person lets the stream
 /// send (Selkies' `--video-bitrate` sets it alone), where the floor only keeps the
@@ -109,12 +152,12 @@ impl RateCtl {
         Capacity::of(paths.iter().map(|p| p.capacity))
     }
 
-    /// One decision, at most every 100 ms, from what every watched path says now.
+    /// One decision, at most every `DECIDE_EVERY`, from what every watched path says now.
     fn step(&mut self, now: Instant, paths: &[PathNow]) {
         let waited = |since: Option<Instant>, time: Duration| {
             since.is_none_or(|t| now.saturating_duration_since(t) >= time)
         };
-        if !waited(self.last_eval, Duration::from_millis(100)) {
+        if !waited(self.last_eval, DECIDE_EVERY) {
             return;
         }
         self.last_eval = Some(now);
@@ -137,17 +180,17 @@ impl RateCtl {
             .any(|p| p.queue_ms > QUEUE_CONGESTED_MS || p.overdue);
         let clear = paths.iter().all(|p| p.queue_ms <= QUEUE_CLEAR_MS);
         if congested {
-            if waited(self.last_dec, Duration::from_millis(300)) {
-                self.target = self.bounds.hold(self.target.times(0.85));
+            if waited(self.last_dec, LOWER_EVERY) {
+                self.target = self.bounds.hold(self.target.times(LOWER_TO));
                 self.last_dec = Some(now);
                 log::debug!("rate: congested, target {:.0} kbps", self.target.get());
             }
         } else if clear
             && self.target < aim
-            && waited(self.last_dec, Duration::from_secs(1))
-            && waited(self.last_inc, Duration::from_millis(200))
+            && waited(self.last_dec, RAISE_AFTER_LOWER)
+            && waited(self.last_inc, RAISE_EVERY)
         {
-            self.target = Kbps::new(self.target.get() * 1.25 + 100.0).min(aim);
+            self.target = Kbps::new(self.target.get() * RAISE_BY + RAISE_STEP.get()).min(aim);
             self.last_inc = Some(now);
         }
     }
@@ -159,6 +202,13 @@ const LATENCY_BUDGET: Duration = Duration::from_millis(60);
 /// A frame in debt may still spend this share of the target's part of one frame time:
 /// the stream keeps moving while it pays back, and pays back because it is under one.
 const DEBT_SHARE: f64 = 0.5;
+/// The tokens pile up to at least this many frame times of the target, and to this alone
+/// on a path not yet known. Ours (9c3cfad): the allowance upstream gave a frame, twice its
+/// share of the target; unmeasured. At one frame five rate tests fail: frames on a path
+/// not yet known are too small to show its rate, the target stays at the start on
+/// 40 Mbit/s, and the first frame of a scroll after stillness gets 37% of what it wanted.
+/// At four nothing fails, and late 3 waits 37 ms.
+const DEPTH_FRAMES: f64 = 2.0;
 
 /// The bits a frame may spend. Tokens come in at the target rate by the time that
 /// really passed, and pile up while the screen is still to what the path carries in
@@ -186,9 +236,9 @@ impl FrameBudget {
     pub fn allow(&mut self, now: Instant, target: Kbps, capacity: Capacity, fps: u32) -> Bits {
         let steady = target.over(Duration::from_secs_f64(1.0 / fps.max(1) as f64));
         let depth = match capacity {
-            Capacity::Known(c) => c.over(LATENCY_BUDGET).max(steady.times(2.0)),
-            // A path nothing is known about gets two frame times of the target at most.
-            Capacity::Unknown | Capacity::NoViewers => steady.times(2.0),
+            Capacity::Known(c) => c.over(LATENCY_BUDGET).max(steady.times(DEPTH_FRAMES)),
+            // A path nothing is known about gets `DEPTH_FRAMES` of the target at most.
+            Capacity::Unknown | Capacity::NoViewers => steady.times(DEPTH_FRAMES),
         };
         let passed = now.saturating_duration_since(self.at);
         self.at = now;
@@ -753,5 +803,135 @@ mod rate_tests {
             depth.bytes() / 1000.0,
             -b.tokens.bytes() * 8.0 / target.bps()
         );
+    }
+
+    /// `RateCtl::step` and `FrameBudget::allow` as they were before their numbers had
+    /// names: the oracle for that refactor.
+    fn old_step(rc: &mut RateCtl, now: Instant, paths: &[PathNow]) {
+        let waited = |since: Option<Instant>, time: Duration| {
+            since.is_none_or(|t| now.saturating_duration_since(t) >= time)
+        };
+        if !waited(rc.last_eval, Duration::from_millis(100)) {
+            return;
+        }
+        rc.last_eval = Some(now);
+        let aim = rc
+            .bounds
+            .hold(match Capacity::of(paths.iter().map(|p| p.capacity)) {
+                Capacity::NoViewers => return,
+                Capacity::Unknown => START,
+                Capacity::Known(c) => c.times(CAPACITY_SHARE),
+            });
+        rc.target = rc.target.min(aim);
+        let congested = paths
+            .iter()
+            .any(|p| p.queue_ms > QUEUE_CONGESTED_MS || p.overdue);
+        let clear = paths.iter().all(|p| p.queue_ms <= QUEUE_CLEAR_MS);
+        if congested {
+            if waited(rc.last_dec, Duration::from_millis(300)) {
+                rc.target = rc.bounds.hold(rc.target.times(0.85));
+                rc.last_dec = Some(now);
+            }
+        } else if clear
+            && rc.target < aim
+            && waited(rc.last_dec, Duration::from_secs(1))
+            && waited(rc.last_inc, Duration::from_millis(200))
+        {
+            rc.target = Kbps::new(rc.target.get() * 1.25 + 100.0).min(aim);
+            rc.last_inc = Some(now);
+        }
+    }
+
+    fn old_allow(
+        b: &mut FrameBudget,
+        now: Instant,
+        target: Kbps,
+        capacity: Capacity,
+        fps: u32,
+    ) -> Bits {
+        let steady = target.over(Duration::from_secs_f64(1.0 / fps.max(1) as f64));
+        let depth = match capacity {
+            Capacity::Known(c) => c.over(LATENCY_BUDGET).max(steady.times(2.0)),
+            Capacity::Unknown | Capacity::NoViewers => steady.times(2.0),
+        };
+        let passed = now.saturating_duration_since(b.at);
+        b.at = now;
+        b.depth = depth;
+        b.tokens = (b.tokens + target.over(passed)).min(depth);
+        b.tokens.max(steady.times(DEBT_SHARE))
+    }
+
+    /// A gap between decisions: often a whole number of 50 ms, so every interval the
+    /// controller waits is hit exactly, else anything up to half a second.
+    fn gap(rng: &mut Rng) -> Duration {
+        match rng.range(0, 2) {
+            0 => Duration::from_millis(50 * rng.range(0, 25)),
+            _ => Duration::from_micros(rng.range(0, 500_000)),
+        }
+    }
+
+    /// What up to three watched paths say: queues around both thresholds, capacities
+    /// unknown or anything, and now and then a frame overdue.
+    fn paths(rng: &mut Rng) -> Vec<PathNow> {
+        (0..rng.range(0, 4))
+            .map(|_| PathNow {
+                queue_ms: [15.0, 30.0, rng.range(0, 60) as f64][rng.range(0, 3) as usize],
+                capacity: (rng.range(0, 3) > 0).then(|| Kbps::new(rng.range(1, 100_000) as f64)),
+                overdue: rng.range(0, 10) == 0,
+            })
+            .collect()
+    }
+
+    fn controller(rng: &mut Rng) -> RateCtl {
+        let kbps = |k: u64| Kbps::new(k as f64);
+        let floor = kbps(rng.range(0, 20_000));
+        let ceiling = (rng.range(0, 4) > 0).then(|| kbps(rng.range(1, 40_000)));
+        let resume = (rng.range(0, 2) > 0).then(|| kbps(rng.range(0, 100_000)));
+        RateCtl::new(Bounds::new(floor, ceiling), resume)
+    }
+
+    /// The named numbers decide as the bare ones did: the same targets at the same
+    /// instants, over random bounds, paths and gaps; and a frame may spend what it could.
+    #[test]
+    fn the_named_numbers_decide_as_the_bare_ones() {
+        let mut rng = Rng(0xD1B54A32D192ED03);
+        let t0 = Instant::now();
+        for _ in 0..2000 {
+            let mut new = controller(&mut rng);
+            let mut old = RateCtl::new(new.bounds, Some(new.target));
+            let mut now = t0;
+            for _ in 0..200 {
+                now += gap(&mut rng);
+                let paths = paths(&mut rng);
+                new.step(now, &paths);
+                old_step(&mut old, now, &paths);
+                assert_eq!(
+                    (new.target, new.last_eval, new.last_dec, new.last_inc),
+                    (old.target, old.last_eval, old.last_dec, old.last_inc)
+                );
+            }
+        }
+        for _ in 0..2000 {
+            let (mut new, mut old) = (FrameBudget::new(t0), FrameBudget::new(t0));
+            let mut now = t0;
+            for _ in 0..200 {
+                now += gap(&mut rng);
+                let target = Kbps::new(rng.range(0, 40_000) as f64);
+                let capacity = match rng.range(0, 3) {
+                    0 => Capacity::NoViewers,
+                    1 => Capacity::Unknown,
+                    _ => Capacity::Known(Kbps::new(rng.range(1, 100_000) as f64)),
+                };
+                let fps = rng.range(0, 241) as u32;
+                assert_eq!(
+                    new.allow(now, target, capacity, fps),
+                    old_allow(&mut old, now, target, capacity, fps)
+                );
+                let bytes = rng.range(0, 400_000) as usize;
+                new.spend(bytes);
+                old.spend(bytes);
+                assert_eq!((new.tokens, new.depth), (old.tokens, old.depth));
+            }
+        }
     }
 }
