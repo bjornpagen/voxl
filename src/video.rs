@@ -752,6 +752,16 @@ impl Sharpening {
             self.on_motion(now);
         }
     }
+    /// A keyframe went out, every block of it at keyframe quality. In place of a due
+    /// pass it is that pass. Otherwise it is, to the schedule, what motion is: the
+    /// Refiner counts every block as changed at `now`, so a burst follows once the
+    /// screen has been still for `delay`, though nothing on it moved.
+    fn on_key(&mut self, pass: Option<Pass>, now: Instant) {
+        match pass {
+            Some(pass) => self.on_pass(pass, now),
+            None => self.on_motion(now),
+        }
+    }
     fn on_nothing_pending(&mut self) {
         self.state = Schedule::Idle;
     }
@@ -1000,16 +1010,14 @@ fn capture_loop(
             .fetch_add((t2 - t1).as_micros() as u64, Ordering::Relaxed);
         hub.stats.captured.fetch_add(1, Ordering::Relaxed);
 
-        if band.is_some() {
-            sharpening.on_motion(t0);
-        }
+        // Each plan is one input to the sharpening schedule.
         let frame = match plan {
             Plan::Key { pass } => {
                 let still = pass.is_some();
-                if let Some(pass) = pass {
-                    sharpening.on_pass(pass, t0);
+                if still {
                     hub.stats.paintovers.fetch_add(1, Ordering::Relaxed);
                 }
+                sharpening.on_key(pass, t0);
                 for c in &clients {
                     c.needs_keyframe.store(false, Ordering::Relaxed);
                 }
@@ -1028,29 +1036,32 @@ fn capture_loop(
                     },
                 }
             }
-            // Piggyback sharpening of blocks that have gone still on this frame.
-            Plan::Motion(moved) => match refiner.due(t0) {
-                // What moved plus what is due; everything else stays skipped.
-                Some((rmap, rband)) => {
-                    let mut m = mb_dirty.take().unwrap_or_else(|| vec![1; rmap.len()]);
-                    for (d, r) in m.iter_mut().zip(&rmap) {
-                        *d |= r;
+            Plan::Motion(moved) => {
+                sharpening.on_motion(t0);
+                // Piggyback sharpening of blocks that have gone still on this frame.
+                match refiner.due(t0) {
+                    // What moved plus what is due; everything else stays skipped.
+                    Some((rmap, rband)) => {
+                        let mut m = mb_dirty.take().unwrap_or_else(|| vec![1; rmap.len()]);
+                        for (d, r) in m.iter_mut().zip(&rmap) {
+                            *d |= r;
+                        }
+                        hub.stats.refines.fetch_add(1, Ordering::Relaxed);
+                        Frame::MotionAndSharpen {
+                            band: union(Some(moved), rband),
+                            dirty: Arc::new(m),
+                            blocks: Sharpen {
+                                map: Arc::new(rmap),
+                                at: t0,
+                            },
+                        }
                     }
-                    hub.stats.refines.fetch_add(1, Ordering::Relaxed);
-                    Frame::MotionAndSharpen {
-                        band: union(Some(moved), rband),
-                        dirty: Arc::new(m),
-                        blocks: Sharpen {
-                            map: Arc::new(rmap),
-                            at: t0,
-                        },
-                    }
+                    None => Frame::Motion {
+                        band: moved,
+                        dirty: mb_dirty.take().map(Arc::new),
+                    },
                 }
-                None => Frame::Motion {
-                    band: moved,
-                    dirty: mb_dirty.take().map(Arc::new),
-                },
-            },
+            }
         };
         last_capture = t0;
         next_idx = 1 - idx;
@@ -2022,6 +2033,39 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    /// A viewer joining a still screen gets a keyframe, every block at keyframe quality,
+    /// with nothing on screen moving: a burst sharpens it the paint-over delay after the
+    /// keyframe, as after motion. A keyframe in place of a due pass is that pass.
+    #[test]
+    fn a_keyframe_on_a_still_screen_is_sharpened() {
+        let (burst, delay) = (3, Duration::from_millis(150));
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let mut s = Sharpening::new(burst, delay);
+        assert_eq!(s.due(ms(0)), Due::Never, "a still screen, all of it sharp");
+        s.on_key(None, ms(1000));
+        assert_eq!(s.due(ms(1149)), Due::In(Duration::from_millis(1)));
+        let Due::Now(pass) = s.due(ms(1150)) else {
+            panic!("no pass due at the keyframe plus the delay")
+        };
+        assert_eq!(
+            pass,
+            Pass {
+                left: burst,
+                at: ms(1150)
+            }
+        );
+        // A keyframe goes out in place of that pass: the burst goes on at once.
+        s.on_key(Some(pass), ms(1160));
+        assert_eq!(
+            s.due(ms(1160)),
+            Due::Now(Pass {
+                left: burst - 1,
+                at: ms(1150)
+            })
+        );
     }
 
     /// Once the screen goes still the paint-overs show x264 forgetting the drag, so the
