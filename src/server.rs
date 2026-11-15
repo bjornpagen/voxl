@@ -3,7 +3,7 @@
 use crate::event::{InputEvent, KeyAct};
 use crate::hub::{Client, Hub, Out, ServerMessage};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -160,6 +160,7 @@ pub fn router(state: AppState) -> Router {
         .route("/inter.woff2", asset!("inter.woff2", "font/woff2"))
         .route("/healthz", get(|| async { "ok" }))
         .route("/stats", get(stats))
+        .route("/stats/trace", get(trace))
         .route("/ws", get(ws_handler))
         .with_state(state)
         .merge(file_routes)
@@ -167,14 +168,7 @@ pub fn router(state: AppState) -> Router {
         .merge(wait_routes)
 }
 
-/// What `/stats` is asked for besides the counters.
-#[derive(serde::Deserialize)]
-struct StatsQuery {
-    /// The newest this many frames' timelines (crate::timeline), at most the ring's.
-    frames: Option<usize>,
-}
-
-async fn stats(State(s): State<AppState>, Query(q): Query<StatsQuery>) -> Response {
+async fn stats(State(s): State<AppState>) -> Response {
     let st = &s.hub.stats;
     let clients: Vec<_> = s
         .hub
@@ -188,7 +182,8 @@ async fn stats(State(s): State<AppState>, Query(q): Query<StatsQuery>) -> Respon
                 "client_ms": (*c.client_ms.lock() * 10.0).round() / 10.0})
         })
         .collect();
-    let mut body = serde_json::json!({
+    let body = serde_json::json!({
+        "now_us": s.hub.timeline.us(Instant::now()),
         "captured": st.captured.load(Ordering::Relaxed),
         "encoded": st.encoded.load(Ordering::Relaxed),
         "bytes": st.bytes.load(Ordering::Relaxed),
@@ -205,13 +200,24 @@ async fn stats(State(s): State<AppState>, Query(q): Query<StatsQuery>) -> Respon
         "send_lat_us_total": st.send_lat_us.load(Ordering::Relaxed),
         "clients": clients,
     });
-    if let Some(n) = q.frames {
-        body["timeline"] = serde_json::json!({
-            "now_us": s.hub.timeline.now_us(Instant::now()),
-            "marks": crate::timeline::MARKS,
-            "frames": s.hub.timeline.newest(n),
-        });
-    }
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// What the server remembers of the last frames, every time in microseconds on the
+/// timeline's clock (`Timeline::us`), as `/stats`'s `now_us` is: each frame's way from
+/// the screen to the sockets (crate::timeline).
+async fn trace(State(s): State<AppState>) -> Response {
+    let timeline = &s.hub.timeline;
+    let frames = timeline.newest(crate::timeline::FRAMES_KEPT);
+    let body = serde_json::json!({
+        "now_us": timeline.us(Instant::now()),
+        "marks": crate::timeline::MARKS,
+        "frames": frames,
+    });
     (
         [(header::CONTENT_TYPE, "application/json")],
         body.to_string(),

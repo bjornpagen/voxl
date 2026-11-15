@@ -1,5 +1,5 @@
 //! When each frame passed each point between the screen changing and its messages
-//! leaving: the last frames, kept in memory, read through `/stats?frames=N`.
+//! leaving: the last frames, kept in memory, read through `/stats/trace`.
 //!
 //! The encode loop records a frame once it is coded and about to be handed to the
 //! viewers; a viewer's socket task adds when it wrote the frame. Nothing here allocates,
@@ -13,7 +13,7 @@ use std::time::Instant;
 /// be read once it is over, in 512 KB (128 bytes a frame). At half, a 30 s scene read at
 /// its end loses its first seconds; at double, the ring takes 1 MB for scenes nobody
 /// runs.
-const FRAMES_KEPT: usize = 4096;
+pub const FRAMES_KEPT: usize = 4096;
 
 /// The points a frame passes up to its hand-off to the viewers, in order, as `/stats`
 /// names them. A viewer's socket task writing the frame comes after.
@@ -185,7 +185,9 @@ impl Timeline {
         }
     }
 
-    fn us(&self, at: Instant) -> u64 {
+    /// Microseconds from the ring's start, which is voxl's (the hub's making), to `at`: the
+    /// one clock `/stats` and `/stats/trace` give every time on, monotonic as `Instant` is.
+    pub fn us(&self, at: Instant) -> u64 {
         at.saturating_duration_since(self.start).as_micros() as u64
     }
 
@@ -232,11 +234,6 @@ impl Timeline {
                 Err(current) => was = current,
             }
         }
-    }
-
-    /// Microseconds from the ring's start to `now`, to set a reader's clock by.
-    pub fn now_us(&self, now: Instant) -> u64 {
-        self.us(now)
     }
 
     /// The newest `n` frames still in the ring, oldest first. A frame being recorded as
