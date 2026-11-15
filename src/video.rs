@@ -412,7 +412,7 @@ fn flow_ok(hub: &Hub, interval_ms: f64) -> bool {
 /// even while other parts of the screen keep moving (a playing video would otherwise
 /// keep the frame-level paint-over from ever running). A block stays pending until a
 /// frame that re-encoded it came out at paint-over quality (`sharpened`): one the rate
-/// cap squeezed leaves it for the next pass.
+/// cap squeezed leaves it for the next pass, which motion elsewhere does not put off.
 struct Refiner {
     blocks: Vec<Block>,
     last_refine: Instant,
@@ -423,12 +423,9 @@ struct Refiner {
 #[derive(Clone, Copy)]
 enum Block {
     Sharp,
-    /// Sent at motion quality, last changed at `changed`. `tried`: sharpened since on a
-    /// frame that also carried motion; once is enough while things move, the rest waits
-    /// for the screen to go still.
+    /// Sent at motion quality, or by a pass the cap squeezed, last changed at `changed`.
     Pending {
         changed: Instant,
-        tried: bool,
     },
 }
 
@@ -446,18 +443,12 @@ impl Refiner {
     fn mark(&mut self, dirty: &[u8], now: Instant) {
         for (b, &d) in self.blocks.iter_mut().zip(dirty) {
             if d != 0 {
-                *b = Block::Pending {
-                    changed: now,
-                    tried: false,
-                };
+                *b = Block::Pending { changed: now };
             }
         }
     }
     fn mark_all(&mut self, now: Instant) {
-        self.blocks.fill(Block::Pending {
-            changed: now,
-            tried: false,
-        });
+        self.blocks.fill(Block::Pending { changed: now });
     }
     /// Every block, as the blocks a frame captured at `now` sharpens: a keyframe codes
     /// them all.
@@ -471,7 +462,7 @@ impl Refiner {
     /// sharp now, unless they changed again since.
     fn sharpened(&mut self, map: &[u8], at: Instant) {
         for (b, &m) in self.blocks.iter_mut().zip(map) {
-            if let Block::Pending { changed, .. } = *b {
+            if let Block::Pending { changed } = *b {
                 if m != 0 && changed <= at {
                     *b = Block::Sharp;
                 }
@@ -501,25 +492,20 @@ impl Refiner {
             .collect();
         self.band(&map).map(|band| (map, band))
     }
-    /// Blocks due for sharpening on a frame that carries motion (1 = refine): pending,
-    /// still for `REFINE_STILL` and not tried since they changed. At most every
-    /// `REFINE_EVERY`.
+    /// Blocks due for sharpening on a frame that carries motion (1 = refine): pending and
+    /// still for `REFINE_STILL`. At most every `REFINE_EVERY`, so a block whose pass came
+    /// back squeezed goes again that long after it, until one comes back sharp.
     fn due(&mut self, now: Instant) -> Option<(Vec<u8>, Band)> {
         if now.saturating_duration_since(self.last_refine) < REFINE_EVERY {
             return None;
         }
         let map: Vec<u8> = self
             .blocks
-            .iter_mut()
+            .iter()
             .map(|b| match *b {
-                Block::Pending {
-                    changed,
-                    tried: false,
-                } if now.saturating_duration_since(changed) >= REFINE_STILL => {
-                    *b = Block::Pending {
-                        changed,
-                        tried: true,
-                    };
+                Block::Pending { changed }
+                    if now.saturating_duration_since(changed) >= REFINE_STILL =>
+                {
                     1
                 }
                 Block::Sharp | Block::Pending { .. } => 0,
@@ -1850,24 +1836,6 @@ mod tests {
         let s = key.into_sharpened().expect("it sharpens what it codes");
         r.sharpened(&s.map, s.at);
         assert_eq!(r.pending_map().map(|p| p.0), Some(vec![0, 0, 0, 1]));
-    }
-
-    /// On frames that carry motion, a block still for `REFINE_STILL` is tried once per
-    /// change, at most every `REFINE_EVERY`.
-    #[test]
-    fn a_moving_screen_tries_each_still_block_once() {
-        let t0 = Instant::now();
-        let ms = |n| t0 + Duration::from_millis(n);
-        let mut r = Refiner::new(2, 2, t0);
-        r.mark(&[1, 1], ms(0));
-        assert!(r.due(ms(299)).is_none(), "too soon after the change");
-        assert_eq!(r.due(ms(300)).map(|d| d.0), Some(vec![1, 1]));
-        assert!(r.due(ms(600)).is_none(), "already tried");
-        r.mark(&[0, 1], ms(700));
-        assert!(r.due(ms(900)).is_none(), "block 1 still for 200 ms only");
-        assert_eq!(r.due(ms(1000)).map(|d| d.0), Some(vec![0, 1]));
-        // Tried, not sharp: both stay pending for the still-screen passes.
-        assert_eq!(r.pending_map().map(|p| p.0), Some(vec![1, 1]));
     }
 
     /// Typing beside an animation on a slow link: what the viewer is shown of blocks that
