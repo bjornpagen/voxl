@@ -5,7 +5,7 @@ use crate::convert::I420;
 use crate::encoder::{Encoded, Encoder, EncoderConfig, Pictures, Planes, Preset, Quality};
 use crate::env::{Debugging, Marker};
 use crate::hub::{wait_any, wait_event};
-use crate::hub::{Client, Hub, Inflight, Out, ServerMessage, Viewer};
+use crate::hub::{Client, Hub, Out, ServerMessage, Takes, Viewer};
 use crate::path::{Capacity, Kbps};
 use crate::rate::{Bounds, FrameBudget, RateCtl, RTT_GUESS_MS};
 use bytes::Bytes;
@@ -1334,7 +1334,8 @@ fn stripe_worker(
     }
 }
 
-/// More frames than this in flight to a viewer, and it is closed: upstream's guess (its
+/// More frames than this in flight to a viewer, and it is closed (it stops watching, and is
+/// sent the close once): upstream's guess (its
 /// first commit), never measured; 10 s of frames at 60 a second. The flow check keeps a
 /// viewer to at most 40 frames in flight, two more in the pipeline, and starts it over
 /// once its oldest frame is 4 s old, but a keyframe passes the flow check. So a viewer
@@ -1493,28 +1494,18 @@ fn encode_loop(
             })
             .collect();
         let now = Instant::now();
-        for (c, viewer) in hub.viewers() {
-            if viewer != Viewer::Started {
-                continue;
-            }
-            {
-                let mut q = c.inflight();
-                if q.len() > HOPELESSLY_BEHIND {
-                    log::warn!("client {} hopelessly behind; dropping", c.id);
-                    drop(q);
-                    c.send(Out::Text(ServerMessage::Close));
-                    continue;
+        for (c, _) in hub.viewers() {
+            match c.takes(frame_id, now, total, HOPELESSLY_BEHIND) {
+                Takes::Nothing => {}
+                Takes::Frame => {
+                    for m in &msgs {
+                        c.send(Out::Bin(m.clone()));
+                    }
                 }
-                let alone = q.is_empty();
-                q.push_back(Inflight {
-                    id: frame_id,
-                    sent: now,
-                    bytes: total,
-                    alone,
-                });
-            }
-            for m in &msgs {
-                c.send(Out::Bin(m.clone()));
+                Takes::Close => {
+                    log::warn!("client {} hopelessly behind; dropping", c.id);
+                    c.send(Out::Text(ServerMessage::Close));
+                }
             }
         }
         hub.stats.send_lat_us.fetch_add(
@@ -1722,7 +1713,6 @@ mod tests {
     /// are in flight, and is then closed, once, by the real encode loop: it is sent
     /// `HOPELESSLY_BEHIND + 1` frames, then one close, then nothing, whatever comes after.
     #[test]
-    #[ignore = "fails until a viewer too far behind is closed once"]
     fn a_viewer_too_far_behind_is_closed() {
         let hub = Hub::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();

@@ -188,6 +188,17 @@ pub enum Viewer {
     Started,
 }
 
+/// What a client is sent of a frame the encode loop has coded.
+#[derive(Debug, PartialEq)]
+pub enum Takes {
+    /// Nothing: it has not started.
+    Nothing,
+    /// The frame, which is in flight to it until acked.
+    Frame,
+    /// A close, once: it was too far behind, and it stops watching.
+    Close,
+}
+
 /// What asking for a keyframe makes of a viewer: one that watches waits for one.
 fn asked(viewer: Viewer) -> Viewer {
     match viewer {
@@ -289,6 +300,30 @@ impl Client {
             }
             (Viewer::Promised, false) => v.viewer = Viewer::Waiting,
             (Viewer::NotWatching | Viewer::Waiting | Viewer::Started, _) => {}
+        }
+    }
+
+    /// The encode loop has frame `id`, of `bytes`, to send at `now`. A client that has
+    /// started takes it, and it is in flight until acked, unless it already has more than
+    /// `behind` frames in flight: then it stops watching, and is to be sent a close.
+    pub fn takes(&self, id: u32, now: Instant, bytes: usize, behind: usize) -> Takes {
+        let mut v = self.viewing.lock();
+        match v.viewer {
+            Viewer::Started if v.inflight.len() > behind => {
+                v.viewer = Viewer::NotWatching;
+                Takes::Close
+            }
+            Viewer::Started => {
+                let alone = v.inflight.is_empty();
+                v.inflight.push_back(Inflight {
+                    id,
+                    sent: now,
+                    bytes,
+                    alone,
+                });
+                Takes::Frame
+            }
+            Viewer::NotWatching | Viewer::Waiting | Viewer::Promised => Takes::Nothing,
         }
     }
 
@@ -709,6 +744,10 @@ mod tests {
         Step::Ack(1),
     ];
 
+    /// The frames in flight past which the model's client is closed: small, so that the
+    /// close is among the states reached.
+    const BEHIND: usize = 2;
+
     /// A frame the encoder holds: a keyframe, with the clients its plan promised it to,
     /// or a frame that is not one.
     type Held = Option<[bool; 2]>;
@@ -764,9 +803,13 @@ mod tests {
                             false => (Waiting, c.1),
                         };
                     }
-                    if c.0 == Started {
-                        c.1 += 1;
-                        sent.push(i);
+                    match c.0 {
+                        Started if c.1 > BEHIND => c.0 = NotWatching,
+                        Started => {
+                            c.1 += 1;
+                            sent.push(i);
+                        }
+                        NotWatching | Waiting | Promised => {}
                     }
                 }
             }
@@ -869,15 +912,9 @@ mod tests {
                         }
                     }
                 }
-                for (v, viewer) in hub.viewers() {
-                    if viewer == Viewer::Started {
-                        let id = v.inflight().back().map_or(1, |f| f.id + 1);
-                        v.inflight().push_back(Inflight {
-                            id,
-                            sent: t0,
-                            bytes: 1000,
-                            alone: true,
-                        });
+                for (v, _) in hub.viewers() {
+                    let id = v.inflight().back().map_or(1, |f| f.id + 1);
+                    if v.takes(id, t0, 1000, BEHIND) == Takes::Frame {
                         sent.push(c.iter().position(|c| c.id == v.id).unwrap());
                     }
                 }
