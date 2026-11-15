@@ -408,6 +408,9 @@ mod tests {
         pings: VecDeque<(Instant, Instant)>,
         ticks: u32,
         in_flight: usize,
+        /// The least a frame comes to, whatever room it was given (x264 cannot make a
+        /// picture smaller than its highest quantizer makes it): 0, as small as its room.
+        floor: usize,
         window: Window,
         /// Since `reset`: how late each frame came back (beyond the round trip), the bytes
         /// sent, the smallest share of what it wanted that a frame got, the most that was
@@ -434,6 +437,7 @@ mod tests {
                 pings: VecDeque::new(),
                 ticks: 0,
                 in_flight: 0,
+                floor: 0,
                 window: Window::new(now, 0, usize::MAX),
                 lates: Vec::new(),
                 sent: 0,
@@ -496,8 +500,9 @@ mod tests {
             let Some(room) = self.window.room(self.now) else {
                 return;
             };
-            // The encoder under its cap: a frame holds at most the room it was given.
-            let bytes = want.min(room);
+            // The encoder under its cap: a frame holds at most the room it was given, but
+            // no less than the least it comes to.
+            let bytes = want.min(room).max(self.floor.min(want));
             self.worst_share = self.worst_share.min(bytes as f64 / want as f64);
             let left = self.window.leave(self.now, bytes);
             self.in_flight += bytes;
@@ -778,6 +783,165 @@ mod tests {
                 sim.rtt,
                 sim.jitter
             );
+        }
+    }
+
+    /// A window starts at `START` within its bounds, and stays within them whatever its
+    /// path does: never under `least` or over `most`, never under a packet, and where the
+    /// two cross `most` wins; and the room it gives a frame is never more than it carries,
+    /// nor less than a packet. Over random bounds (crossing, under a packet, or none) and
+    /// 2000 frame times of random paths, wants, stalls and late acks.
+    #[test]
+    fn a_window_starts_and_stays_within_its_bounds() {
+        let mut rng = Rng(0xA076_1D64_78BD_642F);
+        for _ in 0..300 {
+            let pick = |rng: &mut Rng| match rng.range(0, 5) {
+                0 => 0,
+                1 => rng.range(1, PACKET as u64) as usize,
+                2 => usize::MAX,
+                _ => rng.range(PACKET as u64, 400_000) as usize,
+            };
+            let (least, most) = (pick(&mut rng), pick(&mut rng));
+            let mut sim = Sim::new(rng.range(19_000, 10_000_000) as f64, rng.range(2, 300));
+            sim.jitter = Duration::from_millis(rng.range(0, 300));
+            let from = sim.now + Duration::from_millis(rng.range(0, 20_000));
+            sim.stalls
+                .push((from, from + Duration::from_millis(rng.range(100, 4000))));
+            sim.window = Window::new(sim.now, least, most);
+            let hi = most.max(PACKET);
+            let lo = least.clamp(PACKET, hi);
+            let what = format!("least {least}, most {most}");
+            assert_eq!(sim.window.carries(), START.clamp(lo, hi), "{what}");
+            for _ in 0..2000 {
+                let want = match rng.range(0, 3) {
+                    0 => 0,
+                    1 => rng.range(200, 60_000) as usize,
+                    _ => HEAVY,
+                };
+                sim.tick(want);
+                let carries = sim.window.carries();
+                assert!(lo <= carries && carries <= hi, "{carries}: {what}");
+                if let Some(room) = sim.window.room(sim.now) {
+                    assert!(PACKET <= room && room <= carries, "{room}: {what}");
+                }
+            }
+        }
+    }
+
+    /// The first frame of a scroll after stillness is whole on a link the scroll
+    /// overfills, once a scroll has shown the window the path: what the path carries in
+    /// `LATENESS` is all its room. The frames after it get what the link sustains and come
+    /// back within three times `LATENESS`. A scroll of 45 KB frames (2.7 MB/s) on links of
+    /// 1 to 2.5 MB/s, round trips of 20 to 150 ms, after 2 to 20 s of a desktop at rest.
+    #[test]
+    fn the_first_frame_of_a_scroll_is_whole_on_a_link_it_overfills() {
+        let mut rng = Rng(0x94D0_49BB_1331_11EB);
+        for _ in 0..100 {
+            let rate = rng.range(1_000_000, 2_500_000) as f64;
+            let mut sim = Sim::new(rate, rng.range(20, 150));
+            sim.run(120, rest);
+            sim.run(40, |_| 45_000);
+            sim.run(60 * rng.range(2, 20) as u32, rest);
+            sim.reset();
+            sim.run(1, |_| 45_000);
+            assert_eq!(sim.worst_share, 1.0, "{rate} B/s, {:?}", sim.rtt);
+            sim.run(120, |_| 45_000);
+            let late = sim.late(1.0);
+            assert!(late <= LATENESS * 3, "{rate} B/s, {:?}: {late:?}", sim.rtt);
+        }
+    }
+
+    /// Acks a few ms late on a long path never read as a faster path: a late ack makes a
+    /// frame look slower, and the one after it at most that much faster, so the window
+    /// never carries more than the link does in `LATENESS` and the lateness (measured: at
+    /// most 3.5% over at 6 ms, of the 10% allowed). Rest and scrolls in turn on 2.5 to
+    /// 7.5 MB/s links with round trips of 120 to 180 ms, every ack up to 1, 3 or 6 ms late.
+    #[test]
+    fn late_acks_on_a_long_path_do_not_read_as_a_faster_one() {
+        let mut rng = Rng(0xE703_7ED1_A0B4_28DB);
+        for late_ms in [1, 3, 6] {
+            for _ in 0..30 {
+                let rate = rng.range(2_500_000, 7_500_000) as f64;
+                let mut sim = Sim::new(rate, rng.range(120, 180));
+                sim.jitter = Duration::from_millis(late_ms);
+                let mut most = 0;
+                for _ in 0..4 {
+                    for i in 0..240 {
+                        sim.tick(if i < 120 { rest(i) } else { 62_000 });
+                        most = most.max(sim.window.carries());
+                    }
+                }
+                let read = most as f64 / sim.fits();
+                let over = sim.jitter.as_secs_f64() / LATENESS.as_secs_f64();
+                assert!(
+                    read <= 1.0 + over,
+                    "{rate} B/s, acks {late_ms} ms late: read {read:.3}"
+                );
+            }
+        }
+    }
+
+    /// A path that slows while the screen only types is followed once a scroll tests it:
+    /// typing did not move the window, so the scroll's first frames find the old path's
+    /// room, and from two seconds into it the stream sends no more than the link carries
+    /// (but what is queued when it ends, under what the link carries in `LATENESS`) and
+    /// comes back within about twice `LATENESS`. 5 MB/s links that drop to a tenth, round
+    /// trips of 20 to 150 ms, 10 s of a key every 200 ms between.
+    #[test]
+    fn a_path_that_slows_under_typing_is_followed_by_the_scroll_after() {
+        let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+        for _ in 0..100 {
+            let mut sim = Sim::new(5_000_000.0, rng.range(20, 150));
+            sim.run(600, |_| HEAVY);
+            sim.rate = 500_000.0;
+            sim.run(600, |i| if i % 12 == 0 { 400 } else { 0 });
+            sim.run(120, |_| 60_000);
+            sim.reset();
+            sim.run(600, |_| 60_000);
+            let carried = sim.rate * 10.0;
+            let what = format!(
+                "{:?}: sent {} of {carried}, late p50 {:?}",
+                sim.rtt,
+                sim.sent,
+                sim.late(0.5)
+            );
+            assert!(sim.sent as f64 <= carried + sim.fits(), "{what}");
+            assert!(sim.late(0.5) <= LATENESS * 5 / 2, "{what}");
+        }
+    }
+
+    /// A frame that comes out bigger than its room (x264 cannot make a picture smaller than
+    /// its highest quantizer makes it) is paid for by the frames after it: the window gives
+    /// none until it is through, so a minute of such frames sends no more than the link
+    /// carries (but what is queued when it ends: under one such frame and what the link
+    /// carries in `LATENESS`), and none comes back later than the crossing of its own bytes
+    /// and the rest of the one before it, and three times `LATENESS`. Frames of at least
+    /// 1.5 to 4 times what the link carries in `LATENESS`, on 0.3 to 5 MB/s links, round
+    /// trips of 2 to 300 ms.
+    #[test]
+    fn a_frame_bigger_than_its_room_is_paid_for_by_the_frames_after_it() {
+        let mut rng = Rng(0xBF58_476D_1CE4_E5B9);
+        for _ in 0..100 {
+            let rate = rng.range(300_000, 5_000_000) as f64;
+            let mut sim = Sim::new(rate, rng.range(2, 300));
+            sim.floor = (sim.fits() * rng.range(15, 40) as f64 / 10.0) as usize;
+            sim.run(600, |_| HEAVY);
+            sim.reset();
+            sim.run(3600, |_| HEAVY);
+            let carried = rate * 60.0;
+            let own = Duration::from_secs_f64(sim.floor as f64 / rate);
+            let what = format!(
+                "{rate} B/s, {:?}, floor {}: sent {} of {carried}, late {:?}",
+                sim.rtt,
+                sim.floor,
+                sim.sent,
+                sim.late(1.0)
+            );
+            assert!(
+                sim.sent as f64 <= carried + sim.fits() + sim.floor as f64,
+                "{what}"
+            );
+            assert!(sim.late(1.0) <= own * 2 + LATENESS * 3, "{what}");
         }
     }
 }

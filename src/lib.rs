@@ -29,9 +29,7 @@ mod login;
 mod mac;
 mod mic;
 mod mp4;
-#[allow(dead_code)]
 mod path;
-#[allow(dead_code)]
 mod rate;
 mod record;
 #[cfg(target_os = "linux")]

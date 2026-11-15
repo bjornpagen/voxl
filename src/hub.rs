@@ -174,11 +174,11 @@ impl Hold {
 /// shortest of its last 20 replies, so a path that changes shows within 10 s.
 pub const PING_EVERY: Duration = Duration::from_millis(500);
 
-/// The longest round trip a client's replies can show: 4 s. A client whose oldest
-/// unacknowledged frame is that old has stalled, and the flow gate judges it by that
-/// alone (video.rs), so a longer round trip steers nothing; the bench's links have 80 to
-/// 140 ms. At half, a path of 2 to 4 s would show no round trip and be judged by the
-/// 40 ms guess; at double, a client's record would keep twice the pings for nothing.
+/// The longest round trip a client's replies can show: 4 s. A client whose oldest frame on
+/// its way is that old has stalled, and the flow gate judges it by that alone (video.rs),
+/// so a longer round trip steers nothing; the bench's links have 80 to 140 ms. At half, a
+/// path of 2 to 4 s would give its window no ping's round trip, only its frames'; at
+/// double, a client's record would keep twice the pings for nothing.
 const LONGEST_ROUND_TRIP: Duration = crate::video::STALLED;
 
 /// The pings a client's record keeps: one goes out every `PING_EVERY`, so this many are

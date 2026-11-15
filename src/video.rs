@@ -7,7 +7,7 @@ use crate::encoder::{
 };
 use crate::env::{Debugging, Marker};
 use crate::hub::{wait_any, Waitable};
-use crate::hub::{Backlog, Client, Hub, Out, ServerMessage, Takes, Viewer};
+use crate::hub::{Client, Hub, Out, ServerMessage, Takes, Viewer};
 use crate::path::{Bits, Kbps};
 use crate::rate::Bounds;
 use crate::timeline::{CaptureMarks, Coded};
@@ -575,36 +575,6 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Capturer, String> {
     Ok(cap)
 }
 
-// The flow gate's bounds. For a viewer sent a frame every frame time, each acknowledged
-// its round trip plus some Y after it went (wire, decode, queue), the count holds the
-// capture once Y passes `DECODE_MS` plus two to three frame times (by where the round
-// trip falls on them), and the age once Y passes `MOST_QUEUED_MS` plus up to one. At 60
-// fps the count holds from Y = 73 to 90 ms, the age from 121 to 137 ms.
-
-/// What a viewer is taken to keep a frame for between its arrival and the ack (decode and
-/// draw), in the frames it may have in flight: 40 ms. Upstream's guess (051bb63, unchanged
-/// since), unmeasured. At 60 fps the count holds from Y = 73 to 90 ms; at half (20 ms)
-/// from 53 to 70, at double (80 ms) from 113 to 130, where the age holds anyway.
-const DECODE_MS: f64 = 40.0;
-/// Frames a viewer may have in flight beyond those its round trip and decode cover: 2.
-/// Upstream's guess (051bb63), unmeasured. At 60 fps the count holds from Y = 73 to
-/// 90 ms; with 1 from 57 to 73, with 3 from 90 to 107. The round trip and decode cover
-/// at least one frame time, so a viewer may always have 3: upstream's floor of 3 on the
-/// count (`clamp(3, 40)`) never bound, and is gone.
-const SPARE_FRAMES: usize = 2;
-/// The most frames a viewer may have in flight, whatever its round trip: 40. Upstream's
-/// guess (051bb63), unmeasured. It binds where the round trip and decode cover 38 frame
-/// times, a round trip over 593 ms at 60 fps, and there the stream sends at most 40
-/// frames a round trip. At 39 or 41 that is one frame either way; at half (20) it binds
-/// from a 260 ms round trip, and holds a 400 ms path to about 49 fps; at double (80) only
-/// past 1.26 s.
-const MOST_IN_FLIGHT: usize = 40;
-/// How long past its round trip a viewer's oldest frame may go unacknowledged before
-/// the capture waits for it: 120 ms, of wire time, decode and queue. Upstream's guess
-/// (051bb63), unmeasured. The count holds first (or with it) from 25 fps, this below 25
-/// fps and past `MOST_IN_FLIGHT`. At half (60 ms) this holds first up to 86 fps, at 60
-/// fps from Y = 61 to 77 ms; at double (240 ms) only below 10 fps.
-const MOST_QUEUED_MS: u128 = 120;
 /// A viewer whose oldest frame on its way has been on its way this long has stalled (a
 /// dead socket, a path queued for seconds): 4 s. Upstream's guess (051bb63), unmeasured.
 /// Until then a viewer whose window has no room holds every viewer's picture; from then
@@ -616,44 +586,6 @@ const MOST_QUEUED_MS: u128 = 120;
 /// viewer's ack (`InFlight`): at double, a viewer that answers nothing slows every other
 /// viewer's sharpening to a pass per 8 s.
 pub const STALLED: Duration = Duration::from_millis(4000);
-
-/// What one viewer's frames in flight say about capturing another now.
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Flow {
-    /// Room for one more.
-    Room,
-    /// As many in flight as its round trip covers, or its oldest past the queue it may
-    /// have: the capture waits for its acks, or until it stalls, this long from now: the
-    /// one change time alone brings.
-    Full(Duration),
-    /// Its oldest is `STALLED` old: it has no room, and holds no other viewer.
-    Stalled,
-}
-
-#[allow(dead_code)]
-impl Flow {
-    /// From what it has in flight, its round trip, and the time between frames.
-    fn of(backlog: Option<Backlog>, rtt_ms: u32, interval_ms: f64) -> Flow {
-        let Some(b) = backlog else {
-            return Flow::Room;
-        };
-        if b.oldest >= STALLED {
-            return Flow::Stalled;
-        }
-        let age = b.oldest.as_millis();
-        // Enough frames in flight to cover one round trip plus decode, and no more than
-        // `MOST_QUEUED_MS` of queue past the round trip.
-        let rtt = rtt_ms as f64;
-        let room =
-            (((rtt + DECODE_MS) / interval_ms).ceil() as usize + SPARE_FRAMES).min(MOST_IN_FLIGHT);
-        if b.frames.get() >= room || age > rtt_ms as u128 + MOST_QUEUED_MS {
-            Flow::Full(STALLED - b.oldest)
-        } else {
-            Flow::Room
-        }
-    }
-}
 
 impl Gated {
     /// Asks the windows of `viewers` at `now`, in the hub's order. It only reads.
@@ -1754,8 +1686,8 @@ struct Applied {
 
 /// How far a stripe's cap may move, as a share of the one set, before x264 is told:
 /// each change reconfigures the encoder. Upstream's guess, unmeasured. At none, every
-/// wobble of the frame budget reconfigures x264; at twice this, a frame may be coded
-/// under a cap 8% off its share of the budget.
+/// wobble of what a frame may take reconfigures x264; at twice this, a frame may be coded
+/// under a cap 8% off its share of it.
 const CAP_SLACK: f64 = 0.04;
 
 impl Applied {
@@ -2299,7 +2231,7 @@ fn stripe_worker(
 }
 
 /// How a stream's frames are cut and paced: its stripes' layout, and the frames a second
-/// the frame budget and a keyframe's boost are counted in.
+/// that what a frame may take is told to x264 in (a cap is a rate).
 struct Frames {
     layout: Layout,
     fps: Fps,
