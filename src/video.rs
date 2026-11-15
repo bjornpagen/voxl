@@ -1472,7 +1472,10 @@ fn encode_loop(
         let now = Instant::now();
         for c in hub.video_clients() {
             if !c.started.load(Ordering::Relaxed) {
-                if !all_key {
+                // It starts on a keyframe sent after one was planned for it. One that still
+                // asks for one joined after this frame was planned: it may be a viewer of
+                // the stream that replaces this one, and waits for its own.
+                if !all_key || c.needs_keyframe.load(Ordering::Relaxed) {
                     continue;
                 }
                 c.started.store(true, Ordering::Relaxed);
@@ -2464,7 +2467,6 @@ mod tests {
     /// real encode loop send that last job while a recording has just joined; then
     /// `build`'s `restart_clients` says hello.
     #[test]
-    #[ignore = "fails until a not-started viewer starts only on a keyframe planned for it"]
     fn a_viewer_that_joins_while_the_stream_is_rebuilt_starts_on_the_rebuilt_stream() {
         let hub = Hub::new();
         let watch = || {
