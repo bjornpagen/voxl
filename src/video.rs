@@ -7201,4 +7201,168 @@ mod tests {
             );
         }
     }
+
+    /// A viewer whose decoder fails asks for a keyframe and gets one. The browser's client,
+    /// on a decoder error, drops every frame it holds and has not acknowledged (it resets
+    /// its decoders and forgets them) and sends `kf`; frames that arrive after are
+    /// acknowledged as they arrive, undecoded, until the keyframe. Acks are cumulative, so a
+    /// later frame's ack covers the dropped ones; but if nothing is sent after them, nothing
+    /// ever covers them. So within two seconds of its `kf` reaching the server, the viewer
+    /// is sent a keyframe. A model of the capture loop's flow one frame time at a time at
+    /// 60 fps: the hub's own clients and gate, each viewer's frames, acks and pongs over a
+    /// path that serves in order, a decode of 1 to 10 ms before each ack; a screen that
+    /// changes at every frame or every 100 ms to 2 s (keystrokes, a clock); the viewer's
+    /// decoder fails on one frame between 5 and 15 s in. Alone, or beside a viewer on
+    /// another path; paths of 1 to 100 Mbit/s and 2 to 300 ms.
+    #[test]
+    #[ignore = "fails until a viewer that asks for a keyframe waits at once (the next commit): case 0, one viewer at 72 Mbit/s, 83 ms, a screen that changes every 1.1 s, no keyframe in the 20 s after its kf"]
+    fn a_viewer_whose_decoder_fails_gets_a_keyframe() {
+        let mut rng = Xorshift::new(0x2F2E_9A0C_5B17_D3E1);
+        let mut next = |n: u64| rng.below(n);
+        let ms = Duration::from_millis;
+        let frame = Duration::from_micros(16_667);
+        for case in 0..100 {
+            let start = Instant::now() + Duration::from_secs(10);
+            let n = 1 + next(2) as usize;
+            let mut links: Vec<Link> = (0..n)
+                .map(|_| Link {
+                    rate: (1_000_000 + next(99_000_000)) as f64 / 8.0,
+                    rtt: ms(2 + next(298)),
+                    out: vec![],
+                    free: start,
+                })
+                .collect();
+            let decode = ms(1 + next(10));
+            let every = match next(2) {
+                0 => frame,
+                _ => ms(100 + next(1900)),
+            };
+            let want = 1000 + next(60_000) as usize;
+            let fails = start + ms(5000 + next(10_000));
+            let hub = Hub::new(crate::hub::Paths::ANY);
+            let cs: Vec<_> = (0..n)
+                .map(|_| hub.add_client(tokio::sync::mpsc::unbounded_channel().0, start))
+                .collect();
+            for c in &cs {
+                c.watch(start);
+            }
+            // What reaches the server from each viewer, in order: (when, an ack for a frame,
+            // a pong for the ping that went then, or `kf`).
+            enum Up {
+                Ack(u32),
+                Pong(Instant),
+                Keyframe,
+            }
+            let mut up: Vec<std::collections::VecDeque<(Instant, Up)>> =
+                (0..n).map(|_| Default::default()).collect();
+            let push = |q: &mut std::collections::VecDeque<(Instant, Up)>, at: Instant, m: Up| {
+                let at = q.back().map_or(at, |b| b.0.max(at));
+                q.push_back((at, m));
+            };
+            // The first viewer's decoder: frames it holds undecoded (id, decoded at), when
+            // it failed, and whether it waits for a keyframe.
+            let mut holding = std::collections::VecDeque::<(u32, Instant)>::new();
+            let (mut failed, mut waits_key) = (None::<Instant>, false);
+            // When its `kf` reached the server, and when it was next sent a keyframe.
+            let (mut asked, mut keyed) = (None::<Instant>, None::<Instant>);
+            let (mut id, mut t, mut ping, mut drawn) = (0u32, start, start, start);
+            while t < start + Duration::from_secs(30) {
+                // The first viewer decodes what it holds; its decoder fails on the first
+                // frame decoded after `fails`, and it drops all it holds.
+                while let Some(&(f, at)) = holding.front().filter(|h| h.1 <= t) {
+                    if failed.is_none() && at >= fails {
+                        failed = Some(at);
+                        holding.clear();
+                        waits_key = true;
+                        push(&mut up[0], at + links[0].rtt / 2, Up::Keyframe);
+                        break;
+                    }
+                    holding.pop_front();
+                    push(&mut up[0], at + links[0].rtt / 2, Up::Ack(f));
+                }
+                for (i, c) in cs.iter().enumerate() {
+                    while let Some((at, m)) = up[i].front().filter(|u| u.0 <= t) {
+                        match *m {
+                            Up::Ack(f) => c.on_ack(*at, f, crate::hub::Hold::Unsaid),
+                            Up::Pong(sent) => c.pinged(*at, *at - sent),
+                            Up::Keyframe => {
+                                c.ask_keyframe();
+                                asked = Some(*at);
+                            }
+                        }
+                        up[i].pop_front();
+                    }
+                }
+                if t >= ping {
+                    for (i, link) in links.iter_mut().enumerate() {
+                        let at = link.send(t, 40) + link.rtt / 2;
+                        push(&mut up[i], at, Up::Pong(t));
+                    }
+                    ping += crate::hub::PING_EVERY;
+                }
+                let changed = t >= drawn;
+                if changed {
+                    drawn += every;
+                }
+                let key = cs.iter().any(|c| c.viewer() == crate::hub::Viewer::Waiting);
+                let room = match (key, changed) {
+                    (true, _) => {
+                        for c in &cs {
+                            c.keyframe_planned();
+                        }
+                        for c in &cs {
+                            c.keyframe_sent(true, t);
+                        }
+                        let carries = cs.iter().map(|c| c.window(|w| w.carries())).min();
+                        carries.map(|c| window::scale(c, KEY_TIME, window::LATENESS))
+                    }
+                    (false, true) => match Gated::ask(&hub.viewers(), t) {
+                        Gated::Open(room) => Some(room),
+                        Gated::Held { .. } => None,
+                    },
+                    (false, false) => None,
+                };
+                if let Some(room) = room {
+                    leave_behind(&hub.viewers(), t);
+                    let bytes = want.min(room);
+                    for (i, c) in cs.iter().enumerate() {
+                        if c.takes(id, t, bytes, key, HOPELESSLY_BEHIND) != Takes::Frame {
+                            continue;
+                        }
+                        let arrives = links[i].send(t, bytes);
+                        match (i, waits_key, key) {
+                            (0, false, _) => holding.push_back((id, arrives + decode)),
+                            // Waiting for a keyframe: a frame that is not one is acked as
+                            // it arrives, undecoded; the keyframe is decoded.
+                            (0, true, false) => {
+                                push(&mut up[0], arrives + links[0].rtt / 2, Up::Ack(id))
+                            }
+                            (0, true, true) => {
+                                waits_key = false;
+                                keyed = keyed.or(asked.map(|_| t));
+                                holding.push_back((id, arrives + decode));
+                            }
+                            (_, _, _) => push(&mut up[i], arrives + links[i].rtt / 2, Up::Ack(id)),
+                        }
+                    }
+                    id += 1;
+                }
+                t += frame;
+            }
+            let what = format!(
+                "case {case}: {n} viewers, {:.1} Mbit/s, {:?}, the screen changes every \
+                 {every:?}, decoder failed at {:?}, kf at the server {:?}, keyframe {:?}",
+                links[0].rate * 8e-6,
+                links[0].rtt,
+                failed.map(|f| f - start),
+                asked.map(|a| a - start),
+                keyed.map(|k| k - start)
+            );
+            let asked = asked.expect(&what);
+            assert!(
+                keyed.is_some_and(|k| k - asked <= Duration::from_secs(2)),
+                "{what}"
+            );
+        }
+    }
 }
