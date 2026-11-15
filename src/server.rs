@@ -451,8 +451,9 @@ enum Command {
     Resize { w: u32, h: u32 },
     /// `kf`
     Keyframe,
-    /// `po,<sent>`: a ping's reply.
-    Pong { sent: u64 },
+    /// `po,<sent>`: a ping's reply, naming the ping by when it was sent (`AppState::epoch`,
+    /// in microseconds).
+    Pong { sent: Duration },
     /// `ds,<id>`: switch to another display.
     #[cfg(target_os = "macos")]
     Display(u32),
@@ -513,7 +514,7 @@ impl Command {
             },
             "kf" => Command::Keyframe,
             "po" => Command::Pong {
-                sent: num(&mut it)?,
+                sent: Duration::from_micros(num(&mut it)?),
             },
             #[cfg(target_os = "macos")]
             "ds" => Command::Display(rest.parse().ok()?),
@@ -546,6 +547,15 @@ impl Command {
             Command::Display(_) => false,
         }
     }
+}
+
+/// The round trip a ping's reply shows, in whole ms and at least 1 (a client's
+/// `min_rtt_ms` is 0 until it has one), with `now` and `sent` both since the epoch. A
+/// reply naming a ping sent after `now` answers no ping, and is no round trip; nor is one
+/// longer than a u32 of ms holds (49.7 days), which `as u32` wrapped into any value.
+fn round_trip(now: Duration, sent: Duration) -> Option<u32> {
+    let ms = u32::try_from(now.checked_sub(sent)?.as_millis()).ok()?;
+    Some(ms.max(1))
 }
 
 fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collections::VecDeque<u32>) {
@@ -629,9 +639,10 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
             s.hub.wake();
         }
         Command::Pong { sent } => {
-            let now = s.epoch.elapsed().as_micros() as u64;
-            let rtt = (now.saturating_sub(sent) / 1000) as u32;
-            rtts.push_back(rtt.max(1));
+            let Some(rtt) = round_trip(s.epoch.elapsed(), sent) else {
+                return;
+            };
+            rtts.push_back(rtt);
             if rtts.len() > 20 {
                 rtts.pop_front();
             }
@@ -727,6 +738,21 @@ mod tests {
         assert!(input >= 9, "{input} input events");
         assert_eq!(mic, 1);
         assert!(resized);
+    }
+
+    /// A ping's reply names its ping by when it was sent. One naming a time still to come
+    /// answers no ping, so it is no round trip: it read as 1 ms, the shortest there is,
+    /// and held the client's shortest round trip there for its next 20 replies.
+    #[test]
+    fn a_reply_to_a_ping_not_yet_sent_is_no_round_trip() {
+        let ms = Duration::from_millis;
+        assert_eq!(round_trip(ms(1000), ms(960)), Some(40));
+        assert_eq!(round_trip(ms(1000), ms(1000)), Some(1));
+        for sent in [ms(1001), Duration::from_micros(u64::MAX)] {
+            assert_eq!(round_trip(ms(1000), sent), None, "{sent:?}");
+        }
+        let days = |d: u64| Duration::from_secs(d * 86_400);
+        assert_eq!(round_trip(days(50), Duration::ZERO), None);
     }
 
     /// Every command the web client sends parses here (a display switch only on
