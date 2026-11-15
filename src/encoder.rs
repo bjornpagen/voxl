@@ -12,8 +12,35 @@ mod ffi {
 
 use crate::env::{Debugging, X264Log};
 use crate::path::Kbps;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::ptr;
+
+/// What every encoder is tuned for: no frame held back to look ahead.
+const TUNE: &CStr = c"zerolatency";
+
+/// An x264 preset (`--preset`): a name x264 has, asked of x264 when voxl starts, so no
+/// encoder refuses it later, at a viewer's join.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Preset(CString);
+
+impl Preset {
+    /// The preset named `name`, if x264 has one by that name.
+    pub fn parse(name: &str) -> Option<Preset> {
+        let name = CString::new(name).ok()?;
+        // x264 fills in the parameters itself before it applies the preset.
+        let mut param: ffi::x264_param_t = unsafe { std::mem::zeroed() };
+        let known =
+            unsafe { ffi::x264_param_default_preset(&mut param, name.as_ptr(), TUNE.as_ptr()) }
+                >= 0;
+        known.then_some(Preset(name))
+    }
+}
+
+impl std::fmt::Display for Preset {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.0.to_string_lossy())
+    }
+}
 
 /// What every encoder is opened with, whatever decides its bits: the pictures' size and
 /// rate, the preset and threads that code them, and the debugging variables voxl was
@@ -23,7 +50,7 @@ pub struct Pictures {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
-    pub preset: String,
+    pub preset: Preset,
     pub threads: u32,
     pub debug: Debugging,
 }
@@ -73,11 +100,13 @@ impl Encoder {
         } = *cfg;
         unsafe {
             let mut param: ffi::x264_param_t = std::mem::zeroed();
-            let preset = CString::new(pictures.preset.as_str()).unwrap();
-            let tune = c"zerolatency";
-            if ffi::x264_param_default_preset(&mut param, preset.as_ptr(), tune.as_ptr()) < 0 {
-                return Err(format!("bad x264 preset {}", pictures.preset));
-            }
+            let preset = &pictures.preset;
+            let accepted =
+                ffi::x264_param_default_preset(&mut param, preset.0.as_ptr(), TUNE.as_ptr()) >= 0;
+            assert!(
+                accepted,
+                "x264 refused the preset {preset} it had when voxl started"
+            );
             param.i_width = pictures.width as i32;
             param.i_height = pictures.height as i32;
             param.i_csp = ffi::X264_CSP_I420 as i32;
@@ -367,7 +396,7 @@ mod tests {
                     width: w as u32,
                     height: h as u32,
                     fps: 60,
-                    preset: "ultrafast".into(),
+                    preset: Preset::parse("ultrafast").unwrap(),
                     threads: 1,
                     debug: Debugging::read(|_| None).unwrap(),
                 },
@@ -421,7 +450,7 @@ mod tests {
                     width: w as u32,
                     height: h as u32,
                     fps: 60,
-                    preset: "ultrafast".into(),
+                    preset: Preset::parse("ultrafast").unwrap(),
                     threads: 1,
                     debug: Debugging::read(|_| None).unwrap(),
                 },
@@ -481,7 +510,7 @@ mod bench {
                 width: w as u32,
                 height: h as u32,
                 fps: 60,
-                preset: "ultrafast".into(),
+                preset: Preset::parse("ultrafast").unwrap(),
                 threads: 4,
                 debug: Debugging::read(|_| None).unwrap(),
             },
@@ -564,7 +593,7 @@ mod bench {
                     width: w as u32,
                     height: h as u32,
                     fps: 60,
-                    preset: "ultrafast".into(),
+                    preset: Preset::parse("ultrafast").unwrap(),
                     threads,
                     debug: Debugging::read(|_| None).unwrap(),
                 },

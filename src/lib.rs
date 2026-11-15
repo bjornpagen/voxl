@@ -99,6 +99,13 @@ fn rate_flag(flag: &str, v: Option<&String>, default: u32) -> Result<u32, String
     })
 }
 
+/// `--preset`: a preset x264 has, `ultrafast` when not given. x264 is asked here, where
+/// the flag is read, so a name it does not have starts nothing.
+fn preset(flag: Option<&String>) -> Result<encoder::Preset, String> {
+    let name = flag.map_or("ultrafast", String::as_str);
+    encoder::Preset::parse(name).ok_or_else(|| format!("--preset {name}: x264 has no such preset"))
+}
+
 /// `--min-kbps` and `--max-kbps` (or Selkies' `--video-bitrate`), read together: what the
 /// stream is steered between; 2000 and 30000 kbit/s when not given. A ceiling of 0 is
 /// none: the target goes as high as the viewers' paths carry, and encoders open without
@@ -195,15 +202,16 @@ async fn serve(a: HashMap<String, String>, env: env::Env) {
         log::error!("{e}");
         std::process::exit(1);
     });
+    let preset = preset(a.get("preset")).unwrap_or_else(|e| {
+        log::error!("{e}");
+        std::process::exit(1);
+    });
     let vcfg = video::VideoConfig {
         display: display.clone(),
         #[cfg(target_os = "macos")]
         enable_resize: truthy(a.get("enable-resize"), false) && !truthy(a.get("read-only"), false),
         fps: range_max(a.get("framerate"), 60.0) as u32,
-        preset: a
-            .get("preset")
-            .cloned()
-            .unwrap_or_else(|| "ultrafast".into()),
+        preset,
         // Four sliced threads: lower latency than one, and x264's slicing overhead grows
         // with thread count, so more threads only add CPU (measured on 2560x1600).
         threads: a
@@ -510,6 +518,51 @@ mod tests {
     use super::*;
     use path::Kbps;
     use rate::Bounds;
+
+    /// A preset is one x264 has, asked where the flag is read. Each of x264's presets
+    /// (x264.h's `x264_preset_names`), by its name, in capitals and by its number, starts
+    /// voxl and opens an encoder; each name with a letter added or its first taken away
+    /// starts nothing; and no flag is `ultrafast`.
+    #[test]
+    fn a_preset_is_one_x264_has() {
+        const X264: [&str; 10] = [
+            "ultrafast",
+            "superfast",
+            "veryfast",
+            "faster",
+            "fast",
+            "medium",
+            "slow",
+            "slower",
+            "veryslow",
+            "placebo",
+        ];
+        for (i, name) in X264.iter().enumerate() {
+            for given in [name.to_string(), name.to_uppercase(), i.to_string()] {
+                let preset = preset(Some(&given)).unwrap_or_else(|e| panic!("{e}"));
+                let cfg = encoder::EncoderConfig {
+                    pictures: encoder::Pictures {
+                        width: 64,
+                        height: 64,
+                        fps: 60,
+                        preset,
+                        threads: 1,
+                        debug: env::Debugging::read(|_| None).unwrap(),
+                    },
+                    crf: 24.0,
+                    max_kbps: None,
+                };
+                assert!(encoder::Encoder::new(&cfg).is_ok(), "{given}");
+            }
+            for not in [format!("{name}x"), name[1..].to_string()] {
+                assert!(preset(Some(&not)).is_err(), "{not}");
+            }
+        }
+        assert_eq!(
+            preset(None),
+            Ok(encoder::Preset::parse("ultrafast").unwrap())
+        );
+    }
 
     fn read(min: Option<&str>, max: Option<&str>) -> Result<Bounds, String> {
         bounds(

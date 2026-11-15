@@ -2,7 +2,7 @@
 
 use crate::capture::{Band, Capturer};
 use crate::convert::I420;
-use crate::encoder::{Encoded, Encoder, EncoderConfig, Pictures, Planes, Quality};
+use crate::encoder::{Encoded, Encoder, EncoderConfig, Pictures, Planes, Preset, Quality};
 use crate::env::{Debugging, Marker};
 use crate::hub::{wait_any, wait_event};
 use crate::hub::{Hub, Inflight, Out, ServerMessage};
@@ -20,7 +20,7 @@ pub struct VideoConfig {
     #[cfg(target_os = "macos")]
     pub enable_resize: bool,
     pub fps: u32,
-    pub preset: String,
+    pub preset: Preset,
     pub threads: u32,
     pub convert_threads: usize,
     pub crf: f32,
@@ -1750,7 +1750,7 @@ mod tests {
                         #[cfg(target_os = "macos")]
                         enable_resize: false,
                         fps: 60,
-                        preset: "ultrafast".into(),
+                        preset: Preset::parse("ultrafast").unwrap(),
                         threads: 1,
                         convert_threads: 1,
                         crf: 23.0,
@@ -1880,7 +1880,7 @@ mod tests {
                         width: W as u32,
                         height: H as u32,
                         fps: 60,
-                        preset: "ultrafast".into(),
+                        preset: Preset::parse("ultrafast").unwrap(),
                         threads: 1,
                         debug: Debugging::read(|_| None).unwrap(),
                     },
