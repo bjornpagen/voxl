@@ -46,9 +46,10 @@ struct Job {
 
 /// What a captured frame is for. Each kind carries what only it has.
 enum Frame {
-    /// A new viewer, or a decoder that lost its place: every stripe, from nothing. `still`:
-    /// it went out in place of a sharpening pass, so it is coded at paint-over quality.
-    Key { still: bool },
+    /// A new viewer, or a decoder that lost its place: every stripe, from nothing.
+    /// `blocks`: it went out in place of a sharpening pass, so it is coded at paint-over
+    /// quality and sharpens every block, as that pass would have.
+    Key { blocks: Option<Sharpen> },
     /// What changed on screen, and which blocks (None: analyse every block in the band).
     Motion {
         band: Band,
@@ -80,7 +81,9 @@ impl Frame {
     /// How a stripe codes it.
     fn coding(&self) -> Coding {
         match self {
-            Frame::Key { still } => Coding::Key { still: *still },
+            Frame::Key { blocks } => Coding::Key {
+                still: blocks.is_some(),
+            },
             Frame::Motion { .. } => Coding::Motion,
             Frame::Sharpen { .. } | Frame::MotionAndSharpen { .. } => Coding::Sharpen,
         }
@@ -89,7 +92,7 @@ impl Frame {
     /// Whether it is coded at paint-over quality (a flag in each message's header).
     fn sharpens(&self) -> bool {
         match self {
-            Frame::Key { still } => *still,
+            Frame::Key { blocks } => blocks.is_some(),
             Frame::Motion { .. } => false,
             Frame::Sharpen { .. } | Frame::MotionAndSharpen { .. } => true,
         }
@@ -108,7 +111,8 @@ impl Frame {
     /// The blocks it sharpens, cleared once it came out sharp.
     fn into_sharpened(self) -> Option<Sharpen> {
         match self {
-            Frame::Key { .. } | Frame::Motion { .. } => None,
+            Frame::Motion { .. } => None,
+            Frame::Key { blocks } => blocks,
             Frame::Sharpen { blocks, .. } | Frame::MotionAndSharpen { blocks, .. } => Some(blocks),
         }
     }
@@ -633,6 +637,14 @@ impl Refiner {
             tried: false,
         });
     }
+    /// Every block, as the blocks a frame captured at `now` sharpens: a keyframe codes
+    /// them all.
+    fn every_block(&self, now: Instant) -> Sharpen {
+        Sharpen {
+            map: Arc::new(vec![1; self.blocks.len()]),
+            at: now,
+        }
+    }
     /// A frame captured at `at` coded `map`'s blocks at paint-over quality: they are
     /// sharp now, unless they changed again since.
     fn sharpened(&mut self, map: &[u8], at: Instant) {
@@ -1026,17 +1038,19 @@ fn capture_loop(
         // Each plan is one input to the sharpening schedule.
         let frame = match plan {
             Plan::Key { pass } => {
-                let still = pass.is_some();
-                if still {
+                // Every block goes out at keyframe quality, which the rate cap squeezes:
+                // all of it is pending. In place of a pass the keyframe is coded at
+                // paint-over quality, and what comes back as asked is sharp.
+                refiner.mark_all(t0);
+                let blocks = pass.as_ref().map(|_| refiner.every_block(t0));
+                if blocks.is_some() {
                     hub.stats.paintovers.fetch_add(1, Ordering::Relaxed);
                 }
                 sharpening.on_key(pass, t0);
                 for c in &clients {
                     c.needs_keyframe.store(false, Ordering::Relaxed);
                 }
-                // A keyframe is squeezed into the rate cap; sharpen all of it once still.
-                refiner.mark_all(t0);
-                Frame::Key { still }
+                Frame::Key { blocks }
             }
             Plan::Sharpen { pass, map, band } => {
                 sharpening.on_pass(pass, t0);
@@ -1968,6 +1982,30 @@ mod tests {
         let (map, _) = r.pending_map().unwrap();
         r.sharpened(&map, ms(40));
         assert!(r.pending_map().is_none());
+    }
+
+    /// A keyframe sent in place of a due pass is coded at paint-over quality: when it
+    /// comes back as asked, every block is sharp and nothing is left for the passes
+    /// after it, except a block that changed after its capture. Any other keyframe
+    /// leaves every block pending.
+    #[test]
+    fn a_keyframe_in_place_of_a_pass_sharpens_every_block() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let mut r = Refiner::new(4, 2, t0);
+        r.mark(&[1, 0, 1, 0], ms(10));
+        r.mark_all(ms(200));
+        let key = super::Frame::Key { blocks: None };
+        assert!(key.into_sharpened().is_none());
+        assert_eq!(r.pending_map().map(|p| p.0), Some(vec![1, 1, 1, 1]));
+        let key = super::Frame::Key {
+            blocks: Some(r.every_block(ms(200))),
+        };
+        assert!(key.sharpens());
+        r.mark(&[0, 0, 0, 1], ms(210));
+        let s = key.into_sharpened().expect("it sharpens what it codes");
+        r.sharpened(&s.map, s.at);
+        assert_eq!(r.pending_map().map(|p| p.0), Some(vec![0, 0, 0, 1]));
     }
 
     /// On frames that carry motion, a block still for `REFINE_STILL` is tried once per
