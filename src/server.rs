@@ -851,6 +851,43 @@ mod tests {
         }
     }
 
+    /// The buttons pointer.ts sends, by the number a command names each with: the browser's
+    /// main, middle, secondary, back and forward.
+    const BUTTONS: [(i128, Button); 5] = [
+        (1, Button::Left),
+        (2, Button::Middle),
+        (3, Button::Right),
+        (8, Button::Back),
+        (9, Button::Forward),
+    ];
+
+    /// Whether a position, a button, a wheel, a pixel scroll or a clipboard with its own
+    /// count of fields is a command, written apart from `parse` from what each number must
+    /// be where it is used: a position in X's 16 bits, a button one of `BUTTONS` and a flag,
+    /// a wheel's notches within `MAX_NOTCHES`, a pixel scroll finite and within
+    /// `MAX_SCROLL_PX`, and a clipboard any text. `None` for any other line.
+    fn takes(name: &str, fields: &[&str]) -> Option<bool> {
+        let int = |f: &str| f.trim().parse::<i128>().ok();
+        let position = |f: &str| int(f).is_some_and(|n| i16::try_from(n).is_ok());
+        let most = i128::from(MAX_NOTCHES);
+        let notches = |f: &str| int(f).is_some_and(|n| (-most..=most).contains(&n));
+        let pixels = |f: &str| {
+            f.trim()
+                .parse::<f64>()
+                .is_ok_and(|px| px.abs() <= MAX_SCROLL_PX)
+        };
+        Some(match (name, fields) {
+            ("m", [x, y]) => position(x) && position(y),
+            ("b", [button, down]) => {
+                BUTTONS.iter().any(|&(n, _)| int(button) == Some(n)) && matches!(*down, "0" | "1")
+            }
+            ("s", [dx, dy]) => notches(dx) && notches(dy),
+            ("sp", [dx, dy]) => pixels(dx) && pixels(dy),
+            ("c", [_, ..]) => true,
+            _ => return None,
+        })
+    }
+
     /// One rule for every command: its name and exactly its fields. Each command the web
     /// client sends, with none to four well-formed fields (its own, then copies of its
     /// last), parses exactly when that is a count `fields_of` gives it; an ack without its
@@ -1022,78 +1059,20 @@ mod tests {
         Ok(())
     }
 
-    /// Each number a command carries parses into the range the input threads take, as it
-    /// is, or the line is no command, as a malformed one is: nothing is clamped or wrapped.
-    #[test]
-    fn a_number_out_of_range_makes_no_command() {
-        assert!(matches!(
-            Command::parse("m,32767,-32768"),
-            Some(Command::Move {
-                x: 32767,
-                y: -32768
-            })
-        ));
-        for (line, said) in [
-            ("b,1,1", Button::Left),
-            ("b,2,1", Button::Middle),
-            ("b,3,1", Button::Right),
-            ("b,8,1", Button::Back),
-            ("b,9,1", Button::Forward),
-        ] {
-            assert!(
-                matches!(Command::parse(line), Some(Command::Button { button, down: true }) if button == said),
-                "{line}"
-            );
-        }
-        let edges = [
-            ("s,-20,20", (-20.0, 20.0)),
-            ("sp,-1048576,1048576", (-MAX_SCROLL_PX, MAX_SCROLL_PX)),
-        ];
-        for (line, (x, y)) in edges {
-            let c = Command::parse(line).unwrap_or_else(|| panic!("{line} is no command"));
-            let got = match &c {
-                Command::Scroll { dx, dy } => (f64::from(dx.get()), f64::from(dy.get())),
-                Command::ScrollPx { dx, dy } => (dx.0, dy.0),
-                _ => panic!("{line} is another command"),
-            };
-            assert_eq!(got, (x, y), "{line}");
-            assert_eq!(through_the_input_threads(&c), Ok(()), "{line}");
-        }
-        for line in [
-            "m,32768,0",
-            "m,0,-32769",
-            "m,65636,100",
-            "b,0,1",
-            "b,4,1",
-            "b,7,0",
-            "b,10,1",
-            "b,256,1",
-            "b,-1,1",
-            "s,21,0",
-            "s,0,-21",
-            "s,0,-2147483648",
-            "s,128,0",
-            "sp,1048576.5,0",
-            "sp,0,-1048577",
-            "sp,0,1.7e308",
-            "sp,-1e308,0",
-        ] {
-            assert!(Command::parse(line).is_none(), "{line} parsed");
-        }
-    }
-
     /// 200,000 random lines: every command name, and some that are none, with no fields up
     /// to four, each empty, at an edge of a type or a range, signed, huge, a float, `NaN`,
-    /// `inf`, not a number, or random. Nothing panics; and each that parses into a position,
-    /// a button, a wheel or a pixel scroll holds exactly the numbers the line says, and
-    /// they go through the input threads' arithmetic.
+    /// `inf`, not a number, or random. Nothing panics; a position, a button, a wheel, a
+    /// pixel scroll or a clipboard is a command exactly when `takes` says it is; and each
+    /// that parses into a position, a button, a wheel or a pixel scroll holds exactly the
+    /// numbers the line says (a button the one `BUTTONS` names), and they go through the
+    /// input threads' arithmetic.
     #[test]
     fn random_lines_parse_in_range_or_not_at_all() {
         const NAMES: [&str; 17] = [
             "a", "m", "b", "s", "sp", "k", "r", "c", "v", "au", "mi", "sz", "kf", "po", "ds", "zz",
             "",
         ];
-        const EDGES: [&str; 40] = [
+        const EDGES: [&str; 42] = [
             "",
             "0",
             "-0",
@@ -1123,6 +1102,8 @@ mod tests {
             "1048576",
             "-1048576",
             "1048576.5",
+            "-1048577",
+            "10",
             "1.7e308",
             "-1e308",
             "1e309",
@@ -1163,11 +1144,17 @@ mod tests {
                 };
                 line = format!("{line},{field}");
             }
-            let Some(c) = Command::parse(&line) else {
-                continue;
-            };
             let said: Vec<&str> = line.split(',').skip(1).collect();
             let name = line.split(',').next().expect("a line has a name");
+            let command = Command::parse(&line);
+            match takes(name, &said) {
+                Some(true) if command.is_none() => out.push(format!("{line}: no command")),
+                Some(false) if command.is_some() => out.push(format!("{line}: a command")),
+                _ => {}
+            }
+            let Some(c) = command else {
+                continue;
+            };
             if name != "c" && !fields_of(name).contains(&said.len()) {
                 out.push(format!("{line}: {} fields", said.len()));
             }
@@ -1178,7 +1165,10 @@ mod tests {
                     0,
                     int(0) == Some((*x).into()) && int(1) == Some((*y).into()),
                 ),
-                Command::Button { button, .. } => (1, int(0) == Some(button.number().into())),
+                Command::Button { button, .. } => (
+                    1,
+                    BUTTONS.contains(&(int(0).expect("a button is a number"), *button)),
+                ),
                 Command::Scroll { dx, dy } => (
                     2,
                     int(0) == Some(dx.get().into()) && int(1) == Some(dy.get().into()),
