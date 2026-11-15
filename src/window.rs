@@ -123,6 +123,13 @@ pub struct Window {
     least: usize,
     most: usize,
     fastest: Fastest,
+    /// The path's own round trip: the fastest of the pings that left with nothing on its
+    /// way ahead of them. Kept until another such ping comes back, however long that is:
+    /// while frames follow one another every trip holds some of their queue, and one of
+    /// those must never pass for the path's own.
+    own: Fastest,
+    /// When there was last nothing on its way.
+    emptied: Instant,
     round: Round,
     /// When the last frame that came back did, and when it had left.
     last: Option<(Instant, Instant)>,
@@ -176,6 +183,10 @@ impl Window {
             fastest: Fastest {
                 trips: VecDeque::new(),
             },
+            own: Fastest {
+                trips: VecDeque::new(),
+            },
+            emptied: now,
             round: Round::new(now),
             last: None,
             flying: VecDeque::new(),
@@ -192,7 +203,7 @@ impl Window {
 
     /// The fastest round trip of the last `FASTEST_FOR`, once something has come back.
     pub fn fastest(&self) -> Option<Duration> {
-        self.fastest.get().map(|(trip, _)| trip)
+        self.there_and_back()
     }
 
     /// The bytes that have left and not come back.
@@ -220,7 +231,7 @@ impl Window {
     /// The bytes of the frames on their way at `now` that would be back even behind the
     /// fullest queue the path is allowed, but for the oldest.
     fn overdue(&self, now: Instant) -> usize {
-        let there_and_back = self.fastest.get().map_or(Duration::ZERO, |(trip, _)| trip);
+        let there_and_back = self.there_and_back().unwrap_or(Duration::ZERO);
         self.flying
             .iter()
             .skip(1)
@@ -299,15 +310,35 @@ impl Window {
         self.flying.clear();
         self.queued = 0;
         self.as_of = now;
+        self.emptied = now;
         self.last = None;
         self.round = Round::new(now);
     }
 
-    /// A ping came back at `now`, `trip` after it left. A ping carries nothing, so its
-    /// round trip is the path's own: the fastest is measured against it, and a frame that
-    /// crosses alone is timed against it.
+    /// A ping came back at `now`, `trip` after it left. A ping carries nothing, so one
+    /// that left with nothing on its way ahead of it took the path's own round trip, and
+    /// frames that cross alone are timed against it. One that left behind a frame may
+    /// have queued behind it, and counts only toward the fastest trip of any kind.
     pub fn pinged(&mut self, now: Instant, trip: Duration) {
         self.fastest.take(now, trip, 0);
+        // Nothing was on its way when it left: nothing has been since before then, or what
+        // is on its way now left after it.
+        let Some(left) = now.checked_sub(trip) else {
+            return;
+        };
+        let behind = self
+            .flying
+            .front()
+            .is_some_and(|&(oldest, _)| oldest <= left);
+        if self.emptied <= left && !behind {
+            self.own.take(now, trip, 0);
+        }
+    }
+
+    /// The path's own round trip as far as it is known: a ping's that had the path to
+    /// itself, or, until one has come back, the fastest trip of any kind.
+    fn there_and_back(&self) -> Option<Duration> {
+        self.own.get().or(self.fastest.get()).map(|(trip, _)| trip)
     }
 
     /// A frame of `bytes` that `left` came back at `back` (the time the viewer held it
@@ -318,9 +349,11 @@ impl Window {
             // Everything is through, whatever the queue was taken to be.
             self.queued = 0;
             self.as_of = back;
+            self.emptied = back;
         }
         let trip = back.saturating_duration_since(left.at);
-        let (fastest, weighed) = self.fastest.take(back, trip, bytes);
+        self.fastest.take(back, trip, bytes);
+        let fastest = self.there_and_back().unwrap_or(trip);
         // When it would have come back alone, weighing what the fastest trip's frame did.
         let alone = left.at + fastest;
         match self.last {
@@ -333,16 +366,18 @@ impl Window {
                 self.round.busy += back.saturating_duration_since(ahead);
             }
             // Nothing was ahead: it crossed alone, in the time since `alone`, a moment that
-            // is no acknowledgement. Whatever else held it up made it later, never earlier,
-            // so it never says more than the path carries, and of the frames that crossed
-            // alone in a round the one that says most is nearest the truth. But only when
-            // the fastest trip is a ping's: a frame's trip may hold time it spent queued,
-            // and a frame timed against it would seem to have crossed in less than it did.
+            // is no acknowledgement of a frame. Whatever else held it up made it later,
+            // never earlier, so of the frames that crossed alone in a round the one that
+            // says most is nearest the truth; one that came back no later than a ping would
+            // crossed faster than can be told, and says as much as it may. Only against the
+            // path's own round trip, though: until a ping has had the path to itself there
+            // is none, and a frame timed against another frame's trip says nothing if it is
+            // that frame's size and too much if that frame had queued.
             Some(_) | None => {
-                if let (0, false) = (weighed, bytes == 0) {
-                    let says = match back.saturating_duration_since(alone) {
+                if let Some((own, _)) = self.own.get() {
+                    let says = match back.saturating_duration_since(left.at + own) {
                         Duration::ZERO => usize::MAX,
-                        busy => scale(bytes, LATENESS, busy),
+                        crossed => scale(bytes, LATENESS, crossed),
                     };
                     self.round.alone = self.round.alone.max(Some(says));
                 }
@@ -455,7 +490,13 @@ mod tests {
                 ticks: 0,
                 in_flight: 0,
                 floor: 0,
-                window: Window::new(now, 0, usize::MAX),
+                window: {
+                    // The server pings a client as it connects, before any frame leaves.
+                    let mut window = Window::new(now, 0, usize::MAX);
+                    let rtt = Duration::from_millis(rtt_ms);
+                    window.pinged(now + rtt, rtt);
+                    window
+                },
                 lates: Vec::new(),
                 sent: 0,
                 worst_share: 1.0,
@@ -936,7 +977,6 @@ mod tests {
     /// 1.5 to 4 times what the link carries in `LATENESS`, on 0.3 to 5 MB/s links, round
     /// trips of 2 to 300 ms.
     #[test]
-    #[ignore = "pings queue behind frames that cannot be under their room, the fastest trip is then an inflated ping, and lone frames timed against it over-read: 1.06 s late against 0.53 s at 2.6 MB/s, 259 ms, frames of at least 453 KB"]
     fn a_frame_bigger_than_its_room_is_paid_for_by_the_frames_after_it() {
         let mut rng = Rng(0xBF58_476D_1CE4_E5B9);
         for _ in 0..100 {
