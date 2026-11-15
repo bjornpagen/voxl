@@ -839,12 +839,6 @@ impl Sharpening {
     }
 }
 
-/// How long a capture waits for its buffer to come back from the encoder before the
-/// loop looks again. Upstream's guess, unmeasured. Half: an encode over 25 ms makes the
-/// loop look again before it captures. Double: the loop answers nothing (a resize, a
-/// screenshot, a new viewer) for up to 100 ms while the encoder works.
-const BUFFER_WAIT: Duration = Duration::from_millis(50);
-
 /// Captures may come this share of the frame interval apart, so that a source's jitter
 /// does not alias into dropped frames. Upstream's guess, unmeasured. It caps the capture
 /// rate at the frame rate over it (70.6 a second at 60): at 1, a frame that lands a
@@ -857,9 +851,6 @@ enum Step {
     Wait(Wait),
     /// Capture into the buffer that is home.
     Capture,
-    /// Capture once the encoder gives a buffer back, if it does within `BUFFER_WAIT`;
-    /// otherwise look again.
-    CaptureOnReturn,
 }
 
 /// What the capture loop waits for before it looks again. Damage wakes it through the
@@ -878,6 +869,9 @@ enum Wait {
     /// The flow gate: an ack, a viewer going or a keyframe asked for (a wake), or damage
     /// to take in, or in this long, when the first viewer it holds for will have stalled.
     Gate(Duration),
+    /// A buffer back from the encoder, which wakes the waker as it hands it back; damage
+    /// waits for the capture this leads to.
+    Buffer,
 }
 
 /// What a wait wakes on besides its time.
@@ -915,6 +909,7 @@ impl Wait {
             Wait::Interval(rest) => poll(On::Wake, ms(rest)),
             Wait::Settle(rest) => sleep(rest),
             Wait::Gate(stalls) => poll(On::Event, ms(stalls)),
+            Wait::Buffer => poll(On::Wake, None),
         }
     }
 }
@@ -1030,7 +1025,7 @@ fn step(look: &Look, gate: impl FnOnce() -> Gated) -> Step {
     }
     match look.encoding {
         Encoding::Idle | Encoding::Busy => Step::Capture,
-        Encoding::Full => Step::CaptureOnReturn,
+        Encoding::Full => Step::Wait(Wait::Buffer),
     }
 }
 
@@ -1142,9 +1137,15 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
                 let _ = tx.send(shot.clone());
             }
         }
+        // The encoder holds the sender for as long as it runs: once it is gone, no buffer
+        // will come back to wake the loop.
         if let Some(s) = stream.as_mut() {
-            while let Ok(r) = s.ret_rx.try_recv() {
-                s.returned(r, &mut refiner);
+            loop {
+                match s.ret_rx.try_recv() {
+                    Ok(r) => s.returned(r, &mut refiner),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => return Err("encoder gone".into()),
+                }
             }
         }
         // One read of the viewers: the stream, the rate, the keyframe and whom it is promised
@@ -1209,14 +1210,6 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
                 continue;
             }
             Step::Capture => {}
-            Step::CaptureOnReturn => {
-                if let Ok(r) = s.ret_rx.recv_timeout(BUFFER_WAIT) {
-                    s.returned(r, &mut refiner);
-                }
-                if s.slots[s.next].buf.is_none() {
-                    continue;
-                }
-            }
         }
 
         let t0 = Instant::now();
@@ -3648,7 +3641,7 @@ mod tests {
     }
 
     /// A look waits for the first of these that holds it, and only for that, else it
-    /// captures, at once if its buffer is home: a still screen (nothing damaged, no
+    /// captures if its buffer is home, or waits for the buffer: a still screen (nothing damaged, no
     /// keyframe wanted, and no pass due, or one due while the encoder holds a buffer),
     /// for the pass due or, with none due, for a change; the rest of the least interval
     /// since the last capture; the rest of the coalesce window; the flow gate. The gate
@@ -3685,7 +3678,7 @@ mod tests {
                 (false, None, None) => match (gate_asked, c.gate, c.next_home) {
                     (true, Gated::Held { until }, _) => Step::Wait(Wait::Gate(until - c.now)),
                     (_, _, true) => Step::Capture,
-                    (_, _, false) => Step::CaptureOnReturn,
+                    (_, _, false) => Step::Wait(Wait::Buffer),
                 },
             };
             assert_eq!(
@@ -3701,8 +3694,9 @@ mod tests {
     /// Each wait wakes on what it waits for, and on its time: a change on damage or a
     /// wake, with no limit; a pass on damage or a wake, or once due, and the interval only
     /// on a wake, or once over, each in whole milliseconds less than one late; the gate
-    /// the same way, until a viewer stalls; the coalesce window as a sleep of exactly its
-    /// rest. Over every wait `step` makes in `each_case`.
+    /// the same way, until a viewer stalls; a buffer only on a wake, with no limit; the
+    /// coalesce window as a sleep of exactly its rest. Over every wait `step` makes in
+    /// `each_case`.
     #[test]
     fn a_wait_wakes_on_what_it_waits_for() {
         let ms = |ms: i32| Duration::from_millis(ms as u64);
@@ -3720,6 +3714,7 @@ mod tests {
             };
             let ok = match (wait, polled, slept) {
                 (Wait::Change, Some((On::Event, None)), None) => true,
+                (Wait::Buffer, Some((On::Wake, None)), None) => true,
                 (Wait::Pass(due), Some((On::Event, Some(m))), None) => up_to(due, m),
                 (Wait::Interval(rest), Some((On::Wake, Some(m))), None) => up_to(rest, m),
                 (Wait::Gate(stalls), Some((On::Event, Some(m))), None) => up_to(stalls, m),
