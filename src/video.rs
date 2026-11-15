@@ -313,13 +313,13 @@ struct Slot {
 }
 
 impl Stream {
-    /// The encoders for a screen of `w` x `h`, on their thread, and two buffers that hold
-    /// nothing of it yet.
+    /// The encoders for a screen of `w` x `h`, one for each stripe the hub's hello names,
+    /// on their thread, and two buffers that hold nothing of it yet.
     fn new(cfg: &VideoConfig, hub: &Arc<Hub>, w: u32, h: u32) -> Result<Self, String> {
         log::info!("streaming");
         let (job_tx, job_rx) = mpsc::sync_channel::<Job>(1);
         let (ret_tx, ret_rx) = mpsc::channel::<Returned>();
-        let layout = stripe_layout(h, cfg.stripes);
+        let layout = hub.stripes.lock().clone();
         let mut stripes = Vec::new();
         for &(y, sh) in &layout {
             let ecfg = EncoderConfig {
@@ -1705,7 +1705,7 @@ mod tests {
     /// depends on a frame from before the stream. For every kind of frame, with every block
     /// marked unchanged, over the whole screen and over its first rows, at 1 to 4 stripes,
     /// then a motion frame with every block changed: each stripe's first part is coded
-    /// from nothing and its second is not.
+    /// from nothing and its second is not. The stripes are the ones the hub's hello names.
     #[test]
     fn a_new_streams_first_frame_is_coded_from_nothing() {
         let (w, h) = (64u32, 128u32);
@@ -1758,9 +1758,11 @@ mod tests {
                         paintover_crf: 18.0,
                         paintover_delay_ms: 0,
                         coalesce: Duration::ZERO,
-                        stripes,
+                        // The stream codes the stripes the hub's hello names, not these.
+                        stripes: 1,
                         debug: Debugging::read(|_| None).unwrap(),
                     };
+                    *hub.stripes.lock() = stripe_layout(h, stripes);
                     let s = Stream::new(&cfg, &hub, w, h).unwrap();
                     let next = super::Frame::Motion {
                         band: bands[0],
@@ -1781,7 +1783,7 @@ mod tests {
                     }
                     drop(s);
                     // Whether each part a stripe sent was coded from nothing, in order.
-                    let mut sent = vec![vec![]; stripe_layout(h, stripes).len()];
+                    let mut sent = vec![vec![]; hub.stripes.lock().len()];
                     while let Ok(m) = rx.try_recv() {
                         if let Out::Bin(b) = m {
                             sent[b[10] as usize].push(b[1] & 1 == 1);
