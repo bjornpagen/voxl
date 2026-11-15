@@ -664,6 +664,11 @@ fn capture_loop(
     let marker = cfg.env.marker;
 
     loop {
+        // The wake is taken before anything it may stand for is read: a request that
+        // lands after this line wakes the next wait, and one that landed before it is
+        // seen below. Read first and drained after, a resize asked for in between lost
+        // its wake, and the waits below have no time limit.
+        hub.drain_wake();
         #[cfg(target_os = "macos")]
         if hub.display_req.lock().is_some() {
             return Ok(());
@@ -676,7 +681,6 @@ fn capture_loop(
             return Ok(());
         }
         note_changes(cap, &hub);
-        hub.drain_wake();
         let snaps = std::mem::take(&mut *hub.snapshots.lock());
         if !snaps.is_empty() {
             // The whole current screen, whether or not anyone is watching. Damage
