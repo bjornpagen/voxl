@@ -919,24 +919,54 @@ enum Key {
     NotWanted,
 }
 
-/// What the capturer holds since the last capture: one value for its `damaged` and
-/// `damaged_at`, which it sets together but for `Unreported`, and clears together.
+/// What changed on screen since the last capture, as each platform's capturer holds it.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Damage {
+pub(crate) enum Damage {
     None,
-    /// Marked damaged with no area reported: a new capturer, or the loop after it
-    /// grabbed the whole screen for a new viewer.
+    /// To be captured though no area was reported: a new capturer, or the screen grabbed
+    /// whole for a new stream.
     Unreported,
-    /// Areas reported, the first at this instant.
-    Since(Instant),
+    /// Rows `y0..y1` drawn, the first of them at `since`.
+    Rows {
+        since: Instant,
+        y0: u32,
+        y1: u32,
+    },
 }
 
 impl Damage {
-    fn of(damaged: bool, damaged_at: Option<Instant>) -> Self {
-        match (damaged, damaged_at) {
-            (_, Some(at)) => Damage::Since(at),
-            (true, None) => Damage::Unreported,
-            (false, None) => Damage::None,
+    /// Rows `top..bot` were drawn at `now`.
+    pub(crate) fn add(&mut self, top: u32, bot: u32, now: Instant) {
+        *self = match *self {
+            Damage::Rows { since, y0, y1 } => Damage::Rows {
+                since,
+                y0: y0.min(top),
+                y1: y1.max(bot),
+            },
+            Damage::None | Damage::Unreported => Damage::Rows {
+                since: now,
+                y0: top,
+                y1: bot,
+            },
+        };
+    }
+
+    /// To be captured whether or not anything is drawn.
+    pub(crate) fn mark(&mut self) {
+        if let Damage::None = self {
+            *self = Damage::Unreported;
+        }
+    }
+
+    /// The rows drawn since the last take, aligned to even rows for 4:2:0 within a
+    /// picture `height` tall; nothing is left.
+    pub(crate) fn take(&mut self, height: u32) -> Option<Band> {
+        match std::mem::replace(self, Damage::None) {
+            Damage::Rows { y0, y1, .. } => Some(Band {
+                y0: y0 & !1,
+                y1: ((y1 + 1) & !1).min(height),
+            }),
+            Damage::None | Damage::Unreported => None,
         }
     }
 }
@@ -993,8 +1023,8 @@ fn step(look: &Look) -> Step {
     }
     // Apps present a frame as a burst of puts; give the burst a moment to land so
     // the capture holds one whole frame instead of its first tiles.
-    if let Damage::Since(at) = look.damage {
-        let settled = look.now.saturating_duration_since(at);
+    if let Damage::Rows { since, .. } = look.damage {
+        let settled = look.now.saturating_duration_since(since);
         if settled < look.coalesce {
             return Step::Wait(Wait::Settle(look.coalesce - settled));
         }
@@ -1159,10 +1189,11 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
             (None, false) => {
                 let s = Stream::new(&cfg, &hub, cap.width, cap.height)?;
                 cap.grab(cap.full())?;
-                cap.damaged = true;
-                // Nobody waited for what was drawn while nobody watched: the stream's first
+                // The whole screen is grabbed and pending: it holds what was drawn while
+                // nobody watched, so that damage is taken with it, and the stream's first
                 // frame counts from its capture, not from damage no frame took.
-                cap.damaged_at = None;
+                let _ = cap.damage.take(cap.height);
+                cap.damage.mark();
                 refiner.mark_all(Instant::now());
                 Some(s)
             }
@@ -1185,7 +1216,7 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
         let gate = Gate::ask(&viewers, interval_ms, now);
         let look = Look {
             key,
-            damage: Damage::of(cap.damaged, cap.damaged_at),
+            damage: cap.damage,
             due,
             now,
             last_capture,
@@ -1212,18 +1243,18 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
         }
 
         let t0 = Instant::now();
-        let origin = cap.damaged_at.unwrap_or(t0);
+        let origin = match cap.damage {
+            Damage::Rows { since, .. } => since,
+            Damage::None | Damage::Unreported => t0,
+        };
         hub.stats
             .damage_wait_us
             .fetch_add((t0 - origin).as_micros() as u64, Ordering::Relaxed);
-        let mut band = None;
         let mb_dirty = cap.take_mb_map();
         refiner.mark(&mb_dirty, t0);
-        if cap.damaged {
-            band = cap.take_damage()?;
-            if let Some(b) = band {
-                cap.grab(b)?;
-            }
+        let band = cap.take_damage()?;
+        if let Some(b) = band {
+            cap.grab(b)?;
         }
         let t1 = Instant::now();
         if marker.is_some() {
@@ -3482,14 +3513,13 @@ mod tests {
         assert!(seen.iter().all(|&n| n > 100), "unreached: {seen:?}");
     }
 
-    /// One look, as the capture loop reads it: the capturer's damage as its two fields,
-    /// whether a viewer wants a keyframe, the pass due, the last capture, the pacing, the
+    /// One look, as the capture loop reads it: the capturer's damage, whether a viewer
+    /// wants a keyframe, the pass due, the last capture, the pacing, the
     /// gate, whether the buffer is home, the area the damage comes to when taken, and the
     /// blocks pending.
     #[derive(Clone, Copy)]
     struct StepCase<'a> {
-        damaged: bool,
-        damaged_at: Option<Instant>,
+        damage: Damage,
         want_key: bool,
         now: Instant,
         due: Due,
@@ -3512,7 +3542,7 @@ mod tests {
         fn look(&self) -> Look {
             Look {
                 key: self.key(),
-                damage: Damage::of(self.damaged, self.damaged_at),
+                damage: self.damage,
                 due: self.due,
                 now: self.now,
                 last_capture: self.last_capture,
@@ -3594,10 +3624,14 @@ mod tests {
                     coalesce,
                     coalesce + ms(1),
                 ];
-                let damages = [(false, None), (true, None)]
+                let damages = [Damage::None, Damage::Unreported]
                     .into_iter()
-                    .chain(settled.map(|e| (true, Some(now - e))));
-                for ((damaged, damaged_at), since, due) in damages.flat_map(|d| {
+                    .chain(settled.map(|e| Damage::Rows {
+                        since: now - e,
+                        y0: 16,
+                        y1: 48,
+                    }));
+                for (damage, since, due) in damages.flat_map(|d| {
                     let dues = dues.clone();
                     sinces
                         .into_iter()
@@ -3606,8 +3640,7 @@ mod tests {
                     for (case, gate) in (0..16).flat_map(|case| gates.map(move |g| (case, g))) {
                         let bit = |i: u32| case >> i & 1 == 1;
                         check(StepCase {
-                            damaged,
-                            damaged_at,
+                            damage,
                             want_key: bit(0),
                             now,
                             due,
@@ -3642,14 +3675,15 @@ mod tests {
             let asked = got.asked_gate(c.key());
             // A due pass goes only to an idle encoder.
             let pass_goes = c.due == Due::Now && c.home;
-            let still = !(c.damaged || c.want_key || pass_goes);
+            let still = !(c.damage != Damage::None || c.want_key || pass_goes);
             let since = c.now - c.last_capture;
             let early = (since < c.min_interval).then(|| c.min_interval - since);
-            let settling = c
-                .damaged_at
-                .map(|at| c.now - at)
-                .filter(|&settled| settled < c.coalesce)
-                .map(|settled| c.coalesce - settled);
+            let settling = match c.damage {
+                Damage::Rows { since, .. } => Some(c.now - since),
+                Damage::None | Damage::Unreported => None,
+            }
+            .filter(|&settled| settled < c.coalesce)
+            .map(|settled| c.coalesce - settled);
             let gate_asked = !still && early.is_none() && settling.is_none() && !c.want_key;
             assert_eq!(asked, gate_asked, "the gate asked");
             let want = match (still, early, settling) {
@@ -3756,5 +3790,141 @@ mod tests {
             }
         });
         assert_eq!(cases, CASES);
+    }
+
+    /// The capturer's damage, against what was drawn: over every sequence of five events
+    /// from a new capturer (rows drawn at three places, the screen marked to capture, a
+    /// take), damage is due exactly when something was drawn or marked since the last
+    /// take; it has rows exactly when rows were drawn, since the first of them, spanning
+    /// them all; and a take returns those rows widened to even rows within the picture,
+    /// and leaves nothing.
+    #[test]
+    fn damage_is_what_was_drawn_since_the_take() {
+        let t0 = Instant::now();
+        let height = 101;
+        let rows = [(0, 1), (17, 48), (90, 101)];
+        for seq in 0..5u32.pow(5) {
+            let mut damage = Damage::Unreported;
+            // Since the last take: when rows were first drawn and which, and whether
+            // anything at all is due (a new capturer is).
+            let mut drawn: Option<(Instant, u32, u32)> = None;
+            let mut due: bool;
+            for i in 0..5 {
+                let now = t0 + Duration::from_millis(i as u64);
+                match seq / 5u32.pow(i) % 5 {
+                    r @ 0..=2 => {
+                        let (top, bot) = rows[r as usize];
+                        damage.add(top, bot, now);
+                        drawn = Some(match drawn {
+                            Some((since, a, b)) => (since, a.min(top), b.max(bot)),
+                            None => (now, top, bot),
+                        });
+                        due = true;
+                    }
+                    3 => {
+                        damage.mark();
+                        due = true;
+                    }
+                    _ => {
+                        let band = damage.take(height).map(|b| (b.y0, b.y1));
+                        let want = drawn.map(|(_, a, b)| (a & !1, ((b + 1) & !1).min(height)));
+                        assert_eq!(band, want, "sequence {seq}, event {i}");
+                        assert_eq!(damage, Damage::None);
+                        (drawn, due) = (None, false);
+                    }
+                }
+                let want = match (drawn, due) {
+                    (Some((since, y0, y1)), _) => Damage::Rows { since, y0, y1 },
+                    (None, true) => Damage::Unreported,
+                    (None, false) => Damage::None,
+                };
+                assert_eq!(damage, want, "sequence {seq}, event {i}");
+            }
+        }
+    }
+
+    /// The oracle: the capturer's damage as it was, three fields set by each platform's
+    /// event loop and cleared by its take.
+    struct OldDamage {
+        damaged: bool,
+        damaged_at: Option<Instant>,
+        acc: Option<(u32, u32)>,
+    }
+
+    impl OldDamage {
+        fn new() -> Self {
+            OldDamage {
+                damaged: true,
+                damaged_at: None,
+                acc: None,
+            }
+        }
+        fn add(&mut self, top: u32, bot: u32, now: Instant) {
+            self.acc = Some(match self.acc {
+                Some((a, b)) => (a.min(top), b.max(bot)),
+                None => (top, bot),
+            });
+            self.damaged = true;
+            self.damaged_at.get_or_insert(now);
+        }
+        fn mark(&mut self) {
+            self.damaged = true;
+        }
+        fn take_damage(&mut self, height: u32) -> Option<Band> {
+            self.damaged = false;
+            self.damaged_at = None;
+            let (y0, y1) = self.acc.take()?;
+            Some(Band {
+                y0: y0 & !1,
+                y1: ((y1 + 1) & !1).min(height),
+            })
+        }
+    }
+
+    /// The capturer's damage as one value does what its three fields did: from a new
+    /// capturer, over every sequence of five events (rows drawn at three places, the
+    /// screen marked to capture, a take), the loop reads the same thing after each (no
+    /// damage, damage with no area, or damage since the same instant) and each take
+    /// returns the same band.
+    #[test]
+    fn damage_as_one_value_is_what_the_three_fields_were() {
+        let t0 = Instant::now();
+        let height = 101;
+        let rows = [(0, 1), (17, 48), (90, 101)];
+        let mut sequences = 0;
+        for seq in 0..5u32.pow(5) {
+            let (mut old, mut new) = (OldDamage::new(), Damage::Unreported);
+            for i in 0..5 {
+                let now = t0 + Duration::from_millis(i as u64);
+                let shown = format!("sequence {seq}, event {i}");
+                match seq / 5u32.pow(i) % 5 {
+                    r @ 0..=2 => {
+                        let (top, bot) = rows[r as usize];
+                        old.add(top, bot, now);
+                        new.add(top, bot, now);
+                    }
+                    3 => {
+                        old.mark();
+                        new.mark();
+                    }
+                    _ => {
+                        let (was, is) = (old.take_damage(height), new.take(height));
+                        assert_eq!(
+                            is.map(|b| (b.y0, b.y1)),
+                            was.map(|b| (b.y0, b.y1)),
+                            "{shown}"
+                        );
+                    }
+                }
+                let read = match new {
+                    Damage::None => (false, None),
+                    Damage::Unreported => (true, None),
+                    Damage::Rows { since, .. } => (true, Some(since)),
+                };
+                assert_eq!(read, (old.damaged, old.damaged_at), "{shown}");
+            }
+            sequences += 1;
+        }
+        assert_eq!(sequences, 3125);
     }
 }
