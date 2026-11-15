@@ -32,7 +32,7 @@ pub struct AppState {
     pub favicon: Bytes,
     pub favicon_type: &'static str,
     /// The debugging variables (`VOXL_*`), read when voxl started.
-    pub env: crate::env::Env,
+    pub debug: crate::env::Debugging,
 }
 
 /// The web client's page, titled `title` (--title): the browser tab, and the name of
@@ -229,7 +229,7 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
     if let Some(c) = s.hub.cursor.lock().clone() {
         client.send(Out::Bin(c));
     }
-    let dbg = s.env.marker.is_some();
+    let dbg = s.debug.marker.is_some();
     let writer = tokio::spawn(async move {
         while let Some(m) = rx.recv().await {
             let t = Instant::now();
@@ -700,7 +700,7 @@ mod tests {
             index: Bytes::new(),
             favicon: Bytes::new(),
             favicon_type: "image/x-icon",
-            env: crate::env::Env::read(|_| None),
+            debug: crate::env::Debugging::read(|_| None),
         };
         let (tx, _rx) = mpsc::unbounded_channel();
         let client = hub.add_client(tx);
@@ -759,7 +759,7 @@ mod tests {
             index: Bytes::new(),
             favicon: Bytes::new(),
             favicon_type: "image/x-icon",
-            env: crate::env::Env::read(|_| None),
+            debug: crate::env::Debugging::read(|_| None),
         };
         let (tx, _rx) = mpsc::unbounded_channel();
         let client = hub.add_client(tx);
@@ -798,7 +798,7 @@ mod tests {
             index: Bytes::new(),
             favicon: Bytes::new(),
             favicon_type: "image/x-icon",
-            env: crate::env::Env::read(|_| None),
+            debug: crate::env::Debugging::read(|_| None),
         };
         let (tx, _rx) = mpsc::unbounded_channel();
         let client = hub.add_client(tx);

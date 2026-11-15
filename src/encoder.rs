@@ -10,7 +10,7 @@ mod ffi {
     include!(concat!(env!("OUT_DIR"), "/x264.rs"));
 }
 
-use crate::env::{Env, X264Log};
+use crate::env::{Debugging, X264Log};
 use crate::path::Kbps;
 use std::ffi::CString;
 use std::ptr;
@@ -25,7 +25,7 @@ pub struct Pictures {
     pub fps: u32,
     pub preset: String,
     pub threads: u32,
-    pub env: Env,
+    pub debug: Debugging,
 }
 
 /// The settings of an encoder that codes at a quality, under a cap.
@@ -51,7 +51,7 @@ pub struct Encoder {
     pts: i64,
     pub width: u32,
     pub height: u32,
-    env: Env,
+    debug: Debugging,
 }
 
 unsafe impl Send for Encoder {}
@@ -98,7 +98,7 @@ impl Encoder {
             param.b_annexb = 1;
             param.b_repeat_headers = 1;
             param.b_aud = 0;
-            param.i_log_level = match pictures.env.x264_log {
+            param.i_log_level = match pictures.debug.x264_log {
                 X264Log::Warning => ffi::X264_LOG_WARNING,
                 X264Log::Info => ffi::X264_LOG_INFO,
                 // Per-frame QP, macroblock types and size.
@@ -129,7 +129,7 @@ impl Encoder {
             param.analyse.intra = ffi::X264_ANALYSE_I4x4;
             param.analyse.i_subpel_refine = 1;
             // Per-macroblock "unchanged" hints from X damage let x264 skip analysis.
-            param.analyse.b_mb_info = pictures.env.mb_info as i32;
+            param.analyse.b_mb_info = pictures.debug.mb_info as i32;
             param.i_sync_lookahead = 0;
             param.rc.b_mb_tree = 0;
             if let Some(cap) = max_kbps {
@@ -162,7 +162,7 @@ impl Encoder {
                 pts: 0,
                 width: pictures.width,
                 height: pictures.height,
-                env: pictures.env,
+                debug: pictures.debug,
             })
         }
     }
@@ -252,7 +252,7 @@ impl Encoder {
                 let first = &*nals;
                 out.extend_from_slice(std::slice::from_raw_parts(first.p_payload, size as usize));
             }
-            if self.env.marker.is_some() {
+            if self.debug.marker.is_some() {
                 log::info!(
                     "x264 out {} bytes, delayed {}, pts in {} out {}",
                     size,
@@ -369,7 +369,7 @@ mod tests {
                     fps: 60,
                     preset: "ultrafast".into(),
                     threads: 1,
-                    env: Env::read(|_| None),
+                    debug: Debugging::read(|_| None),
                 },
                 crf: 24.0,
                 max_kbps: None,
@@ -423,7 +423,7 @@ mod tests {
                     fps: 60,
                     preset: "ultrafast".into(),
                     threads: 1,
-                    env: Env::read(|_| None),
+                    debug: Debugging::read(|_| None),
                 },
                 crf: 24.0,
                 max_kbps,
@@ -486,7 +486,7 @@ mod bench {
                     fps: 60,
                     preset: "ultrafast".into(),
                     threads: 4,
-                    env: Env::read(|name| std::env::var(name).ok()),
+                    debug: Debugging::read(|name| std::env::var_os(name)),
                 },
                 crf: 24.0,
                 max_kbps: None,
@@ -570,7 +570,7 @@ mod bench {
                     fps: 60,
                     preset: "ultrafast".into(),
                     threads,
-                    env: Env::read(|name| std::env::var(name).ok()),
+                    debug: Debugging::read(|name| std::env::var_os(name)),
                 },
                 crf: 24.0,
                 max_kbps: Some(Kbps::new(30000.0)),

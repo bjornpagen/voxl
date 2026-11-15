@@ -125,7 +125,7 @@ pub fn run(args: impl IntoIterator<Item = String>) {
         return;
     }
     let a = parse_args(args);
-    let env = env::Env::read(|name| std::env::var(name).ok());
+    let env = env::Env::read(|name| std::env::var_os(name));
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .try_init();
     // A panic on any thread ends the process, as in voxl's own release build (panic = "abort"),
@@ -157,9 +157,7 @@ pub fn run(args: impl IntoIterator<Item = String>) {
 async fn serve(a: HashMap<String, String>, env: env::Env) {
     // macOS: --display picks a screen (index or display ID); DISPLAY there belongs to XQuartz.
     #[cfg(target_os = "linux")]
-    let display = std::env::var("DISPLAY")
-        .ok()
-        .or_else(|| a.get("display").cloned());
+    let display = env.display.or_else(|| a.get("display").cloned());
     #[cfg(not(target_os = "linux"))]
     let display = a.get("display").cloned();
     #[cfg(target_os = "macos")]
@@ -215,7 +213,7 @@ async fn serve(a: HashMap<String, String>, env: env::Env) {
         // small updates encode a few ms slower on one thread.
         adaptive_threads: truthy(a.get("adaptive-threads"), false),
         coalesce: std::time::Duration::from_micros(range_max(a.get("coalesce-us"), 0.0) as u64),
-        env,
+        debug: env.debug,
     };
     let clip = a
         .get("enable-clipboard")
@@ -286,7 +284,7 @@ async fn serve(a: HashMap<String, String>, env: env::Env) {
         .unwrap_or_default();
     if radius > 0 || !named.is_empty() {
         #[cfg(target_os = "linux")]
-        if let Err(e) = corners::spawn(display.clone(), radius, named, env) {
+        if let Err(e) = corners::spawn(display.clone(), radius, named, env.debug) {
             log::warn!("rounded corners unavailable: {e}");
         }
         #[cfg(not(target_os = "linux"))]
@@ -300,7 +298,7 @@ async fn serve(a: HashMap<String, String>, env: env::Env) {
         }
     };
     let px_per_notch = range_max(a.get("scroll-px-per-notch"), 180.0);
-    match input::spawn(display.clone(), clipboard, px_per_notch) {
+    match input::spawn(display.clone(), clipboard, px_per_notch, env.runtime_dir) {
         Ok(tx) => *hub.input.lock() = Some(tx),
         Err(e) => log::error!("input init failed: {e}"),
     }
@@ -322,8 +320,7 @@ async fn serve(a: HashMap<String, String>, env: env::Env) {
     let root = a
         .get("files-root")
         .cloned()
-        .or_else(|| std::env::var("HOME").ok())
-        .or_else(|| std::env::var("USERPROFILE").ok())
+        .or(env.home)
         .unwrap_or_else(|| "/".into());
     let root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.into());
     let files = std::sync::Arc::new(files::Files {
@@ -406,7 +403,7 @@ async fn serve(a: HashMap<String, String>, env: env::Env) {
         ),
         favicon,
         favicon_type,
-        env,
+        debug: env.debug,
     };
     // --allowed-hosts and --allowed-origins: the host names and other sites voxl answers
     // besides IP addresses, localhost and its own page (see access.rs).
@@ -416,8 +413,8 @@ async fn serve(a: HashMap<String, String>, env: env::Env) {
     ));
     // The login (see login.rs): a password, given or made up at startup, unless
     // --enable-basic-auth=false.
-    let login =
-        login::Login::from_args(&a).map(|(l, generated)| (std::sync::Arc::new(l), generated));
+    let login = login::Login::from_args(&a, env.password)
+        .map(|(l, generated)| (std::sync::Arc::new(l), generated));
     let mut app = server::router(state);
     if let Some((l, _)) = &login {
         app = app.layer(axum::middleware::from_fn_with_state(
@@ -432,11 +429,7 @@ async fn serve(a: HashMap<String, String>, env: env::Env) {
     // and the --allowed-hosts names.
     let tls = {
         let mut names = vec!["localhost".to_string(), "127.0.0.1".into(), "::1".into()];
-        for v in ["COMPUTERNAME", "HOSTNAME"] {
-            if let Ok(h) = std::env::var(v) {
-                names.push(h.to_ascii_lowercase());
-            }
-        }
+        names.extend(env.host_names);
         if !matches!(
             addr.as_str(),
             "0.0.0.0" | "::" | "127.0.0.1" | "::1" | "localhost"
@@ -454,7 +447,7 @@ async fn serve(a: HashMap<String, String>, env: env::Env) {
         }
         names.sort();
         names.dedup();
-        tls::from_args(&a, names)
+        tls::from_args(&a, names, &env.tls_dir)
     };
     let scheme = if tls.is_some() { "https" } else { "http" };
     let listener = tokio::net::TcpListener::bind((addr.as_str(), port))

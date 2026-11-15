@@ -3,7 +3,7 @@
 use crate::capture::{Band, Capturer};
 use crate::convert::I420;
 use crate::encoder::{Encoded, Encoder, EncoderConfig, Pictures, Planes, Quality};
-use crate::env::{Env, Marker};
+use crate::env::{Debugging, Marker};
 use crate::hub::{wait_any, wait_event};
 use crate::hub::{Hub, Inflight, Out};
 use crate::path::{Capacity, Kbps};
@@ -32,7 +32,7 @@ pub struct VideoConfig {
     pub stripes: u32,
     pub adaptive_threads: bool,
     /// The debugging variables (`VOXL_*`), read when voxl started.
-    pub env: Env,
+    pub debug: Debugging,
 }
 
 struct Job {
@@ -299,7 +299,7 @@ fn switch_display(
 }
 
 fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
-    let cap = Capturer::new(cfg.display.as_deref(), cfg.env)?;
+    let cap = Capturer::new(cfg.display.as_deref(), cfg.debug)?;
     let (w, h) = (cap.width, cap.height);
     hub.width.store(w, Ordering::Relaxed);
     hub.height.store(h, Ordering::Relaxed);
@@ -330,7 +330,7 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
                 fps: cfg.fps,
                 preset: cfg.preset.clone(),
                 threads: fixed,
-                env: cfg.env,
+                debug: cfg.debug,
             },
             crf: cfg.crf,
             max_kbps: cfg.bounds.ceiling(),
@@ -352,10 +352,10 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
     }
     *hub.stripes.lock() = layout;
     let hub2 = hub.clone();
-    let (crf, po_crf, env) = (cfg.crf, cfg.paintover_crf, cfg.env);
+    let (crf, po_crf, debug) = (cfg.crf, cfg.paintover_crf, cfg.debug);
     let encode = std::thread::Builder::new()
         .name("encode".into())
-        .spawn(move || encode_loop(stripes, job_rx, ret_tx, hub2, crf, po_crf, env))
+        .spawn(move || encode_loop(stripes, job_rx, ret_tx, hub2, crf, po_crf, debug))
         .unwrap();
     #[cfg(target_os = "macos")]
     {
@@ -661,7 +661,7 @@ fn capture_loop(
         w.div_ceil(16),
         Instant::now(),
     );
-    let marker = cfg.env.marker;
+    let marker = cfg.debug.marker;
 
     loop {
         // The wake is taken before anything it may stand for is read: a request that
@@ -1331,7 +1331,7 @@ fn encode_loop(
     hub: Arc<Hub>,
     crf: f32,
     po_crf: f32,
-    env: Env,
+    debug: Debugging,
 ) {
     let epoch = Instant::now();
     let mut frame_id: u32 = 0;
@@ -1342,7 +1342,7 @@ fn encode_loop(
         paintover: po_crf,
     };
     let mut budget = FrameBudget::new(epoch);
-    let debug_stripes = env.stripes;
+    let debug_stripes = debug.stripes;
     // Geometry stays here; encoders move to their workers.
     let stripes: Vec<(usize, usize)> = stripes_in.iter().map(|s| (s.y, s.h)).collect();
     let (done_tx, done_rx) = mpsc::channel::<StripeResult>();
@@ -1649,7 +1649,7 @@ mod tests {
                         fps: 60,
                         preset: "ultrafast".into(),
                         threads: 1,
-                        env: Env::read(|_| None),
+                        debug: Debugging::read(|_| None),
                     },
                     crf,
                     max_kbps,
