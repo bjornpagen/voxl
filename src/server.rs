@@ -12,14 +12,13 @@ use bytes::Bytes;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::sync::mpsc;
 
 #[derive(Clone)]
 pub struct AppState {
     pub hub: Arc<Hub>,
     pub audio: bool,
-    pub epoch: Instant,
     pub files: Arc<crate::files::Files>,
     pub mic: Option<std::sync::mpsc::Sender<crate::mic::MicMsg>>,
     /// Resizing was enabled; hub.resize_max tracks the current display's capability.
@@ -251,13 +250,13 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
     });
     let pinger = {
         let c = client.clone();
-        let epoch = s.epoch;
         tokio::spawn(async move {
             let mut iv = tokio::time::interval(crate::hub::PING_EVERY);
             loop {
                 iv.tick().await;
-                let t = c.pings.lock().send(epoch.elapsed()).as_micros();
-                c.send(Out::Text(format!("{{\"t\":\"ping\",\"s\":{t}}}")));
+                let token = crate::hub::Token::random();
+                c.pings.lock().send(Instant::now(), token);
+                c.send(Out::Text(format!("{{\"t\":\"ping\",\"s\":\"{token}\"}}")));
             }
         })
     };
@@ -451,9 +450,8 @@ enum Command {
     Resize { w: u32, h: u32 },
     /// `kf`
     Keyframe,
-    /// `po,<sent>`: a ping's reply, naming the ping by when it was sent (`AppState::epoch`,
-    /// in microseconds).
-    Pong { sent: Duration },
+    /// `po,<token>`: a ping's reply, echoing the token the ping carried.
+    Pong { token: crate::hub::Token },
     /// `ds,<id>`: switch to another display.
     #[cfg(target_os = "macos")]
     Display(u32),
@@ -514,7 +512,7 @@ impl Command {
             },
             "kf" => Command::Keyframe,
             "po" => Command::Pong {
-                sent: Duration::from_micros(num(&mut it)?),
+                token: crate::hub::Token::parse(it.next()?)?,
             },
             #[cfg(target_os = "macos")]
             "ds" => Command::Display(rest.parse().ok()?),
@@ -629,8 +627,8 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
             c.needs_keyframe.store(true, Ordering::Relaxed);
             s.hub.wake();
         }
-        Command::Pong { sent } => {
-            let Some(rtt) = c.pings.lock().answer(s.epoch.elapsed(), sent) else {
+        Command::Pong { token } => {
+            let Some(rtt) = c.pings.lock().answer(Instant::now(), token) else {
                 return;
             };
             // Whole ms, and at least 1: a client's min_rtt_ms is 0 until it has one. A
@@ -648,6 +646,7 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// Every command the web client sends (web/src/protocol.ts), with arguments.
     const ALL: &[&str] = &[
@@ -668,7 +667,7 @@ mod tests {
         "mi,1",
         "sz,640,480",
         "kf",
-        "po,1",
+        "po,0123456789abcdef",
         "ds,4294967295",
     ];
 
@@ -685,7 +684,6 @@ mod tests {
         let s = AppState {
             hub: hub.clone(),
             audio: true,
-            epoch: Instant::now(),
             files: Arc::new(crate::files::Files {
                 root: std::env::temp_dir(),
                 upload: false,
@@ -733,12 +731,10 @@ mod tests {
         assert!(resized);
     }
 
-    /// A reply names its ping by when it was sent, and one naming a time no ping went out
-    /// at answers no ping, as one from the future does not
-    /// (a_reply_is_a_round_trip_only_to_a_ping_still_out). The server keeps no record of the
-    /// pings it sent, so a reply naming a moment just past reads as a 1 ms round trip on
-    /// a viewer that was never pinged: its frames are then overdue at 81 ms, and the flow
-    /// check holds every viewer's frames once one of its own is 121 ms old. A read-only
+    /// A reply to no ping is no round trip (wip/red-ping-unsent 25e4049). With no record of
+    /// the pings sent, a reply naming a moment just past read as a 1 ms round trip on a
+    /// viewer that was never pinged: its frames were then overdue at 81 ms, and the flow
+    /// check held every viewer's frames once one of its own was 121 ms old. A read-only
     /// viewer may send it.
     #[test]
     fn a_reply_to_no_ping_is_no_round_trip() {
@@ -746,7 +742,6 @@ mod tests {
         let s = AppState {
             hub: hub.clone(),
             audio: true,
-            epoch: Instant::now() - Duration::from_secs(10),
             files: Arc::new(crate::files::Files {
                 root: std::env::temp_dir(),
                 upload: false,
@@ -765,14 +760,11 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let client = hub.add_client(tx);
         let mut rtts = Default::default();
-        // No ping was sent to this viewer. It names a moment a millisecond ago.
-        let just_past = s.epoch.elapsed() - Duration::from_millis(1);
-        handle_text(
-            &s,
-            &client,
-            &format!("po,{}", just_past.as_micros()),
-            &mut rtts,
-        );
+        // No ping was sent to this viewer. It names a moment just past, as replies did when
+        // pings were named by the microsecond they went out, then a token.
+        for reply in ["po,9999000", "po,0123456789abcdef"] {
+            handle_text(&s, &client, reply, &mut rtts);
+        }
         assert_eq!(
             client.rtt_ms(),
             None,
@@ -788,7 +780,6 @@ mod tests {
         let s = AppState {
             hub: hub.clone(),
             audio: true,
-            epoch: Instant::now() - Duration::from_secs(10),
             files: Arc::new(crate::files::Files {
                 root: std::env::temp_dir(),
                 upload: false,
@@ -807,8 +798,9 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let client = hub.add_client(tx);
         let mut rtts = Default::default();
-        let sent = client.pings.lock().send(s.epoch.elapsed());
-        handle_text(&s, &client, &format!("po,{}", sent.as_micros()), &mut rtts);
+        let token = crate::hub::Token::random();
+        client.pings.lock().send(Instant::now(), token);
+        handle_text(&s, &client, &format!("po,{token}"), &mut rtts);
         assert!(
             client.rtt_ms().is_some(),
             "the reply to a ping was no round trip"
