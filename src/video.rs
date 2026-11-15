@@ -518,6 +518,11 @@ fn switch_display(
 fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Capturer, String> {
     let cap = Capturer::new(cfg.display.as_deref(), cfg.debug)?;
     let (w, h) = (cap.width, cap.height);
+    // A video message places its stripe by the stripe's top row, in 16 bits.
+    let rows = u16::try_from(h).map_err(|_| {
+        let most = u16::MAX;
+        format!("a screen of {h} rows is taller than a video message can place ({most})")
+    })?;
     hub.width.store(w, Ordering::Relaxed);
     hub.height.store(h, Ordering::Relaxed);
     hub.activity.reset(w, h);
@@ -529,7 +534,7 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Capturer, String> {
         cfg.preset,
         cfg.threads
     );
-    *hub.stripes.lock() = stripe_layout(h, cfg.stripes);
+    *hub.stripes.lock() = stripe_layout(u32::from(rows), cfg.stripes);
     #[cfg(target_os = "macos")]
     {
         let resizing = hub.resize_max.lock().is_some();
