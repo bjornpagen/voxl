@@ -1,5 +1,6 @@
 //! X11 screen capture: MIT-SHM GetImage into a persistent BGRX frame, driven by XDamage.
 
+use crate::env::Env;
 use std::os::fd::{AsFd, BorrowedFd};
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::damage::{self, ConnectionExt as _};
@@ -104,10 +105,11 @@ pub struct Capturer {
     pub mb_cols: usize,
     /// Areas (x0, y0, x1, y1) changed since the video thread last took them, for `/wait`.
     pub changes: Vec<(u32, u32, u32, u32)>,
+    env: Env,
 }
 
 impl Capturer {
-    pub fn new(display: Option<&str>) -> Result<Self, String> {
+    pub fn new(display: Option<&str>, env: Env) -> Result<Self, String> {
         let (conn, screen_num) =
             RustConnection::connect(display).map_err(|e| format!("X connect: {e}"))?;
         let screen = &conn.setup().roots[screen_num];
@@ -149,7 +151,7 @@ impl Capturer {
         let seg = conn.generate_id().map_err(|e| e.to_string())?;
         let server_pid = display.and_then(xserver_pid);
         let (buf, offset, direct) =
-            match find_xvfb_framebuffer(&conn, root, width, height, server_pid) {
+            match find_xvfb_framebuffer(&conn, root, width, height, server_pid, env) {
                 Some((buf, offset, fb_stride)) => {
                     log::info!(
                         "capturing directly from the Xvfb framebuffer (shmid {})",
@@ -195,6 +197,7 @@ impl Capturer {
             mb_dirty: vec![0; (width as usize).div_ceil(16) * (height as usize).div_ceil(16)],
             mb_cols: (width as usize).div_ceil(16),
             changes: Vec::new(),
+            env,
         })
     }
 
@@ -214,7 +217,7 @@ impl Capturer {
             }
             if let Event::DamageNotify(e) = ev {
                 DAMAGE_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if std::env::var("VOXL_DEBUG_DAMAGE").is_ok() {
+                if self.env.damage {
                     log::info!(
                         "dmg {:?} x{} y{} {}x{}",
                         std::time::SystemTime::now()
@@ -393,8 +396,9 @@ fn find_xvfb_framebuffer(
     width: u32,
     height: u32,
     server_pid: Option<u32>,
+    env: Env,
 ) -> Option<(ShmBuf, usize, usize)> {
-    if std::env::var("VOXL_NO_DIRECT_FB").is_ok() {
+    if !env.direct_fb {
         return None;
     }
     let table = std::fs::read_to_string("/proc/sysvipc/shm").ok()?;

@@ -31,6 +31,8 @@ pub struct AppState {
     /// The page's icon and its content type (--favicon).
     pub favicon: Bytes,
     pub favicon_type: &'static str,
+    /// The debugging variables (`VOXL_*`), read when voxl started.
+    pub env: crate::env::Env,
 }
 
 /// The web client's page, titled `title` (--title): the browser tab, and the name of
@@ -227,8 +229,8 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
     if let Some(c) = s.hub.cursor.lock().clone() {
         client.send(Out::Bin(c));
     }
+    let dbg = s.env.marker.is_some();
     let writer = tokio::spawn(async move {
-        let dbg = std::env::var("VOXL_DEBUG_MARKER").is_ok();
         while let Some(m) = rx.recv().await {
             let t = Instant::now();
             let big = matches!(&m, Out::Bin(b) if b.len() > 2000);
@@ -698,6 +700,7 @@ mod tests {
             index: Bytes::new(),
             favicon: Bytes::new(),
             favicon_type: "image/x-icon",
+            env: crate::env::Env::read(|_| None),
         };
         let (tx, _rx) = mpsc::unbounded_channel();
         let client = hub.add_client(tx);
@@ -756,6 +759,7 @@ mod tests {
             index: Bytes::new(),
             favicon: Bytes::new(),
             favicon_type: "image/x-icon",
+            env: crate::env::Env::read(|_| None),
         };
         let (tx, _rx) = mpsc::unbounded_channel();
         let client = hub.add_client(tx);
@@ -794,6 +798,7 @@ mod tests {
             index: Bytes::new(),
             favicon: Bytes::new(),
             favicon_type: "image/x-icon",
+            env: crate::env::Env::read(|_| None),
         };
         let (tx, _rx) = mpsc::unbounded_channel();
         let client = hub.add_client(tx);

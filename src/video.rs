@@ -3,6 +3,7 @@
 use crate::capture::{Band, Capturer};
 use crate::convert::I420;
 use crate::encoder::{Encoded, Encoder, EncoderConfig, Pictures, Planes, Quality};
+use crate::env::{Env, Marker};
 use crate::hub::{wait_any, wait_event};
 use crate::hub::{Hub, Inflight, Out};
 use crate::path::{Capacity, Kbps};
@@ -30,6 +31,8 @@ pub struct VideoConfig {
     pub coalesce: Duration,
     pub stripes: u32,
     pub adaptive_threads: bool,
+    /// The debugging variables (`VOXL_*`), read when voxl started.
+    pub env: Env,
 }
 
 struct Job {
@@ -296,7 +299,7 @@ fn switch_display(
 }
 
 fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
-    let cap = Capturer::new(cfg.display.as_deref())?;
+    let cap = Capturer::new(cfg.display.as_deref(), cfg.env)?;
     let (w, h) = (cap.width, cap.height);
     hub.width.store(w, Ordering::Relaxed);
     hub.height.store(h, Ordering::Relaxed);
@@ -327,6 +330,7 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
                 fps: cfg.fps,
                 preset: cfg.preset.clone(),
                 threads: fixed,
+                env: cfg.env,
             },
             crf: cfg.crf,
             max_kbps: cfg.bounds.ceiling(),
@@ -348,10 +352,10 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
     }
     *hub.stripes.lock() = layout;
     let hub2 = hub.clone();
-    let (crf, po_crf) = (cfg.crf, cfg.paintover_crf);
+    let (crf, po_crf, env) = (cfg.crf, cfg.paintover_crf, cfg.env);
     let encode = std::thread::Builder::new()
         .name("encode".into())
-        .spawn(move || encode_loop(stripes, job_rx, ret_tx, hub2, crf, po_crf))
+        .spawn(move || encode_loop(stripes, job_rx, ret_tx, hub2, crf, po_crf, env))
         .unwrap();
     #[cfg(target_os = "macos")]
     {
@@ -657,7 +661,7 @@ fn capture_loop(
         w.div_ceil(16),
         Instant::now(),
     );
-    let debug_marker = std::env::var("VOXL_DEBUG_MARKER").is_ok();
+    let marker = cfg.env.marker;
 
     loop {
         #[cfg(target_os = "macos")]
@@ -802,7 +806,7 @@ fn capture_loop(
             }
         }
         let t1 = Instant::now();
-        if debug_marker {
+        if marker.is_some() {
             log::info!(
                 "cap dt {:.1} ms band {:?} grab {} us",
                 last_capture.elapsed().as_secs_f64() * 1000.0,
@@ -810,8 +814,8 @@ fn capture_loop(
                 (t1 - t0).as_micros()
             );
         }
-        let marker_ms = match cap.bgrx() {
-            Some((px, stride)) if debug_marker => marker_probe(px, stride, "grab"),
+        let marker_ms = match (cap.bgrx(), marker) {
+            (Some((px, stride)), Some(at)) => marker_probe(px, stride, at, "grab"),
             _ => -1,
         };
         // What this capture is sent as, decided once, before a buffer is taken.
@@ -1323,6 +1327,7 @@ fn encode_loop(
     hub: Arc<Hub>,
     crf: f32,
     po_crf: f32,
+    env: Env,
 ) {
     let epoch = Instant::now();
     let mut frame_id: u32 = 0;
@@ -1333,7 +1338,7 @@ fn encode_loop(
         paintover: po_crf,
     };
     let mut budget = FrameBudget::new(epoch);
-    let debug_stripes = std::env::var("VOXL_DEBUG_STRIPES").is_ok();
+    let debug_stripes = env.stripes;
     // Geometry stays here; encoders move to their workers.
     let stripes: Vec<(usize, usize)> = stripes_in.iter().map(|s| (s.y, s.h)).collect();
     let (done_tx, done_rx) = mpsc::channel::<StripeResult>();
@@ -1533,18 +1538,11 @@ fn thread_cpu_us() -> i64 {
     }
 }
 
-fn marker_probe(buf: &[u8], stride: usize, what: &str) -> i64 {
+fn marker_probe(buf: &[u8], stride: usize, at: Marker, what: &str) -> i64 {
     let mut v: u64 = 0;
-    let (mx, my) = std::env::var("VOXL_DEBUG_MARKER")
-        .ok()
-        .and_then(|s| {
-            s.split_once(',')
-                .and_then(|(a, b)| Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?)))
-        })
-        .unwrap_or((300, 150));
     for b in 0..40 {
-        let x = mx + (b % 20) * 24 + 12;
-        let y = my + (b / 20) * 24 + 12;
+        let x = at.x + (b % 20) * 24 + 12;
+        let y = at.y + (b / 20) * 24 + 12;
         let i = y * stride + x * 4;
         if buf[i + 2] > 128 {
             v |= 1 << b;
@@ -1647,6 +1645,7 @@ mod tests {
                         fps: 60,
                         preset: "ultrafast".into(),
                         threads: 1,
+                        env: Env::read(|_| None),
                     },
                     crf,
                     max_kbps,

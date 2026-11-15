@@ -15,6 +15,7 @@ mod corners;
 #[cfg(target_os = "linux")]
 mod desktop;
 mod encoder;
+mod env;
 mod files;
 mod help;
 mod hub;
@@ -124,6 +125,7 @@ pub fn run(args: impl IntoIterator<Item = String>) {
         return;
     }
     let a = parse_args(args);
+    let env = env::Env::read(|name| std::env::var(name).ok());
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .try_init();
     // A panic on any thread ends the process, as in voxl's own release build (panic = "abort"),
@@ -145,14 +147,14 @@ pub fn run(args: impl IntoIterator<Item = String>) {
     // main dispatch queue and the server runs beside it.
     #[cfg(target_os = "macos")]
     {
-        std::thread::spawn(move || rt.block_on(serve(a)));
+        std::thread::spawn(move || rt.block_on(serve(a, env)));
         dispatch2::dispatch_main();
     }
     #[cfg(not(target_os = "macos"))]
-    rt.block_on(serve(a));
+    rt.block_on(serve(a, env));
 }
 
-async fn serve(a: HashMap<String, String>) {
+async fn serve(a: HashMap<String, String>, env: env::Env) {
     // macOS: --display picks a screen (index or display ID); DISPLAY there belongs to XQuartz.
     #[cfg(target_os = "linux")]
     let display = std::env::var("DISPLAY")
@@ -213,6 +215,7 @@ async fn serve(a: HashMap<String, String>) {
         // small updates encode a few ms slower on one thread.
         adaptive_threads: truthy(a.get("adaptive-threads"), false),
         coalesce: std::time::Duration::from_micros(range_max(a.get("coalesce-us"), 0.0) as u64),
+        env,
     };
     let clip = a
         .get("enable-clipboard")
@@ -283,7 +286,7 @@ async fn serve(a: HashMap<String, String>) {
         .unwrap_or_default();
     if radius > 0 || !named.is_empty() {
         #[cfg(target_os = "linux")]
-        if let Err(e) = corners::spawn(display.clone(), radius, named) {
+        if let Err(e) = corners::spawn(display.clone(), radius, named, env) {
             log::warn!("rounded corners unavailable: {e}");
         }
         #[cfg(not(target_os = "linux"))]
@@ -403,6 +406,7 @@ async fn serve(a: HashMap<String, String>) {
         ),
         favicon,
         favicon_type,
+        env,
     };
     // --allowed-hosts and --allowed-origins: the host names and other sites voxl answers
     // besides IP addresses, localhost and its own page (see access.rs).
