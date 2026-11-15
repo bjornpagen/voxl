@@ -292,8 +292,6 @@ struct Stream {
     /// what it was given.
     job_tx: mpsc::SyncSender<Job>,
     ret_rx: mpsc::Receiver<Returned>,
-    /// The threads a capture is converted on.
-    rows: crate::convert::Rows,
     /// None while the encoder holds it.
     buf: Option<Arc<I420>>,
     /// The rows that changed on screen since the buffer was last converted into: the
@@ -372,7 +370,6 @@ impl Stream {
             ret_rx,
             buf: Some(Arc::new(I420::new(w as usize, h as usize))),
             pending: Some(Band { y0: 0, y1: h }),
-            rows: crate::convert::Rows::new(cfg.convert_threads),
             _encode: encode,
         })
     }
@@ -1327,7 +1324,7 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
         };
         if let Some(t) = todo {
             let pic = Arc::get_mut(&mut buf).expect("a picture comes back from every stripe");
-            cap.convert(pic, t.y0 as usize, t.y1 as usize, &s.rows);
+            cap.convert(pic, t.y0 as usize, t.y1 as usize, cfg.convert_threads);
         }
         let t2 = Instant::now();
         let rows = todo.map_or(0, |t| t.y1 - t.y0);
@@ -4767,8 +4764,9 @@ mod tests {
     /// goes through C's malloc, which this allocator does not see.
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "frames allocate on main: 40 B once in 120 frames on the test's own thread, \
-                which plays the capture loop and the viewer"]
+    #[ignore = "frames allocate on main: the conversion's threads (split_rows), started per \
+                capture; 40 B once in 120 frames on the test's own thread, which plays the \
+                capture loop and the viewer"]
     fn a_steady_state_frame_allocates_nothing() {
         if !in_a_process_of_its_own("video::tests::a_steady_state_frame_allocates_nothing") {
             return;
@@ -4875,7 +4873,7 @@ mod tests {
             }
             let mut buf = stream.buf.take().unwrap();
             let pic = Arc::get_mut(&mut buf).unwrap();
-            crate::convert::convert_band(&screen, w * 4, pic, y0, y1, &stream.rows);
+            crate::convert::convert_band(&screen, w * 4, pic, y0, y1, cfg.convert_threads);
             stream
                 .job_tx
                 .send(Job {

@@ -40,9 +40,6 @@ impl I420 {
     }
 }
 
-use std::panic::AssertUnwindSafe;
-use std::sync::mpsc;
-
 struct SendPtr(*mut u8);
 unsafe impl Send for SendPtr {}
 unsafe impl Sync for SendPtr {}
@@ -52,154 +49,32 @@ impl SendPtr {
     }
 }
 
-/// The fewest rows a conversion hands to a thread of its own: upstream's guess,
-/// unmeasured. A band of fewer than twice as many is converted on the capture thread
-/// alone.
-const LEAST_ROWS: usize = 64;
-
-/// Threads that share out ranges of rows with the thread that asks. They are made once,
-/// with the stream, so that splitting a band starts no thread: a thread started per
-/// capture waits to be scheduled, and allocates.
-pub struct Rows {
-    helpers: Vec<Helper>,
-}
-
-/// A thread of `Rows`, and its two channels.
-struct Helper {
-    /// Its next range.
-    range: mpsc::SyncSender<Range>,
-    /// Once it has run a range: what the run panicked with, if it did. A helper that is
-    /// gone ends it.
-    done: mpsc::Receiver<std::thread::Result<()>>,
-    thread: std::thread::JoinHandle<()>,
-}
-
-/// A range of rows for a helper, and what to run over it. `run` points into the frame
-/// of the `split` that sent it, which waits for the helper to finish before returning.
-struct Range {
-    run: *const (dyn Fn(usize, usize) + Sync),
-    a: usize,
-    b: usize,
-}
-
-unsafe impl Send for Range {}
-
-impl Rows {
-    /// `threads` threads in all, the caller's among them: so `threads - 1` helpers.
-    pub fn new(threads: usize) -> Rows {
-        let helpers = (1..threads)
-            .map(|i| {
-                let (range, ranges) = mpsc::sync_channel::<Range>(1);
-                let (ran, done) = mpsc::sync_channel(1);
-                let thread = std::thread::Builder::new()
-                    .name(format!("rows-{i}"))
-                    .spawn(move || {
-                        while let Ok(r) = ranges.recv() {
-                            // A panic goes back to the caller, which waits for this.
-                            let run = AssertUnwindSafe(|| unsafe { (*r.run)(r.a, r.b) });
-                            if ran.send(std::panic::catch_unwind(run)).is_err() {
-                                return;
-                            }
-                        }
-                    })
-                    .expect("a thread for converting rows");
-                Helper {
-                    range,
-                    done,
-                    thread,
-                }
-            })
-            .collect();
-        Rows { helpers }
+/// Runs `run(a, b)` over row chunks of [y0, y1) on up to `threads` threads; chunk
+/// edges stay even for 4:2:0.
+fn split_rows(y0: usize, y1: usize, threads: usize, run: impl Fn(usize, usize) + Sync) {
+    let rows = y1 - y0;
+    if rows == 0 {
+        return;
     }
-
-    /// Runs `run(a, b)` over ranges that cover rows [y0, y1): at most one a thread, each
-    /// starting `step` rows apart from y0 and, but the last, at least `least` rows long.
-    /// The calling thread takes the last range. Returns once every range has run; a range
-    /// that panicked on a helper panics here with what it panicked with, once every other
-    /// range has run.
-    pub fn split(
-        &self,
-        y0: usize,
-        y1: usize,
-        step: usize,
-        least: usize,
-        run: impl Fn(usize, usize) + Sync,
-    ) {
-        let rows = y1.saturating_sub(y0);
-        let n = (self.helpers.len() + 1).min(rows / least).max(1);
-        let chunk = rows.div_ceil(n).next_multiple_of(step);
-        let run: &(dyn Fn(usize, usize) + Sync) = &run;
-        // The helpers run it only while this call waits for them (`Wait`, below).
-        let shared: *const (dyn Fn(usize, usize) + Sync + 'static) =
-            unsafe { std::mem::transmute(run) };
-        let mut wait = Wait {
-            helpers: &self.helpers,
-            out: 0,
-        };
+    let n = threads.clamp(1, (rows / 64).max(1));
+    if n == 1 {
+        run(y0, y1);
+        return;
+    }
+    let chunk = (rows.div_ceil(n) + 1) & !1;
+    std::thread::scope(|s| {
         let mut a = y0;
-        for helper in &self.helpers {
+        while a < y1 {
             let b = (a + chunk).min(y1);
+            let run = &run;
             if b == y1 {
-                break;
+                run(a, b);
+            } else {
+                s.spawn(move || run(a, b));
             }
-            helper
-                .range
-                .send(Range { run: shared, a, b })
-                .expect("a thread for converting rows ended");
-            wait.out += 1;
             a = b;
         }
-        if a < y1 {
-            run(a, y1);
-        }
-        if let Some(panic) = wait.all() {
-            std::panic::resume_unwind(panic);
-        }
-    }
-}
-
-/// Waits for the helpers' ranges still out, also if the caller's own range panics: they
-/// run a closure that lives in the caller's frame.
-struct Wait<'a> {
-    helpers: &'a [Helper],
-    /// The first this many helpers have a range.
-    out: usize,
-}
-
-impl Wait<'_> {
-    /// Every range out has run: what the first that panicked panicked with, or that its
-    /// helper is gone.
-    fn all(&mut self) -> Option<Box<dyn std::any::Any + Send>> {
-        let out = std::mem::take(&mut self.out);
-        let mut first = None;
-        for helper in &self.helpers[..out] {
-            let ran = helper
-                .done
-                .recv()
-                .unwrap_or_else(|gone| Err(Box::new(gone)));
-            if let (None, Err(panic)) = (&first, ran) {
-                first = Some(panic);
-            }
-        }
-        first
-    }
-}
-
-impl Drop for Wait<'_> {
-    /// The caller's own range panicked: its panic goes on once the helpers are done.
-    fn drop(&mut self) {
-        self.all();
-    }
-}
-
-impl Drop for Rows {
-    fn drop(&mut self) {
-        for helper in self.helpers.drain(..) {
-            drop(helper.range);
-            let _ = helper.thread.join();
-        }
-    }
+    });
 }
 
 /// Convert rows [y0, y1) (even-aligned) of `src` into `dst`.
@@ -210,9 +85,10 @@ pub fn convert_band(
     dst: &mut I420,
     y0: usize,
     y1: usize,
-    rows: &Rows,
+    threads: usize,
 ) {
-    if y1 <= y0 {
+    let rows = y1 - y0;
+    if rows == 0 {
         return;
     }
     let w = dst.width;
@@ -237,8 +113,7 @@ pub fn convert_band(
             (b - a) as i32,
         );
     };
-    // Chunk edges stay even, for 4:2:0.
-    rows.split(y0, y1, 2, LEAST_ROWS, run);
+    split_rows(y0, y1, threads, run);
 }
 
 /// Copy rows [y0, y1) (even-aligned) of an NV12 frame into `dst`: the luma rows as
@@ -253,7 +128,7 @@ pub fn convert_nv12_band(
     dst: &mut I420,
     y0: usize,
     y1: usize,
-    rows: &Rows,
+    threads: usize,
 ) {
     let w = dst.width;
     let cw = w.div_ceil(2);
@@ -264,7 +139,7 @@ pub fn convert_nv12_band(
         SendPtr(dst.v.as_mut_ptr()),
     );
     let (sy, suv_src) = (SendPtr(src_y as *mut u8), SendPtr(src_uv as *mut u8));
-    rows.split(y0, y1, 2, LEAST_ROWS, |a, b| unsafe {
+    split_rows(y0, y1, threads, |a, b| unsafe {
         for r in a..b {
             std::ptr::copy_nonoverlapping(sy.get().add(r * stride_y), yp.get().add(r * w), w);
         }
@@ -302,97 +177,6 @@ pub fn nv12_to_bgrx(
             px[1] = clamp(c - 100 * d - 208 * e + 128);
             px[2] = clamp(c + 409 * e + 128);
             px[3] = 255;
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct Rng(u64);
-    impl Rng {
-        fn below(&mut self, n: usize) -> usize {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0 as usize % n
-        }
-    }
-
-    /// A range that panics, on a helper or on the calling thread, panics in the caller
-    /// with what it panicked with, once every other range has run; and the threads split
-    /// the next band as before. Any band, on 1 to 6 threads, each of its ranges in turn.
-    #[test]
-    fn a_range_that_panics_panics_in_the_caller() {
-        #[derive(Debug, PartialEq)]
-        struct Panicked(usize, usize);
-        let crews: Vec<Rows> = (1..=6).map(Rows::new).collect();
-        let mut rng = Rng(0x2545F4914F6CDD1D);
-        let mut panicked_on_helpers = 0;
-        for _ in 0..300 {
-            let rows = &crews[rng.below(crews.len())];
-            let y0 = rng.below(1000);
-            let y1 = y0 + rng.below(1000);
-            let ranges = |pick: Option<(usize, usize)>| {
-                let ran = std::sync::Mutex::new(vec![]);
-                let caller = std::thread::current().id();
-                let on_caller = std::sync::Mutex::new(None);
-                let panicked = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    rows.split(y0, y1, 2, LEAST_ROWS, |a, b| {
-                        ran.lock().unwrap().push((a, b));
-                        if std::thread::current().id() == caller {
-                            *on_caller.lock().unwrap() = Some((a, b));
-                        }
-                        if pick == Some((a, b)) {
-                            std::panic::panic_any(Panicked(a, b));
-                        }
-                    })
-                }));
-                let mut ran = ran.into_inner().unwrap();
-                ran.sort();
-                let panicked = panicked.err().map(|p| *p.downcast::<Panicked>().unwrap());
-                (ran, on_caller.into_inner().unwrap(), panicked)
-            };
-            let (all, _, none) = ranges(None);
-            assert_eq!(none, None);
-            for &(a, b) in &all {
-                let (ran, on_caller, panicked) = ranges(Some((a, b)));
-                assert_eq!(panicked, Some(Panicked(a, b)), "rows {y0}..{y1}");
-                assert_eq!(ran, all, "every range ran");
-                panicked_on_helpers += usize::from(on_caller != Some((a, b)));
-            }
-            assert_eq!(ranges(None).0, all, "the threads split as before");
-        }
-        assert!(
-            panicked_on_helpers > 100,
-            "{panicked_on_helpers} on helpers"
-        );
-    }
-
-    /// Converting a band on any number of threads gives the bytes one thread gives.
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn a_band_converts_on_many_threads_as_on_one() {
-        let (w, h) = (333usize, 700usize);
-        let mut rng = Rng(0x9E3779B97F4A7C15);
-        let src: Vec<u8> = (0..w * 4 * h).map(|_| rng.below(256) as u8).collect();
-        let one = Rows::new(1);
-        let crews: Vec<Rows> = (2..=6).map(Rows::new).collect();
-        for _ in 0..200 {
-            let y0 = rng.below(h) & !1;
-            let y1 = (y0 + rng.below(h - y0 + 1)) & !1;
-            let mut want = I420::new(w, h);
-            convert_band(&src, w * 4, &mut want, y0, y1, &one);
-            for rows in &crews {
-                let mut got = I420::new(w, h);
-                convert_band(&src, w * 4, &mut got, y0, y1, rows);
-                assert!(
-                    got.y == want.y && got.u == want.u && got.v == want.v,
-                    "rows {y0}..{y1} on {} threads",
-                    rows.helpers.len() + 1
-                );
-            }
         }
     }
 }
