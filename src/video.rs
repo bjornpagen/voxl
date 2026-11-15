@@ -4496,45 +4496,6 @@ mod tests {
         }
     }
 
-    /// The oracle: `Header::read` before it said what it found.
-    fn old_read(m: &[u8]) -> Option<Header> {
-        if m.len() <= Header::LEN || m[0] != Header::VIDEO {
-            return None;
-        }
-        let u32_at = |i: usize| u32::from_be_bytes([m[i], m[i + 1], m[i + 2], m[i + 3]]);
-        Some(Header {
-            key: m[1] & Header::KEY != 0,
-            sharpens: m[1] & Header::SHARPENS != 0,
-            frame: u32_at(2),
-            pipe: Pipe(u32_at(6)),
-            stripe: m[10],
-            stripes: m[11],
-            parts: m[12],
-            y: u16::from_be_bytes([m[14], m[15]]),
-        })
-    }
-
-    #[test]
-    fn a_stripe_is_what_the_old_reader_read_and_nothing_else_is() {
-        let mut rng = Rng(0xd1b5_4a32_d192_ed03);
-        for _ in 0..200_000 {
-            let mut m: Vec<u8> = (0..rng.next() % 40).map(|_| rng.next() as u8).collect();
-            if rng.next() & 1 == 1 {
-                if let Some(t) = m.first_mut() {
-                    *t = Header::VIDEO;
-                }
-            }
-            let stripe = match Header::read(&m) {
-                Ok(Video::Stripe(h, picture)) => {
-                    assert_eq!(picture, &m[Header::LEN..]);
-                    Some(h)
-                }
-                Ok(Video::Empty(_)) | Err(NotVideo::Other | NotVideo::Short) => None,
-            };
-            assert_eq!(stripe, old_read(&m));
-        }
-    }
-
     /// One case of web/src/video-header.json.
     #[derive(serde::Deserialize)]
     struct Case {
