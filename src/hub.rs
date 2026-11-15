@@ -42,16 +42,98 @@ impl ServerMessage {
     }
 }
 
-/// The `hello` message: the stream's geometry and the server's settings.
+/// The `hello` message: the stream's geometry and the server's settings, the fields
+/// `Hello` in web/src/protocol.ts names.
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct Hello {
     pub w: u32,
     pub h: u32,
     /// Encoded stripes as (y, height).
     pub stripes: Vec<(u32, u32)>,
-    /// What else a viewer is told (audio, files, ...), as `Hub::hello_extra` holds it.
     #[serde(flatten)]
-    pub settings: serde_json::Map<String, serde_json::Value>,
+    pub settings: Settings,
+}
+
+/// What a hello tells a viewer besides the geometry. Each part has its writer: `run` says
+/// what voxl started with, once, before it serves a viewer; on macOS each pipeline says
+/// its displays; dynamic resolution says its scale, from `run` and on macOS from each
+/// pipeline.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
+pub struct Settings {
+    /// None until `run` has started all it reports: only the first pipeline's hello,
+    /// which goes to nobody, is without it.
+    #[serde(flatten)]
+    pub startup: Option<Startup>,
+    #[cfg(target_os = "macos")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub displays: Option<Displays>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resize: Option<Resize>,
+}
+
+impl Settings {
+    /// What `run` says, once it has started everything a viewer is told of.
+    pub fn start(&mut self, startup: Startup, resize: Option<Resize>) {
+        self.startup = Some(startup);
+        if resize.is_some() {
+            self.resize = resize;
+        }
+    }
+
+    /// What a macOS pipeline says when it is built: its displays, and its scale if it
+    /// resizes.
+    #[cfg(target_os = "macos")]
+    pub fn pipeline(&mut self, displays: Displays, resize: Option<Resize>) {
+        self.displays = Some(displays);
+        self.resize = resize;
+    }
+}
+
+/// What voxl started with, as a viewer needs it.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Startup {
+    /// Desktop audio is sent.
+    pub audio: bool,
+    pub files: FilesConfig,
+    /// The browser's microphone can be the desktop's.
+    pub mic: bool,
+    /// The server's platform, as Rust names it (`std::env::consts::OS`).
+    pub os: &'static str,
+    /// Viewers only watch; said only when they do.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
+}
+
+/// What a viewer may do with files (`FilesConfig` in web/src/protocol.ts).
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct FilesConfig {
+    /// The folder, relative to the shared root, the panel opens and uploads into.
+    pub dir: String,
+    pub download: bool,
+    pub upload: bool,
+}
+
+/// Dynamic resolution: desktop pixels per CSS pixel of the viewer's window.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+pub struct Resize {
+    pub scale: f64,
+}
+
+/// macOS: the displays a viewer may switch between, and the one it sees.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct Displays {
+    pub available: Vec<Display>,
+    pub selected: u32,
+}
+
+/// macOS: one display, by its CoreGraphics ID.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct Display {
+    pub id: u32,
+    pub name: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -571,8 +653,8 @@ pub struct Hub {
     pub resize_req: Mutex<Option<(u32, u32)>>,
     /// Largest desktop size (Some when dynamic resolution is on).
     pub resize_max: Mutex<Option<(u32, u32)>>,
-    /// Server settings sent in every `hello` besides the geometry (audio, files, ...).
-    pub hello_extra: Mutex<serde_json::Map<String, serde_json::Value>>,
+    /// What every `hello` says besides the geometry.
+    pub settings: Mutex<Settings>,
     /// Screenshot requests, answered by the capture thread with the current screen.
     pub snapshots: Mutex<Vec<tokio::sync::oneshot::Sender<Arc<crate::record::Snapshot>>>>,
     /// When each part of the screen last changed (`/wait`).
@@ -601,7 +683,7 @@ impl Hub {
             last_clipboard: Mutex::new(None),
             resize_req: Mutex::new(None),
             resize_max: Mutex::new(None),
-            hello_extra: Mutex::new(serde_json::Map::new()),
+            settings: Mutex::new(Settings::default()),
             snapshots: Mutex::new(Vec::new()),
             activity: Default::default(),
             timeline: crate::timeline::Timeline::new(Instant::now()),
@@ -686,7 +768,7 @@ impl Hub {
 
     /// The `hello` message: current geometry plus the server's settings.
     pub fn hello(&self) -> ServerMessage {
-        let settings = self.hello_extra.lock().clone();
+        let settings = self.settings.lock().clone();
         let stripes = self.stripes.lock().clone();
         ServerMessage::Hello(Hello {
             w: self.width.load(Ordering::Relaxed),
@@ -1307,44 +1389,58 @@ mod tests {
                 })
                 .collect()
         }
-        fn value(&mut self, depth: u32) -> serde_json::Value {
-            use serde_json::Value;
-            match self.below(if depth == 0 { 5 } else { 7 }) {
-                0 => Value::Null,
-                1 => Value::Bool(self.next() & 1 == 1),
-                2 => Value::from(self.next() as i64 >> self.below(64)),
-                // Not finite: null, as serde_json writes it.
-                3 => Value::from(f64::from_bits(self.next())),
-                4 => Value::String(self.text()),
-                5 => Value::Array((0..self.below(4)).map(|_| self.value(depth - 1)).collect()),
-                _ => Value::Object(
-                    (0..self.below(4))
-                        .map(|_| (self.text(), self.value(depth - 1)))
-                        .collect(),
-                ),
+        /// Any f64, NaN and the infinities among them.
+        fn float(&mut self) -> f64 {
+            f64::from_bits(self.next())
+        }
+        fn startup(&mut self) -> Startup {
+            Startup {
+                audio: self.next() & 1 == 1,
+                files: FilesConfig {
+                    dir: self.text(),
+                    download: self.next() & 1 == 1,
+                    upload: self.next() & 1 == 1,
+                },
+                mic: self.next() & 1 == 1,
+                os: ["linux", "macos", "windows"][self.below(3) as usize],
+                read_only: self.next() & 1 == 1,
+            }
+        }
+        fn resize(&mut self) -> Option<Resize> {
+            (self.next() & 1 == 1).then(|| Resize {
+                scale: self.float(),
+            })
+        }
+        #[cfg(target_os = "macos")]
+        fn displays(&mut self) -> Displays {
+            Displays {
+                available: (0..self.below(4))
+                    .map(|_| Display {
+                        id: self.next() as u32,
+                        name: self.text(),
+                    })
+                    .collect(),
+                selected: self.next() as u32,
+            }
+        }
+        fn settings(&mut self) -> Settings {
+            Settings {
+                startup: (self.next() & 1 == 1).then(|| self.startup()),
+                #[cfg(target_os = "macos")]
+                displays: (self.next() & 1 == 1).then(|| self.displays()),
+                resize: self.resize(),
             }
         }
         fn message(&mut self) -> ServerMessage {
             match self.below(5) {
-                0 => {
-                    // What lib.rs and the macOS pipeline put there, with anything in them.
-                    let mut settings = serde_json::Map::new();
-                    for k in [
-                        "os", "audio", "mic", "readOnly", "files", "resize", "displays",
-                    ] {
-                        if self.next() & 1 == 1 {
-                            settings.insert(k.into(), self.value(2));
-                        }
-                    }
-                    ServerMessage::Hello(Hello {
-                        w: self.next() as u32,
-                        h: self.next() as u32,
-                        stripes: (0..self.below(17))
-                            .map(|_| (self.next() as u32, self.next() as u32))
-                            .collect(),
-                        settings,
-                    })
-                }
+                0 => ServerMessage::Hello(Hello {
+                    w: self.next() as u32,
+                    h: self.next() as u32,
+                    stripes: (0..self.below(17))
+                        .map(|_| (self.next() as u32, self.next() as u32))
+                        .collect(),
+                    settings: self.settings(),
+                }),
                 1 => ServerMessage::Ping {
                     s: Token(self.next()),
                 },
@@ -1363,7 +1459,7 @@ mod tests {
             hub.width.store(h.w, Ordering::Relaxed);
             hub.height.store(h.h, Ordering::Relaxed);
             *hub.stripes.lock() = h.stripes.clone();
-            *hub.hello_extra.lock() = h.settings.clone();
+            *hub.settings.lock() = h.settings.clone();
         }
     }
 
@@ -1378,14 +1474,44 @@ mod tests {
             let m = rng.message();
             say(&hub, &m);
             if let ServerMessage::Hello(_) = m {
-                assert_eq!(hub.hello(), m);
+                // As JSON: a scale may be NaN, which equals nothing.
+                assert_eq!(hub.hello().json(), m.json());
             }
             let (kind, fields) = match &m {
+                // Its geometry and its settings, as `Hello` in web/src/protocol.ts names them.
                 ServerMessage::Hello(h) => {
-                    let mut f = h.settings.clone();
+                    let mut f = serde_json::Map::new();
                     f.insert("w".into(), h.w.into());
                     f.insert("h".into(), h.h.into());
                     f.insert("stripes".into(), serde_json::json!(h.stripes));
+                    if let Some(s) = &h.settings.startup {
+                        f.insert("audio".into(), s.audio.into());
+                        let files = &s.files;
+                        f.insert(
+                            "files".into(),
+                            serde_json::json!({
+                                "dir": files.dir, "download": files.download, "upload": files.upload
+                            }),
+                        );
+                        f.insert("mic".into(), s.mic.into());
+                        f.insert("os".into(), s.os.into());
+                        if s.read_only {
+                            f.insert("readOnly".into(), true.into());
+                        }
+                    }
+                    #[cfg(target_os = "macos")]
+                    if let Some(d) = &h.settings.displays {
+                        let available: Vec<_> = (d.available.iter())
+                            .map(|x| serde_json::json!({ "id": x.id, "name": x.name }))
+                            .collect();
+                        f.insert(
+                            "displays".into(),
+                            serde_json::json!({ "available": available, "selected": d.selected }),
+                        );
+                    }
+                    if let Some(r) = h.settings.resize {
+                        f.insert("resize".into(), serde_json::json!({ "scale": r.scale }));
+                    }
                     ("hello", serde_json::Value::Object(f))
                 }
                 ServerMessage::Ping { s } => ("ping", serde_json::json!({ "s": s.to_string() })),
@@ -1401,6 +1527,148 @@ mod tests {
             // Read back as the message is: serde_json reads some floats one unit off.
             let fields: serde_json::Value = serde_json::from_str(&fields.to_string()).unwrap();
             assert_eq!(serde_json::Value::Object(object), fields, "{json}");
+        }
+    }
+
+    /// `run` says what voxl started with, and its scale if it has one; without one, the
+    /// scale a pipeline said stays. A macOS pipeline says its displays and its scale, or
+    /// that it has none.
+    #[test]
+    fn each_writer_says_its_part_of_the_settings() {
+        let scale = |r: Option<Resize>| r.map(|r| r.scale.to_bits());
+        let mut rng = Rng(0x3c6e_f372_fe94_f82b);
+        for _ in 0..20_000 {
+            let mut s = rng.settings();
+            let before = s.clone();
+            let (startup, resize) = (rng.startup(), rng.resize());
+            s.start(startup.clone(), resize);
+            assert_eq!(s.startup, Some(startup));
+            assert_eq!(scale(s.resize), scale(resize.or(before.resize)));
+            #[cfg(target_os = "macos")]
+            {
+                assert_eq!(s.displays, before.displays);
+                let (displays, resize) = (rng.displays(), rng.resize());
+                s.pipeline(displays.clone(), resize);
+                assert_eq!(s.displays, Some(displays));
+                assert_eq!(scale(s.resize), scale(resize));
+            }
+        }
+    }
+
+    /// The oracle: a hello before its settings were typed, written from the map that
+    /// `run` and the macOS pipeline wrote into.
+    #[derive(serde::Serialize)]
+    #[serde(tag = "t", rename_all = "lowercase")]
+    enum OldMessage {
+        Hello(OldHello),
+    }
+
+    #[derive(serde::Serialize)]
+    struct OldHello {
+        w: u32,
+        h: u32,
+        stripes: Vec<(u32, u32)>,
+        #[serde(flatten)]
+        settings: serde_json::Map<String, serde_json::Value>,
+    }
+
+    /// The oracle: what `run` wrote into the map.
+    fn old_run(
+        extra: &mut serde_json::Map<String, serde_json::Value>,
+        s: &Startup,
+        resize: Option<Resize>,
+    ) {
+        extra.insert("os".into(), s.os.into());
+        extra.insert("audio".into(), s.audio.into());
+        extra.insert("mic".into(), s.mic.into());
+        if s.read_only {
+            extra.insert("readOnly".into(), true.into());
+        }
+        extra.insert(
+            "files".into(),
+            serde_json::json!({"upload": s.files.upload, "download": s.files.download, "dir": s.files.dir}),
+        );
+        if let Some(Resize { scale }) = resize {
+            extra.insert("resize".into(), serde_json::json!({ "scale": scale }));
+        }
+    }
+
+    /// The oracle: what a macOS pipeline wrote into the map.
+    #[cfg(target_os = "macos")]
+    fn old_pipeline(
+        extra: &mut serde_json::Map<String, serde_json::Value>,
+        d: &Displays,
+        resize: Option<Resize>,
+    ) {
+        let available: Vec<_> = (d.available.iter())
+            .map(|x| serde_json::json!({ "id": x.id, "name": x.name }))
+            .collect();
+        extra.insert(
+            "displays".into(),
+            serde_json::json!({ "selected": d.selected, "available": available }),
+        );
+        match resize {
+            Some(Resize { scale }) => {
+                extra.insert("resize".into(), serde_json::json!({ "scale": scale }));
+            }
+            None => {
+                extra.remove("resize");
+            }
+        }
+    }
+
+    /// Through every order its writers can come in (`run` once, and on macOS a pipeline
+    /// built any number of times before and after it), a hub's hello says what the map
+    /// said: byte for byte where the map's sorted keys were the fields' order (everywhere
+    /// but macOS), the same JSON on macOS, where `displays` now follows `readOnly`.
+    #[test]
+    fn a_hello_says_what_its_map_said() {
+        let mut rng = Rng(0x6a09_e667_f3bc_c908);
+        let hub = Hub::new();
+        for _ in 0..20_000 {
+            let (w, h) = (rng.next() as u32, rng.next() as u32);
+            let stripes: Vec<(u32, u32)> = (0..rng.below(17))
+                .map(|_| (rng.next() as u32, rng.next() as u32))
+                .collect();
+            hub.width.store(w, Ordering::Relaxed);
+            hub.height.store(h, Ordering::Relaxed);
+            *hub.stripes.lock() = stripes.clone();
+            *hub.settings.lock() = Settings::default();
+            let mut extra = serde_json::Map::new();
+            let mut started = false;
+            for _ in 0..1 + rng.below(6) {
+                let new = hub.hello().json();
+                let old = serde_json::to_string(&OldMessage::Hello(OldHello {
+                    w,
+                    h,
+                    stripes: stripes.clone(),
+                    settings: extra.clone(),
+                }))
+                .unwrap();
+                #[cfg(not(target_os = "macos"))]
+                assert_eq!(new, old);
+                #[cfg(target_os = "macos")]
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&new).unwrap(),
+                    serde_json::from_str::<serde_json::Value>(&old).unwrap(),
+                );
+                match rng.below(2) {
+                    0 if !started => {
+                        let (startup, resize) = (rng.startup(), rng.resize());
+                        old_run(&mut extra, &startup, resize);
+                        hub.settings.lock().start(startup, resize);
+                        started = true;
+                    }
+                    #[cfg(target_os = "macos")]
+                    _ => {
+                        let (displays, resize) = (rng.displays(), rng.resize());
+                        old_pipeline(&mut extra, &displays, resize);
+                        hub.settings.lock().pipeline(displays, resize);
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    _ => {}
+                }
+            }
         }
     }
 }

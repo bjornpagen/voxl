@@ -210,8 +210,8 @@ pub fn select_display(id: u32) -> Result<(), String> {
     Ok(())
 }
 
-pub fn display_info() -> serde_json::Value {
-    let displays: Vec<_> = active_displays()
+pub fn display_info() -> crate::hub::Displays {
+    let available = active_displays()
         .into_iter()
         .enumerate()
         .map(|(i, id)| {
@@ -220,10 +220,16 @@ pub fn display_info() -> serde_json::Value {
             } else {
                 ""
             };
-            serde_json::json!({ "id": id, "name": format!("Display {}{suffix}", i + 1) })
+            crate::hub::Display {
+                id,
+                name: format!("Display {}{suffix}", i + 1),
+            }
         })
         .collect();
-    serde_json::json!({ "selected": display(), "available": displays })
+    crate::hub::Displays {
+        available,
+        selected: display(),
+    }
 }
 
 pub fn fps() -> u32 {

@@ -544,16 +544,12 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Capturer, String> {
     #[cfg(target_os = "macos")]
     {
         let resizing = hub.resize_max.lock().is_some();
-        let mut extra = hub.hello_extra.lock();
-        extra.insert("displays".into(), crate::mac::display_info());
-        if resizing {
-            extra.insert(
-                "resize".into(),
-                serde_json::json!({ "scale": crate::mac::resize_scale() }),
-            );
-        } else {
-            extra.remove("resize");
-        }
+        hub.settings.lock().pipeline(
+            crate::mac::display_info(),
+            resizing.then(|| crate::hub::Resize {
+                scale: crate::mac::resize_scale(),
+            }),
+        );
     }
     // New geometry (and a keyframe) for clients already connected; no-op at startup.
     hub.restart_clients();

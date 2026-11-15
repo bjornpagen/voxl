@@ -399,25 +399,22 @@ async fn serve(a: HashMap<String, String>, env: env::Env) {
         .then_some(())
         .and(mic_sink)
         .map(|sink| mic::spawn(sink, hub.clone()));
-    {
-        let mut extra = hub.hello_extra.lock();
-        extra.insert("os".into(), std::env::consts::OS.into());
-        extra.insert("audio".into(), audio_on.into());
-        extra.insert("mic".into(), mic.is_some().into());
-        if read_only {
-            extra.insert("readOnly".into(), true.into());
-        }
-        extra.insert(
-            "files".into(),
-            serde_json::json!({"upload": files.upload, "download": files.download, "dir": files.default_dir}),
-        );
-        if resize_on {
-            extra.insert(
-                "resize".into(),
-                serde_json::json!({ "scale": resize_scale }),
-            );
-        }
-    }
+    hub.settings.lock().start(
+        hub::Startup {
+            audio: audio_on,
+            files: hub::FilesConfig {
+                dir: files.default_dir.clone(),
+                download: files.download,
+                upload: files.upload,
+            },
+            mic: mic.is_some(),
+            os: std::env::consts::OS,
+            read_only,
+        },
+        resize_on.then_some(hub::Resize {
+            scale: resize_scale,
+        }),
+    );
     // --favicon: the tab's icon (default: voxl's own).
     let (favicon, favicon_type) = server::favicon(a.get("favicon").map(|s| s.as_str()))
         .unwrap_or_else(|e| {
