@@ -1324,6 +1324,18 @@ fn stripe_worker(
     }
 }
 
+/// More frames than this in flight to a viewer, and it is closed: upstream's guess (its
+/// first commit), never measured; 10 s of frames at 60 a second. The flow check keeps a
+/// viewer to at most 40 frames in flight, two more in the pipeline, and starts it over
+/// once its oldest frame is 4 s old, but a keyframe passes the flow check. So a viewer
+/// gets this far only on keyframes: while a client asks for one at every capture (the
+/// page asks at most every 500 ms), the flow check never runs, and a viewer that acks
+/// nothing is sent one keyframe a capture until this bound closes it, after 10 s at 60
+/// a second, with 36 to 108 MB of keyframes (60 to 180 KB on a terminal at 3024x1898)
+/// queued for a socket that may not be read. At half it closes after 5 s; at double after
+/// 20 s, with twice that queued. A page reaches neither.
+const HOPELESSLY_BEHIND: usize = 600;
+
 fn encode_loop(
     stripes_in: Vec<Stripe>,
     rx: mpsc::Receiver<Job>,
@@ -1472,7 +1484,7 @@ fn encode_loop(
             }
             {
                 let mut q = c.inflight.lock();
-                if q.len() > 600 {
+                if q.len() > HOPELESSLY_BEHIND {
                     log::warn!("client {} hopelessly behind; dropping", c.id);
                     drop(q);
                     c.send(Out::Text(ServerMessage::Close));
@@ -1689,6 +1701,92 @@ mod tests {
             }));
             assert_eq!(rx.try_iter().count(), steps as usize, "{steps} steps");
         }
+    }
+
+    /// A viewer that acks nothing is sent frames until more than `HOPELESSLY_BEHIND` of them
+    /// are in flight, and is then closed, by the real encode loop: it is sent
+    /// `HOPELESSLY_BEHIND + 1` frames and then the close, whatever comes after.
+    #[test]
+    fn a_viewer_too_far_behind_is_closed() {
+        let hub = Hub::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let viewer = hub.add_client(tx);
+        viewer.watch();
+        viewer.keyframe_planned();
+        let (w, h) = (64, 64);
+        let ecfg = EncoderConfig {
+            pictures: Pictures {
+                width: w as u32,
+                height: h as u32,
+                fps: 60,
+                preset: Preset::parse("ultrafast").unwrap(),
+                threads: 1,
+                debug: Debugging::read(|_| None).unwrap(),
+            },
+            crf: 23.0,
+            max_kbps: None,
+        };
+        let stripe = Stripe {
+            y: 0,
+            h,
+            enc: Encoder::new(&ecfg).unwrap(),
+            applied_kbps: 0,
+            applied_crf: -1.0,
+        };
+        let (job_tx, job_rx) = mpsc::sync_channel::<Job>(1);
+        let (ret_tx, _ret_rx) = mpsc::channel::<Returned>();
+        let encode = std::thread::spawn({
+            let hub = hub.clone();
+            move || {
+                encode_loop(
+                    vec![stripe],
+                    job_rx,
+                    ret_tx,
+                    hub,
+                    60,
+                    Crfs {
+                        configured: 23.0,
+                        paintover: 18.0,
+                    },
+                    Debugging::read(|_| None).unwrap(),
+                )
+            }
+        });
+        for i in 0..HOPELESSLY_BEHIND + 3 {
+            let frame = match i {
+                0 => super::Frame::Key { blocks: None },
+                _ => super::Frame::Motion {
+                    band: Band {
+                        y0: 0,
+                        y1: h as u32,
+                    },
+                    dirty: Arc::new(vec![1; (w / 16) * (h / 16)]),
+                },
+            };
+            job_tx
+                .send(Job {
+                    buf: Box::new(I420::new(w, h)),
+                    idx: 0,
+                    frame,
+                    target: Kbps::new(8000.0),
+                    capacity: Capacity::Unknown,
+                    captured_at: Instant::now(),
+                    marker_ms: None,
+                })
+                .unwrap();
+        }
+        drop(job_tx);
+        encode.join().unwrap();
+        let mut frames = 0;
+        let close = loop {
+            match rx.try_recv() {
+                Ok(Out::Bin(_)) => frames += 1,
+                Ok(Out::Text(t)) => break Some(t),
+                Err(_) => break None,
+            }
+        };
+        assert_eq!(frames, HOPELESSLY_BEHIND + 1);
+        assert_eq!(close, Some(ServerMessage::Close));
     }
 
     /// A stream is made when somebody starts watching, so its encoders are new: whatever
