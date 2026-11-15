@@ -2656,4 +2656,349 @@ mod tests {
              hello, and ends there"
         );
     }
+
+    /// The test binary's allocator on Linux: the system's, counting by thread what is
+    /// allocated while it is armed.
+    #[cfg(target_os = "linux")]
+    #[global_allocator]
+    static COUNTING: counting::Counting = counting::Counting;
+
+    #[cfg(target_os = "linux")]
+    mod counting {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Mutex, MutexGuard};
+
+        pub struct Counting;
+
+        /// What one thread allocated while the count was armed.
+        #[derive(Clone, Copy, Debug)]
+        pub struct Thread {
+            /// As the kernel has it: 15 bytes at most.
+            pub name: [u8; 16],
+            pub allocations: usize,
+            /// How many of each size it allocated, which tells where they come from: the
+            /// first 16 sizes it allocated, by size.
+            pub sizes: [Option<(usize, usize)>; 16],
+        }
+
+        /// Every thread that allocated while armed: a fixed table, since the allocator
+        /// cannot allocate to keep it.
+        struct Seen {
+            threads: [Option<Thread>; 32],
+            /// Allocations by threads after the table's 32.
+            others: usize,
+        }
+
+        static ARMED: AtomicBool = AtomicBool::new(false);
+        static SEEN: Mutex<Seen> = Mutex::new(Seen {
+            threads: [None; 32],
+            others: 0,
+        });
+
+        fn seen() -> MutexGuard<'static, Seen> {
+            SEEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        /// The calling thread's name, as the kernel has it.
+        pub fn thread_name() -> [u8; 16] {
+            let mut name = [0u8; 16];
+            unsafe { libc::prctl(libc::PR_GET_NAME, name.as_mut_ptr()) };
+            name
+        }
+
+        fn note(size: usize) {
+            if !ARMED.load(Ordering::Relaxed) {
+                return;
+            }
+            let name = thread_name();
+            let mut seen = seen();
+            let slot = seen
+                .threads
+                .iter()
+                .position(|t| t.is_none_or(|t| t.name == name));
+            let Some(i) = slot else {
+                seen.others += 1;
+                return;
+            };
+            let t = seen.threads[i].get_or_insert(Thread {
+                name,
+                allocations: 0,
+                sizes: [None; 16],
+            });
+            t.allocations += 1;
+            let same = t
+                .sizes
+                .iter()
+                .position(|s| s.is_none_or(|(s, _)| s == size));
+            if let Some(s) = same {
+                t.sizes[s].get_or_insert((size, 0)).1 += 1;
+            }
+        }
+
+        /// Counts every allocation from now on, by every thread of the process.
+        pub fn arm() {
+            *seen() = Seen {
+                threads: [None; 32],
+                others: 0,
+            };
+            ARMED.store(true, Ordering::SeqCst);
+        }
+
+        /// Stops counting: what each thread allocated since `arm`, and how many
+        /// allocations came from threads past the table.
+        pub fn disarm() -> (Vec<Thread>, usize) {
+            ARMED.store(false, Ordering::SeqCst);
+            let seen = seen();
+            (
+                seen.threads.iter().flatten().copied().collect(),
+                seen.others,
+            )
+        }
+
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                note(layout.size());
+                System.alloc(layout)
+            }
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                note(layout.size());
+                System.alloc_zeroed(layout)
+            }
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+                note(size);
+                System.realloc(ptr, layout, size)
+            }
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                System.dealloc(ptr, layout)
+            }
+        }
+    }
+
+    /// The counting allocator counts the whole process, where other tests allocate as
+    /// they please: so `name` runs in a process of its own, the test binary started again
+    /// with only that test selected. True in that process; in the first, starts it and
+    /// checks that it ran the test and the test passed.
+    #[cfg(target_os = "linux")]
+    fn in_a_process_of_its_own(name: &str) -> bool {
+        const ALONE: &str = "VOXL_TEST_IN_A_PROCESS_OF_ITS_OWN";
+        if std::env::var_os(ALONE).is_some() {
+            return true;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([name, "--exact", "--include-ignored", "--test-threads=1"])
+            .env(ALONE, "1")
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && said.contains("1 passed"),
+            "{said}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        false
+    }
+
+    /// A frame in steady state allocates nothing, whatever it is: the capture loop's
+    /// conversion of its band into a buffer, the encode loop, the stripe workers and the
+    /// hand-off of its messages to a viewer. The oracle is the allocator itself: it
+    /// counts every allocation the process makes while frames go through.
+    ///
+    /// The stream is the one a viewer starts, at the defaults, with one viewer; the test
+    /// plays the capture loop (with no X server it cannot grab, so it draws) and the
+    /// viewer's socket task. First every kind of frame goes through, which brings every
+    /// buffer the stream keeps to its size. Then a generated run of frames (each kind,
+    /// bands of any height, block maps of any shape, keyframes among them) is counted.
+    /// The maps the test hands the encode loop are made before the count, so what is
+    /// counted is the pipeline's. What the capture loop does before it converts (taking
+    /// the damage and the block map, sharpening's bookkeeping, the flow gate and the rate)
+    /// needs an X server and is not run here. x264 and libyuv are C: what they allocate
+    /// goes through C's malloc, which this allocator does not see.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "frames allocate on main: the conversion's threads (split_rows); the encode \
+                loop's selected, results, parts and msgs, its viewer list and each message's \
+                Bytes header; the stripe worker's output and hint vectors; the blocks of the \
+                unbounded channels between the loops"]
+    fn a_steady_state_frame_allocates_nothing() {
+        if !in_a_process_of_its_own("video::tests::a_steady_state_frame_allocates_nothing") {
+            return;
+        }
+        let (w, h) = (1024usize, 768usize);
+        let cfg = VideoConfig {
+            display: None,
+            fps: 60,
+            preset: Preset::parse("ultrafast").unwrap(),
+            threads: 4,
+            convert_threads: 4,
+            crf: 24.0,
+            bounds: Bounds::new(Kbps::new(2000.0), Some(Kbps::new(30000.0))),
+            paintover_crf: 16.0,
+            paintover_delay_ms: 150,
+            coalesce: Duration::ZERO,
+            stripes: 1,
+            debug: Debugging::read(|_| None).unwrap(),
+        };
+        let hub = Hub::new();
+        let (tx, mut socket) = tokio::sync::mpsc::unbounded_channel();
+        let viewer = hub.add_client(tx);
+        viewer.watch();
+        // The capture loop planned its keyframe: the first frame played is one.
+        viewer.keyframe_planned();
+        *hub.stripes.lock() = stripe_layout(h as u32, cfg.stripes);
+        let mut stream = Stream::new(&cfg, &hub, w as u32, h as u32).unwrap();
+        let (cols, rows) = (w.div_ceil(16), h.div_ceil(16));
+        let mut rng = 0x2545F4914F6CDD1Du64;
+        let mut next = |n: usize| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng as usize % n
+        };
+        // Bands of block rows, each with a map of the blocks in it that changed.
+        let maps: Vec<(Band, Arc<Vec<u8>>)> = (0..8)
+            .map(|_| {
+                let first = next(rows);
+                let last = first + next(rows - first);
+                let map = (0..cols * rows)
+                    .map(|b| ((first..=last).contains(&(b / cols)) && next(3) > 0) as u8)
+                    .collect();
+                let band = Band {
+                    y0: (first * 16) as u32,
+                    y1: ((last + 1) * 16).min(h) as u32,
+                };
+                (band, Arc::new(map))
+            })
+            .collect();
+        let every = Arc::new(vec![1u8; cols * rows]);
+        let sharpen = |map: &Arc<Vec<u8>>| Sharpen {
+            map: map.clone(),
+            at: Instant::now(),
+        };
+        let mut screen = vec![0u8; w * h * 4];
+        // The viewer the first keyframe was planned for; it starts on it.
+        let mut starts = vec![viewer.clone()];
+        let mut capture = |kind: usize, which: usize, n: usize| {
+            let (band, map) = &maps[which];
+            let frame = match kind {
+                0 => super::Frame::Key {
+                    blocks: None,
+                    starts: std::mem::take(&mut starts),
+                },
+                1 => super::Frame::Key {
+                    blocks: Some(sharpen(&every)),
+                    starts: std::mem::take(&mut starts),
+                },
+                2 => super::Frame::Motion {
+                    band: *band,
+                    dirty: every.clone(),
+                },
+                3 => super::Frame::Motion {
+                    band: *band,
+                    dirty: map.clone(),
+                },
+                4 => super::Frame::Sharpen {
+                    band: *band,
+                    blocks: sharpen(map),
+                },
+                _ => super::Frame::MotionAndSharpen {
+                    band: *band,
+                    dirty: map.clone(),
+                    blocks: sharpen(map),
+                },
+            };
+            // What moved: lines of 9 px glyphs scrolled 3 px a frame through the band.
+            let (y0, y1) = match kind {
+                0 | 1 => (0, h),
+                _ => (band.y0 as usize, band.y1 as usize),
+            };
+            for (y, row) in screen.chunks_exact_mut(w * 4).enumerate().take(y1).skip(y0) {
+                let (line, within) = ((y + 3 * n) / 18, (y + 3 * n) % 18);
+                for (x, glyph) in row.chunks_mut(9 * 4).enumerate() {
+                    let ink = within < 12 && (x * 2654435761 + line * 40503) >> 7 & 1 == 1;
+                    glyph.fill(if ink { 30 } else { 235 });
+                }
+            }
+            let idx = n % 2;
+            while stream.slots[idx].buf.is_none() {
+                let r = stream.ret_rx.recv().unwrap();
+                stream.returned(r);
+            }
+            let mut buf = stream.slots[idx].buf.take().unwrap();
+            crate::convert::convert_band(&screen, w * 4, &mut buf, y0, y1, cfg.convert_threads);
+            stream
+                .job_tx
+                .send(Job {
+                    buf,
+                    idx,
+                    frame,
+                    target: Kbps::new(6000.0),
+                    capacity: Capacity::Unknown,
+                    captured_at: Instant::now(),
+                    marker_ms: None,
+                })
+                .unwrap();
+            // The viewer: what was handed to its socket task goes, and every frame is
+            // acknowledged as it arrives.
+            while let Ok(m) = socket.try_recv() {
+                if let Out::Bin(m) = m {
+                    let id = u32::from_be_bytes([m[2], m[3], m[4], m[5]]);
+                    viewer.on_ack(Instant::now(), id, crate::hub::Hold::Unsaid);
+                }
+            }
+        };
+        // Every kind of frame, over every band, twice: every buffer the stream keeps has
+        // then been as large as these frames make it.
+        let mut n = 0;
+        for _ in 0..2 {
+            for kind in 0..6 {
+                for which in 0..maps.len() {
+                    capture(kind, which, n);
+                    n += 1;
+                }
+            }
+        }
+        // Each kind about thirty times, keyframes four.
+        const COUNTED: usize = 120;
+        let test = counting::thread_name();
+        counting::arm();
+        for _ in 0..COUNTED {
+            // A keyframe now and then, as a viewer joining asks for one.
+            let kind = match next(30) {
+                0 => next(2),
+                _ => 2 + next(4),
+            };
+            capture(kind, next(maps.len()), n);
+            n += 1;
+        }
+        let (threads, others) = counting::disarm();
+        drop(stream);
+        let allocated: Vec<String> = threads
+            .iter()
+            .map(|t| {
+                let name = match t.name == test {
+                    true => "the capture loop and the viewer (this test's thread)".into(),
+                    false => String::from_utf8_lossy(&t.name)
+                        .trim_end_matches('\0')
+                        .to_owned(),
+                };
+                let sizes: Vec<String> = t
+                    .sizes
+                    .iter()
+                    .flatten()
+                    .map(|(size, n)| format!("{size} B x {n}"))
+                    .collect();
+                format!(
+                    "{name}: {:.2} a frame ({})",
+                    t.allocations as f64 / COUNTED as f64,
+                    sizes.join(", ")
+                )
+            })
+            .collect();
+        assert!(
+            allocated.is_empty() && others == 0,
+            "{COUNTED} frames allocated, by thread:\n{}\nand {others} times on threads past the table",
+            allocated.join("\n")
+        );
+    }
 }
