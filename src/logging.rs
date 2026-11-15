@@ -237,18 +237,9 @@ pub fn exit(code: i32) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::xorshift::Xorshift;
     use std::collections::VecDeque;
     use std::sync::Mutex;
-
-    struct Rng(u64);
-    impl Rng {
-        fn range(&mut self, lo: u64, hi: u64) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            lo + self.0 % (hi - lo)
-        }
-    }
 
     /// What a writer wrote: a line each, level, target and message.
     #[derive(Clone, Default)]
@@ -310,7 +301,7 @@ mod tests {
     /// once the loggers are gone, the log thread's loop writes what is left and ends.
     #[test]
     fn a_thread_that_logs_never_waits_for_the_log() {
-        let mut rng = Rng(0x5EED_1065);
+        let mut rng = Xorshift::new(0x5EED_1065);
         for _ in 0..300 {
             let slots = rng.range(1, 48) as usize;
             let sink = Sink::default();
@@ -362,7 +353,7 @@ mod tests {
     /// written, so a line logged before the process exits is in the log.
     #[test]
     fn a_flushed_log_holds_every_line_logged_before() {
-        let mut rng = Rng(0xF1u64 << 32 | 0x05);
+        let mut rng = Xorshift::new(0xF1u64 << 32 | 0x05);
         for _ in 0..200 {
             let slots = rng.range(1, 32) as usize;
             let sink = Sink::default();
@@ -402,8 +393,8 @@ mod tests {
             (kept[..t].into(), format!("{}{CUT}", &kept[t..]))
         }
         const CHARS: [char; 6] = ['a', ' ', 'é', '€', '…', '😀'];
-        let mut rng = Rng(0xC07_u64 << 20 | 1);
-        let text = |rng: &mut Rng, most: u64| -> String {
+        let mut rng = Xorshift::new(0xC07_u64 << 20 | 1);
+        let text = |rng: &mut Xorshift, most: u64| -> String {
             (0..rng.range(0, most))
                 .map(|_| CHARS[rng.range(0, CHARS.len() as u64) as usize])
                 .collect()

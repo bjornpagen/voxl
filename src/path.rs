@@ -355,6 +355,7 @@ fn agreed(rates: &VecDeque<Rate>) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::xorshift::Xorshift;
 
     /// A path as the estimator's oracle: `rate` bit/s behind a queue that serves frames
     /// in order, and `rtt` of delay that has nothing to do with size.
@@ -390,19 +391,6 @@ mod tests {
         }
     }
 
-    struct Rng(u64);
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0
-        }
-        fn range(&mut self, lo: u64, hi: u64) -> u64 {
-            lo + self.next() % (hi - lo)
-        }
-    }
-
     /// Drives the estimator with a schedule of frames over a link; acks arrive in order.
     /// Returns the estimator and the time of the last ack.
     fn run(est: &mut PathEst, link: &mut Link, frames: &[(Instant, usize)]) -> Instant {
@@ -426,10 +414,10 @@ mod tests {
     /// `bursts` of 3 to 5 frames of `size()` bytes, far enough apart that none waits
     /// behind another.
     fn bursts(
-        rng: &mut Rng,
+        rng: &mut Xorshift,
         t0: Instant,
         rate: f64,
-        mut size: impl FnMut(&mut Rng) -> usize,
+        mut size: impl FnMut(&mut Xorshift) -> usize,
     ) -> Vec<(Instant, usize)> {
         let mut frames = trickle(t0, 30, 16, 600);
         let mut t = t0 + Duration::from_millis(600);
@@ -476,7 +464,7 @@ mod tests {
     fn capacity_comes_from_the_frames_themselves() {
         // Any link, any round trip, frames that take longer to cross than delays can be
         // told apart: the estimate lands on the link's rate.
-        let mut rng = Rng(0x9E3779B97F4A7C15);
+        let mut rng = Xorshift::new(0x9E3779B97F4A7C15);
         for _ in 0..200 {
             let rate = rng.range(2_000_000, 80_000_000) as f64;
             let rtt = rng.range(5, 200);
@@ -504,7 +492,7 @@ mod tests {
         // A stream that never sends a big frame, on a path slow enough that its frames
         // take time to cross: the rate is read from them, where a fixed size to qualify
         // would wait for a frame that never comes.
-        let mut rng = Rng(0x2545F4914F6CDD1D);
+        let mut rng = Xorshift::new(0x2545F4914F6CDD1D);
         for _ in 0..200 {
             let rate = rng.range(500_000, 4_000_000) as f64;
             let t0 = Instant::now();
@@ -537,7 +525,7 @@ mod tests {
     fn frames_too_quick_to_time_read_low_never_high() {
         // Frames of any size on any link: one that crosses in under MIN_WIRE proves
         // only its size over that long.
-        let mut rng = Rng(0x94D049BB133111EB);
+        let mut rng = Xorshift::new(0x94D049BB133111EB);
         for _ in 0..200 {
             let rate = rng.range(2_000_000, 200_000_000) as f64;
             let t0 = Instant::now();
@@ -565,7 +553,7 @@ mod tests {
     fn jitter_moves_the_estimate_by_no_more_than_its_share_of_the_wire_time() {
         // Every ack late by up to 4 ms, at random, on frames that take 20 ms or more to
         // cross: the estimate stays within what 4 ms is of 20.
-        let mut rng = Rng(0x2545F4914F6CDD1D);
+        let mut rng = Xorshift::new(0x2545F4914F6CDD1D);
         for _ in 0..200 {
             let rate = rng.range(2_000_000, 60_000_000) as f64;
             let t0 = Instant::now();
@@ -600,7 +588,7 @@ mod tests {
         // An ack now and then that comes long before its frame can have crossed (a
         // client that acknowledged part of it): fewer than CAPACITY_AGREE of them in
         // the window read as nothing.
-        let mut rng = Rng(0xDA942042E4DD58B5);
+        let mut rng = Xorshift::new(0xDA942042E4DD58B5);
         for _ in 0..200 {
             let rate = rng.range(2_000_000, 60_000_000) as f64;
             let rtt = rng.range(5, 200);
@@ -637,7 +625,7 @@ mod tests {
         // baseline needs is a frame per window that waited behind nothing, which flow
         // control provides by draining the queue; here, a small frame on an empty link
         // every 15 s.
-        let mut rng = Rng(0xD1B54A32D192ED03);
+        let mut rng = Xorshift::new(0xD1B54A32D192ED03);
         for _ in 0..200 {
             let rate = rng.range(1_000_000, 60_000_000) as f64;
             let t0 = Instant::now();
@@ -667,7 +655,7 @@ mod tests {
     fn a_big_frame_alone_is_not_a_queue() {
         // One large frame on an idle link takes its own time to cross and waits behind
         // nothing: once the path's capacity is known, that is not congestion.
-        let mut rng = Rng(0xA0761D6478BD642F);
+        let mut rng = Xorshift::new(0xA0761D6478BD642F);
         for _ in 0..100 {
             let rate = rng.range(4_000_000, 60_000_000) as f64;
             let t0 = Instant::now();
@@ -692,7 +680,7 @@ mod tests {
     fn a_standing_queue_shows() {
         // Frames sent faster than the link carries them wait behind each other, and
         // the estimate follows the wait the link really imposed.
-        let mut rng = Rng(0xE7037ED1A0B428DB);
+        let mut rng = Xorshift::new(0xE7037ED1A0B428DB);
         for _ in 0..100 {
             let rate = rng.range(2_000_000, 20_000_000) as f64;
             let t0 = Instant::now();
@@ -986,7 +974,7 @@ mod tests {
     /// a second.
     #[test]
     fn frames_that_all_queued_show_no_rate() {
-        let mut rng = Rng(0xD6E8FEB86659FD93);
+        let mut rng = Xorshift::new(0xD6E8FEB86659FD93);
         for _ in 0..200 {
             let rate = rng.range(1_500_000, 6_000_000) as f64;
             let t0 = Instant::now();

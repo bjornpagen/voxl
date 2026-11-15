@@ -306,19 +306,10 @@ impl FrameBudget {
 mod rate_tests {
     use super::*;
     use crate::path::PathEst;
+    use crate::xorshift::Xorshift;
     use std::collections::VecDeque;
 
     const FPS: Fps = Fps::new(60).unwrap();
-
-    struct Rng(u64);
-    impl Rng {
-        fn range(&mut self, lo: u64, hi: u64) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            lo + self.0 % (hi - lo)
-        }
-    }
 
     /// One viewer on one link, driven a frame time at a tick.
     struct Sim {
@@ -340,7 +331,7 @@ mod rate_tests {
         sent_bytes: usize,
         /// Every ack comes up to this late, at random.
         late: Duration,
-        late_rng: Rng,
+        late_rng: Xorshift,
         /// The highest the estimate read, as a share of the link's rate.
         highest_read: f64,
     }
@@ -364,7 +355,7 @@ mod rate_tests {
                 worst_share: 1.0,
                 sent_bytes: 0,
                 late: Duration::ZERO,
-                late_rng: Rng(0x9E3779B97F4A7C15),
+                late_rng: Xorshift::new(0x9E3779B97F4A7C15),
                 highest_read: 0.0,
             }
         }
@@ -444,7 +435,7 @@ mod rate_tests {
         // than the scroll needs (60 KB a frame at 60 fps is 29 Mbit/s), scrolled now and
         // then. Every scroll frame gets what it asks for, from the first one, and
         // nothing queues.
-        let mut rng = Rng(0x2545F4914F6CDD1D);
+        let mut rng = Xorshift::new(0x2545F4914F6CDD1D);
         for _ in 0..40 {
             let rate = rng.range(36_000_000, 80_000_000) as f64;
             let mut sim = Sim::new(rate, rng.range(20, 150), 30_000.0);
@@ -473,7 +464,7 @@ mod rate_tests {
         // A slower link can't carry the whole scroll at full quality, but what piled up
         // during the stillness pays for its first frame in full, within the latency
         // budget; the frames after it get what the link sustains.
-        let mut rng = Rng(0x94D049BB133111EB);
+        let mut rng = Xorshift::new(0x94D049BB133111EB);
         for _ in 0..40 {
             let rate = rng.range(8_000_000, 20_000_000) as f64;
             let mut sim = Sim::new(rate, rng.range(20, 150), 30_000.0);
@@ -503,7 +494,7 @@ mod rate_tests {
         // small to show its rate. The target has to come back to the cautious start by
         // itself, and from there the path shows what it carries: here after half a
         // second of a desktop at rest, which gives the estimate its baseline.
-        let mut rng = Rng(0xA0761D6478BD642F);
+        let mut rng = Xorshift::new(0xA0761D6478BD642F);
         for _ in 0..40 {
             let rate = rng.range(20_000_000, 80_000_000) as f64;
             let mut sim = Sim::new(rate, rng.range(20, 100), 30_000.0);
@@ -620,7 +611,7 @@ mod rate_tests {
     #[test]
     fn the_target_never_leaves_its_bounds() {
         let kbps = |k: u64| Kbps::new(k as f64);
-        let mut rng = Rng(0x2545F4914F6CDD1D);
+        let mut rng = Xorshift::new(0x2545F4914F6CDD1D);
         let t0 = Instant::now();
         for _ in 0..300 {
             let floor = kbps(rng.range(0, 20_000));
@@ -654,7 +645,7 @@ mod rate_tests {
         // few frames are sent with nothing unacknowledged, and every ack a few ms late:
         // rest, then scrolls, then rest again. A late ack makes a frame look slower,
         // never the path faster.
-        let mut rng = Rng(0xE7037ED1A0B428DB);
+        let mut rng = Xorshift::new(0xE7037ED1A0B428DB);
         for late_ms in [1, 3, 6] {
             for _ in 0..30 {
                 let rate = rng.range(20_000_000, 60_000_000) as f64;
@@ -701,7 +692,7 @@ mod rate_tests {
     fn sustained_motion_settles_under_a_slow_link() {
         // Video-like motion that always wants more than the link carries: the stream
         // settles under the link's rate, uses most of it, and the queue stays short.
-        let mut rng = Rng(0x9E6C63D0876A9A47);
+        let mut rng = Xorshift::new(0x9E6C63D0876A9A47);
         for _ in 0..40 {
             let rate = rng.range(2_500_000, 12_000_000) as f64;
             let rtt = rng.range(20, 150);
@@ -752,7 +743,7 @@ mod rate_tests {
         // Whatever the tokens, a frame may spend at least its share in debt of the
         // target's part of one frame time, and at most what the path carries in the
         // latency budget.
-        let mut rng = Rng(0xBF58476D1CE4E5B9);
+        let mut rng = Xorshift::new(0xBF58476D1CE4E5B9);
         let t0 = Instant::now();
         let frame_time = Duration::from_secs_f64(1.0 / FPS.get() as f64);
         for _ in 0..500 {

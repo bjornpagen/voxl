@@ -1380,16 +1380,14 @@ mod tests {
         );
     }
 
-    struct Rng(u64);
+    /// The tests' generator, drawing the hub's values.
+    struct Rng(crate::xorshift::Xorshift);
     impl Rng {
         fn next(&mut self) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0
+            self.0.next()
         }
         fn below(&mut self, n: u64) -> u64 {
-            self.next() % n
+            self.0.below(n)
         }
         /// Text that JSON escapes and text it doesn't, and the words the recorder looks for.
         fn text(&mut self) -> String {
@@ -1495,7 +1493,7 @@ mod tests {
     /// is its geometry and its settings.
     #[test]
     fn a_message_is_its_fields_after_its_kind() {
-        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let mut rng = Rng(crate::xorshift::Xorshift::new(0x2545_f491_4f6c_dd1d));
         let hub = Hub::new();
         for _ in 0..100_000 {
             let m = rng.message();
@@ -1563,7 +1561,7 @@ mod tests {
     #[test]
     fn each_writer_says_its_part_of_the_settings() {
         let scale = |r: Option<Resize>| r.map(|r| r.scale.to_bits());
-        let mut rng = Rng(0x3c6e_f372_fe94_f82b);
+        let mut rng = Rng(crate::xorshift::Xorshift::new(0x3c6e_f372_fe94_f82b));
         for _ in 0..20_000 {
             let mut s = rng.settings();
             let before = s.clone();

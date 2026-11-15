@@ -293,13 +293,6 @@ pub async fn stop(
 mod tests {
     use super::*;
 
-    fn next(rng: &mut u64) -> u64 {
-        *rng ^= *rng << 13;
-        *rng ^= *rng >> 7;
-        *rng ^= *rng << 17;
-        *rng
-    }
-
     /// Video frame `id`: a keyframe, its SPS and PPS as mp4.rs's own test writes them.
     fn video(id: u32) -> Out {
         let mut m = vec![0x01, 1];
@@ -334,20 +327,20 @@ mod tests {
         let hub = Hub::new();
         let (tx, _) = mpsc::unbounded_channel();
         let client = hub.add_client(tx);
-        let mut rng = 0x9e37_79b9_7f4a_7c15;
+        let mut rng = crate::xorshift::Xorshift::new(0x9e37_79b9_7f4a_7c15);
         for _ in 0..2_000 {
             let (tx, rx) = mpsc::unbounded_channel();
             let (mut held, mut ended) = (0, false);
-            for id in 0..next(&mut rng) % 12 {
-                let m = match next(&mut rng) % 7 {
+            for id in 0..rng.next() % 12 {
+                let m = match rng.next() % 7 {
                     0..=2 => video(id as u32),
                     3 => Out::Text(hub.hello()),
                     4 => Out::Text(ServerMessage::Close),
                     5 => Out::Text(ServerMessage::Clip {
-                        d: CLIPS[(next(&mut rng) % CLIPS.len() as u64) as usize].into(),
+                        d: CLIPS[(rng.next() % CLIPS.len() as u64) as usize].into(),
                     }),
                     _ => Out::Text(ServerMessage::Mic {
-                        on: next(&mut rng) & 1 == 1,
+                        on: rng.next() & 1 == 1,
                     }),
                 };
                 match &m {

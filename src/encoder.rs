@@ -555,13 +555,8 @@ mod tests {
     fn x264_says_what_it_refuses_in_voxls_log() {
         log::set_logger(&Logged).unwrap();
         log::set_max_level(log::LevelFilter::Trace);
-        let mut seed = 0x264_u64 << 40 | 0x1065;
-        let mut range = |lo: u32, hi: u32| {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            lo + (seed % u64::from(hi - lo)) as u32
-        };
+        let mut rng = crate::xorshift::Xorshift::new(0x264_u64 << 40 | 0x1065);
+        let mut range = |lo: u32, hi: u32| rng.range(u64::from(lo), u64::from(hi)) as u32;
         for i in 0..500 {
             // Odd or nothing on one side or both; past x264's 16384 x 16384 once in a while.
             let side = |range: &mut dyn FnMut(u32, u32) -> u32, refused: bool| match refused {

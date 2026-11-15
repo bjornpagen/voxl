@@ -2490,6 +2490,7 @@ fn marker_age(ms: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::xorshift::Xorshift;
 
     /// A marker is read where all of it fits the capture, as the time painted on it, and
     /// nowhere else: a place past an edge (by a pixel, by far, or so far the sum overflows)
@@ -2831,12 +2832,9 @@ mod tests {
                 }
             }
             Scene::Noise => {
-                let mut state = (frame as u64 + 1).wrapping_mul(0x9E3779B97F4A7C15);
+                let mut rng = Xorshift::new((frame as u64 + 1).wrapping_mul(0x9E3779B97F4A7C15));
                 for p in y.iter_mut() {
-                    state ^= state << 13;
-                    state ^= state >> 7;
-                    state ^= state << 17;
-                    *p = 64 + (state % 128) as u8;
+                    *p = 64 + rng.below(128) as u8;
                 }
             }
         }
@@ -3175,13 +3173,8 @@ mod tests {
             back: None,
             last_pass: None,
         };
-        let mut rng = 0x2545F4914F6CDD1Du64;
-        let mut next = |n: u64| {
-            rng ^= rng << 13;
-            rng ^= rng >> 7;
-            rng ^= rng << 17;
-            rng % n
-        };
+        let mut rng = Xorshift::new(0x2545F4914F6CDD1D);
+        let mut next = |n: u64| rng.below(n);
         for _ in 0..300 {
             m.needs = 1 + next(8) as u32;
             let bound = REFINE_STILL + (REFINE_EVERY + FRAME) * m.needs + FRAME;
@@ -3220,13 +3213,8 @@ mod tests {
         let t0 = Instant::now();
         let mut s = Sharpening::new(delay);
         let mut from: Option<Instant> = None;
-        let mut rng = 0x2545F4914F6CDD1Du64;
-        let mut next = |n: u64| {
-            rng ^= rng << 13;
-            rng ^= rng >> 7;
-            rng ^= rng << 17;
-            rng % n
-        };
+        let mut rng = Xorshift::new(0x2545F4914F6CDD1D);
+        let mut next = |n: u64| rng.below(n);
         let mut now = t0;
         for _ in 0..20_000 {
             now += Duration::from_millis(next(120));
@@ -3335,13 +3323,8 @@ mod tests {
     fn a_pass_never_holds_a_change_back() {
         let t0 = Instant::now();
         let frame = Duration::from_micros(14_167);
-        let mut rng = 0x9E3779B97F4A7C15u64;
-        let mut next = |n: u64| {
-            rng ^= rng << 13;
-            rng ^= rng >> 7;
-            rng ^= rng << 17;
-            rng % n
-        };
+        let mut rng = Xorshift::new(0x9E3779B97F4A7C15);
+        let mut next = |n: u64| rng.below(n);
         let mut captured = Captured::new(t0);
         let (mut now, mut last_any, mut last_change) = (t0, t0, t0);
         for _ in 0..20_000 {
@@ -3364,14 +3347,11 @@ mod tests {
         }
     }
 
-    /// A tiny xorshift generator, for properties over generated cases.
-    struct Gen(u64);
+    /// The tests' generator, drawing the stripes' cases.
+    struct Gen(Xorshift);
     impl Gen {
         fn below(&mut self, n: u64) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0 % n
+            self.0.below(n)
         }
         fn bytes(&mut self, len: usize) -> Vec<u8> {
             (0..len).map(|_| self.below(256) as u8).collect()
@@ -3457,7 +3437,7 @@ mod tests {
     /// write it again.
     #[test]
     fn a_lent_picture_comes_back_as_it_went() {
-        let mut g = Gen(0x5851F42D4C957F2D);
+        let mut g = Gen(Xorshift::new(0x5851F42D4C957F2D));
         for case in 0..300 {
             let width = 16 + g.below(80) as usize;
             let height = 16 + g.below(200) as usize;
@@ -3591,7 +3571,7 @@ mod tests {
     /// in order.
     #[test]
     fn a_frame_comes_out_as_its_stripes_did() {
-        let mut g = Gen(0xD1B54A32D192ED03);
+        let mut g = Gen(Xorshift::new(0xD1B54A32D192ED03));
         // Frames that came out sharp, not sharp, a whole keyframe, and with an empty stripe.
         let mut reached = [0; 4];
         for case in 0..20_000 {
@@ -3668,7 +3648,7 @@ mod tests {
     /// otherwise sets nothing.
     #[test]
     fn a_stripe_sets_its_rate_when_it_moves() {
-        let mut g = Gen(0x94D049BB133111EB);
+        let mut g = Gen(Xorshift::new(0x94D049BB133111EB));
         // Frames that kept a rate, that set one, and that moved the cap onto the slack's edge.
         let mut reached = [0; 3];
         for case in 0..2_000 {
@@ -3775,7 +3755,7 @@ mod tests {
                 })
                 .collect::<Vec<Coder>>()
         };
-        let mut g = Gen(0xBF58476D1CE4E5B9);
+        let mut g = Gen(Xorshift::new(0xBF58476D1CE4E5B9));
         let mut sent = 0;
         for case in 0..40 {
             let width = 16 * (2 + g.below(10) as usize);
@@ -3889,13 +3869,8 @@ mod tests {
             configured: 24.0,
             paintover: 16.0,
         };
-        let mut rng = 0x2545F4914F6CDD1Du64;
-        let mut next = |n: usize| {
-            rng ^= rng << 13;
-            rng ^= rng >> 7;
-            rng ^= rng << 17;
-            rng as usize % n
-        };
+        let mut rng = Xorshift::new(0x2545F4914F6CDD1D);
+        let mut next = |n: usize| rng.below(n as u64) as usize;
         for stripes in 1..=3 {
             let layout = stripe_layout(h as u16, stripes);
             let mut coders = layout.rows().map(|(y, sh)| {
@@ -4012,12 +3987,9 @@ mod tests {
                 // or noise over the whole picture, which wants more bytes than any text.
                 let pic = Arc::get_mut(&mut buf).unwrap();
                 if noise {
-                    let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ n as u64;
+                    let mut rng = Xorshift::new(0x9E37_79B9_7F4A_7C15u64 ^ n as u64);
                     for p in pic.y.iter_mut() {
-                        state ^= state << 13;
-                        state ^= state >> 7;
-                        state ^= state << 17;
-                        *p = state as u8;
+                        *p = rng.next() as u8;
                     }
                 }
                 let (y0, y1) = match noise {
@@ -4201,7 +4173,7 @@ mod tests {
     /// for any crew and any of its workers gone, while the others' stay open.
     #[test]
     fn a_gone_worker_closes_both_its_channels() {
-        let mut g = Gen(0x2545F4914F6CDD1D);
+        let mut g = Gen(Xorshift::new(0x2545F4914F6CDD1D));
         for case in 0..300 {
             let n = 1 + g.below(8) as usize;
             let ends: Vec<End> = (0..n)
@@ -4268,7 +4240,7 @@ mod tests {
     /// waker, none on a clock.
     #[test]
     fn a_dead_worker_ends_the_pipeline() {
-        let mut g = Gen(0x9E3779B97F4A7C15);
+        let mut g = Gen(Xorshift::new(0x9E3779B97F4A7C15));
         // Cases that ended with each way of dying, that ended well, that refused, and
         // that ended with stripe 0 panicking on the encode loop's thread.
         let mut reached = [0; 6];
@@ -4460,7 +4432,7 @@ mod tests {
     /// has in flight every frame so far that put out a part, and no other.
     #[test]
     fn a_frame_is_in_flight_before_its_picture_goes_home() {
-        let mut g = Gen(0x2545F4914F6CDD1D);
+        let mut g = Gen(Xorshift::new(0x2545F4914F6CDD1D));
         // Frames counted in flight, frames every stripe of which failed, frames that
         // touched no stripe.
         let mut reached = [0; 3];
@@ -4618,13 +4590,11 @@ mod tests {
         );
     }
 
-    struct Rng(u64);
+    /// The tests' generator, drawing headers' fields.
+    struct Rng(Xorshift);
     impl Rng {
         fn next(&mut self) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0
+            self.0.next()
         }
         /// A number of any size: a random one, shifted right by a random amount.
         fn any(&mut self) -> u64 {
@@ -4648,7 +4618,7 @@ mod tests {
 
     #[test]
     fn a_header_reads_back_as_it_was_written() {
-        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut rng = Rng(Xorshift::new(0x9e37_79b9_7f4a_7c15));
         for _ in 0..100_000 {
             let header = random_header(&mut rng);
             let picture: Vec<u8> = (0..1 + rng.next() % 64).map(|_| rng.next() as u8).collect();
@@ -4659,7 +4629,7 @@ mod tests {
 
     #[test]
     fn a_header_alone_is_empty_less_is_short_and_another_type_is_not_video() {
-        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let mut rng = Rng(Xorshift::new(0x2545_f491_4f6c_dd1d));
         for _ in 0..100_000 {
             let header = random_header(&mut rng);
             let bytes = header.bytes();
@@ -4677,7 +4647,7 @@ mod tests {
 
     #[test]
     fn a_pipe_is_whole_tenths_of_a_millisecond() {
-        let mut rng = Rng(0x6a09_e667_f3bc_c908);
+        let mut rng = Rng(Xorshift::new(0x6a09_e667_f3bc_c908));
         let tenth = Duration::from_micros(100);
         for _ in 0..100_000 {
             let d = Duration::from_nanos(rng.any());
@@ -5398,13 +5368,8 @@ mod tests {
             hub: hub.clone(),
             frames: 0,
         };
-        let mut rng = 0x2545F4914F6CDD1Du64;
-        let mut next = move |n: u64| {
-            rng ^= rng << 13;
-            rng ^= rng >> 7;
-            rng ^= rng << 17;
-            rng % n
-        };
+        let mut rng = Xorshift::new(0x2545F4914F6CDD1D);
+        let mut next = move |n: u64| rng.below(n);
         // A keyframe 1 in 30 steps, sharpening 1 in 10.
         const STEPS: usize = 60;
         let kinds: [u64; STEPS] = std::array::from_fn(|_| match next(30) {
@@ -5644,16 +5609,6 @@ mod tests {
         );
     }
 
-    /// Xorshift from `seed`: each call gives 0 to `n` less one, the same cases every run.
-    fn generator(mut seed: u64) -> impl FnMut(u64) -> u64 {
-        move |n| {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed % n
-        }
-    }
-
     /// A held gate names the soonest moment time alone can open it: the viewer that holds
     /// it stalls. Over generated viewers (watching or not, a round trip of up to 4 s or
     /// none, up to 45 frames in flight whose oldest is about its round trip old,
@@ -5667,7 +5622,8 @@ mod tests {
     /// is full, to when the first of them stalls; else open while one has room.
     #[test]
     fn a_held_flow_gate_waits_until_a_viewer_stalls() {
-        let mut next = generator(0x9E37_79B9_7F4A_7C15);
+        let mut rng = Xorshift::new(0x9E37_79B9_7F4A_7C15);
+        let mut next = |n: u64| rng.below(n);
         let now = Instant::now() + Duration::from_secs(10);
         // Held to a stall, held with every watching viewer stalled, and open.
         let mut seen = [0u32; 3];
@@ -5850,13 +5806,8 @@ mod tests {
     /// frames to 4 KB, encodes of 1 to 30 ms and quiet windows to 4 ms, 30 s each.
     #[test]
     fn a_keystroke_waits_behind_one_pass_at_most() {
-        let mut seed = 0x2545_F491_4F6C_DD1Du64;
-        let mut next = |n: u64| {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed % n
-        };
+        let mut rng = Xorshift::new(0x2545_F491_4F6C_DD1D);
+        let mut next = |n: u64| rng.below(n);
         let us = Duration::from_micros;
         // A frame on its way: when it went, when its last byte left the path's queue,
         // when its ack comes back, and whether it is a pass.
@@ -6290,18 +6241,9 @@ mod tests {
     /// rates. A put wakes the loop only through a wait that wakes on damage.
     #[test]
     fn a_capture_waits_for_the_drawing_to_go_quiet_or_its_deadline() {
-        struct Rng(u64);
-        impl Rng {
-            fn range(&mut self, lo: u64, hi: u64) -> u64 {
-                self.0 ^= self.0 << 13;
-                self.0 ^= self.0 >> 7;
-                self.0 ^= self.0 << 17;
-                lo + self.0 % (hi - lo)
-            }
-        }
         let us = Duration::from_micros;
         let t0 = Instant::now() + Duration::from_secs(10);
-        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let mut rng = Xorshift::new(0x9E37_79B9_7F4A_7C15);
         let mut timelines = 0;
         for fps in [30u64, 60, 120, 144] {
             let deadline = us(1_000_000 / fps);
@@ -6392,15 +6334,10 @@ mod tests {
     /// generated runs of one to 64 areas, 0 to 20 ms apart, added as a capturer adds them.
     #[test]
     fn a_drawing_runs_from_its_first_area_to_its_latest() {
-        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut rng = Xorshift::new(0x2545_F491_4F6C_DD1D);
         let t0 = Instant::now() + Duration::from_secs(10);
         for _ in 0..10_000 {
-            let mut next = || {
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
-                x
-            };
+            let mut next = || rng.next();
             let n = 1 + next() % 64;
             let mut at = t0;
             let mut areas = Vec::new();
@@ -6582,7 +6519,8 @@ mod tests {
     /// or not, at 10 to 120 fps. Every viewer joins at the start.
     #[test]
     fn a_late_viewer_is_sent_no_keyframe_and_holds_nobody_else() {
-        let mut next = generator(0x2545_F491_4F6C_DD1D);
+        let mut rng = Xorshift::new(0x2545_F491_4F6C_DD1D);
+        let mut next = |n: u64| rng.below(n);
         let start = Instant::now() + Duration::from_secs(10);
         // Steps where the late viewer had stalled: beside viewers the gate opened for,
         // beside viewers one of which held it, and alone; and late viewers that came back.

@@ -41,6 +41,8 @@ mod video;
 mod wait;
 #[cfg(windows)]
 mod win;
+#[cfg(test)]
+mod xorshift;
 
 // The macOS and Windows backends provide the same modules with the same interfaces.
 #[cfg(target_os = "macos")]
@@ -678,13 +680,8 @@ mod tests {
     /// words, and numbers of every size a u32 holds and past it.
     #[test]
     fn a_framerate_outside_1_to_240_starts_nothing() {
-        let mut x = 0x2545F4914F6CDD1Du64;
-        let mut draw = |n: u64| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x % n
-        };
+        let mut rng = crate::xorshift::Xorshift::new(0x2545F4914F6CDD1D);
+        let mut draw = |n: u64| rng.below(n);
         for _ in 0..20_000 {
             let v = match draw(6) {
                 0 => format!("{}", draw(300)),
@@ -716,13 +713,8 @@ mod tests {
     /// across every magnitude a u32 holds.
     #[test]
     fn every_framerate_read_opens_an_encoder() {
-        let mut x = 0x9E3779B97F4A7C15u64;
-        let mut draw = |n: u64| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x % n
-        };
+        let mut rng = crate::xorshift::Xorshift::new(0x9E3779B97F4A7C15);
+        let mut draw = |n: u64| rng.below(n);
         let edges = [
             "240",
             "241",

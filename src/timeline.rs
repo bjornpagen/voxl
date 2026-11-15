@@ -478,17 +478,8 @@ impl Timeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::xorshift::Xorshift;
     use std::time::Duration;
-
-    struct Rng(u64);
-    impl Rng {
-        fn below(&mut self, n: u64) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0 % n
-        }
-    }
 
     /// A frame whose marks follow its damage at `start + at`, `gaps` apart.
     fn frame(
@@ -537,7 +528,7 @@ mod tests {
     fn the_ring_returns_the_newest_frames_as_recorded() {
         let start = Instant::now();
         let ring = Timeline::new(start);
-        let mut rng = Rng(0x2545F4914F6CDD1D);
+        let mut rng = Xorshift::new(0x2545F4914F6CDD1D);
         // The model: frame number -> (what was recorded, its write).
         let mut model: Vec<(u32, Recorded)> = vec![];
         let mut at = 0u64;
@@ -757,7 +748,7 @@ mod tests {
     fn each_viewer_keeps_its_last_frames_and_their_acks() {
         const STEPS: u32 = 64_000;
         let hub = crate::hub::Hub::new();
-        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let mut rng = Xorshift::new(0x9E37_79B9_7F4A_7C15);
         let mut at = Instant::now();
         let mut watchers: Vec<Watcher> = vec![];
         // The last to leave, with when each left and at which step, oldest first.
@@ -861,7 +852,7 @@ mod tests {
                     let n = w.sent.len();
                     let from = n.saturating_sub(FRAMES_KEPT);
                     let open = (from..n).find(|&i| w.sent[i].ack.is_none());
-                    let pick = |rng: &mut Rng, lo: usize, hi: usize| {
+                    let pick = |rng: &mut Xorshift, lo: usize, hi: usize| {
                         (hi > lo).then(|| lo + rng.below((hi - lo) as u64) as usize)
                     };
                     let kind = rng.below(6) as usize;

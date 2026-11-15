@@ -1121,13 +1121,8 @@ mod tests {
             "1e3",
             "18446744073709551616",
         ];
-        let mut seed = 0x9E3779B97F4A7C15u64;
-        let mut next = move || {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed
-        };
+        let mut rng = crate::xorshift::Xorshift::new(0x9E3779B97F4A7C15);
+        let mut next = move || rng.next();
         // Lines that parsed into a position, a button and a pixel scroll.
         let mut parsed = [0; 3];
         let mut out = vec![];
