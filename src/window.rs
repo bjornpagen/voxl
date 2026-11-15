@@ -1005,4 +1005,39 @@ mod tests {
             assert!(late <= LATENESS * 3, "{what}");
         }
     }
+
+    /// Acks late at random under sustained motion (a busy server or client: at a load of
+    /// 300 the lag was 5 ms at p10 and 17 ms at p50) do not read as a faster path: a late
+    /// ack makes its frame look slower and the one after it at most that much faster, so
+    /// the window never carries more than the link does in `LATENESS` and the lateness, as
+    /// `late_acks_on_a_long_path_do_not_read_as_a_faster_one` bounds it; and frames come back
+    /// within the lateness of sustained motion and that of their acks. Links of 1 to 80
+    /// Mbit/s, round trips of 2 to 300 ms, every ack up to 1 to 40 ms late, 30 s.
+    #[test]
+    #[ignore = "fails until the next commit (heels can show the path carries less, never more): 1.73 of the link and 198 ms late, at 7.6 MB/s, 11 ms, acks up to 39 ms late"]
+    fn late_acks_under_motion_do_not_read_as_a_faster_path() {
+        let mut rng = Rng(0x1405_7B7E_F767_814F);
+        for _ in 0..200 {
+            let rate = rng.range(125_000, 10_000_000) as f64;
+            let mut sim = Sim::new(rate, rng.range(2, 300));
+            sim.jitter = Duration::from_millis(rng.range(1, 40));
+            sim.run(600, |_| HEAVY);
+            sim.reset();
+            let mut most = 0;
+            for _ in 0..1200 {
+                sim.tick(HEAVY);
+                most = most.max(sim.window.carries());
+            }
+            let read = most as f64 / sim.fits();
+            let over = sim.jitter.as_secs_f64() / LATENESS.as_secs_f64();
+            let what = format!(
+                "{rate} B/s, {:?}, acks up to {:?} late: window {read:.2} of the link, late {:?}",
+                sim.rtt,
+                sim.jitter,
+                sim.late(1.0)
+            );
+            assert!(read <= 1.0 + over, "{what}");
+            assert!(sim.late(1.0) <= LATENESS * 3 + sim.jitter, "{what}");
+        }
+    }
 }
