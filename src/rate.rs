@@ -1,6 +1,6 @@
 //! Rate control: the bitrate the stream is steered to, and the bits each frame may spend.
 
-use crate::hub::Hub;
+use crate::hub::{Client, Hub, Viewer};
 use crate::path::{Bits, Capacity, Kbps};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -90,11 +90,11 @@ impl RateCtl {
     }
 
     /// Steers by what the clients' paths say now; what they can carry together.
-    pub fn update(&mut self, hub: &Hub, clients: &[Arc<crate::hub::Client>]) -> Capacity {
-        let paths: Vec<PathNow> = clients
+    pub fn update(&mut self, hub: &Hub, viewers: &[(Arc<Client>, Viewer)]) -> Capacity {
+        let paths: Vec<PathNow> = viewers
             .iter()
-            .filter(|c| c.started())
-            .map(|c| {
+            .filter(|(_, viewer)| *viewer == Viewer::Started)
+            .map(|(c, _)| {
                 let (_, age) = c.backlog();
                 let rtt = c.rtt_ms().unwrap_or(RTT_GUESS_MS) as f64;
                 PathNow {

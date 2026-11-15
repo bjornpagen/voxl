@@ -174,7 +174,7 @@ impl Pings {
 /// What a client is to the stream. Each change is a method of `Client`, named for the step
 /// that makes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum Viewer {
+pub enum Viewer {
     /// It is sent no video.
     NotWatching,
     /// It waits for a keyframe, and none has been planned for it: the capture loop plans one.
@@ -230,28 +230,9 @@ impl Client {
         parking_lot::MutexGuard::map(self.viewing.lock(), |v| &mut v.inflight)
     }
 
-    /// Whether it watches: whether it is sent video once it has started.
-    pub fn watching(&self) -> bool {
-        match self.viewing.lock().viewer {
-            Viewer::NotWatching => false,
-            Viewer::Waiting | Viewer::Promised | Viewer::Started => true,
-        }
-    }
-
-    /// Whether it waits for a keyframe that has not been planned.
-    pub fn wants_keyframe(&self) -> bool {
-        match self.viewing.lock().viewer {
-            Viewer::Waiting => true,
-            Viewer::NotWatching | Viewer::Promised | Viewer::Started => false,
-        }
-    }
-
-    /// Whether it is sent every frame.
-    pub fn started(&self) -> bool {
-        match self.viewing.lock().viewer {
-            Viewer::Started => true,
-            Viewer::NotWatching | Viewer::Waiting | Viewer::Promised => false,
-        }
+    /// What it is to the stream, as one read sees it.
+    pub fn viewer(&self) -> Viewer {
+        self.viewing.lock().viewer
     }
 
     /// It starts watching (`v,1`, or a recording begins): it waits for a keyframe, and acks
@@ -599,12 +580,14 @@ impl Hub {
         self.wake();
     }
 
-    pub fn video_clients(&self) -> Vec<Arc<Client>> {
+    /// Every client that watches, with what it is to the stream as one read of it saw it:
+    /// whatever is decided from them is decided from that read.
+    pub fn viewers(&self) -> Vec<(Arc<Client>, Viewer)> {
         self.clients
             .lock()
             .iter()
-            .filter(|c| c.watching())
-            .cloned()
+            .map(|c| (c.clone(), c.viewer()))
+            .filter(|(_, viewer)| *viewer != Viewer::NotWatching)
             .collect()
     }
 
@@ -822,9 +805,8 @@ mod tests {
         }
     }
 
-    /// What the hub reads of a client: whether it watches, wants a keyframe and has
-    /// started, and its frames in flight.
-    type Read = (bool, bool, bool, usize);
+    /// What the hub reads of a client: what it is to the stream, and its frames in flight.
+    type Read = (Viewer, usize);
 
     /// What a step did: whether it planned a keyframe, which clients it sent a frame, the
     /// model after it, and what the hub reads of the two clients.
@@ -859,20 +841,20 @@ mod tests {
             Step::AskKeyframe(i) => c[i].ask_keyframe(),
             Step::Stall(i) => {
                 assert!(
-                    c[i].watching() && c[i].backlog().0 > 0,
+                    c[i].viewer() != Viewer::NotWatching && c[i].backlog().0 > 0,
                     "stalls only a watcher"
                 );
                 c[i].start_over();
             }
             Step::Restart => hub.restart_clients(),
             Step::Capture => {
-                let clients = hub.video_clients();
-                planned = clients.iter().any(|c| c.wants_keyframe());
+                let viewers = hub.viewers();
+                planned = viewers.iter().any(|(_, v)| *v == Viewer::Waiting);
                 let promised: Vec<u64> = match planned {
-                    true => clients
+                    true => viewers
                         .iter()
-                        .filter(|c| c.keyframe_planned())
-                        .map(|c| c.id)
+                        .filter(|(c, v)| *v == Viewer::Waiting && c.keyframe_planned())
+                        .map(|(c, _)| c.id)
                         .collect(),
                     false => vec![],
                 };
@@ -887,8 +869,8 @@ mod tests {
                         }
                     }
                 }
-                for v in hub.video_clients() {
-                    if v.started() {
+                for (v, viewer) in hub.viewers() {
+                    if viewer == Viewer::Started {
                         let id = v.inflight().back().map_or(1, |f| f.id + 1);
                         v.inflight().push_back(Inflight {
                             id,
@@ -915,13 +897,13 @@ mod tests {
         let read = [0, 1].map(|i| {
             let c = &c[i];
             let inflight = c.backlog().0;
-            (c.watching(), c.wants_keyframe(), c.started(), inflight)
+            (c.viewer(), inflight)
         });
-        let listed = hub.video_clients();
+        let listed = hub.viewers();
         for (i, c) in c.iter().enumerate() {
             assert_eq!(
-                listed.iter().any(|v| v.id == c.id),
-                after.c[i].0 != Viewer::NotWatching,
+                listed.iter().find(|(v, _)| v.id == c.id).map(|(_, v)| *v),
+                (after.c[i].0 != Viewer::NotWatching).then_some(after.c[i].0),
                 "the hub's viewers"
             );
         }
@@ -964,13 +946,7 @@ mod tests {
                         "{what}"
                     );
                     for (i, &(viewer, inflight)) in after.c.iter().enumerate() {
-                        let as_it_is = (
-                            viewer != Viewer::NotWatching,
-                            viewer == Viewer::Waiting,
-                            viewer == Viewer::Started,
-                            inflight,
-                        );
-                        assert_eq!(read[i], as_it_is, "client {i}: {what}");
+                        assert_eq!(read[i], (viewer, inflight), "client {i}: {what}");
                         if viewer == Viewer::Started && before.c[i].0 != Viewer::Started {
                             assert!(
                                 matches!(step, Step::Send { whole: true })

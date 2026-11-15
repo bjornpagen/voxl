@@ -5,7 +5,7 @@ use crate::convert::I420;
 use crate::encoder::{Encoded, Encoder, EncoderConfig, Pictures, Planes, Preset, Quality};
 use crate::env::{Debugging, Marker};
 use crate::hub::{wait_any, wait_event};
-use crate::hub::{Client, Hub, Inflight, Out, ServerMessage};
+use crate::hub::{Client, Hub, Inflight, Out, ServerMessage, Viewer};
 use crate::path::{Capacity, Kbps};
 use crate::rate::{Bounds, FrameBudget, RateCtl, RTT_GUESS_MS};
 use bytes::Bytes;
@@ -520,7 +520,7 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Capturer, String> {
 }
 
 fn flow_ok(hub: &Hub, interval_ms: f64) -> bool {
-    for c in hub.video_clients() {
+    for (c, _) in hub.viewers() {
         let (n, age) = c.backlog();
         if n == 0 {
             continue;
@@ -846,8 +846,10 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
                 }
             }
         }
-        let clients = hub.video_clients();
-        stream = match (stream.take(), clients.is_empty()) {
+        // One read of the viewers: the stream, the rate, the keyframe and whom it is promised
+        // to are all decided from it.
+        let viewers = hub.viewers();
+        stream = match (stream.take(), viewers.is_empty()) {
             // Nobody watches: a stream is dropped here, once its encoder has sent what it
             // holds.
             (None | Some(_), true) => None,
@@ -868,8 +870,8 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
             wait_event(&[cap.fd(), hub.waker.waitable()]);
             continue;
         };
-        let capacity = rc.update(&hub, &clients);
-        let want_key = clients.iter().any(|c| c.wants_keyframe());
+        let capacity = rc.update(&hub, &viewers);
+        let want_key = viewers.iter().any(|(_, v)| *v == Viewer::Waiting);
         // One reading of the clock for every decision before the capture; the capture
         // itself is stamped `t0` below, after any wait for a buffer.
         let now = Instant::now();
@@ -1006,10 +1008,10 @@ fn capture_loop(cap: &mut Capturer, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(
                     Keyframe::Fresh => None,
                 };
                 sharpening.on_key(keyframe, t0);
-                let starts = clients
+                let starts = viewers
                     .iter()
-                    .filter(|c| c.keyframe_planned())
-                    .cloned()
+                    .filter(|(c, v)| *v == Viewer::Waiting && c.keyframe_planned())
+                    .map(|(c, _)| c.clone())
                     .collect();
                 Frame::Key { blocks, starts }
             }
@@ -1491,8 +1493,8 @@ fn encode_loop(
             })
             .collect();
         let now = Instant::now();
-        for c in hub.video_clients() {
-            if !c.started() {
+        for (c, viewer) in hub.viewers() {
+            if viewer != Viewer::Started {
                 continue;
             }
             {
@@ -2631,8 +2633,9 @@ mod tests {
         // A page joins; the capture loop plans its keyframe and clears its request.
         let (_page, _page_rx) = watch();
         let starts = hub
-            .video_clients()
+            .viewers()
             .into_iter()
+            .map(|(c, _)| c)
             .filter(|c| c.keyframe_planned())
             .collect();
         let key = Job {

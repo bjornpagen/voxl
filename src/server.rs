@@ -176,7 +176,7 @@ async fn stats(State(s): State<AppState>) -> Response {
         .iter()
         .map(|c| {
             let (n, age) = c.backlog();
-            serde_json::json!({"id": c.id, "video": c.watching(), "inflight": n, "oldest_ms": age,
+            serde_json::json!({"id": c.id, "video": c.viewer() != crate::hub::Viewer::NotWatching, "inflight": n, "oldest_ms": age,
                 "min_rtt_ms": c.min_rtt_ms.load(Ordering::Relaxed), "queue_ms": c.queue_ms() as u64, "capacity_kbps": c.capacity().map(|k| k.get() as u64),
                 "client_ms": (*c.client_ms.lock() * 10.0).round() / 10.0})
         })
