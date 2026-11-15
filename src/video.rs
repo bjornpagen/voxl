@@ -3389,57 +3389,15 @@ mod tests {
         );
     }
 
-    /// A stripe coded on the encode loop's own thread comes out as on a worker's: against
-    /// the parent's crew (the oracle), where every stripe had a worker, over generated
-    /// screens of 1-4 stripes and runs of frames (each picture new, any selection, every
-    /// coding, caps that move, block maps or none), real x264 encoders on one thread each
-    /// put out the same bytes, keyframes and quality, stripe by stripe.
+    /// The crew codes each stripe as the stripe's coder alone would, wherever it runs it:
+    /// stripe 0 on the encode loop's own thread, the others on their workers. Over
+    /// generated screens of 1-4 stripes and runs of frames (each picture new, any
+    /// selection, every coding, caps that move, block maps or none), real x264 encoders
+    /// on one thread each put out, stripe by stripe, the bytes, keyframes and quality
+    /// their coders put out when handed the same jobs one by one on this thread, and a
+    /// stripe not selected is skipped.
     #[test]
     fn a_stripe_coded_where_its_frame_is_comes_out_as_on_a_worker() {
-        struct OldCrew(Vec<Hand>);
-        impl OldCrew {
-            fn spawn<W>(workers: impl IntoIterator<Item = W>) -> OldCrew
-            where
-                W: FnOnce(mpsc::Receiver<StripeJob>, mpsc::SyncSender<StripeResult>)
-                    + Send
-                    + 'static,
-            {
-                OldCrew(
-                    workers
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, work)| {
-                            let (jobs, rx) = mpsc::sync_channel(1);
-                            let (answer, done) = mpsc::sync_channel(1);
-                            std::thread::Builder::new()
-                                .name(format!("enc-{i}"))
-                                .spawn(move || work(rx, answer))
-                                .unwrap();
-                            Hand { jobs, done }
-                        })
-                        .collect(),
-                )
-            }
-            fn run(
-                &self,
-                selected: &[bool],
-                job: StripeJob,
-            ) -> Result<(FrameOut, Arc<I420>), Gone> {
-                let asked = || self.0.iter().enumerate().filter(|&(i, _)| selected[i]);
-                for (i, hand) in asked() {
-                    hand.jobs.send(job.clone()).map_err(|_| Gone(i))?;
-                }
-                let mut results: Vec<StripeOut> =
-                    (0..self.0.len()).map(|_| StripeOut::Skipped).collect();
-                for (i, hand) in asked() {
-                    let StripeResult { out, buf } = hand.done.recv().map_err(|_| Gone(i))?;
-                    results[i] = out;
-                    drop(buf);
-                }
-                Ok((FrameOut(results), job.buf))
-            }
-        }
-
         let crfs = Crfs {
             configured: 24.0,
             paintover: 16.0,
@@ -3481,11 +3439,7 @@ mod tests {
                 .collect();
             let n = layout.len();
             let cap = (g.below(2) == 0).then(|| Kbps::new(2000.0 + g.below(20_000) as f64));
-            let old = OldCrew::spawn(
-                coders(width, &layout, cap)
-                    .into_iter()
-                    .map(|c| move |rx, done| stripe_worker(c, rx, done)),
-            );
+            let mut alone = coders(width, &layout, cap);
             let mut ours = coders(width, &layout, cap).into_iter();
             let mut own = ours.next().unwrap();
             let mut new = Crew::spawn(
@@ -3534,10 +3488,16 @@ mod tests {
                     },
                     mb_cols,
                 };
-                let (want, back) = old.run(&selected, job.clone()).unwrap();
-                drop(back);
+                let want: Vec<StripeOut> = alone
+                    .iter_mut()
+                    .zip(&selected)
+                    .map(|(coder, &on)| match on {
+                        true => coder.code(job.clone()).out,
+                        false => StripeOut::Skipped,
+                    })
+                    .collect();
                 let (got, back) = new.run(&selected, job).unwrap();
-                let want = shown(&want.0);
+                let want = shown(&want);
                 assert_eq!(shown(&got.0), want, "case {case} frame {frame}");
                 sent += want.iter().filter(|w| w.len() > 20).count();
                 buf = back;
