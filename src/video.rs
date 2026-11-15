@@ -664,6 +664,20 @@ fn capture_loop(
         Instant::now(),
     );
     let marker = cfg.debug.marker;
+    // The marker is read only where all of it fits this capture (a resize builds a new
+    // loop): past an edge its squares are outside the picture or in the next row.
+    let probe = marker.and_then(|at| {
+        let probe = MarkerProbe::fit(at, w, h);
+        if probe.is_none() {
+            log::error!(
+                "VOXL_DEBUG_MARKER={},{}: the marker does not fit the {w}x{h} capture; \
+                 it is not read",
+                at.x,
+                at.y
+            );
+        }
+        probe
+    });
 
     loop {
         // The wake is taken before anything it may stand for is read: a request that
@@ -820,7 +834,7 @@ fn capture_loop(
                 (t1 - t0).as_micros()
             );
         }
-        let marker_ms = marker_reading(cap.bgrx(), marker);
+        let marker_ms = marker_reading(cap.bgrx(), probe);
         // What this capture is sent as, decided once, before a buffer is taken.
         let plan = match (want_key, band, due) {
             (true, Some(_), Due::Now | Due::In(_) | Due::Never) => Plan::Key(Keyframe::Fresh),
@@ -1540,21 +1554,46 @@ fn thread_cpu_us() -> i64 {
     }
 }
 
+/// The bench loadgen's marker as `bench/loadgen.c` draws it: 40 bits (the wall clock's
+/// milliseconds in the low 24, the frame in the next 16), each a square of 24 px, 20 to
+/// a row, read at each square's centre. These are loadgen's numbers, not chosen here: any
+/// other value reads pixels it did not draw.
+const MARKER_BITS: usize = 40;
+const MARKER_ROW: usize = 20;
+const MARKER_SQUARE: usize = 24;
+
+/// A `VOXL_DEBUG_MARKER` place on a capture the whole marker fits, so every square it
+/// reads is a pixel of the picture in the square's own row.
+#[derive(Clone, Copy, Debug)]
+struct MarkerProbe(Marker);
+
+impl MarkerProbe {
+    /// The marker at `at` on a `width` x `height` capture, if the centre of its last
+    /// square across and its last square down are inside it.
+    fn fit(at: Marker, width: usize, height: usize) -> Option<MarkerProbe> {
+        let last = |from: usize, squares: usize| {
+            from.checked_add((squares - 1) * MARKER_SQUARE + MARKER_SQUARE / 2)
+        };
+        (last(at.x, MARKER_ROW)? < width && last(at.y, MARKER_BITS / MARKER_ROW)? < height)
+            .then_some(MarkerProbe(at))
+    }
+}
+
 /// What the bench loadgen's marker says on this capture: none unless `VOXL_DEBUG_MARKER`
-/// placed it and the capture has pixels to read it from.
-fn marker_reading(bgrx: Option<(&[u8], usize)>, marker: Option<Marker>) -> Option<u32> {
-    match (bgrx, marker) {
+/// placed it where it fits and the capture has pixels to read it from.
+fn marker_reading(bgrx: Option<(&[u8], usize)>, probe: Option<MarkerProbe>) -> Option<u32> {
+    match (bgrx, probe) {
         (Some((px, stride)), Some(at)) => Some(marker_probe(px, stride, at, "grab")),
         _ => None,
     }
 }
 
 /// Debug: decode the bench loadgen marker at `at` and log its age.
-fn marker_probe(buf: &[u8], stride: usize, at: Marker, what: &str) -> u32 {
+fn marker_probe(buf: &[u8], stride: usize, MarkerProbe(at): MarkerProbe, what: &str) -> u32 {
     let mut v: u64 = 0;
-    for b in 0..40 {
-        let x = at.x + (b % 20) * 24 + 12;
-        let y = at.y + (b / 20) * 24 + 12;
+    for b in 0..MARKER_BITS {
+        let x = at.x + (b % MARKER_ROW) * MARKER_SQUARE + MARKER_SQUARE / 2;
+        let y = at.y + (b / MARKER_ROW) * MARKER_SQUARE + MARKER_SQUARE / 2;
         let i = y * stride + x * 4;
         if buf[i + 2] > 128 {
             v |= 1 << b;
@@ -1588,11 +1627,14 @@ fn marker_age(ms: u32) -> i64 {
 mod tests {
     use super::*;
 
-    /// A capture's marker reading is the time painted on it, and none without the pixels or
-    /// the variable. Screens are drawn at random (a fixed seed) with a marker painted on
-    /// them, its time sometimes 0 and sometimes the largest it can be.
+    /// A marker is read where all of it fits the capture, as the time painted on it, and
+    /// nowhere else: a place past an edge (by a pixel, by far, or so far the sum overflows)
+    /// reads none and never leaves its square's row or the picture. Captures of random sizes
+    /// and padding, either side of the marker's own, with random pixels (a fixed seed); the
+    /// places are drawn around the last one that fits, anywhere, and near the largest. The
+    /// model is the 40 squares' centres as loadgen draws them.
     #[test]
-    fn a_marker_reading_is_the_time_painted() {
+    fn a_marker_is_read_where_it_fits_and_nowhere_else() {
         let mut state = 0u64;
         let mut next = || {
             // splitmix64
@@ -1600,43 +1642,67 @@ mod tests {
             let mut z = state;
             z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
             z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^ (z >> 31)
+            (z ^ (z >> 31)) as usize
         };
-        for _ in 0..2000 {
-            let at = Marker {
-                x: (next() % 64) as usize,
-                y: (next() % 64) as usize,
-            };
-            // Wide and tall enough for the marker's 20x2 cells of 24 px, and a little more.
-            let stride = (at.x + 469 + (next() % 8) as usize) * 4 + (next() % 4) as usize;
-            let height = at.y + 37 + (next() % 8) as usize;
-            let mut buf = vec![0u8; stride * height];
+        // Places that fit, that do not, and one pixel either side of the last that fits.
+        let (mut fits, mut not, mut edge) = (0, 0, 0);
+        for _ in 0..4000 {
+            let (w, h) = (440 + next() % 100, 30 + next() % 40);
+            let stride = w * 4 + next() % 3 * 4;
+            let mut buf = vec![0u8; stride * h];
             for chunk in buf.chunks_mut(8) {
                 chunk.copy_from_slice(&next().to_le_bytes()[..chunk.len()]);
             }
+            let mut place = |room: usize| match next() % 8 {
+                0..=2 => room.saturating_sub(4) + next() % 8,
+                3..=5 => next() % (room + 8),
+                6 => usize::MAX - next() % 600,
+                _ => next(),
+            };
+            let at = Marker {
+                x: place(w.saturating_sub(468)),
+                y: place(h.saturating_sub(36)),
+            };
+            let centres: Vec<_> = (0..40)
+                .map(|b| {
+                    let x = at.x.checked_add(b % 20 * 24 + 12).filter(|&x| x < w)?;
+                    let y = at.y.checked_add(b / 20 * 24 + 12).filter(|&y| y < h)?;
+                    Some(y * stride + x * 4)
+                })
+                .collect::<Option<_>>()
+                .unwrap_or_default();
             let painted = match next() % 4 {
                 0 => next() & !0xff_ffff,
                 1 => next() | 0xff_ffff,
                 _ => next(),
             } & 0xff_ffff_ffff;
-            for b in 0..40 {
-                let i = (at.y + (b / 20) * 24 + 12) * stride + (at.x + (b % 20) * 24 + 12) * 4;
+            for (b, &i) in centres.iter().enumerate() {
                 let r = next() as u8 % 127;
                 buf[i + 2] = if painted >> b & 1 == 1 { 129 + r } else { r };
             }
-            for (bgrx, marker) in [
-                (Some((&buf[..], stride)), Some(at)),
-                (None, Some(at)),
-                (Some((&buf[..], stride)), None),
-                (None, None),
-            ] {
-                assert_eq!(
-                    marker_reading(bgrx, marker),
-                    bgrx.and(marker).map(|_| (painted & 0xff_ffff) as u32),
-                    "{at:?} {painted:#x}"
-                );
+            let probe = MarkerProbe::fit(at, w, h);
+            assert_eq!(probe.is_some(), !centres.is_empty(), "{at:?} on {w}x{h}");
+            if probe.is_some() {
+                fits += 1;
+            } else {
+                not += 1;
             }
+            if [469, 468].contains(&w.wrapping_sub(at.x))
+                || [37, 36].contains(&h.wrapping_sub(at.y))
+            {
+                edge += 1;
+            }
+            assert_eq!(
+                marker_reading(Some((&buf[..], stride)), probe),
+                probe.map(|_| (painted & 0xff_ffff) as u32),
+                "{at:?} on {w}x{h} {painted:#x}"
+            );
+            assert_eq!(marker_reading(None, probe), None);
         }
+        assert!(
+            fits > 300 && not > 300 && edge > 300,
+            "{fits} fit, {not} do not, {edge} at an edge"
+        );
     }
 
     const W: usize = 1280;
