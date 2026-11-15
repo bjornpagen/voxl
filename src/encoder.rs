@@ -541,9 +541,9 @@ mod bench {
     #[test]
     #[ignore]
     fn encode_cost() {
-        /// One thread: what `--adaptive-threads` encodes on until a frame would miss its
-        /// budget. The bench's default since it was written; it was also run at four, the
-        /// default without that flag.
+        /// One thread: what the thread governor (`--adaptive-threads`, since removed)
+        /// encoded on until a frame would miss its budget. The bench's default since it
+        /// was written; it was also run at four, the default.
         const THREADS: u32 = 1;
         let (w, h) = (2560usize, 1600usize);
         let mbs = (w / 16) * (h / 16);

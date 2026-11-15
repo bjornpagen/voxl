@@ -35,8 +35,6 @@ Video:
                                 a ceiling under the floor wins)
   --preset                      x264 preset (default ultrafast)
   --encoder-threads             x264 sliced threads (default min(4, cores/4))
-  --adaptive-threads            encode on one thread, fanning out only under
-                                sustained heavy motion (default false)
   --paintover-crf, --paintover-delay-ms
                                 sharpening once the screen goes still
                                 (default 16, 150)

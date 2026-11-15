@@ -217,10 +217,6 @@ async fn serve(a: HashMap<String, String>, env: env::Env) {
         paintover_crf: range_max(a.get("paintover-crf"), 16.0) as f32,
         paintover_delay_ms: range_max(a.get("paintover-delay-ms"), 150.0) as u64,
         stripes: range_max(a.get("stripes"), 1.0) as u32,
-        // Opt-in: one thread unless a frame would miss the frame budget. x264's sliced
-        // threads cost ~3x the CPU on desktop content, so this saves 20-55% CPU, but
-        // small updates encode a few ms slower on one thread.
-        adaptive_threads: truthy(a.get("adaptive-threads"), false),
         coalesce: std::time::Duration::from_micros(range_max(a.get("coalesce-us"), 0.0) as u64),
         debug: env.debug,
     };

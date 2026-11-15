@@ -30,7 +30,6 @@ pub struct VideoConfig {
     pub paintover_delay_ms: u64,
     pub coalesce: Duration,
     pub stripes: u32,
-    pub adaptive_threads: bool,
     /// The debugging variables (`VOXL_*`), read when voxl started.
     pub debug: Debugging,
 }
@@ -320,44 +319,36 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
     let layout = stripe_layout(h, cfg.stripes);
     let mut stripes = Vec::new();
     for &(y, sh) in &layout {
-        let fixed = if cfg.adaptive_threads {
-            1
-        } else {
-            (cfg.threads / layout.len() as u32).max(1)
-        };
         let ecfg = EncoderConfig {
             pictures: Pictures {
                 width: w,
                 height: sh,
                 fps: cfg.fps,
                 preset: cfg.preset.clone(),
-                threads: fixed,
+                threads: (cfg.threads / layout.len() as u32).max(1),
                 debug: cfg.debug,
             },
             crf: cfg.crf,
             max_kbps: cfg.bounds.ceiling(),
         };
-        let max_threads = if cfg.adaptive_threads {
-            (cfg.threads / layout.len() as u32).max(1)
-        } else {
-            1
-        };
         stripes.push(Stripe {
             y: y as usize,
             h: sh as usize,
             enc: Encoder::new(&ecfg)?,
-            cfg: ecfg,
-            max_threads,
             applied_kbps: 0,
             applied_crf: -1.0,
         });
     }
     *hub.stripes.lock() = layout;
     let hub2 = hub.clone();
-    let (crf, po_crf, debug) = (cfg.crf, cfg.paintover_crf, cfg.debug);
+    let crfs = Crfs {
+        configured: cfg.crf,
+        paintover: cfg.paintover_crf,
+    };
+    let (fps, debug) = (cfg.fps, cfg.debug);
     let encode = std::thread::Builder::new()
         .name("encode".into())
-        .spawn(move || encode_loop(stripes, job_rx, ret_tx, hub2, crf, po_crf, debug))
+        .spawn(move || encode_loop(stripes, job_rx, ret_tx, hub2, fps, crfs, debug))
         .unwrap();
     #[cfg(target_os = "macos")]
     {
@@ -971,9 +962,6 @@ struct Stripe {
     y: usize,
     h: usize,
     enc: Encoder,
-    cfg: EncoderConfig,
-    /// Sliced threads to fan out to under sustained heavy motion (1 = never).
-    max_threads: u32,
     applied_kbps: u32,
     applied_crf: f32,
 }
@@ -1013,89 +1001,6 @@ enum StripeOut {
         bytes: Vec<u8>,
         quality: Quality,
     },
-}
-
-/// x264's sliced threading costs ~3x the CPU of one thread on desktop content (and on
-/// small updates is even slower), so a stripe encodes single-threaded and only fans out
-/// while sustained heavy motion would otherwise blow the frame budget.
-struct ThreadGovernor {
-    threads: u32,
-    ewma_ms: f64,
-    heavy: u32,
-    light_since: Option<Instant>,
-    budget_ms: f64,
-    /// One-thread encode time as a function of changed macroblocks, learned from
-    /// single-threaded frames, to tell when one thread would fit again.
-    fit: CostFit,
-    /// Predicted one-thread time while threaded.
-    predicted_ms: f64,
-}
-
-/// Exponentially weighted least squares fit of encode ms = a + b * changed MBs.
-#[derive(Default)]
-struct CostFit {
-    w: f64,
-    x: f64,
-    y: f64,
-    xx: f64,
-    xy: f64,
-}
-
-impl CostFit {
-    fn add(&mut self, x: f64, y: f64) {
-        let k = 0.995;
-        self.w = self.w * k + 1.0;
-        self.x = self.x * k + x;
-        self.y = self.y * k + y;
-        self.xx = self.xx * k + x * x;
-        self.xy = self.xy * k + x * y;
-    }
-    fn predict(&self, x: f64) -> Option<f64> {
-        if self.w < 30.0 {
-            return None;
-        }
-        let var = self.xx * self.w - self.x * self.x;
-        if var <= f64::EPSILON * self.w * self.w {
-            return Some(self.y / self.w);
-        }
-        let b = (self.xy * self.w - self.x * self.y) / var;
-        let a = (self.y - b * self.x) / self.w;
-        Some(a + b * x)
-    }
-}
-
-impl ThreadGovernor {
-    fn want(&mut self, enc_ms: f64, changed_mbs: f64, max: u32) -> Option<u32> {
-        self.ewma_ms = self.ewma_ms * 0.8 + enc_ms * 0.2;
-        if self.threads == 1 {
-            self.fit.add(changed_mbs, enc_ms);
-            // Before one thread runs out of frame budget: encode times vary from frame to
-            // frame, and at ~90% of the budget on average enough frames miss it to drop
-            // the frame rate.
-            self.heavy = if self.ewma_ms > self.budget_ms * 0.65 {
-                self.heavy + 1
-            } else {
-                0
-            };
-            if self.heavy >= 20 {
-                self.predicted_ms = self.ewma_ms;
-                return Some(max);
-            }
-            return None;
-        }
-        // Without enough one-thread history, assume one thread is no faster than these.
-        let one = self.fit.predict(changed_mbs).unwrap_or(enc_ms);
-        self.predicted_ms = self.predicted_ms * 0.8 + one * 0.2;
-        if self.predicted_ms < self.budget_ms * 0.5 {
-            // One thread would fit with room to spare (switching reopens the encoder,
-            // which costs a keyframe, so not on a brief lull).
-            let since = *self.light_since.get_or_insert_with(Instant::now);
-            (since.elapsed() >= Duration::from_secs(2)).then_some(1)
-        } else {
-            self.light_since = None;
-            None
-        }
-    }
 }
 
 /// x264's CRF raises the QP of frames it judges complex, and its quick half-resolution
@@ -1197,18 +1102,10 @@ fn stripe_worker(
     mut s: Stripe,
     rx: mpsc::Receiver<StripeJob>,
     done: mpsc::Sender<StripeResult>,
+    fps: u32,
     crfs: Crfs,
     debug: bool,
 ) {
-    let mut gov = ThreadGovernor {
-        threads: 1,
-        ewma_ms: 0.0,
-        heavy: 0,
-        light_since: None,
-        budget_ms: 1000.0 / s.cfg.pictures.fps as f64,
-        fit: CostFit::default(),
-        predicted_ms: 0.0,
-    };
     let mut motion = MotionQuality::default();
     while let Ok(job) = rx.recv() {
         let buf = unsafe { &*job.buf.0 };
@@ -1223,8 +1120,7 @@ fn stripe_worker(
             // A keyframe is what a new viewer sees first; don't starve it to the
             // steady-state frame budget (up to ~8 frames' worth at 4x the cap).
             let boost = job.cap.saturating_mul(4).max(16_000);
-            s.enc
-                .set_rate_buf(asked, boost, boost / s.cfg.pictures.fps.max(1) * 8);
+            s.enc.set_rate_buf(asked, boost, boost / fps.max(1) * 8);
             s.applied_kbps = 0;
         } else {
             let moved = s.applied_kbps == 0
@@ -1278,33 +1174,6 @@ fn stripe_worker(
                 out.len()
             );
         }
-        if s.max_threads > 1 {
-            if let Some(t) = gov.want(
-                te.elapsed().as_secs_f64() * 1000.0,
-                changed as f64,
-                s.max_threads,
-            ) {
-                let mut cfg = s.cfg.clone();
-                cfg.pictures.threads = t;
-                match Encoder::new(&cfg) {
-                    Ok(e) => {
-                        log::info!(
-                            "stripe {i}: encoder now {t} thread(s) (encode {:.1} ms)",
-                            gov.ewma_ms
-                        );
-                        // A fresh encoder opens with an IDR on its next frame, and
-                        // its rate control starts over.
-                        s.enc = e;
-                        motion = MotionQuality::default();
-                        s.applied_kbps = 0;
-                        gov.threads = t;
-                        gov.heavy = 0;
-                        gov.light_since = None;
-                    }
-                    Err(e) => log::error!("encoder reopen failed: {e}"),
-                }
-            }
-        }
         let result = match r {
             Ok(e) => {
                 let size = matches!(job.coding, Coding::Motion).then(|| MotionSize {
@@ -1342,18 +1211,13 @@ fn encode_loop(
     rx: mpsc::Receiver<Job>,
     ret: mpsc::Sender<Returned>,
     hub: Arc<Hub>,
-    crf: f32,
-    po_crf: f32,
+    fps: u32,
+    crfs: Crfs,
     debug: Debugging,
 ) {
     let epoch = Instant::now();
     let mut frame_id: u32 = 0;
     let n = stripes_in.len();
-    let fps = stripes_in.first().map_or(60, |s| s.cfg.pictures.fps);
-    let crfs = Crfs {
-        configured: crf,
-        paintover: po_crf,
-    };
     let mut budget = FrameBudget::new(epoch);
     let debug_stripes = debug.stripes;
     // Geometry stays here; encoders move to their workers.
@@ -1367,7 +1231,7 @@ fn encode_loop(
             let done = done_tx.clone();
             let h = std::thread::Builder::new()
                 .name(format!("enc-{i}"))
-                .spawn(move || stripe_worker(i, s, rx, done, crfs, debug_stripes))
+                .spawn(move || stripe_worker(i, s, rx, done, fps, crfs, debug_stripes))
                 .unwrap();
             (tx, h)
         })
