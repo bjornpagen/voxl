@@ -627,6 +627,17 @@ impl Injector {
     }
 }
 
+impl crate::event::Inject for Injector {
+    fn inject(&mut self, ev: InputEvent) {
+        self.handle(ev);
+    }
+
+    /// X keeps requests in the connection's buffer until it is flushed.
+    fn flush(&mut self) {
+        let _ = self.conn.flush();
+    }
+}
+
 pub fn spawn(
     display: Option<String>,
     clipboard: Option<crate::desktop::ClipboardHandle>,
@@ -636,35 +647,7 @@ pub fn spawn(
     let mut inj = Injector::new(display.as_deref(), runtime_dir)?;
     inj.clipboard = clipboard;
     inj.px_per_notch = px_per_notch.max(1.0);
-    let (tx, rx) = mpsc::channel::<InputEvent>();
-    std::thread::Builder::new()
-        .name("input".into())
-        .spawn(move || {
-            while let Ok(first) = rx.recv() {
-                let mut pending_move: Option<(i16, i16)> = None;
-                let handle =
-                    |inj: &mut Injector, ev: InputEvent, pm: &mut Option<(i16, i16)>| match ev {
-                        InputEvent::Move { x, y } => *pm = Some((x, y)),
-                        other => {
-                            if let Some((x, y)) = pm.take() {
-                                inj.handle(InputEvent::Move { x, y });
-                            }
-                            inj.handle(other);
-                        }
-                    };
-                handle(&mut inj, first, &mut pending_move);
-                // Coalesce whatever queued up meanwhile; moves collapse to the latest.
-                while let Ok(ev) = rx.try_recv() {
-                    handle(&mut inj, ev, &mut pending_move);
-                }
-                if let Some((x, y)) = pending_move {
-                    inj.handle(InputEvent::Move { x, y });
-                }
-                let _ = inj.conn.flush();
-            }
-        })
-        .unwrap();
-    Ok(tx)
+    Ok(crate::event::spawn(move || inj))
 }
 
 #[cfg(test)]

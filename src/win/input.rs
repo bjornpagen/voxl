@@ -464,13 +464,22 @@ impl Injector {
     }
 }
 
+impl crate::event::Inject for Injector {
+    fn inject(&mut self, ev: InputEvent) {
+        self.handle(ev);
+    }
+
+    /// Each event is sent as it is made.
+    fn flush(&mut self) {}
+}
+
 pub fn spawn(
     _display: Option<String>,
     clipboard: Option<super::desktop::ClipboardHandle>,
     px_per_notch: f64,
     _runtime_dir: Option<String>,
 ) -> Result<mpsc::Sender<InputEvent>, String> {
-    let mut inj = Injector {
+    let inj = Injector {
         pressed: HashMap::new(),
         mods: HashMap::new(),
         buttons: [false; 16],
@@ -478,33 +487,8 @@ pub fn spawn(
         px_per_notch,
         clipboard,
     };
-    let (tx, rx) = mpsc::channel::<InputEvent>();
-    std::thread::Builder::new()
-        .name("input".into())
-        .spawn(move || {
-            super::follow_input_desktop();
-            while let Ok(first) = rx.recv() {
-                let mut pending_move: Option<(i16, i16)> = None;
-                let handle =
-                    |inj: &mut Injector, ev: InputEvent, pm: &mut Option<(i16, i16)>| match ev {
-                        InputEvent::Move { x, y } => *pm = Some((x, y)),
-                        other => {
-                            if let Some((x, y)) = pm.take() {
-                                inj.handle(InputEvent::Move { x, y });
-                            }
-                            inj.handle(other);
-                        }
-                    };
-                handle(&mut inj, first, &mut pending_move);
-                // Coalesce whatever queued up meanwhile; moves collapse to the latest.
-                while let Ok(ev) = rx.try_recv() {
-                    handle(&mut inj, ev, &mut pending_move);
-                }
-                if let Some((x, y)) = pending_move {
-                    inj.handle(InputEvent::Move { x, y });
-                }
-            }
-        })
-        .unwrap();
-    Ok(tx)
+    Ok(crate::event::spawn(move || {
+        super::follow_input_desktop();
+        inj
+    }))
 }
