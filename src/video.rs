@@ -1087,9 +1087,12 @@ enum Next {
 
 impl Next {
     /// What ends the wait for the frame interval before capturing this, besides its time.
+    /// Before a pass, damage too: it makes the capture a change, which the pass does not
+    /// hold back.
     fn interval_ends(self) -> On {
         match self {
-            Next::Change | Next::Pass => On::Wake,
+            Next::Change => On::Wake,
+            Next::Pass => On::Event,
         }
     }
 }
@@ -3803,8 +3806,9 @@ mod tests {
     }
 
     /// Each wait wakes on what it waits for, and ends on its time: a change on damage or
-    /// a wake, with no limit; a pass on damage or a wake, or once due; the interval only on
-    /// a wake, or once over; the gate on damage or a wake, or once a viewer will have
+    /// a wake, with no limit; a pass on damage or a wake, or once due; the interval before
+    /// a change only on a wake, before a pass on damage too, or once over; the gate on
+    /// damage or a wake, or once a viewer will have
     /// stalled; a buffer only on a wake, with no limit; the coalesce window as a sleep of
     /// exactly its rest. Over every wait `step` makes in `each_case`.
     #[test]
@@ -3820,7 +3824,14 @@ mod tests {
             let want = match wait {
                 Wait::Change => (Some((On::Event, None)), None),
                 Wait::Pass(due) => (Some((On::Event, Some(due))), None),
-                Wait::Interval { rest, .. } => (Some((On::Wake, Some(rest))), None),
+                Wait::Interval {
+                    rest,
+                    next: Next::Change,
+                } => (Some((On::Wake, Some(rest))), None),
+                Wait::Interval {
+                    rest,
+                    next: Next::Pass,
+                } => (Some((On::Event, Some(rest))), None),
                 Wait::Settle(rest) => (None, Some(rest)),
                 Wait::Gate(stalls) => (Some((On::Event, Some(stalls))), None),
                 Wait::Buffer => (Some((On::Wake, None)), None),
@@ -3930,7 +3941,6 @@ mod tests {
     /// the interval for a change, more damage changes nothing, and only a wake ends it
     /// early. Over every interval wait `step` makes in `each_case`.
     #[test]
-    #[ignore = "fails until the next commit: a pass's interval wait wakes on the waker alone"]
     fn damage_ends_the_wait_before_a_pass() {
         let mut waits = [0; 2];
         each_case(|c| {
