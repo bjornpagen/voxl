@@ -44,7 +44,9 @@ struct Job {
     target: Kbps,
     capacity: Capacity,
     captured_at: Instant,
-    marker_ms: i64,
+    /// What the bench loadgen's marker said when the frame was captured, while
+    /// `VOXL_DEBUG_MARKER` is set (see `marker_reading`).
+    marker_ms: Option<u32>,
 }
 
 /// What a captured frame is for. Each kind carries what only it has.
@@ -818,10 +820,7 @@ fn capture_loop(
                 (t1 - t0).as_micros()
             );
         }
-        let marker_ms = match (cap.bgrx(), marker) {
-            (Some((px, stride)), Some(at)) => marker_probe(px, stride, at, "grab"),
-            _ => -1,
-        };
+        let marker_ms = marker_reading(cap.bgrx(), marker);
         // What this capture is sent as, decided once, before a buffer is taken.
         let plan = match (want_key, band, due) {
             (true, Some(_), Due::Now | Due::In(_) | Due::Never) => Plan::Key(Keyframe::Fresh),
@@ -1453,7 +1452,7 @@ fn encode_loop(
         frame_id = frame_id.wrapping_add(1);
         // Server-side pipeline latency (capture -> sent) in 1/10 ms, for client stats.
         let mut pipe = (job.captured_at.elapsed().as_micros() / 100).min(u32::MAX as u128) as u32;
-        if job.marker_ms >= 0 {
+        if job.marker_ms.is_some() {
             // Debug: wall-clock send time instead of pipeline latency.
             pipe = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1510,10 +1509,10 @@ fn encode_loop(
             job.captured_at.elapsed().as_micros() as u64,
             Ordering::Relaxed,
         );
-        if job.marker_ms >= 0 {
+        if let Some(ms) = job.marker_ms {
             log::info!(
                 "marker sent age {} ms (encode {} us)",
-                marker_age(job.marker_ms),
+                marker_age(ms),
                 enc_us
             );
         }
@@ -1542,7 +1541,16 @@ fn thread_cpu_us() -> i64 {
     }
 }
 
-fn marker_probe(buf: &[u8], stride: usize, at: Marker, what: &str) -> i64 {
+/// What the bench loadgen's marker says on this capture: none unless `VOXL_DEBUG_MARKER`
+/// placed it and the capture has pixels to read it from.
+fn marker_reading(bgrx: Option<(&[u8], usize)>, marker: Option<Marker>) -> Option<u32> {
+    match (bgrx, marker) {
+        (Some((px, stride)), Some(at)) => Some(marker_probe(px, stride, at, "grab")),
+        _ => None,
+    }
+}
+
+fn marker_probe(buf: &[u8], stride: usize, at: Marker, what: &str) -> u32 {
     let mut v: u64 = 0;
     for b in 0..40 {
         let x = at.x + (b % 20) * 24 + 12;
@@ -1552,28 +1560,115 @@ fn marker_probe(buf: &[u8], stride: usize, at: Marker, what: &str) -> i64 {
             v |= 1 << b;
         }
     }
-    let ms = (v & 0xffffff) as i64;
+    let ms = (v & 0xffffff) as u32;
     let now = (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64)
         & 0xffffff;
-    log::info!("marker {} frame {} age {} ms", what, v >> 24, now - ms);
+    log::info!(
+        "marker {} frame {} age {} ms",
+        what,
+        v >> 24,
+        now - i64::from(ms)
+    );
     ms
 }
 
-fn marker_age(ms: i64) -> i64 {
+fn marker_age(ms: u32) -> i64 {
     let now = (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64)
         & 0xffffff;
-    now - ms
+    now - i64::from(ms)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The marker's reading as it was written before it was an `Option`: -1 for none.
+    fn old_marker_ms(bgrx: Option<(&[u8], usize)>, marker: Option<Marker>) -> i64 {
+        match (bgrx, marker) {
+            (Some((px, stride)), Some(at)) => old_marker_probe(px, stride, at, "grab"),
+            _ => -1,
+        }
+    }
+
+    fn old_marker_probe(buf: &[u8], stride: usize, at: Marker, what: &str) -> i64 {
+        let mut v: u64 = 0;
+        for b in 0..40 {
+            let x = at.x + (b % 20) * 24 + 12;
+            let y = at.y + (b / 20) * 24 + 12;
+            let i = y * stride + x * 4;
+            if buf[i + 2] > 128 {
+                v |= 1 << b;
+            }
+        }
+        let ms = (v & 0xffffff) as i64;
+        let now = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64)
+            & 0xffffff;
+        log::info!("marker {} frame {} age {} ms", what, v >> 24, now - ms);
+        ms
+    }
+
+    /// A capture's marker reading is what it was when -1 meant none: the encode loop's
+    /// `>= 0` and `is_some()` agree, and so do the times it logs. Screens are drawn at
+    /// random (a fixed seed) with a marker painted on them, its time sometimes 0 and
+    /// sometimes the largest it can be, with and without the pixels and the variable.
+    #[test]
+    fn a_marker_reading_is_what_it_was() {
+        let mut state = 0u64;
+        let mut next = || {
+            // splitmix64
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        for _ in 0..2000 {
+            let at = Marker {
+                x: (next() % 64) as usize,
+                y: (next() % 64) as usize,
+            };
+            // Wide and tall enough for the marker's 20x2 cells of 24 px, and a little more.
+            let stride = (at.x + 469 + (next() % 8) as usize) * 4 + (next() % 4) as usize;
+            let height = at.y + 37 + (next() % 8) as usize;
+            let mut buf = vec![0u8; stride * height];
+            for chunk in buf.chunks_mut(8) {
+                chunk.copy_from_slice(&next().to_le_bytes()[..chunk.len()]);
+            }
+            let painted = match next() % 4 {
+                0 => next() & !0xff_ffff,
+                1 => next() | 0xff_ffff,
+                _ => next(),
+            } & 0xff_ffff_ffff;
+            for b in 0..40 {
+                let i = (at.y + (b / 20) * 24 + 12) * stride + (at.x + (b % 20) * 24 + 12) * 4;
+                let r = next() as u8 % 127;
+                buf[i + 2] = if painted >> b & 1 == 1 { 129 + r } else { r };
+            }
+            for (bgrx, marker) in [
+                (Some((&buf[..], stride)), Some(at)),
+                (None, Some(at)),
+                (Some((&buf[..], stride)), None),
+                (None, None),
+            ] {
+                let new = marker_reading(bgrx, marker);
+                assert_eq!(new.map_or(-1, i64::from), old_marker_ms(bgrx, marker));
+                assert_eq!(
+                    new,
+                    bgrx.and(marker).map(|_| (painted & 0xff_ffff) as u32),
+                    "{at:?} {painted:#x}"
+                );
+            }
+        }
+    }
 
     const W: usize = 1280;
     const H: usize = 768;
