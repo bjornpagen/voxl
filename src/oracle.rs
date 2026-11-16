@@ -201,7 +201,7 @@ impl Seat {
             self.up.pop_front();
             match up {
                 Up::Ack(id, held) => {
-                    let acked = self.client.on_ack(at, id, Hold::Said(held));
+                    let acked = self.client.on_ack(at, id, Hold(held));
                     assert_eq!(acked, Acked::Oldest, "the page's ack of frame {id}");
                 }
                 Up::Pong(token) => {

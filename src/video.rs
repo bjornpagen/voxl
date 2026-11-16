@@ -4216,7 +4216,7 @@ mod tests {
                 while let Ok(m) = socket.try_recv() {
                     if let Out::Bin(m) = m {
                         let id = u32::from_be_bytes([m[2], m[3], m[4], m[5]]);
-                        viewer.on_ack(Instant::now(), id, crate::hub::Hold::Said(Duration::ZERO));
+                        viewer.on_ack(Instant::now(), id, crate::hub::Hold(Duration::ZERO));
                         arrived.push(m);
                     }
                 }
@@ -5776,7 +5776,7 @@ mod tests {
                     let now = Instant::now();
                     self.hub.timeline.written(header.frame, now);
                     self.client
-                        .on_ack(now, header.frame, crate::hub::Hold::Said(Duration::ZERO));
+                        .on_ack(now, header.frame, crate::hub::Hold(Duration::ZERO));
                     self.frames += 1;
                     if what(&header) {
                         return;
@@ -6012,9 +6012,8 @@ mod tests {
                 continue;
             }
             let hold = match mix(k) % 3 {
-                0 => Hold::Said(Duration::ZERO),
-                1 => Hold::Said(Duration::from_micros(mix(k) % 10_000)),
-                _ => Hold::Unreadable,
+                1 => Hold(Duration::from_micros(mix(k) % 10_000)),
+                _ => Hold(Duration::ZERO),
             };
             let acked = at + Duration::from_millis(mix(k) % 400);
             for viewer in &viewers[gone..] {
@@ -6074,7 +6073,7 @@ mod tests {
                 if !sent.is_empty() && next(2) == 0 {
                     let (left, id) = sent[next(sent.len() as u64) as usize];
                     let back = (left + Duration::from_micros(next(300_000))).min(now);
-                    c.on_ack(back, id, crate::hub::Hold::Said(Duration::ZERO));
+                    c.on_ack(back, id, crate::hub::Hold(Duration::ZERO));
                 }
             }
             let at = format!("case {case}");
@@ -6187,7 +6186,7 @@ mod tests {
             let seen = looked(&hub, now);
             for (c, ids) in &sent {
                 if let Some(k) = (next(ids.len() as u64 + 1) as usize).checked_sub(1) {
-                    c.on_ack(now, ids[k], crate::hub::Hold::Said(Duration::ZERO));
+                    c.on_ack(now, ids[k], crate::hub::Hold(Duration::ZERO));
                 }
             }
             let Gated::Open(room) = Gated::ask(&seen) else {
@@ -7213,7 +7212,7 @@ mod tests {
             while t < start + Duration::from_secs(30) {
                 for v in &mut viewers {
                     while let Some(&(when, id)) = v.coming.front().filter(|a| a.0 <= t) {
-                        v.c.on_ack(when, id, crate::hub::Hold::Said(Duration::ZERO));
+                        v.c.on_ack(when, id, crate::hub::Hold(Duration::ZERO));
                         v.coming.pop_front();
                     }
                 }

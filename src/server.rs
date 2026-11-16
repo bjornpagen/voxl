@@ -609,7 +609,7 @@ impl Command {
         Some(match (name, fields.as_slice()) {
             ("a", [frame, hold]) => Command::Ack {
                 frame: num(frame)?,
-                hold: crate::hub::Hold::parse(hold),
+                hold: crate::hub::Hold::parse(hold)?,
             },
             ("m", [x, y]) => Command::Move {
                 x: num(x)?,
@@ -1241,7 +1241,8 @@ mod tests {
             );
         }
         for c in [
-            "v,2", "v", "a", "a,x", "k,65", "k,65,3", "b,1,7", "sp,1", "po,-1", "zz,1",
+            "v,2", "v", "a", "a,x", "a,1", "a,1,x", "a,1,-1", "a,1,NaN", "k,65", "k,65,3", "b,1,7",
+            "sp,1", "po,-1", "zz,1",
         ] {
             assert!(Command::parse(c).is_none(), "{c} parsed");
         }
@@ -1330,7 +1331,7 @@ mod tests {
                 assert_eq!(parsed.is_some(), has, "{line}");
                 match parsed {
                     Some(Command::Ack { hold, .. }) => {
-                        assert_eq!(hold, Hold::parse(fields[1]), "{line}");
+                        assert_eq!(Some(hold), Hold::parse(fields[1]), "{line}");
                     }
                     Some(Command::Clipboard(text)) => assert_eq!(text, fields.join(","), "{line}"),
                     _ => {}

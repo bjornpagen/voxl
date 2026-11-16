@@ -446,8 +446,6 @@ pub struct AckRow {
 pub enum HoldRow {
     /// The ack named the frame and said it held it this many microseconds.
     SaidUs(u128),
-    /// It named the frame with a hold that is not a time.
-    Unreadable,
 }
 
 impl Timeline {
@@ -460,10 +458,7 @@ impl Timeline {
             key: s.key,
             ack: s.ack.map(|a| AckRow {
                 at_us: self.us(a.at),
-                hold: match a.hold {
-                    Hold::Said(held) => HoldRow::SaidUs(held.as_micros()),
-                    Hold::Unreadable => HoldRow::Unreadable,
-                },
+                hold: HoldRow::SaidUs(a.hold.0.as_micros()),
             }),
         };
         trace.frames().map(row).collect()
@@ -693,12 +688,7 @@ mod tests {
         kept.iter()
             .map(|s| {
                 let ack = s.ack.map(|a| {
-                    let hold = match a.hold {
-                        Hold::Said(held) => {
-                            serde_json::json!({"said_us": held.as_micros() as u64})
-                        }
-                        Hold::Unreadable => "unreadable".into(),
-                    };
+                    let hold = serde_json::json!({"said_us": a.hold.0.as_micros() as u64});
                     serde_json::json!({"at_us": us(a.at), "hold": hold})
                 });
                 serde_json::json!({
@@ -721,7 +711,7 @@ mod tests {
     /// frame goes to a viewer as it leaves, a viewer gone already leaves again, a viewer is
     /// sent most frames but not every one, and goes deaf for spells long enough that frames
     /// leave its ring before their acks come. Frames are numbered by the hub's timeline;
-    /// acks come with a hold of none, any time, or unreadable. The run must reach every one of
+    /// acks come with a hold of none or any time. The run must reach every one of
     /// those, and a leaver pushed out by later ones.
     #[test]
     fn each_viewer_keeps_its_last_frames_and_their_acks() {
@@ -831,9 +821,8 @@ mod tests {
                     // oldest frame's not yet acked.
                     for _ in 0..(1 + rng.below(64) as usize).min(w.sent.len() - w.acked) {
                         let hold = match rng.below(3) {
-                            0 => Hold::Said(Duration::ZERO),
-                            1 => Hold::Said(Duration::from_micros(rng.below(1 << 40))),
-                            _ => Hold::Unreadable,
+                            1 => Hold(Duration::from_micros(rng.below(1 << 40))),
+                            _ => Hold(Duration::ZERO),
                         };
                         w.client.trace.lock().acked(at, hold);
                         let kept = w.acked + FRAMES_KEPT >= w.sent.len();
