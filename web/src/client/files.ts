@@ -143,8 +143,8 @@ export function createFiles(app: App) {
 		list.querySelector('.f-empty span')!.textContent = text;
 	}
 
-	function setup(f: FilesConfig | undefined) {
-		cfg = f && (f.upload || f.download) ? f : null;
+	function setup(f: FilesConfig) {
+		cfg = f.upload || f.download ? f : null;
 		app.tools.classList.toggle('files', !!cfg);
 		if (!cfg) {
 			close();

@@ -145,10 +145,10 @@ function main() {
 				app.remoteMac = m.os === 'macos';
 				app.readOnly = !!m.readOnly;
 				app.tools.classList.toggle('read-only', app.readOnly);
-				video.build(m.stripes && m.stripes.length ? m.stripes : [[0, m.h]]);
+				video.build(m.stripes);
 				video.layout();
 				files.setup(m.files);
-				mic.setup(!!m.mic && !app.readOnly);
+				mic.setup(m.mic && !app.readOnly);
 				updateDisplays(m.displays);
 				resize.setup(m.resize);
 				statusEl.style.display = 'none';

@@ -36,11 +36,11 @@ export interface Hello {
 	w: number;
 	h: number;
 	/** The server's platform: 'linux' (X11) or 'macos'. */
-	os?: string;
+	os: string;
 	audio: boolean;
-	mic?: boolean;
-	stripes?: Stripe[];
-	files?: FilesConfig;
+	mic: boolean;
+	stripes: Stripe[];
+	files: FilesConfig;
 	/** The server only shows the desktop: the viewer cannot send input. */
 	readOnly?: boolean;
 	/** Dynamic resolution: desktop pixels per CSS pixel of the viewer's window. */
