@@ -222,38 +222,62 @@ def _stalled(every, length):
     return lambda t: t >= every - 1e-9 and (t + 1e-9) % every < length
 
 
-# The stall schedules the check draws from: the model, and the oracle's account of it.
-SCHEDULES = [(Never(), lambda t: False), (Every(0.5, 0.05), _stalled(0.5, 0.05)), (Every(0.3, 0.12), _stalled(0.3, 0.12))]
+# The stall schedules the check draws, as the tools are given them, and the oracle's own
+# reading of each: seconds between stalls and milliseconds of stall, by the option's words.
+SCHEDULES = [([], lambda t: False, None), (["--stall", "0.5,50"], _stalled(0.5, 0.05), (0.5, 0.05)),
+             (["--stall", "0.3,120"], _stalled(0.3, 0.12), (0.3, 0.12))]
+
+
+def _path(argv, bps, owd):
+    """The link a tool builds from these command-line words, as linkviewer.py and shaper.py
+    build it."""
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    add_options(ap)
+    return Path(ap.parse_args(argv), rate(bps), owd)
 
 
 def _check(seed=0x5EED):
-    """The model against independent accounts of it. Prints what it checked and how often
-    each clause was reached; exits on the first miss or on a clause never reached.
+    """The link the tools build from their options, against independent accounts of it.
+    Prints what it checked and how often each clause was reached; exits on the first miss
+    or on a clause never reached. Every part goes through `add_options`, `Path` and `rate`,
+    as the tools do.
 
-    - `Down` against an oracle that serves the queue a tick at a time. It kills: a carry
-      that ignores stalls, a wait that counts stall time, a link that never stalls, an
-      arrival without half the round trip, a jitter twice as wide, and a jitter that
-      reorders. It does not kill an arrival late by half a tick, inside `TOLERANCE`.
-    - The lateness against the measured values: every draw is one of them, each decile's
-      share is right within four standard deviations, and the top 1 % is absent exactly
-      when asked. It kills a draw from an interpolated table and a cut that keeps the top.
-      It does not kill a cut of the top 0.1 % (four values).
+    - `Down` against an oracle that serves the queue a tick at a time, in bits. It kills: a
+      carry that ignores stalls, a wait that counts stall time, a link that never stalls,
+      an arrival without half the round trip, a jitter twice as wide, a jitter that
+      reorders, `--stall`'s length or `--jitter` read as seconds, and `rate` taking bytes
+      for bits. It does not kill an arrival late by half a tick, inside `TOLERANCE`.
+    - `begun` against a count of the schedule's stalls one by one, over spans that start at
+      0 and elsewhere. It kills a stall counted at 0, one too many, and a count that ignores
+      where the span began. It does not kill one that miscounts only past 10,000 stalls.
+    - The lateness `--late` names, drawn through `Path`: every draw is a measured value,
+      each decile's share is right within four standard deviations, and the top 1 % is
+      drawn under `page` and never under `page-99`. It kills a draw from an interpolated
+      table, `page` without its top 1 % and `page-99` with it. It does not kill a cut of
+      the top 0.1 % (four values).
+    - One stream for each kind of draw: the same answers, with and without `--jitter`,
+      leave at the same times. It kills jitter and lateness drawn from one stream. It does
+      not kill the decode holds sharing it (linkviewer.py draws those itself).
     - `Up` against the contract of a page that answers in order: no answer leaves before
       its own lateness, none overtakes the one before, each leaves at its own time or with
       the one before, and it crosses at the first moment out of a stall. It kills answers
-      that may overtake, a lateness added twice, and an answer held when it needn't be. It
-      does not kill a crossing later by less than the nanosecond it allows for rounding.
+      that may overtake, a lateness added twice, an answer held when it needn't be, and an
+      up path that never stalls. It does not kill a crossing later by less than the
+      nanosecond it allows for rounding.
     """
     rng = random.Random(seed)
     reach = {"waited": 0, "began in a stall": 0, "carried across a stall": 0, "jittered": 0,
-             "held by the one ahead": 0, "left at its own time": 0, "left with the one before": 0,
-             "crossed after a stall": 0}
+             "held by the one ahead": 0, "a span from 0": 0, "a span with stalls": 0,
+             "left at its own time": 0, "left with the one before": 0, "crossed after a stall": 0}
     for case in range(300):
         bps = rng.choice([1e6, 5e6, 20e6, 1e9])
-        # The link's stalls, and the oracle's own account of when it is stalled.
-        stalls, stalled = rng.choice(SCHEDULES)
-        jitter = rng.choice([0.0, 0.005, 0.02])
-        down = Down(Rate(bps), rng.uniform(0, 0.1), stalls, Jitter(jitter, random.Random(case)))
+        # The link's stalls as the tool is told them, and the oracle's own account.
+        argv, stalled, _ = rng.choice(SCHEDULES)
+        jitter_ms = rng.choice([0, 5, 20])
+        down = _path(argv + ["--jitter", str(jitter_ms), "--seed", str(case)], bps, rng.uniform(0, 0.1)).down
+        jitter = jitter_ms / 1000
         now, sent = 0.0, []
         for _ in range(30):
             now += rng.expovariate(1 / rng.choice([0.001, 0.016, 0.1]))
@@ -302,29 +326,55 @@ def _check(seed=0x5EED):
                 before = arrival
                 i, left = i + 1, None
             k += 1
-    # The lateness: each draw is one of the measured values; below each decile of them, the
-    # decile's share of the draws, within four standard deviations; the cut model never
-    # draws from the top 1 % and the whole one does.
+    # Stalls begun in a span, against the schedule's stalls counted one by one.
+    for argv, _, schedule in SCHEDULES[1:]:
+        stalls = _path(argv, 1e6, 0.0).stalls
+        every, length = schedule
+        for _ in range(5_000):
+            a = rng.choice([0.0, rng.uniform(0, 30)])
+            b = a + rng.uniform(0, 10)
+            want = sum(1 for k in range(1, int(b / every) + 2) if a <= k * every < b)
+            if stalls.begun(a, b) != want:
+                sys.exit(f"--stall {argv[1]}: {stalls.begun(a, b)} stalls begin in [{a:.4f}, {b:.4f}), not {want}")
+            reach["a span from 0"] += a == 0.0
+            reach["a span with stalls"] += want > 0
+    # The lateness each model draws, through the path the tools build: each draw one of the
+    # measured values; below each decile of them, the decile's share of the draws, within
+    # four standard deviations; the top 1 % drawn under `page` and never under `page-99`.
     n = 40_000
-    whole, cut = page_late(1.0), page_late(0.99)
-    top = set(whole[len(cut):])
-    for name, values in (("all", whole), ("without the top 1 %", cut)):
-        late = Measured(values, rng)
+    whole = page_late(1.0)
+    top = set(whole[round(len(whole) * 0.99):])
+    for model in ("page", "page-99"):
+        late = _path(["--late", model, "--seed", str(seed)], 1e6, 0.0).up.late
         draws = sorted(late.draw() for _ in range(n))
+        values = [v for v in whole if model == "page" or v not in top]
         if not set(draws) <= set(values):
-            sys.exit(f"{name}: a lateness that was never measured")
+            sys.exit(f"--late {model}: a lateness that was never measured, or one from the top 1 %")
         for d in range(1, 10):
             at = values[len(values) * d // 10]
             share = bisect.bisect_left(draws, at) / n
             want = bisect.bisect_left(values, at) / len(values)
             if abs(share - want) > 4 * (want * (1 - want) / n) ** 0.5:
-                sys.exit(f"{name}: {share:.4f} of draws fall below {at * 1000:.1f} ms; the values say {want:.4f}")
-        if (values is cut) == bool(top & set(draws)):
-            sys.exit(f"{name}: drew from the top 1 % {len(top & set(draws))} times")
-    # Answers given in order, each with its own lateness, and a stall on the way up.
-    twin = random.Random(seed)
-    stalls = Every(1.0, 0.25)
-    up = Up(0.055, stalls, Measured(whole, random.Random(seed)))
+                sys.exit(f"--late {model}: {share:.4f} of draws fall below {at * 1000:.1f} ms; the values say {want:.4f}")
+        if (model == "page") != bool(top & set(draws)):
+            sys.exit(f"--late {model}: drew from the top 1 % {len(top & set(draws))} times")
+    # One stream for each kind of draw: with and without a jitter, the same answers leave
+    # at the same times.
+    quiet = _path(["--late", "page", "--seed", str(seed)], 20e6, 0.055)
+    jittery = _path(["--late", "page", "--seed", str(seed), "--jitter", "20"], 20e6, 0.055)
+    now = 0.0
+    for _ in range(2_000):
+        now += rng.expovariate(1 / 0.01)
+        quiet.down.send(now, 9000)
+        jittery.down.send(now, 9000)
+        if quiet.up.send(now) != jittery.up.send(now):
+            sys.exit("an answer leaves at another time when the link jitters: one stream for two kinds of draw")
+    # Answers given in order, each with its own lateness, through a path that stalls. The
+    # oracle draws the same lateness from the measured values in its own stream, seeded as
+    # the tools seed theirs.
+    twin = random.Random(f"{seed}:late")
+    every, length = 1.0, 0.25
+    up = _path(["--late", "page", "--seed", str(seed), "--stall", "1,250"], 1e6, 0.055).up
     now, last = 0.0, 0.0
     for _ in range(20_000):
         now += rng.expovariate(1 / 0.01)
@@ -341,18 +391,19 @@ def _check(seed=0x5EED):
         # When it starts across, to within rounding.
         crosses = arrival - up.owd
         held = crosses - leaves > 1e-9
-        in_stall = stalls.every <= leaves and leaves % stalls.every < stalls.length
+        in_stall = every <= leaves and leaves % every < length
         if crosses < leaves - 1e-9 or held != in_stall:
             sys.exit(f"an answer leaving at {leaves:.6f} crosses at {crosses:.6f}; in a stall: {in_stall}")
         if held:
             reach["crossed after a stall"] += 1
-            if abs(crosses % stalls.every - stalls.length) > 1e-9:
+            if abs(crosses % every - length) > 1e-9:
                 sys.exit(f"an answer held by a stall crosses at {crosses:.6f}, not at its end")
         last = leaves
     if not all(reach.values()):
         sys.exit(f"a clause never reached: {reach}")
-    print("link: 300 queues as a tick-by-tick oracle serves them; the page's lateness, all of it and"
-          " without its top 1 %, against its measured values; 20,000 answers in order. Reached: "
+    print("link, as the tools build it from their options: 300 queues as a tick-by-tick oracle serves"
+          " them; stalls begun, counted one by one; the lateness of page and page-99 against the"
+          " measured values; one stream a kind of draw; 20,000 answers in order. Reached: "
           + ", ".join(f"{k} {v:,}" for k, v in reach.items()))
 
 
