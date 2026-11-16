@@ -893,6 +893,10 @@ mod tests {
             hub.width.store(max.0, Ordering::Relaxed);
             hub.height.store(max.1, Ordering::Relaxed);
             *hub.resize_max.lock() = Some(max);
+            // An input thread, as `run` gives the hub: on macOS a client may resize only
+            // while the hub has input, and every client here joins at or over its floor.
+            let (input, _input_thread) = std::sync::mpsc::channel();
+            *hub.input.lock() = Some(input);
             let mut d = Desk {
                 s: app(&hub, false, None),
                 screen: Screen {
