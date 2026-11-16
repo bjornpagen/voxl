@@ -1289,16 +1289,15 @@ mod tests {
         }
     }
 
-    /// A run of 200 frames one viewer is sent, generated from `seed`: each leaves 1 to
-    /// 40 ms after the one before, of 200 B to 60 KB, arrives 0 to 120 ms later, and is
-    /// acked 0 to 50 ms after that, each no sooner than the one before (TCP keeps them in
-    /// order); with `covering`, about one in four is covered by a later frame's ack. The
-    /// last is acked.
-    fn run(seed: u64, covering: bool) -> Vec<Sent> {
+    /// A run of 200 frames a viewer of `hub` is sent, numbered by the hub's one count and
+    /// generated from `seed`: each leaves 1 to 40 ms after the one before, of 200 B to
+    /// 60 KB, arrives 0 to 120 ms later, and is acked 0 to 50 ms after that, each no sooner
+    /// than the one before (TCP keeps them in order); with `covering`, about one in four is
+    /// covered by a later frame's ack. The last is acked.
+    fn run(hub: &Hub, seed: u64, covering: bool) -> Vec<Sent> {
         let mut rng = Rng(crate::xorshift::Xorshift::new(seed));
         let t0 = Instant::now();
         let (mut at, mut arrives, mut acks) = (t0, t0, t0);
-        let numbers = crate::timeline::Timeline::new(t0);
         let mut frames: Vec<Sent> = (0..200)
             .map(|_| {
                 at += Duration::from_millis(1 + rng.below(40));
@@ -1306,7 +1305,7 @@ mod tests {
                 acks = acks.max(arrives + Duration::from_millis(rng.below(51)));
                 Sent {
                     at,
-                    id: numbers.number(),
+                    id: hub.timeline.number(),
                     bytes: 200 + rng.below(60_000) as usize,
                     arrives,
                     acks,
@@ -1354,7 +1353,7 @@ mod tests {
         let mut otherwise = 0;
         for seed in 1..=50u64 {
             let hub = Hub::new(Paths::ANY);
-            let frames = run(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15), false);
+            let frames = run(&hub, seed.wrapping_mul(0x9E37_79B9_7F4A_7C15), false);
             let end = frames.last().unwrap().acks + Duration::from_secs(1);
             let says = acked(&hub, &frames, |f| f.acks, |f| Hold::Said(f.held()));
             let twin = acked(&hub, &frames, |f| f.arrives, |_| Hold::Unsaid);
@@ -1372,7 +1371,7 @@ mod tests {
     fn a_frame_an_ack_covers_comes_back_when_the_ack_arrives() {
         for seed in 1..=50u64 {
             let hub = Hub::new(Paths::ANY);
-            let frames = run(seed.wrapping_mul(0x2545_F491_4F6C_DD1D), true);
+            let frames = run(&hub, seed.wrapping_mul(0x2545_F491_4F6C_DD1D), true);
             let end = frames.last().unwrap().acks + Duration::from_secs(1);
             // Each frame acked, a covered one when the ack that covers it arrives.
             let mut each = frames.clone();
@@ -1428,10 +1427,10 @@ mod tests {
             |f| Hold::Said(f.acks - f.at + Duration::from_nanos(1)),
         ];
         for seed in 1..=50u64 {
-            let frames = run(seed.wrapping_mul(0xD1B5_4A32_D192_ED03), true);
-            let end = frames.last().unwrap().acks + Duration::from_secs(1);
             for lie in lies {
                 let hub = Hub::new(Paths::ANY);
+                let frames = run(&hub, seed.wrapping_mul(0xD1B5_4A32_D192_ED03), true);
+                let end = frames.last().unwrap().acks + Duration::from_secs(1);
                 let truth = |f: &Sent| Hold::Said(f.held());
                 let c = acked(
                     &hub,
