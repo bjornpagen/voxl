@@ -479,13 +479,15 @@ impl Client {
         }
     }
 
-    /// At `now`, the ack for frame `id` (and every one before it) arrived. Each frame it
-    /// covers comes back to the window, oldest first. The one it names came back when the
-    /// client had it: what the client says it held of the trip is its own time, not the
-    /// path's. Any it covers without an ack of its own, and one whose hold cannot be true
-    /// (unreadable, or longer than the trip it is part of), came back at `now`: later, so
-    /// what the window reads of the path can only be lower. One left behind wants its
-    /// keyframe once the last of what is on its way is back.
+    /// At `now`, the ack for frame `id` (and every one before it) arrived. It names a frame
+    /// only if that frame is in flight to this client: an id that is not (one acked or
+    /// covered already, one sent to another client, one never given) takes nothing out of
+    /// flight. Each frame it covers comes back to the window, oldest first. The one it
+    /// names came back when the client had it: what the client says it held of the trip is
+    /// its own time, not the path's. Any it covers without an ack of its own, and one whose
+    /// hold cannot be true (unreadable, or longer than the trip it is part of), came back
+    /// at `now`: later, so what the window reads of the path can only be lower. One left
+    /// behind wants its keyframe once the last of what is on its way is back.
     pub fn on_ack(&self, now: Instant, id: u32, hold: Hold) {
         self.trace.lock().acked(now, id, hold);
         let mut v = self.viewing.lock();
@@ -494,9 +496,11 @@ impl Client {
             inflight,
             window,
         } = &mut *v;
+        let Some(named) = inflight.iter().position(|f| f.id.get() == id) else {
+            return;
+        };
         let mut said = None;
-        while let Some(&f) = inflight.front().filter(|f| wrapping_le(f.id.get(), id)) {
-            inflight.pop_front();
+        for f in inflight.drain(..=named) {
             let back = match hold {
                 Hold::Said(held)
                     if f.id.get() == id && held <= now.saturating_duration_since(f.left.at) =>
@@ -668,10 +672,6 @@ pub fn wait_any<const N: usize>(w: [Waitable; N], timeout: Option<std::time::Dur
         };
         unsafe { windows::Win32::System::Threading::WaitForMultipleObjects(&hs, false, ms) };
     }
-}
-
-fn wrapping_le(a: u32, b: u32) -> bool {
-    b.wrapping_sub(a) < 0x8000_0000
 }
 
 #[derive(Default)]
@@ -1755,20 +1755,24 @@ mod tests {
         }
     }
 
-    /// An ack pops nothing it did not name, whatever came between: over any interleaving of
-    /// viewers that watch, stop and ask for keyframes, streams rebuilt, frames sent, and acks
-    /// of any frame numbered before (one in flight, one acked already, one from before a
-    /// watch or a rebuild, one sent to the other viewer), every frame an ack takes out of
-    /// flight, and every frame it covers in the trace, left no later than the frame it
-    /// names. Frames are numbered as the encode loop numbers them, by the hub's timeline;
-    /// the test knows each frame by the order it numbered it in (its bytes), not by its
-    /// number. Numbering that started again at a rebuild fails it.
+    /// An ack takes out of flight exactly the frames up to the one it names, if that one is
+    /// in flight, and nothing else: over any interleaving of viewers that watch, stop and
+    /// ask for keyframes, streams rebuilt, frames sent, and acks of any frame numbered
+    /// before (one in flight, one acked already, one from before a watch or a rebuild, one
+    /// sent to the other viewer) or of a number never given (past the newest, or before
+    /// the first), the frames in flight after it are those before it less that run, and
+    /// the frames its trace covers are its uncovered frames up to the one named, if it
+    /// keeps that one uncovered, and none otherwise. Frames are numbered as the encode
+    /// loop numbers them, by the hub's count; the test knows each frame by the order it
+    /// numbered it in (its bytes), not by its number. Counted, and each must happen: acks
+    /// that took frames out, acks of a frame numbered but not in flight, and acks of a
+    /// number never given, each beside frames in flight.
     #[test]
-    fn an_ack_pops_nothing_it_did_not_name() {
+    fn an_ack_takes_out_exactly_the_frames_up_to_the_one_it_names() {
         let mut rng = Rng(crate::xorshift::Xorshift::new(0x9E37_79B9_7F4A_7C15));
-        // Acks that took frames out of flight; that named a frame from before the viewer
-        // last watched, started over or started, and took nothing.
-        let (mut popped, mut stale) = (0, 0);
+        // Acks that took frames out of flight; that named a frame numbered but not in
+        // flight; that named a number never given; the last two beside frames in flight.
+        let (mut popped, mut stale, mut unnamed) = (0, 0, 0);
         for _ in 0..40 {
             let t0 = Instant::now();
             let hub = Hub::new(Paths::ANY);
@@ -1801,44 +1805,62 @@ mod tests {
                     }
                     _ if numbered.is_empty() => {}
                     _ => {
-                        // Any frame numbered so far, most often a recent one.
-                        let back = match rng.below(2) {
-                            0 => rng.below(4),
-                            _ => rng.below(numbered.len() as u64),
-                        };
-                        let named = numbered.len() - 1 - (back as usize).min(numbered.len() - 1);
                         let flying = |c: &Client| -> Vec<usize> {
                             c.viewing.lock().inflight.iter().map(|f| f.bytes).collect()
                         };
-                        let covered = |c: &Client| -> Vec<usize> {
+                        // A frame in flight to it, a recent one or any frame numbered so
+                        // far; or a number never given, past the newest or before the
+                        // first.
+                        let last = numbered.len() - 1;
+                        let in_flight = flying(&c[i]);
+                        let (named, id) = match rng.below(6) {
+                            0 => (None, numbered[last].wrapping_add(1 + rng.below(9) as u32)),
+                            1 => (None, numbered[0].wrapping_sub(1 + rng.below(9) as u32)),
+                            2 if !in_flight.is_empty() => {
+                                let k = in_flight[rng.below(in_flight.len() as u64) as usize];
+                                (Some(k), numbered[k])
+                            }
+                            2 | 3 => {
+                                let k = last - (rng.below(4) as usize).min(last);
+                                (Some(k), numbered[k])
+                            }
+                            _ => {
+                                let k = rng.below(numbered.len() as u64) as usize;
+                                (Some(k), numbered[k])
+                            }
+                        };
+                        let open = |c: &Client| -> Vec<usize> {
                             let t = c.trace.lock();
                             t.frames()
-                                .filter(|f| f.ack.is_some())
+                                .filter(|f| f.ack.is_none())
                                 .map(|f| f.frame.bytes)
                                 .collect()
                         };
-                        let (before, covered_before) = (flying(&c[i]), covered(&c[i]));
-                        c[i].on_ack(now, numbered[named], Hold::Unsaid);
-                        let (after, covered_after) = (flying(&c[i]), covered(&c[i]));
-                        let gone = &before[..before.len() - after.len()];
-                        assert_eq!(after, before[gone.len()..], "only from the front");
-                        assert!(
-                            gone.iter().all(|&k| k <= named),
-                            "the ack of frame {named} took {gone:?} out of flight"
-                        );
-                        let newly = covered_after.iter().filter(|k| !covered_before.contains(k));
-                        assert!(newly.clone().all(|&k| k <= named), "covered {newly:?}");
-                        popped += usize::from(!gone.is_empty());
-                        stale += usize::from(
-                            gone.is_empty() && before.first().is_some_and(|&k| k > named),
-                        );
+                        let (before, open_before) = (flying(&c[i]), open(&c[i]));
+                        c[i].on_ack(now, id, Hold::Unsaid);
+                        let (after, open_after) = (flying(&c[i]), open(&c[i]));
+                        // The run up to the frame named, in what was in flight and in what
+                        // the trace had not yet seen acked.
+                        let through = |list: &[usize]| {
+                            named
+                                .and_then(|k| list.iter().position(|&f| f == k))
+                                .map_or(0, |p| p + 1)
+                        };
+                        let gone = through(&before);
+                        assert_eq!(after, before[gone..], "the ack of {named:?} ({id})");
+                        let covered = through(&open_before);
+                        assert_eq!(open_after, open_before[covered..], "{named:?} ({id})");
+                        let beside = !before.is_empty();
+                        popped += usize::from(gone > 0);
+                        stale += usize::from(named.is_some() && gone == 0 && beside);
+                        unnamed += usize::from(named.is_none() && beside);
                     }
                 }
             }
         }
         assert!(
-            popped > 100 && stale > 100,
-            "popped {popped}, stale {stale}"
+            popped > 100 && stale > 100 && unnamed > 100,
+            "popped {popped}, stale {stale}, unnamed {unnamed}"
         );
     }
 }
