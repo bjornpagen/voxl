@@ -253,7 +253,7 @@ pub struct Hub {
     pub cursor: Mutex<Option<Bytes>>,
     /// Wakes the capture thread (acks, joins, keyframe requests).
     pub waker: Wake,
-    pub input: Mutex<Option<std::sync::mpsc::Sender<crate::input::InputEvent>>>,
+    pub input: Mutex<Option<std::sync::mpsc::Sender<crate::event::InputEvent>>>,
     pub last_clipboard: Mutex<Option<String>>,
     /// Desktop size a client asked for (dynamic resolution), applied by the video thread.
     pub resize_req: Mutex<Option<(u32, u32)>>,
@@ -378,7 +378,7 @@ impl Hub {
         let sender = input.take()?;
         let (done, ready) = std::sync::mpsc::channel();
         if sender
-            .send(crate::input::InputEvent::DisplayBarrier(done))
+            .send(crate::event::InputEvent::DisplayBarrier(done))
             .is_err()
         {
             *input = Some(sender);
