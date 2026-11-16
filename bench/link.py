@@ -4,8 +4,9 @@ it inside a headless viewer, and shaper.py imposes it on a real TCP connection.
 - Down (server to viewer): a rate through an unbounded queue served in order, then half the
   round trip, then a one-sided jitter that keeps the order (nothing arrives before what
   went ahead of it).
-- Up (viewer to server): what the page answers leaves it late by the page's own lateness
-  (`PAGE_LATE`, or none), in the order it was answered, then crosses in half the round trip.
+- Up (viewer to server): what the page answers leaves it late by a lateness drawn from the
+  page's own measured answers (`page-late.txt`), or by none, in the order it was answered,
+  then crosses in half the round trip.
 - Stalls, both ways: every `every` seconds the link carries nothing for `length`.
 
 Times are seconds on the caller's clock, always passed in. Run as a script, this file
@@ -14,47 +15,34 @@ clock is read): `python3 -I bench/link.py`.
 """
 
 import bisect
+import os
 import random
 import sys
 
-# How late the page that fell to the window's floor answered, past the path's fastest trip
-# and past the hold it said it kept the frame: ms, quantiles of 4,091 of its acks at rest
-# on a 20 Mbit/s, 110 ms path (its /stats/trace). Between two knots, a straight line. The
-# least is 0: a page that answers at once is rare, not impossible.
-PAGE_LATE = (
-    (0.0, 0.0),
-    (0.05, 9.106),
-    (0.10, 10.235),
-    (0.15, 10.788),
-    (0.20, 11.128),
-    (0.25, 11.478),
-    (0.30, 11.778),
-    (0.35, 12.131),
-    (0.40, 12.434),
-    (0.45, 12.824),
-    (0.50, 13.218),
-    (0.55, 13.629),
-    (0.60, 14.052),
-    (0.65, 14.542),
-    (0.70, 15.048),
-    (0.75, 15.647),
-    (0.80, 16.567),
-    (0.85, 17.432),
-    (0.90, 18.947),
-    (0.95, 22.749),
-    (0.99, 41.789),
-    (0.999, 327.014),
-    (1.0, 423.745),
-)
-_PROBS = [p for p, _ in PAGE_LATE]
+# A page's measured lateness: `page-late.txt`, beside this file.
+PAGE_LATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "page-late.txt")
 
 
-def page_late(rng):
-    """One answer's lateness, in seconds, drawn from `PAGE_LATE`."""
-    u = rng.random()
-    i = bisect.bisect_right(_PROBS, u)
-    (p0, l0), (p1, l1) = PAGE_LATE[i - 1], PAGE_LATE[i]
-    return (l0 + (l1 - l0) * (u - p0) / (p1 - p0)) / 1000
+def page_late(share):
+    """The page's measured lateness in seconds, smallest first: its lowest `share` of it
+    (1: all of it)."""
+    with open(PAGE_LATE) as f:
+        values = [int(line) / 1e6 for line in f if not line.startswith("#")]
+    return values[: round(len(values) * share)]
+
+
+# The page's lateness models: none, all of its measured answers, or all but their top 1 %.
+LATE = {"none": None, "page": 1.0, "page-99": 0.99}
+
+
+def lateness(model):
+    """The lateness `model` (a key of `LATE`) draws from."""
+    return drawn_from(page_late(LATE[model])) if LATE[model] else None
+
+
+def drawn_from(values):
+    """A lateness drawn from `values`, each as likely as any other."""
+    return lambda rng: rng.choice(values)
 
 
 class Stalls:
@@ -137,16 +125,40 @@ class Up:
         return self.leaving, self.stalls.resume(self.leaving) + self.owd
 
 
+# How far the oracle may differ from the model: a message is handed over within one tick
+# of the oracle's grid, and served to within one more.
+TICK = 1e-4
+TOLERANCE = 2 * TICK
+
+
 def _check(seed=0x5EED):
-    """The model against an oracle that serves the queue a tick at a time, and the lateness
-    against the table it is drawn from. Prints what it checked; exits on the first miss."""
+    """The model against independent accounts of it. Prints what it checked and how often
+    each clause was reached; exits on the first miss or on a clause never reached.
+
+    - `Down` against an oracle that serves the queue a tick at a time. It kills: a carry
+      that ignores stalls, a wait that counts stall time, a link that never stalls, an
+      arrival without half the round trip, a jitter twice as wide, and a jitter that
+      reorders. It does not kill an arrival late by half a tick, inside `TOLERANCE`.
+    - The lateness against the measured values: every draw is one of them, each decile's
+      share is right within four standard deviations, and the top 1 % is absent exactly
+      when asked. It kills a draw from an interpolated table and a cut that keeps the top.
+      It does not kill a cut of the top 0.1 % (four values).
+    - `Up` against the contract of a page that answers in order: no answer leaves before
+      its own lateness, none overtakes the one before, each leaves at its own time or with
+      the one before, and it crosses at the first moment out of a stall. It kills answers
+      that may overtake, a lateness added twice, and an answer held when it needn't be. It
+      does not kill a crossing later by less than the nanosecond it allows for rounding.
+    """
     rng = random.Random(seed)
-    tick = 1e-4
+    reach = {"waited": 0, "began in a stall": 0, "carried across a stall": 0, "jittered": 0,
+             "held by the one ahead": 0, "left at its own time": 0, "left with the one before": 0,
+             "crossed after a stall": 0}
     for case in range(300):
         bps = rng.choice([1e6, 5e6, 20e6, 1e9])
         every, length = rng.choice([(0.0, 0.0), (0.5, 0.05), (0.3, 0.12)])
         jitter = rng.choice([0.0, 0.005, 0.02])
-        down = Down(bps, rng.uniform(0, 0.1), Stalls(every, length), jitter, random.Random(case))
+        stalls = Stalls(every, length)
+        down = Down(bps, rng.uniform(0, 0.1), stalls, jitter, random.Random(case))
         now, sent = 0.0, []
         for _ in range(30):
             now += rng.expovariate(1 / rng.choice([0.001, 0.016, 0.1]))
@@ -158,66 +170,96 @@ def _check(seed=0x5EED):
         stalled = lambda t: every > 0 and t >= every - 1e-9 and (t + 1e-9) % every < length
         k, i, left, pos, began, before = 0, 0, None, 0.0, None, 0.0
         while i < len(sent):
-            t = k * tick
-            if left is None and sent[i][0] >= t + tick:  # an idle link: on to the next hand-over
-                k = int(sent[i][0] // tick)
+            t = k * TICK
+            if left is None and sent[i][0] >= t + TICK:  # an idle link: on to the next hand-over
+                k = int(sent[i][0] // TICK)
                 continue
             if stalled(t):
+                if left is not None and began is not None:
+                    reach["carried across a stall"] += 1
                 k += 1
                 continue
             pos = max(pos, t)
-            while i < len(sent) and pos < t + tick:
+            while i < len(sent) and pos < t + TICK:
                 at, nbytes, arrival, wait = sent[i]
                 if left is None:
-                    if at >= t + tick:
+                    if at >= t + TICK:
                         break
                     left, began = nbytes * 8, max(pos, at)
-                    stall_time = sum(tick for q in range(int(at // tick), int(began // tick)) if stalled(q * tick))
+                    stall_time = sum(TICK for q in range(int(at // TICK), int(began // TICK)) if stalled(q * TICK))
+                    reach["began in a stall"] += stall_time > 0
+                    reach["waited"] += began - at - stall_time > TOLERANCE
                     pos = began
-                served = min(left, (t + tick - pos) * bps)
+                served = min(left, (t + TICK - pos) * bps)
                 left -= served
                 pos += served / bps
                 if left > 1e-6:
                     break
                 # The jitter only delays, by at most `jitter`, and never reorders.
                 want = pos + down.owd
-                if not (want - 2 * tick <= arrival <= max(want + jitter, before) + 2 * tick) or arrival < before:
+                if not (want - TOLERANCE <= arrival <= max(want + jitter, before) + TOLERANCE) or arrival < before:
                     sys.exit(f"case {case}: message {i} arrives at {arrival:.6f}, the oracle says {want:.6f}"
                              f" to {want + jitter:.6f}, after {before:.6f}")
-                before = arrival
+                reach["jittered"] += arrival > want + TOLERANCE and arrival > before
+                reach["held by the one ahead"] += arrival == before
                 owed = began - at - stall_time
-                if abs(wait - owed) > 2 * tick:
+                if abs(wait - owed) > TOLERANCE:
                     sys.exit(f"case {case}: message {i} waits {wait:.6f}, the oracle says {owed:.6f}")
+                before = arrival
                 i, left = i + 1, None
             k += 1
-    # The page's lateness: below each knot's lateness, the knot's share of draws, within
-    # four standard deviations; never below 0.
+    # The lateness: each draw is one of the measured values; below each decile of them, the
+    # decile's share of the draws, within four standard deviations; the cut model never
+    # draws from the top 1 % and the whole one does.
     n = 40_000
-    draws = sorted(page_late(rng) for _ in range(n))
-    if draws[0] < 0:
-        sys.exit("a lateness below zero")
-    for p, ms in PAGE_LATE[1:-1]:
-        share = bisect.bisect_left(draws, ms / 1000) / n
-        if abs(share - p) > 4 * (p * (1 - p) / n) ** 0.5 + 1 / n:
-            sys.exit(f"{share:.4f} of draws fall below {ms} ms, the table says {p}")
-    # Answers: each leaves at its own lateness or with the one before it, whichever is
-    # later. The oracle draws the same lateness from a twin stream.
+    whole, cut = page_late(1.0), page_late(0.99)
+    top = set(whole[len(cut):])
+    for name, values in (("all", whole), ("without the top 1 %", cut)):
+        draw = drawn_from(values)
+        draws = sorted(draw(rng) for _ in range(n))
+        if not set(draws) <= set(values):
+            sys.exit(f"{name}: a lateness that was never measured")
+        for d in range(1, 10):
+            at = values[len(values) * d // 10]
+            share = bisect.bisect_left(draws, at) / n
+            want = bisect.bisect_left(values, at) / len(values)
+            if abs(share - want) > 4 * (want * (1 - want) / n) ** 0.5:
+                sys.exit(f"{name}: {share:.4f} of draws fall below {at * 1000:.1f} ms; the values say {want:.4f}")
+        if (values is cut) == bool(top & set(draws)):
+            sys.exit(f"{name}: drew from the top 1 % {len(top & set(draws))} times")
+    # Answers given in order, each with its own lateness, and a stall on the way up.
     twin = random.Random(seed)
-    up = Up(0.055, Stalls(1.0, 0.25), page_late, random.Random(seed))
-    now, before, held = 0.0, 0.0, 0
+    stalls = Stalls(1.0, 0.25)
+    up = Up(0.055, stalls, drawn_from(whole), random.Random(seed))
+    now, last = 0.0, 0.0
     for _ in range(20_000):
         now += rng.expovariate(1 / 0.01)
-        own = now + page_late(twin)
+        own = now + twin.choice(whole)
         leaves, arrival = up.send(now)
-        if leaves != max(own, before):
-            sys.exit(f"an answer due at {own:.6f} after one at {before:.6f} leaves at {leaves:.6f}")
-        if arrival < leaves + up.owd:
-            sys.exit(f"an answer leaving at {leaves:.6f} arrives at {arrival:.6f}")
-        before, held = leaves, held + (own < before)
-    if not 0 < held < 20_000:
-        sys.exit(f"{held} of 20,000 answers held back: the check never saw both sides")
-    print(f"link: 300 queues as a tick-by-tick oracle serves them; PAGE_LATE's {len(PAGE_LATE) - 2} inner"
-          f" quantiles over {n:,} draws; 20,000 answers in order, {held:,} of them held back")
+        if leaves < own or leaves < last:
+            sys.exit(f"an answer due at {own:.6f} leaves at {leaves:.6f}, after one at {last:.6f}")
+        if leaves == own:
+            reach["left at its own time"] += 1
+        elif leaves == last:
+            reach["left with the one before"] += 1
+        else:
+            sys.exit(f"an answer due at {own:.6f} leaves at {leaves:.6f}: neither its time nor {last:.6f}")
+        # When it starts across, to within rounding.
+        crosses = arrival - up.owd
+        held = crosses - leaves > 1e-9
+        in_stall = stalls.every <= leaves and leaves % stalls.every < stalls.length
+        if crosses < leaves - 1e-9 or held != in_stall:
+            sys.exit(f"an answer leaving at {leaves:.6f} crosses at {crosses:.6f}; in a stall: {in_stall}")
+        if held:
+            reach["crossed after a stall"] += 1
+            if abs(crosses % stalls.every - stalls.length) > 1e-9:
+                sys.exit(f"an answer held by a stall crosses at {crosses:.6f}, not at its end")
+        last = leaves
+    if not all(reach.values()):
+        sys.exit(f"a clause never reached: {reach}")
+    print("link: 300 queues as a tick-by-tick oracle serves them; the page's lateness, all of it and"
+          " without its top 1 %, against its measured values; 20,000 answers in order. Reached: "
+          + ", ".join(f"{k} {v:,}" for k, v in reach.items()))
 
 
 if __name__ == "__main__":

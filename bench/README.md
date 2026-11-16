@@ -36,8 +36,10 @@ is its log. CBR from 30 Mbps, with congestion control down to 2 Mbps.
   crossed the link, after a decode hold (3 ms, or a software decoder's with `--hold`,
   carried in the ack as the page's is), and can scroll and type into a terminal on
   the benchmark display (`--fifo`). With `--late page` its acks and pongs leave late as
-  a real page's do (`link.PAGE_LATE`, seeded by `--seed`), `--stall EVERY_S,LENGTH_MS`
-  stops the link periodically and `--jitter MS` jitters its arrivals. The `cold` scenario is a first
+  a real page's did, drawn from that page's 4,091 measured answers (`page-late.txt`;
+  `--late page-99` without their top 1 %), `--stall EVERY_S,LENGTH_MS` stops the link
+  periodically and `--jitter MS` jitters its arrivals; every kind of draw has its own
+  stream, seeded by `--seed`. The `cold` scenario is a first
   load: the terminal is filled with dense text before the viewer connects, and it is
   measured from the connect. At the end it reads from `/stats` the viewer's lowest
   `carries` since it connected and the window's `LATENESS`, `START` and `FALL`, and the
@@ -47,7 +49,8 @@ is its log. CBR from 30 Mbps, with congestion control down to 2 Mbps.
   is for rate control, and writes when each message arrived and each ack left.
 - `link.py`: the link model both use: a rate through an unbounded queue served in order,
   half the round trip each way, one-sided jitter, a page's lateness, periodic stalls.
-  `python3 -I link.py` checks it against an oracle that serves the queue a tick at a time.
+  `python3 -I link.py` checks it against an oracle that serves the queue a tick at a time,
+  the lateness against the measured values, and the answers against a page's order.
 - `keyhold.py host:port keysym repeat`: holds a key as a browser does, behind a link: the
   down, the browser's repeats (each sent as `k,<keysym>,<repeat>`, `1` as upstream's page
   sends a repeat or `2` as this one does), the up; every key message late by `--delay` ms
