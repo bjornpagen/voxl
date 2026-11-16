@@ -610,9 +610,10 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
                 if let Err(e) = result {
                     log::warn!("display switch: {e}");
                 }
-                // A hello resets the page's decoders: it waits for a keyframe, as after `kf`.
-                c.ask_keyframe();
-                c.send(Out::Text(s.hub.hello()));
+                // The page is told the stream again, which resets its decoders: for this
+                // viewer the stream starts over. A keyframe that reached the page ahead of
+                // the hello would be lost there, with the viewer counted as started.
+                c.start_over(Instant::now(), s.hub.hello());
                 s.hub.wake();
             }
         },

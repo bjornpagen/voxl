@@ -402,20 +402,24 @@ impl Client {
         self.viewing.lock().viewer = Viewer::NotWatching;
     }
 
-    /// It asks for a keyframe (`kf`, or a hello after a failed display switch): if it
-    /// watches, it wants one at once, whatever is on its way, unless one is already
-    /// promised it.
+    /// It asks for a keyframe (`kf`): if it watches, it wants one at once, whatever is on
+    /// its way, unless one is already promised it.
     pub fn ask_keyframe(&self) {
         let mut v = self.viewing.lock();
         v.viewer = asked(v.viewer);
     }
 
-    /// The stream starts over for it at `now` (it is rebuilt): if it watches, it waits for a
-    /// keyframe; acks for frames sent before no longer apply.
-    pub fn start_over(&self, now: Instant) {
+    /// The stream starts over for it at `now` (it is rebuilt, or a display switch failed),
+    /// and its page is told so by `hello`, which resets the page's decoders: if it watches,
+    /// it waits for a keyframe of what follows; acks for frames sent before no longer apply.
+    /// The hello is queued under the lock a keyframe is planned, sent and taken under, so a
+    /// keyframe planned for it after this reaches the page behind the hello, and one planned
+    /// before is not sent it.
+    pub fn start_over(&self, now: Instant, hello: ServerMessage) {
         let mut v = self.viewing.lock();
         v.forget(now);
         v.viewer = restarted(v.viewer);
+        self.send(Out::Text(hello));
     }
 
     /// At `now` a capture goes to the viewers that have room. One that has started and
@@ -873,8 +877,7 @@ impl Hub {
     pub fn restart_clients(&self, now: Instant) {
         let hello = self.hello();
         for c in self.clients.lock().iter() {
-            c.start_over(now);
-            c.send(Out::Text(hello.clone()));
+            c.start_over(now, hello.clone());
         }
     }
 
@@ -922,9 +925,11 @@ mod tests {
         Watch(usize),
         /// `v,0` (server.rs).
         StopWatching(usize),
-        /// `kf`, and the hello after a failed display switch, which runs the same lines
-        /// (server.rs).
+        /// `kf` (server.rs).
         AskKeyframe(usize),
+        /// The hello after a failed display switch (server.rs): the stream starts over for
+        /// this client alone, and what the encoder holds is still sent.
+        StartOver(usize),
         /// A recording begins (record.rs): only on a client nothing has been done to.
         Record(usize),
         /// A capture finds a client that has started, with frames in flight, stalled, and
@@ -943,13 +948,15 @@ mod tests {
         Ack(usize),
     }
 
-    const STEPS: [Step; 16] = [
+    const STEPS: [Step; 18] = [
         Step::Watch(0),
         Step::Watch(1),
         Step::StopWatching(0),
         Step::StopWatching(1),
         Step::AskKeyframe(0),
         Step::AskKeyframe(1),
+        Step::StartOver(0),
+        Step::StartOver(1),
         Step::Record(0),
         Step::Record(1),
         Step::Stall(0),
@@ -998,6 +1005,14 @@ mod tests {
             Step::Stall(i) => c[i].0 = Behind,
             Step::StopWatching(i) => c[i].0 = NotWatching,
             Step::AskKeyframe(i) => c[i] = asked(c[i]),
+            // Starting over: one that watches waits for a keyframe of what follows; its
+            // frames on their way no longer count.
+            Step::StartOver(i) => {
+                if c[i].0 != NotWatching {
+                    c[i].0 = Waiting;
+                }
+                c[i].1 = 0;
+            }
             Step::Restart => {
                 for c in c.iter_mut() {
                     if c.0 != NotWatching {
@@ -1046,6 +1061,7 @@ mod tests {
         if let Step::Watch(i)
         | Step::StopWatching(i)
         | Step::AskKeyframe(i)
+        | Step::StartOver(i)
         | Step::Record(i)
         | Step::Stall(i)
         | Step::Ack(i) = step
@@ -1076,6 +1092,7 @@ mod tests {
             Step::Watch(_)
             | Step::StopWatching(_)
             | Step::AskKeyframe(_)
+            | Step::StartOver(_)
             | Step::Ack(_)
             | Step::Restart => true,
         }
@@ -1110,6 +1127,7 @@ mod tests {
             Step::Watch(i) | Step::Record(i) => c[i].watch(t0),
             Step::StopWatching(i) => c[i].stop_watching(),
             Step::AskKeyframe(i) => c[i].ask_keyframe(),
+            Step::StartOver(i) => c[i].start_over(t0, hub.hello()),
             Step::Stall(i) => {
                 // Its frames went at `t0`: it has stalled `STALLED` later.
                 c[i].falls_behind(t0 + crate::video::STALLED);
@@ -1180,12 +1198,14 @@ mod tests {
 
     /// A viewer starts only on a whole keyframe promised it, is sent frames only once
     /// started, and is started in the end. Over every state two clients and the encoder
-    /// reach in up to 12 of the hub's steps (`v,1`, `v,0`, `kf`, a recording on a new
-    /// client, a stall, `restart_clients`, a capture, a frame sent, an ack), breadth first,
+    /// reach in up to 12 of the hub's steps (`v,1`, `v,0`, `kf`, a hello after a failed
+    /// display switch, a recording on a new client, a stall, `restart_clients`, a capture, a
+    /// frame sent, an ack), breadth first,
     /// every step from every state, run on a real hub's clients through the methods: each
     /// step does what the rule says, the hub reads each client as its value is, a client
     /// that starts was promised a keyframe and was sent a whole one, a request for a keyframe
-    /// already promised changes nothing, and from every state,
+    /// already promised changes nothing, one whose stream starts over is not started by a
+    /// keyframe planned before, and from every state,
     /// once the encoder has sent what it holds, one capture and its keyframe sent whole
     /// start every viewer watching.
     #[test]
@@ -1202,6 +1222,8 @@ mod tests {
         // Viewers that asked for a keyframe with frames on their way, and while one was
         // promised them.
         let (mut asked_with_frames, mut asked_while_promised) = (0, 0);
+        // Clients whose stream started over while a keyframe was promised them.
+        let mut started_over_while_promised = 0;
         for _depth in 0..12 {
             let mut next = vec![];
             for before in frontier {
@@ -1235,6 +1257,14 @@ mod tests {
                     // A viewer that asks for a keyframe is promised one by the next capture,
                     // whatever is on its way; one already promised one keeps that promise,
                     // and its request changes nothing.
+                    // One whose stream starts over waits for a keyframe of what follows,
+                    // even one promised a keyframe that may already be on its way.
+                    if let Step::StartOver(i) = step {
+                        if before.c[i].0 == Viewer::Promised {
+                            assert_eq!(after.c[i].0, Viewer::Waiting, "{what}");
+                            started_over_while_promised += 1;
+                        }
+                    }
                     if let Step::AskKeyframe(i) = step {
                         if before.c[i].0 == Viewer::Promised {
                             assert_eq!(after.c, before.c, "{what}");
@@ -1289,8 +1319,11 @@ mod tests {
             seen.iter().flat_map(|m| m.c.map(|c| c.0)).collect();
         assert_eq!(reached.len(), 5, "{reached:?}");
         assert!(
-            steps > 0 && asked_with_frames > 0 && asked_while_promised > 0,
-            "{asked_with_frames} {asked_while_promised}"
+            steps > 0
+                && asked_with_frames > 0
+                && asked_while_promised > 0
+                && started_over_while_promised > 0,
+            "{asked_with_frames} {asked_while_promised} {started_over_while_promised}"
         );
     }
 

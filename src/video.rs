@@ -6130,7 +6130,7 @@ mod tests {
                     .collect();
                 now += Duration::from_secs(60);
                 for (c, frames) in viewers.iter().zip(&picked) {
-                    c.start_over(now - Duration::from_secs(40));
+                    c.start_over(now - Duration::from_secs(40), hub.hello());
                     for &(age, bytes) in frames.iter() {
                         c.fly(hub.timeline.number(), now - age, bytes);
                     }
