@@ -112,7 +112,9 @@ DISPLAY=:1 ./target/release/voxl --port=6901
 
 Start Xvfb with `-shmem` for zero-copy capture, and use the patched Xvfb
 (`nix-build -E 'with import <nixpkgs> {}; callPackage ./xvfb.nix {}'`) for smooth
-scrolling. voxl accepts selkies' command-line flags; other selkies flags are ignored.
+scrolling. A held key repeats as the viewer's keyboard repeats it, so while voxl runs no
+keyboard on its X server autorepeats, and if voxl crashes that stays so until the X server
+restarts. voxl accepts selkies' command-line flags; other selkies flags are ignored.
 `voxl --help` lists every flag with its default, and `voxl --version` prints the version.
 
 | Flag                                                           | Default                            |                                                                                                                   |

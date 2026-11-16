@@ -8,6 +8,15 @@ use std::collections::HashMap;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+/// What a viewer's key did. Its own keyboard decides when a held key repeats.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum KeyAct {
+    Down,
+    /// The viewer's keyboard repeated the key it holds.
+    Repeat,
+    Up,
+}
+
 pub enum InputEvent {
     /// A desktop pixel, in 16 bits as X's coordinates are; a CGFloat holds every one.
     Move {
@@ -25,7 +34,7 @@ pub enum InputEvent {
     },
     Key {
         keysym: u32,
-        down: bool,
+        act: KeyAct,
     },
     /// Remote clipboard update, ordered with the key events around it.
     Clipboard(super::desktop::ClipContent),
@@ -312,7 +321,7 @@ impl Injector {
                 }
                 self.post(e);
             }
-            InputEvent::Key { keysym, down } => self.key(keysym, down),
+            InputEvent::Key { keysym, act } => self.key(keysym, act),
             InputEvent::Clipboard(content) => {
                 if let Some(c) = &self.clipboard {
                     c.set_blocking(content);
@@ -326,11 +335,14 @@ impl Injector {
         }
     }
 
-    fn key(&mut self, keysym: u32, down: bool) {
+    fn key(&mut self, keysym: u32, act: KeyAct) {
         if let Some((kc, flag)) = modifier(keysym) {
-            if down == self.mods.contains_key(&keysym) {
-                return;
-            }
+            let down = match (act, self.mods.contains_key(&keysym)) {
+                (KeyAct::Down, false) => true,
+                (KeyAct::Up, true) => false,
+                // Down or up already, or repeated: a modifier is sent once, held or not.
+                (KeyAct::Down, true) | (KeyAct::Up, false) | (KeyAct::Repeat, _) => return,
+            };
             if down {
                 self.mods.insert(keysym, flag);
             } else {
@@ -347,17 +359,23 @@ impl Injector {
             }
             return;
         }
-        if !down {
-            if let Some((kc, extra)) = self.pressed.remove(&keysym) {
+        match (act, self.pressed.get(&keysym).copied()) {
+            (KeyAct::Down, None) => self.key_down(keysym),
+            (KeyAct::Repeat, Some((kc, extra))) => {
+                self.key_event(kc, true, self.flags() | extra, true)
+            }
+            (KeyAct::Up, Some((kc, extra))) => {
+                self.pressed.remove(&keysym);
                 self.key_event(kc, false, self.flags() | extra, false);
             }
-            return;
+            // Down already (a second viewer, or a page that sends repeats as downs), or
+            // not down at all.
+            (KeyAct::Down, Some(_)) | (KeyAct::Repeat, None) | (KeyAct::Up, None) => {}
         }
-        if let Some(&(kc, extra)) = self.pressed.get(&keysym) {
-            // Autorepeat.
-            self.key_event(kc, true, self.flags() | extra, true);
-            return;
-        }
+    }
+
+    /// A key going down that isn't held.
+    fn key_down(&mut self, keysym: u32) {
         if let Some(kc) = named(keysym) {
             self.pressed.insert(keysym, (kc, 0));
             self.key_event(kc, true, self.flags(), false);
@@ -411,7 +429,7 @@ impl Injector {
             self.key_event(kc, false, self.flags() | extra, false);
         }
         for ks in self.mods.keys().copied().collect::<Vec<_>>() {
-            self.key(ks, false);
+            self.key(ks, KeyAct::Up);
         }
         for button in crate::server::Button::ALL {
             if self.buttons[usize::from(button.number())] {

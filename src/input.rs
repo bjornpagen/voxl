@@ -1,15 +1,30 @@
 //! Input injection via XTEST. Keys arrive as keysyms; they are resolved against the
 //! server keymap, falling back to temporarily remapped spare keycodes for symbols the
 //! layout lacks or that need a shift level the client isn't holding.
+//!
+//! A held key repeats when the viewer's keyboard repeats it, never on the X server's
+//! timer: that timer runs until the key-up arrives, so a key-up held up on the network
+//! typed characters the viewer never sent. While voxl runs, no keyboard on its X server
+//! autorepeats (see `repeat_off`).
 
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
-use x11rb::connection::Connection;
+use x11rb::connection::{Connection, RequestConnection as _};
+use x11rb::protocol::xkb::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{self, ConnectionExt as _};
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
+
+/// What a viewer's key did. Its own keyboard decides when a held key repeats.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum KeyAct {
+    Down,
+    /// The viewer's keyboard repeated the key it holds.
+    Repeat,
+    Up,
+}
 
 pub enum InputEvent {
     /// A desktop pixel, in X's own 16-bit coordinates.
@@ -28,7 +43,7 @@ pub enum InputEvent {
     },
     Key {
         keysym: u32,
-        down: bool,
+        act: KeyAct,
     },
     /// Remote clipboard update, ordered with the key events around it.
     Clipboard(crate::desktop::ClipContent),
@@ -37,12 +52,165 @@ pub enum InputEvent {
     Shutdown,
 }
 
-enum ShiftFix {
-    None,
-    /// Symbol lives on the shifted level but no Shift is held.
-    Add,
-    /// Symbol lives on the plain level but Shift is held.
-    Lift,
+/// Where a key's symbol is on its keycode, which decides the Shift it is pressed with.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Level {
+    /// The same with Shift or without (function keys, a remapped spare keycode).
+    Either,
+    /// Without Shift: Shift held by the viewer is let go around the press.
+    Plain,
+    /// With Shift: Shift is pressed around it unless the viewer holds one.
+    Shifted,
+}
+
+/// A key a viewer holds, as X has it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Held {
+    /// In X's modifier map: pressed as it is, and never repeated (X never repeats one).
+    Modifier(u8),
+    /// Pressed, and pressed again on each repeat, with the Shift its symbol needs given
+    /// the Shift keys held at that moment.
+    Key { keycode: u8, level: Level },
+}
+
+impl Held {
+    fn keycode(self) -> u8 {
+        match self {
+            Held::Modifier(keycode) | Held::Key { keycode, .. } => keycode,
+        }
+    }
+}
+
+/// One XTEST key event.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Stroke {
+    Press(u8),
+    Release(u8),
+}
+
+/// What a viewer's key event does: the key events X gets, and what is held for its
+/// keysym afterwards.
+#[derive(Debug, PartialEq)]
+struct Outcome {
+    strokes: Vec<Stroke>,
+    held: Option<Held>,
+}
+
+/// A viewer's key event, from what is held for its keysym. `find` names the key X has for
+/// the symbol; it is asked only for a key going down that isn't held, since finding one
+/// can remap a spare keycode. `shift` is the keycode pressed for a shifted symbol when the
+/// viewer holds no Shift, and `shifts` the Shift keys it holds.
+fn key_event(
+    held: Option<Held>,
+    act: KeyAct,
+    find: impl FnOnce() -> Option<Held>,
+    shift: u8,
+    shifts: &[u8],
+) -> Outcome {
+    let nothing = |held| Outcome {
+        strokes: vec![],
+        held,
+    };
+    match (act, held) {
+        (KeyAct::Down, None) => match find() {
+            Some(key) => Outcome {
+                strokes: press(key, shift, shifts),
+                held: Some(key),
+            },
+            // Neither the layout nor a spare keycode can type it.
+            None => nothing(None),
+        },
+        // Down already: a second viewer holding the same key, or a page that sends its
+        // repeats as downs. X itself drops a second press of a key that is down.
+        (KeyAct::Down, Some(_)) => nothing(held),
+        // Its down named a symbol X cannot type, or it was let go (ReleaseAll).
+        (KeyAct::Repeat, None) => nothing(None),
+        // X never repeats a modifier; a repeat would be a release and a press of it.
+        (KeyAct::Repeat, Some(Held::Modifier(_))) => nothing(held),
+        // X takes no press from XTEST as a repeat (a press of a key that is down is
+        // dropped), so a repeat is a release and a press.
+        (KeyAct::Repeat, Some(key @ Held::Key { keycode, .. })) => Outcome {
+            strokes: std::iter::once(Stroke::Release(keycode))
+                .chain(press(key, shift, shifts))
+                .collect(),
+            held,
+        },
+        // As for a repeat of a key that isn't held.
+        (KeyAct::Up, None) => nothing(None),
+        (KeyAct::Up, Some(key)) => Outcome {
+            strokes: vec![Stroke::Release(key.keycode())],
+            held: None,
+        },
+    }
+}
+
+/// Presses `key` so it types its symbol, given the Shift keys held (`shifts`); `shift`
+/// is the keycode pressed for a shifted symbol when none is.
+fn press(key: Held, shift: u8, shifts: &[u8]) -> Vec<Stroke> {
+    let (keycode, level) = match key {
+        Held::Modifier(keycode) => (keycode, Level::Either),
+        Held::Key { keycode, level } => (keycode, level),
+    };
+    match (level, shifts.is_empty()) {
+        (Level::Either, _) | (Level::Plain, true) | (Level::Shifted, false) => {
+            vec![Stroke::Press(keycode)]
+        }
+        (Level::Shifted, true) => vec![
+            Stroke::Press(shift),
+            Stroke::Press(keycode),
+            Stroke::Release(shift),
+        ],
+        (Level::Plain, false) => shifts
+            .iter()
+            .map(|&s| Stroke::Release(s))
+            .chain([Stroke::Press(keycode)])
+            .chain(shifts.iter().map(|&s| Stroke::Press(s)))
+            .collect(),
+    }
+}
+
+/// Turns the X server's autorepeat off for every key, and returns the per-key bits it
+/// found, to put back at shutdown.
+///
+/// The repeats of a key XTEST holds come from the core keyboard's timer, whose per-key
+/// bits every keyboard attached to it shares: none of them repeats while voxl runs, and
+/// after a crash they stay so until the X server restarts. The per-key bits rather than
+/// the global switch or the RepeatKeys control, because desktop settings daemons
+/// (xfsettingsd) turn those back on.
+fn repeat_off(conn: &RustConnection) -> Result<[u8; 32], String> {
+    let xkb = conn
+        .xkb_use_extension(1, 0)
+        .map_err(|e| e.to_string())?
+        .reply()
+        .map_err(|e| e.to_string())?;
+    if !xkb.supported {
+        return Err(format!(
+            "the X server's XKB is {}.{}, older than 1.0",
+            xkb.server_major, xkb.server_minor
+        ));
+    }
+    let found = conn
+        .xkb_get_controls(xkb::ID::USE_CORE_KBD.into())
+        .map_err(|e| e.to_string())?
+        .reply()
+        .map_err(|e| e.to_string())?
+        .per_key_repeat;
+    set_repeat(conn, &[0; 32]).map_err(|e| e.to_string())?;
+    Ok(found)
+}
+
+/// Sets the core keyboard's per-key autorepeat bits, and no other control.
+fn set_repeat(
+    conn: &RustConnection,
+    bits: &[u8; 32],
+) -> Result<(), x11rb::errors::ConnectionError> {
+    conn.send_trait_request_without_reply(xkb::SetControlsRequest {
+        device_spec: xkb::ID::USE_CORE_KBD.into(),
+        change_controls: xkb::Control::PER_KEY_REPEAT,
+        per_key_repeat: std::borrow::Cow::Borrowed(bits),
+        ..Default::default()
+    })?;
+    Ok(())
 }
 
 fn scratch_file(display: Option<&str>) -> std::path::PathBuf {
@@ -174,9 +342,13 @@ struct Injector {
     scratch: Vec<u8>,
     /// keysym -> scratch keycode currently mapped (with last-use time).
     scratch_map: HashMap<u32, (u8, Instant)>,
-    pressed: HashMap<u32, u8>,
+    /// Keycodes in X's modifier map.
+    modifiers: Vec<u8>,
+    /// The per-key autorepeat bits as voxl found them, put back at shutdown.
+    repeat: [u8; 32],
+    /// keysym -> the key a viewer holds for it.
+    pressed: HashMap<u32, Held>,
     buttons: [bool; 16],
-    shift_down: u32,
     clipboard: Option<crate::desktop::ClipboardHandle>,
     smooth: Option<SmoothScroll>,
     /// Scroll units (120 per notch) not yet sent: fractions, or partial notches
@@ -193,6 +365,7 @@ impl Injector {
         let root = conn.setup().roots[n].root;
         let min_kc = conn.setup().min_keycode;
         let max_kc = conn.setup().max_keycode;
+        let repeat = repeat_off(&conn)?;
         let mut me = Injector {
             conn,
             root,
@@ -202,9 +375,10 @@ impl Injector {
             lookup: HashMap::new(),
             scratch: vec![],
             scratch_map: HashMap::new(),
+            modifiers: vec![],
+            repeat,
             pressed: HashMap::new(),
             buttons: [false; 16],
-            shift_down: 0,
             clipboard: None,
             smooth: None,
             scroll_acc: (0.0, 0.0),
@@ -250,6 +424,17 @@ impl Injector {
             .map_err(|e| e.to_string())?;
         self.per = r.keysyms_per_keycode as usize;
         self.syms = r.keysyms;
+        // Eight modifiers' keycodes, 0 where a modifier has fewer than the most.
+        self.modifiers = self
+            .conn
+            .get_modifier_mapping()
+            .map_err(|e| e.to_string())?
+            .reply()
+            .map_err(|e| e.to_string())?
+            .keycodes
+            .into_iter()
+            .filter(|&kc| kc != 0)
+            .collect();
         self.lookup.clear();
         self.scratch.clear();
         for i in 0..count as usize {
@@ -290,31 +475,27 @@ impl Injector {
             .xtest_fake_input(ty, detail, x11rb::CURRENT_TIME, self.root, x, y, 0);
     }
 
-    fn resolve(&mut self, keysym: u32) -> (u8, ShiftFix) {
-        let want_level = if self.shift_down > 0 { 1 } else { 0 };
+    /// The keycode that types `keysym` and the level it is on, if X has one or a spare
+    /// keycode can be mapped to it.
+    fn resolve(&mut self, keysym: u32) -> Option<(u8, Level)> {
         if let Some(&(kc, lvl)) = self.lookup.get(&keysym) {
             let row = self.row(kc);
             let l0 = row[0];
             let l1 = if row.len() > 1 { row[1] } else { 0 };
             let shift_neutral = l1 == 0 || l0 == l1 || (0xfd00..0x10000).contains(&keysym);
-            if lvl == want_level || shift_neutral {
-                return (kc, ShiftFix::None);
-            }
-            return (
-                kc,
-                if lvl == 1 {
-                    ShiftFix::Add
-                } else {
-                    ShiftFix::Lift
-                },
-            );
+            let level = match (shift_neutral, lvl) {
+                (true, _) => Level::Either,
+                (false, 0) => Level::Plain,
+                (false, _) => Level::Shifted,
+            };
+            return Some((kc, level));
         }
         if let Some((kc, t)) = self.scratch_map.get_mut(&keysym) {
             *t = Instant::now();
-            return (*kc, ShiftFix::None);
+            return Some((*kc, Level::Either));
         }
         if self.scratch.is_empty() {
-            return (0, ShiftFix::None);
+            return None;
         }
         // Map the keysym onto a spare keycode at every level.
         let kc = if self.scratch_map.len() < self.scratch.len() {
@@ -344,7 +525,46 @@ impl Injector {
             .map(|(k, _)| k.to_string())
             .collect();
         let _ = std::fs::write(&self.scratch_path, used.join(" "));
-        (kc, ShiftFix::None)
+        Some((kc, Level::Either))
+    }
+
+    /// The keycodes of the Shift keys viewers hold.
+    fn shifts(&self) -> Vec<u8> {
+        [SHIFT_L, SHIFT_R]
+            .iter()
+            .filter_map(|k| self.pressed.get(k))
+            .map(|h| h.keycode())
+            .collect()
+    }
+
+    fn stroke(&self, stroke: Stroke) {
+        match stroke {
+            Stroke::Press(kc) => self.fake(xproto::KEY_PRESS_EVENT, kc, 0, 0),
+            Stroke::Release(kc) => self.fake(xproto::KEY_RELEASE_EVENT, kc, 0, 0),
+        }
+    }
+
+    /// The key X has for `keysym`, if the layout or a spare keycode can type it.
+    fn find(&mut self, keysym: u32) -> Option<Held> {
+        let (keycode, level) = self.resolve(keysym)?;
+        Some(if self.modifiers.contains(&keycode) {
+            Held::Modifier(keycode)
+        } else {
+            Held::Key { keycode, level }
+        })
+    }
+
+    fn key(&mut self, keysym: u32, act: KeyAct) {
+        let held = self.pressed.get(&keysym).copied();
+        let (shift, shifts) = (self.shift_kc, self.shifts());
+        let out = key_event(held, act, || self.find(keysym), shift, &shifts);
+        match out.held {
+            Some(held) => self.pressed.insert(keysym, held),
+            None => self.pressed.remove(&keysym),
+        };
+        for s in out.strokes {
+            self.stroke(s);
+        }
     }
 
     fn restore_keymap(&mut self) {
@@ -414,50 +634,7 @@ impl Injector {
                     self.wheel(nx.clamp(-most, most) as i8, (6, 7));
                 }
             }
-            InputEvent::Key { keysym, down } => {
-                if down {
-                    if self.pressed.contains_key(&keysym) {
-                        // Autorepeat: re-press without release is fine for X.
-                        let kc = self.pressed[&keysym];
-                        self.fake(xproto::KEY_PRESS_EVENT, kc, 0, 0);
-                        return;
-                    }
-                    let (kc, fix) = self.resolve(keysym);
-                    if kc == 0 {
-                        return;
-                    }
-                    if keysym == SHIFT_L || keysym == SHIFT_R {
-                        self.shift_down += 1;
-                    }
-                    self.pressed.insert(keysym, kc);
-                    match fix {
-                        ShiftFix::None => self.fake(xproto::KEY_PRESS_EVENT, kc, 0, 0),
-                        ShiftFix::Add => {
-                            self.fake(xproto::KEY_PRESS_EVENT, self.shift_kc, 0, 0);
-                            self.fake(xproto::KEY_PRESS_EVENT, kc, 0, 0);
-                            self.fake(xproto::KEY_RELEASE_EVENT, self.shift_kc, 0, 0);
-                        }
-                        ShiftFix::Lift => {
-                            let held: Vec<u8> = [SHIFT_L, SHIFT_R]
-                                .iter()
-                                .filter_map(|k| self.pressed.get(k).copied())
-                                .collect();
-                            for &h in &held {
-                                self.fake(xproto::KEY_RELEASE_EVENT, h, 0, 0);
-                            }
-                            self.fake(xproto::KEY_PRESS_EVENT, kc, 0, 0);
-                            for &h in &held {
-                                self.fake(xproto::KEY_PRESS_EVENT, h, 0, 0);
-                            }
-                        }
-                    }
-                } else if let Some(kc) = self.pressed.remove(&keysym) {
-                    if keysym == SHIFT_L || keysym == SHIFT_R {
-                        self.shift_down = self.shift_down.saturating_sub(1);
-                    }
-                    self.fake(xproto::KEY_RELEASE_EVENT, kc, 0, 0);
-                }
-            }
+            InputEvent::Key { keysym, act } => self.key(keysym, act),
             InputEvent::Clipboard(text) => {
                 if let Some(c) = &self.clipboard {
                     c.set_blocking(text);
@@ -466,12 +643,13 @@ impl Injector {
             InputEvent::Shutdown => {
                 self.handle(InputEvent::ReleaseAll);
                 self.restore_keymap();
+                let _ = set_repeat(&self.conn, &self.repeat);
+                let _ = self.conn.sync();
             }
             InputEvent::ReleaseAll => {
-                for (_, kc) in std::mem::take(&mut self.pressed) {
-                    self.fake(xproto::KEY_RELEASE_EVENT, kc, 0, 0);
+                for (_, held) in std::mem::take(&mut self.pressed) {
+                    self.stroke(Stroke::Release(held.keycode()));
                 }
-                self.shift_down = 0;
                 for b in 1..self.buttons.len() {
                     if self.buttons[b] {
                         self.buttons[b] = false;
@@ -520,4 +698,190 @@ pub fn spawn(
         })
         .unwrap();
     Ok(tx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use Stroke::{Press, Release};
+
+    const A: u8 = 38;
+    const ONE: u8 = 10;
+    const SHIFT_L_KC: u8 = 50;
+    const SHIFT_R_KC: u8 = 62;
+    const PLAIN: Held = Held::Key {
+        keycode: A,
+        level: Level::Plain,
+    };
+    const SHIFTED: Held = Held::Key {
+        keycode: ONE,
+        level: Level::Shifted,
+    };
+    const SHIFT: Held = Held::Modifier(SHIFT_L_KC);
+
+    fn event(held: Option<Held>, act: KeyAct, found: Option<Held>, shifts: &[u8]) -> Outcome {
+        key_event(held, act, || found, SHIFT_L_KC, shifts)
+    }
+
+    fn outcome(strokes: &[Stroke], held: Option<Held>) -> Outcome {
+        Outcome {
+            strokes: strokes.to_vec(),
+            held,
+        }
+    }
+
+    /// Every cell of the table: down, repeat and up, against a key that isn't held, a held
+    /// key and a held modifier.
+    #[test]
+    fn each_key_event_does_what_the_table_says() {
+        let down = KeyAct::Down;
+        let repeat = KeyAct::Repeat;
+        let up = KeyAct::Up;
+        assert_eq!(
+            event(None, down, Some(PLAIN), &[]),
+            outcome(&[Press(A)], Some(PLAIN))
+        );
+        assert_eq!(event(None, down, None, &[]), outcome(&[], None));
+        assert_eq!(
+            event(Some(PLAIN), down, None, &[]),
+            outcome(&[], Some(PLAIN))
+        );
+        assert_eq!(
+            event(Some(SHIFT), down, None, &[]),
+            outcome(&[], Some(SHIFT))
+        );
+        assert_eq!(event(None, repeat, None, &[]), outcome(&[], None));
+        assert_eq!(
+            event(Some(PLAIN), repeat, None, &[]),
+            outcome(&[Release(A), Press(A)], Some(PLAIN))
+        );
+        assert_eq!(
+            event(Some(SHIFT), repeat, None, &[SHIFT_L_KC]),
+            outcome(&[], Some(SHIFT))
+        );
+        assert_eq!(event(None, up, None, &[]), outcome(&[], None));
+        assert_eq!(
+            event(Some(PLAIN), up, None, &[]),
+            outcome(&[Release(A)], None)
+        );
+        assert_eq!(
+            event(Some(SHIFT), up, None, &[SHIFT_L_KC]),
+            outcome(&[Release(SHIFT_L_KC)], None)
+        );
+    }
+
+    /// A symbol's Shift is decided by the Shift keys held when it is pressed, so a repeat
+    /// after the viewer pressed or let go of Shift still types the same symbol.
+    #[test]
+    fn a_key_is_pressed_with_the_shift_its_symbol_needs() {
+        let either = Held::Key {
+            keycode: A,
+            level: Level::Either,
+        };
+        let shifts = [SHIFT_L_KC, SHIFT_R_KC];
+        assert_eq!(press(either, SHIFT_L_KC, &[]), [Press(A)]);
+        assert_eq!(press(either, SHIFT_L_KC, &shifts), [Press(A)]);
+        assert_eq!(press(PLAIN, SHIFT_L_KC, &[]), [Press(A)]);
+        assert_eq!(
+            press(PLAIN, SHIFT_L_KC, &shifts),
+            [
+                Release(SHIFT_L_KC),
+                Release(SHIFT_R_KC),
+                Press(A),
+                Press(SHIFT_L_KC),
+                Press(SHIFT_R_KC)
+            ]
+        );
+        assert_eq!(
+            press(SHIFTED, SHIFT_L_KC, &[]),
+            [Press(SHIFT_L_KC), Press(ONE), Release(SHIFT_L_KC)]
+        );
+        assert_eq!(press(SHIFTED, SHIFT_L_KC, &[SHIFT_R_KC]), [Press(ONE)]);
+        assert_eq!(press(SHIFT, SHIFT_L_KC, &[SHIFT_R_KC]), [Press(SHIFT_L_KC)]);
+    }
+
+    /// Every sequence of up to six key events over 'a', '!' (shifted, on the '1' key) and
+    /// Shift, carried out as `Injector::key` does. The oracle is a model with no `Held`
+    /// in it: a key is held from a down until its up. After every event X's keys are
+    /// valid (nothing pressed twice or released while up) and exactly the held keys are
+    /// down; and a key's own keycode is pressed once for a down of a key not held and
+    /// once for a repeat of a held key that isn't a modifier, never otherwise.
+    #[test]
+    fn x_holds_exactly_what_the_viewer_holds_and_types_each_repeat_once() {
+        const KEYS: [(u32, Held); 3] = [(0x61, PLAIN), (0x21, SHIFTED), (SHIFT_L, SHIFT)];
+        const ACTS: [KeyAct; 3] = [KeyAct::Down, KeyAct::Repeat, KeyAct::Up];
+
+        #[derive(Clone, Default)]
+        struct State {
+            pressed: HashMap<u32, Held>,
+            /// The model: the keysyms the viewer holds.
+            viewer: Vec<u32>,
+            /// The keycodes X has down, from the key events sent.
+            x: Vec<u8>,
+        }
+
+        fn walk(state: &State, depth: usize, events: &mut Vec<(u32, KeyAct)>, seen: &mut usize) {
+            if depth == 0 {
+                return;
+            }
+            for (keysym, key) in KEYS {
+                for act in ACTS {
+                    let mut st = state.clone();
+                    events.push((keysym, act));
+                    *seen += 1;
+                    let shifts: Vec<u8> = [SHIFT_L, SHIFT_R]
+                        .iter()
+                        .filter_map(|k| st.pressed.get(k))
+                        .map(|h| h.keycode())
+                        .collect();
+                    let held = st.pressed.get(&keysym).copied();
+                    let out = key_event(held, act, || Some(key), SHIFT_L_KC, &shifts);
+                    match out.held {
+                        Some(h) => st.pressed.insert(keysym, h),
+                        None => st.pressed.remove(&keysym),
+                    };
+                    for &s in &out.strokes {
+                        match s {
+                            Press(kc) => {
+                                assert!(!st.x.contains(&kc), "{kc} pressed twice: {events:?}");
+                                st.x.push(kc);
+                            }
+                            Release(kc) => {
+                                assert!(st.x.contains(&kc), "{kc} released while up: {events:?}");
+                                st.x.retain(|&k| k != kc);
+                            }
+                        }
+                    }
+                    let was_held = st.viewer.contains(&keysym);
+                    match act {
+                        KeyAct::Down if !was_held => st.viewer.push(keysym),
+                        KeyAct::Up => st.viewer.retain(|&k| k != keysym),
+                        _ => {}
+                    }
+                    let mut want: Vec<u8> = st
+                        .viewer
+                        .iter()
+                        .map(|k| KEYS.iter().find(|(ks, _)| ks == k).unwrap().1.keycode())
+                        .collect();
+                    let mut got = st.x.clone();
+                    want.sort();
+                    got.sort();
+                    assert_eq!(got, want, "X's keys after {events:?}");
+                    let typed = out.strokes.iter().filter(|&&s| s == Press(key.keycode()));
+                    let once = match (act, key) {
+                        (KeyAct::Down, _) => !was_held,
+                        (KeyAct::Repeat, Held::Key { .. }) => was_held,
+                        (KeyAct::Repeat, Held::Modifier(_)) | (KeyAct::Up, _) => false,
+                    };
+                    assert_eq!(typed.count(), usize::from(once), "{events:?}");
+                    walk(&st, depth - 1, events, seen);
+                    events.pop();
+                }
+            }
+        }
+
+        let mut seen = 0;
+        walk(&State::default(), 6, &mut Vec::new(), &mut seen);
+        assert_eq!(seen, (1..=6).map(|n| 9usize.pow(n)).sum::<usize>());
+    }
 }
