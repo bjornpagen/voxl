@@ -68,7 +68,6 @@ import heapq
 import json
 import math
 import os
-import random
 import sys
 import time
 import urllib.request
@@ -233,7 +232,6 @@ async def main():
     # screen would be whatever was on it.
     if a.fifo is None and any(kind == "term" for kind, _ in PREPARE.get(a.scenario, []) + SCENARIOS[a.scenario]):
         ap.error(f"{a.scenario} prints to a terminal on the benchmark display: give --fifo")
-    holds = random.Random(f"{a.seed}:hold")
     path = link.Path(a, link.rate(a.kbps * 1000.0), a.rtt / 2000.0)
     down, up = path.down, path.up
     stats_url = a.stats or f"http://{a.hostport}/stats"
@@ -342,7 +340,7 @@ async def main():
                     continue
                 # The frame's last part is in: hold it for decode and draw, then ack.
                 del frames[fid]
-                hold = 0.002 + f["bytes"] / 1e7 + holds.uniform(0, 0.008) if a.hold else 0.003
+                hold = 0.002 + f["bytes"] / 1e7 + path.holds.uniform(0, 0.008) if a.hold else 0.003
                 leaves, ack_at = up.send(at + hold)
                 acks.write(f"{fid}\t{at:.4f}\t{ack_at:.4f}\t{hold * 1000:.1f}\t{(leaves - at - hold) * 1000:.1f}\n")
                 schedule(ack_at, f"a,{fid},{hold * 1000:.1f}")

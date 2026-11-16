@@ -203,12 +203,15 @@ def add_options(ap):
 
 class Path:
     """One connection's link, as `add_options` parsed it: `down`, `up`, the `rate` and
-    the `stalls` both directions share."""
+    the `stalls` both directions share; and `holds`, the stream a viewer draws its decode
+    holds from. Every stream a run draws from is made here, each under its own key, so
+    that no two kinds of draw share numbers."""
 
     def __init__(self, a, rate, owd):
         self.rate, self.stalls = rate, a.stall
         self.down = Down(rate, owd, a.stall, Jitter(a.jitter / 1000, random.Random(f"{a.seed}:jitter")))
         self.up = Up(owd, a.stall, LATE[a.late](random.Random(f"{a.seed}:late")))
+        self.holds = random.Random(f"{a.seed}:hold")
 
 
 # How far the oracle may differ from the model: a message is handed over within one tick
@@ -258,8 +261,10 @@ def _check(seed=0x5EED):
       table, `page` without its top 1 % and `page-99` with it. It does not kill a cut of
       the top 0.1 % (four values).
     - One stream for each kind of draw: the same answers, with and without `--jitter`,
-      leave at the same times. It kills jitter and lateness drawn from one stream. It does
-      not kill the decode holds sharing it (linkviewer.py draws those itself).
+      leave at the same times; and the jitter, the lateness and the holds start with
+      different numbers. It kills jitter and lateness drawn from one stream, and any two
+      kinds seeded under one key. It does not kill a kind seeded under another's key but
+      one draw ahead of it.
     - `Up` against the contract of a page that answers in order: no answer leaves before
       its own lateness, none overtakes the one before, each leaves at its own time or with
       the one before, and it crosses at the first moment out of a stall. It kills answers
@@ -369,6 +374,16 @@ def _check(seed=0x5EED):
         jittery.down.send(now, 9000)
         if quiet.up.send(now) != jittery.up.send(now):
             sys.exit("an answer leaves at another time when the link jitters: one stream for two kinds of draw")
+    # No two kinds of draw are seeded alike: each stream's first numbers differ from every
+    # other's (drawn from copies, so the path's own are untouched).
+    path = _path(["--late", "page", "--jitter", "5", "--seed", str(seed)], 1e6, 0.0)
+    firsts = []
+    for stream in (path.down.jitter.rng, path.up.late.rng, path.holds):
+        twin_stream = random.Random()
+        twin_stream.setstate(stream.getstate())
+        firsts.append(tuple(twin_stream.getrandbits(64) for _ in range(4)))
+    if len(set(firsts)) != len(firsts):
+        sys.exit("two kinds of draw are seeded alike: their streams start with the same numbers")
     # Answers given in order, each with its own lateness, through a path that stalls. The
     # oracle draws the same lateness from the measured values in its own stream, seeded as
     # the tools seed theirs.
