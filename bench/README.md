@@ -85,9 +85,12 @@ is its log. CBR from 30 Mbps, with congestion control down to 2 Mbps.
   `shaper.py`). Needs the `daytona` SDK and `DAYTONA_API_KEY`.
 - `suite.sh`: every config (`CONFIGS`: selkies with and without picom, voxl and
   KasmVNC with and without picom) x workload
-  (Chromium scroll, 1080p and full-screen animation) x link (`NETS`: LAN, 10 Mbps/40 ms,
-  5 Mbps/60 ms, and 50 Mbps/20 ms with arrivals jittered by up to 10 ms) via `shaper.py`,
-  a userspace bottleneck proxy (`--jitter`, `--late page`, `--stall` as `linkviewer.py`).
+  (Chromium scroll, 1080p and full-screen animation, and for voxl `linkviewer.py`'s `cold`)
+  x link (`NETS`: LAN, 10 Mbps/40 ms, 5 Mbps/60 ms, and 50 Mbps/20 ms with arrivals
+  jittered by up to 10 ms) via `shaper.py`, a userspace bottleneck proxy (`--jitter`,
+  `--late page`, `--stall` as `linkviewer.py`). `cold` prints its page through a terminal:
+  start `env/term.sh FIFO` (xterm on the benchmark display, `XTERM` to override) and set
+  `COLD_FIFO=FIFO`. The suite exits 1 if any `cold` run failed its bounds.
 - `ab.sh <workload> <reps>`: interleaved voxl vs selkies runs.
 - `cpusuite.sh`: server CPU (X server + streamer) per workload with one client connected.
 - `scroll.html`: the long page `scrolltarget.mjs` smooth-scrolls, with a marker drawn every frame.
