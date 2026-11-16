@@ -706,33 +706,68 @@ mod tests {
         );
     }
 
-    /// What x264 logs while this test runs, as voxl's log would get it.
+    /// What x264 logs on this test's own thread, as voxl's log would get it. The other
+    /// tests run beside it in the same process, and one that opens an encoder x264 refuses
+    /// logs the same kind of line at the same moment: a line is this test's only if its
+    /// thread logged it. Every line, on any thread, is counted.
     struct Logged;
 
+    /// The thread whose lines are kept: the test's.
+    static OWNER: std::sync::OnceLock<std::thread::ThreadId> = std::sync::OnceLock::new();
     static LOGGED: std::sync::Mutex<Vec<(log::Level, String, String)>> =
         std::sync::Mutex::new(Vec::new());
+    static LINES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     impl log::Log for Logged {
         fn enabled(&self, _: &log::Metadata) -> bool {
             true
         }
         fn log(&self, r: &log::Record) {
-            let line = (r.level(), r.target().to_string(), r.args().to_string());
-            LOGGED.lock().unwrap().push(line);
+            LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if OWNER.get() == Some(&std::thread::current().id()) {
+                let line = (r.level(), r.target().to_string(), r.args().to_string());
+                LOGGED.lock().unwrap().push(line);
+            }
         }
         fn flush(&self) {}
+    }
+
+    /// An encoder of `w` x `h` at x264's fastest, one thread.
+    fn open(w: u32, h: u32) -> Result<Encoder, String> {
+        Encoder::new(&EncoderConfig {
+            pictures: Pictures {
+                width: w,
+                height: h,
+                fps: Fps::new(60).unwrap(),
+                preset: Preset::parse("ultrafast").unwrap(),
+                threads: 1,
+                debug: Debugging::read(|_| None).0,
+            },
+            crf: 24.0,
+            max_kbps: None,
+        })
     }
 
     /// x264's log reaches voxl's, with the arguments x264 formatted into it: a size x264
     /// refuses (an odd side, none, or past its limit) is said once, as an error under
     /// `x264`, ending in the size, where x264's own log would have written it to stderr.
+    /// Each case first has another thread open an encoder x264 refuses, as a test running
+    /// beside this one may: its line is logged, and is not this test's.
     #[test]
     fn x264_says_what_it_refuses_in_voxls_log() {
+        OWNER.set(std::thread::current().id()).unwrap();
         log::set_logger(&Logged).unwrap();
         log::set_max_level(log::LevelFilter::Trace);
         let mut rng = crate::xorshift::Xorshift::new(0x264_u64 << 40 | 0x1065);
         let mut range = |lo: u32, hi: u32| rng.range(u64::from(lo), u64::from(hi)) as u32;
         for i in 0..500 {
+            let before = LINES.load(std::sync::atomic::Ordering::Relaxed);
+            let beside = std::thread::spawn(|| open(64, 15).is_err()).join().unwrap();
+            let logged = LINES.load(std::sync::atomic::Ordering::Relaxed) - before;
+            assert!(
+                beside && logged > 0,
+                "{i}: the other thread's refusal said nothing"
+            );
             // Odd or nothing on one side or both; past x264's 16384 x 16384 once in a while.
             let side = |range: &mut dyn FnMut(u32, u32) -> u32, refused: bool| match refused {
                 true => [0, range(0, 2048) * 2 + 1, range(8193, 40000) * 2][range(0, 3) as usize],
@@ -741,19 +776,7 @@ mod tests {
             let refused = range(0, 3);
             let w = side(&mut range, refused != 1);
             let h = side(&mut range, refused != 0);
-            let open = Encoder::new(&EncoderConfig {
-                pictures: Pictures {
-                    width: w,
-                    height: h,
-                    fps: Fps::new(60).unwrap(),
-                    preset: Preset::parse("ultrafast").unwrap(),
-                    threads: 1,
-                    debug: Debugging::read(|_| None).0,
-                },
-                crf: 24.0,
-                max_kbps: None,
-            });
-            assert!(open.is_err(), "{w}x{h} opened");
+            assert!(open(w, h).is_err(), "{w}x{h} opened");
             let said = format!("({w}x{h})");
             let lines: Vec<_> = std::mem::take(&mut *LOGGED.lock().unwrap())
                 .into_iter()
