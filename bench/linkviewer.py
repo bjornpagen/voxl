@@ -361,35 +361,49 @@ async def main():
                     acked[last_ack[0]][4] = fid
                 last_ack = (fid, leaves, entry)
 
-        tasks = [asyncio.create_task(sender()), asyncio.create_task(receiver())]
-        await ws.send("v,1")
-        await asyncio.wait_for(got_key.wait(), 30)
-        if a.passive:
-            marks.write(f"watch\t{clock():.4f}\n")
-            await asyncio.sleep(a.passive)
-            marks.write(f"end\t{clock():.4f}\n")
-        elif a.scenario in PREPARE:
-            # Measured from the connect: no pointer, no settling.
-            await run(SCENARIOS[a.scenario])
-        else:
-            await ws.send("m,1512,1000")
-            await asyncio.sleep(a.settle)
-            await run(SCENARIOS[a.scenario])
-        # Read while the viewer is still connected, so /stats still lists it.
-        ended = clock()
-        try:
-            final = await asyncio.to_thread(fetch_stats, stats_url)
-        except OSError as e:
-            sys.exit(f"no /stats at {stats_url} at the end ({e}): the window was not measured")
-        for t in tasks:
+        async def watch():
+            """The scenario, then the /stats read that ends it, while the viewer is still
+            connected so /stats still lists it: (when it ended, that read)."""
+            await ws.send("v,1")
+            await asyncio.wait_for(got_key.wait(), 30)
+            if a.passive:
+                marks.write(f"watch\t{clock():.4f}\n")
+                await asyncio.sleep(a.passive)
+                marks.write(f"end\t{clock():.4f}\n")
+            elif a.scenario in PREPARE:
+                # Measured from the connect: no pointer, no settling.
+                await run(SCENARIOS[a.scenario])
+            else:
+                await ws.send("m,1512,1000")
+                await asyncio.sleep(a.settle)
+                await run(SCENARIOS[a.scenario])
+            ended = clock()
+            try:
+                return ended, await asyncio.to_thread(fetch_stats, stats_url)
+            except OSError as e:
+                raise NotMeasured(f"no /stats at {stats_url} at the end ({e})") from None
+
+        # One group: the viewer's sending and receiving last as long as the scenario, and
+        # whichever of the three ends first ends the run; only the scenario may.
+        watching = asyncio.create_task(watch())
+        group = [watching, asyncio.create_task(sender()), asyncio.create_task(receiver())]
+        done, _ = await asyncio.wait(group, return_when=asyncio.FIRST_COMPLETED)
+        for t in group:
             t.cancel()
+        first = watching if watching in done else done.pop()
+        stopped = clock()
     with open(f"{a.out}.acks.tsv", "w") as f:
         for fid, (arrived, ack_at, hold, late, covered_by) in acked.items():
             f.write(f"{fid}\t{arrived:.4f}\t{ack_at:.4f}\t{hold:.1f}\t{late:.1f}\t{covered_by}\n")
-    with open(f"{a.out}.stats.json", "w") as f:
-        json.dump(final, f)
     for f in (msgs, marks, scrolls, keys):
         f.close()
+    if first is not watching or first.exception():
+        why = first.exception() or "the server closed the connection"
+        print(f"the run ended early, {stopped - connected:.1f} s from the connect: {why!r}: FAIL")
+        return False
+    ended, final = first.result()
+    with open(f"{a.out}.stats.json", "w") as f:
+        json.dump(final, f)
     return verdict(final, before, waits, rate, stalls.begun(connected, ended))
 
 
