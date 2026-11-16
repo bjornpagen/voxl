@@ -3870,7 +3870,7 @@ mod tests {
                         cap = match g.below(6) {
                             0 => 1 + g.below(40_000) as u32,
                             // Onto the edge of the slack, or one past it.
-                            1 if set.1.is_multiple_of(25) => {
+                            1 if set.1 % 25 == 0 => {
                                 let kbps = set.1;
                                 let edge = kbps / 25 + g.below(2) as u32;
                                 match g.below(2) {

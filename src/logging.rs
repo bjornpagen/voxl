@@ -51,9 +51,17 @@ struct Fill {
     asked: usize,
 }
 
+/// The bytes of `s`'s whole characters that fit in `room`.
+fn whole_chars(s: &str, room: usize) -> usize {
+    (1..=room.min(s.len()))
+        .rev()
+        .find(|&at| s.is_char_boundary(at))
+        .unwrap_or(0)
+}
+
 impl std::fmt::Write for Fill {
     fn write_str(&mut self, s: &str) -> std::fmt::Result {
-        let keep = s.floor_char_boundary(LINE - self.len);
+        let keep = whole_chars(s, LINE - self.len);
         self.text[self.len..self.len + keep].copy_from_slice(&s.as_bytes()[..keep]);
         self.len += keep;
         self.asked += s.len();
@@ -78,7 +86,7 @@ impl Line {
         } = fill;
         if asked > len {
             let kept = std::str::from_utf8(&text[..len]).expect("whole characters");
-            let at = kept.floor_char_boundary(LINE - CUT.len());
+            let at = whole_chars(kept, LINE - CUT.len());
             text[at..at + CUT.len()].copy_from_slice(CUT.as_bytes());
             len = at + CUT.len();
             target = target.min(at);
