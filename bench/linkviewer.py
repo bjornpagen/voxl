@@ -26,7 +26,8 @@ and acks leave later than the model says, never earlier.
 It can also drive the desktop while it watches: trackpad-like scroll gestures (`sp`
 commands at 60 Hz) and shell commands written to a FIFO that a terminal on the
 benchmark display reads (`--fifo`; a terminal running `while read -r l < FIFO; do eval
-"$l"; done`). Scenarios name what to do; `{page}` in their commands is `--page`.
+"$l"; done`). Scenarios name what to do; `{page}` in their commands is `--page`. A
+scenario that prints to the terminal does not start without `--fifo`.
 
 The `hold` scenario holds a key (`--keysym`) for `--key-hold` seconds as a browser does:
 a down, a repeat after the first `--key-repeat` delay and then every interval, an up. Key
@@ -225,6 +226,10 @@ async def main():
     ap.add_argument("--key-delay", type=float, default=0, help="one-way delay of every key message (ms)")
     ap.add_argument("--key-stall", type=float, default=0, help="extra delay of the key-up alone (ms)")
     a = ap.parse_args()
+    # A scenario that writes to the terminal measures nothing it meant to without one: the
+    # screen would be whatever was on it.
+    if a.fifo is None and any(kind == "term" for kind, _ in PREPARE.get(a.scenario, []) + SCENARIOS[a.scenario]):
+        ap.error(f"{a.scenario} prints to a terminal on the benchmark display: give --fifo")
     holds = random.Random(f"{a.seed}:hold")
     path = link.Path(a, link.rate(a.kbps * 1000.0), a.rtt / 2000.0)
     down, up = path.down, path.up
@@ -250,9 +255,8 @@ async def main():
         heapq.heappush(sendq, (at, seq, msg))
 
     def term(cmd):
-        if a.fifo:
-            with open(a.fifo, "w") as f:
-                f.write(cmd.replace("{page}", a.page) + "\n")
+        with open(a.fifo, "w") as f:
+            f.write(cmd.replace("{page}", a.page) + "\n")
 
     async def run(steps):
         for kind, arg in steps:
