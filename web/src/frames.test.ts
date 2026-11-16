@@ -6,7 +6,8 @@
 // one, and now and then unasked, now and then of another codec; a hello now and then
 // between two parts of a frame, as a failed display switch does, or between frames with
 // a new cut and codec, as a rebuild does. The socket closes now and then, between any two
-// messages, and opens again. The fake browser runs the decoders' outputs and errors as
+// messages, and opens again. Now and then a part names a stripe outside the cut, or comes
+// before the hello; the worker closes the socket on it, as it does. The fake browser runs the decoders' outputs and errors as
 // tasks in the order queued, between the socket's messages in any order. A decoder puts
 // out what it took in order; it fails or is reclaimed at any time, and its error closes
 // it; now and then it refuses a part (`decode` throws). One opened for a codec the browser
@@ -27,7 +28,9 @@
 //   since the last hello; a keyframe goes to a decoder of its codec, opened only when the
 //   stripe has no live one of it, and the decoder it replaces is closed; a stripe that
 //   could not decode a codec opens nothing more until the next hello;
-// - the record never decodes into, or closes, a decoder that is closed.
+// - the record never decodes into, or closes, a decoder that is closed;
+// - a part is admitted exactly when its stripe is inside the cut of the last hello on this
+//   socket.
 // Once a whole keyframe has arrived, every stripe nothing has happened to since its part
 // arrived decodes with the decoder its part went to. At the end of a run, once every part
 // has arrived and every decoder has put out what it holds, every frame has been shown;
@@ -130,6 +133,8 @@ const reached = {
 	droppedRefused: 0,
 	helloInFrame: 0,
 	closedWithFrames: 0,
+	outsideCut: 0,
+	beforeHello: 0,
 	wholeChecked: 0,
 	shownAfterLoss: 0,
 };
@@ -151,6 +156,8 @@ function run(seed: number) {
 	let codec = GOOD[0];
 	let keyOwed = true;
 	let socket: Message[] = [{ t: 'hello', count }];
+	/** The stripes of the last hello on this socket. */
+	let cut = 0;
 
 	// The browser, and what it has seen.
 	const tasks: Task[] = [];
@@ -290,6 +297,9 @@ function run(seed: number) {
 			() => whole || !draw(2)
 		);
 		if (!stripes.length) stripes.push(draw(count));
+		// Now and then a part of a stripe outside the cut: often the first one past it.
+		if (!draw(100))
+			stripes[draw(stripes.length)] = count + (draw(2) ? 0 : draw(256 - count));
 		for (let i = stripes.length - 1; i > 0; i--) {
 			const j = draw(i + 1);
 			[stripes[i], stripes[j]] = [stripes[j], stripes[i]];
@@ -333,6 +343,7 @@ function run(seed: number) {
 	};
 
 	const hello = (n: number) => {
+		cut = n;
 		hellos++;
 		refused = Array.from({ length: n }, () => false);
 		broke = Array.from({ length: n }, () => false);
@@ -340,9 +351,34 @@ function run(seed: number) {
 		frames.hello(n);
 	};
 
+	/** The socket closes, and another opens, now and then with a part ahead of its hello. */
+	const reconnect = () => {
+		if (sent.length > shown) reached.closedWithFrames++;
+		sent = [];
+		shown = 0;
+		cut = 0;
+		frames.closed();
+		count = 1 + draw(STRIPES_MOST);
+		socket = [{ t: 'hello', count }];
+		keyOwed = true;
+		if (!draw(10)) {
+			const head = { key: true, frame: nextId, stripe: draw(256), parts: 1 };
+			nextId = (nextId + 1) >>> 0;
+			socket.unshift({ t: 'part', head, bytes: { codec }, whole: false });
+		}
+	};
+
 	const part = (m: Extract<Message, { t: 'part' }>) => {
-		const { head, bytes } = m;
-		const i = head.stripe;
+		const { bytes } = m;
+		const i = m.head.stripe;
+		const head = frames.admit(m.head);
+		if (!head !== i >= cut)
+			fail(`a part of stripe ${i} admitted ${!!head}, the cut being ${cut}`);
+		if (!head) {
+			reached[cut ? 'outsideCut' : 'beforeHello']++;
+			reconnect();
+			return;
+		}
 		let s = sent.find((x) => x.id === head.frame);
 		const isFirst = !s;
 		if (!s) {
@@ -499,14 +535,7 @@ function run(seed: number) {
 				});
 			}
 		} else {
-			// The socket closes, and another opens.
-			if (sent.length > shown) reached.closedWithFrames++;
-			sent = [];
-			shown = 0;
-			frames.closed();
-			count = 1 + draw(STRIPES_MOST);
-			socket = [{ t: 'hello', count }];
-			keyOwed = true;
+			reconnect();
 		}
 		check();
 	}
@@ -530,6 +559,7 @@ function run(seed: number) {
 	// The socket closes.
 	sent = [];
 	shown = 0;
+	cut = 0;
 	frames.closed();
 	while (tasks.length) runTask(tasks.shift()!);
 	check();

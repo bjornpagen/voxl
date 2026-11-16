@@ -64,6 +64,11 @@ export interface Frame<P> {
 /** What the record reads of a part's header. */
 export type Head = Pick<VideoHeader, 'key' | 'frame' | 'stripe' | 'parts'>;
 
+declare const inCut: unique symbol;
+/** A part of a stripe of the cut the last hello gave. Only `Frames.admit` makes one, so
+ * every part the record takes has a stripe to go to. */
+export type Part = Head & { readonly [inCut]: true };
+
 export class Frames<D, P, B> {
 	readonly #world: World<D, P, B>;
 	#stripes: Stripe<D>[] = [];
@@ -109,9 +114,15 @@ export class Frames<D, P, B> {
 		this.#frames.length = 0;
 	}
 
+	/** `head` as a part of a stripe of the cut the last hello gave: none is one before the
+	 * first hello or after the socket closed. */
+	admit(head: Head): Part | undefined {
+		return head.stripe < this.#stripes.length ? (head as Part) : undefined;
+	}
+
 	/** A part arrived at `at`, of its frame's `head.parts`. Whether it was the frame's
 	 * first. */
-	part(at: number, head: Head, data: B): boolean {
+	part(at: number, head: Part, data: B): boolean {
 		const { key, frame, stripe: i } = head;
 		let f = this.#find(frame);
 		const first = !f;

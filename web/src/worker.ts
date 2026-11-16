@@ -79,7 +79,7 @@ function connect() {
 		const b = new Uint8Array(e.data);
 		switch (b[0]) {
 			case Bin.Video:
-				onVideo(b);
+				onVideo(sock, b);
 				break;
 			case Bin.Audio:
 				onAudio(b);
@@ -198,10 +198,18 @@ const frames = new Frames<VideoDecoder, StripeFrame, Uint8Array>({
 	},
 });
 
-function onVideo(b: Uint8Array) {
+function onVideo(sock: WebSocket, b: Uint8Array) {
 	const h = parseVideoHeader(b);
 	st.bytes += b.length;
-	if (frames.part(performance.now(), h, b.subarray(VIDEO_HEADER_BYTES)))
+	const part = frames.admit(h);
+	if (!part) {
+		// Its frame could never be acknowledged, and the server would hold the picture for
+		// it for good: the connection starts over, from a hello.
+		post({ t: 'log', s: `a part of stripe ${h.stripe}, outside the cut` });
+		sock.close();
+		return;
+	}
+	if (frames.part(performance.now(), part, b.subarray(VIDEO_HEADER_BYTES)))
 		st.pipeMs += h.pipe / 10;
 }
 
