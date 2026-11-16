@@ -566,7 +566,7 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Capturer, String> {
         );
     }
     // New geometry (and a keyframe) for clients already connected; no-op at startup.
-    hub.restart_clients();
+    hub.restart_clients(Instant::now());
     Ok(cap)
 }
 
@@ -5205,7 +5205,7 @@ mod tests {
         drop(job_tx);
         encode.join().unwrap();
         // build(): the rebuilt stream's hello.
-        hub.restart_clients();
+        hub.restart_clients(Instant::now());
         assert!(
             matches!(recording_rx.try_recv().unwrap(), Out::Text(_)),
             "the recording held a frame of the old stream before the rebuilt stream's \

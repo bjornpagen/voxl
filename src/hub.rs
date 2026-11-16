@@ -856,11 +856,10 @@ impl Hub {
         })
     }
 
-    /// After the stream restarts (new size): every client needs the new geometry and
-    /// a keyframe, and acks for the old stream's frames no longer apply.
-    pub fn restart_clients(&self) {
+    /// After the stream restarts at `now` (new size): every client needs the new geometry
+    /// and a keyframe, and acks for the old stream's frames no longer apply.
+    pub fn restart_clients(&self, now: Instant) {
         let hello = self.hello();
-        let now = Instant::now();
         for c in self.clients.lock().iter() {
             c.start_over(now);
             c.send(Out::Text(hello.clone()));
@@ -1096,7 +1095,7 @@ mod tests {
                 // Its frames went at `t0`: it has stalled `STALLED` later.
                 c[i].falls_behind(t0 + crate::video::STALLED);
             }
-            Step::Restart => hub.restart_clients(),
+            Step::Restart => hub.restart_clients(t0),
             Step::Capture => {
                 let viewers = hub.viewers();
                 planned = viewers.iter().any(|(_, v)| *v == Viewer::Waiting);
@@ -1784,7 +1783,7 @@ mod tests {
                     0 => c[i].watch(now),
                     1 => c[i].stop_watching(),
                     2 => c[i].ask_keyframe(),
-                    3 => hub.restart_clients(),
+                    3 => hub.restart_clients(now),
                     4 => {
                         // A keyframe planned and sent: it starts who it was promised to.
                         let promised = c.each_ref().map(|c| c.keyframe_planned());
