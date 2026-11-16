@@ -1354,9 +1354,8 @@ impl Resize for crate::screen::Screen {
 
 /// A size asked for, given to the screen: whether the stream, at `streamed`, is rebuilt.
 /// Only a screen whose size really changed rebuilds it and says hello to the viewers; an
-/// ask the screen refuses, or one for the size it has, changes nothing. A rebuild for
-/// either said hello for nothing, and a page that answered each hello by asking again
-/// kept the stream starting over for as long as the screen refused it.
+/// ask the screen refuses, or one for the size it has, changes nothing: a rebuild for
+/// either would restart every viewer's stream and say hello for nothing.
 pub(crate) fn rebuilds_for(
     screen: &mut impl Resize,
     (w, h): (u32, u32),
