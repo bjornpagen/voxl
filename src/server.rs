@@ -649,7 +649,8 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
         // The desktop size this client's window wants (dynamic resolution). The newest new
         // ask wins: it is the request until a newer one, and no ask clears another, so the
         // screen ends at the size asked last whatever the capture loop was doing. The
-        // capture loop gives it to the screen, which changes nothing if it has it already.
+        // capture loop gives it to the screen, which fits it to a size it can take (each
+        // platform has its own rule) and changes nothing if it has that size already.
         Command::Resize { w, h } => {
             if !s.resize {
                 return;
@@ -660,12 +661,9 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
             if input.is_none() || c.id < s.hub.input_floor.load(Ordering::Relaxed) {
                 return;
             }
-            if let Some(max) = *s.hub.resize_max.lock() {
-                let want = crate::screen::fit(w, h, max);
-                if c.asks_for(want) {
-                    *s.hub.resize_req.lock() = Some(want);
-                    s.hub.wake();
-                }
+            if s.hub.resize_max.lock().is_some() && c.asks_for((w, h)) {
+                *s.hub.resize_req.lock() = Some((w, h));
+                s.hub.wake();
             }
         }
         Command::Keyframe => {
@@ -872,8 +870,10 @@ mod tests {
     ///   asks for, unless it refuses that size: no page's ask clears another's.
     ///
     /// Each clause is counted over the runs (refused asks, asks already met, repeated asks,
-    /// rests reached with one rebuild and with none, newest asks met and refused), so none
-    /// holds unreached.
+    /// rests reached with one rebuild and with none, newest asks met and refused, and real
+    /// changes of the screen's size), so none holds unreached. The screen is the test's own,
+    /// fit and all: the server gives it the size as asked, so the property is the same on
+    /// every platform, whatever its screen's rule for fitting a size.
     #[test]
     fn resizing_rebuilds_once_per_size_granted_and_rests_after_the_last_ask() {
         let sizes = [
@@ -886,8 +886,8 @@ mod tests {
         let max = (3024, 1898);
         let mut rng = crate::xorshift::Xorshift::new(0x9E37_79B9_7F4A_7C15);
         // refused, met, repeated, rested after one rebuild, after none, newest met, newest
-        // refused
-        let mut reach = [0usize; 7];
+        // refused, real changes of the screen's size
+        let mut reach = [0usize; 8];
         for run in 0..500 {
             let hub = Hub::new(crate::hub::Paths::ANY);
             hub.width.store(max.0, Ordering::Relaxed);
@@ -974,6 +974,7 @@ mod tests {
             reach[0] += d.screen.refused;
             reach[1] += d.screen.met;
             reach[2] += d.repeats;
+            reach[7] += d.screen.changes;
             reach[3 + usize::from(after == 0)] += 1;
         }
         assert!(reach.iter().all(|&n| n > 0), "unreached: {reach:?}");

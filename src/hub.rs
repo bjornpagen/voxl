@@ -350,7 +350,7 @@ pub struct Client {
     /// Its last frames as they were sent and acked (`/stats/trace`), kept a while once it
     /// has left.
     pub trace: Arc<Mutex<crate::timeline::Trace>>,
-    /// The desktop size it last asked for (`sz`, fitted to the screen), if it has asked.
+    /// The desktop size it last asked for (`sz`, as asked), if it has asked.
     asked: Mutex<Option<(u32, u32)>>,
 }
 
