@@ -5,7 +5,7 @@ use crate::convert::I420;
 use crate::encoder::{Encoded, Encoder, EncoderConfig, Planes};
 use crate::env::{Debugging, Marker};
 use crate::hub::wait_any;
-use crate::hub::{Hub, Inflight, Out};
+use crate::hub::{Hub, Inflight, Out, ServerMessage};
 use bytes::Bytes;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -236,16 +236,12 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
     #[cfg(target_os = "macos")]
     {
         let resizing = hub.resize_max.lock().is_some();
-        let mut extra = hub.hello_extra.lock();
-        extra.insert("displays".into(), crate::mac::display_info());
-        if resizing {
-            extra.insert(
-                "resize".into(),
-                serde_json::json!({ "scale": crate::mac::resize_scale() }),
-            );
-        } else {
-            extra.remove("resize");
-        }
+        hub.settings.lock().pipeline(
+            crate::mac::display_info(),
+            resizing.then(|| crate::hub::Resize {
+                scale: crate::mac::resize_scale(),
+            }),
+        );
     }
     // New geometry (and a keyframe) for clients already connected; no-op at startup.
     hub.restart_clients();
@@ -1337,7 +1333,7 @@ fn encode_loop(
                 if q.len() > 600 {
                     log::warn!("client {} hopelessly behind; dropping", c.id);
                     drop(q);
-                    c.send(Out::Text("{\"t\":\"close\"}".into()));
+                    c.send(Out::Text(ServerMessage::Close));
                     continue;
                 }
                 q.push_back(Inflight {
