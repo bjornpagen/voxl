@@ -140,7 +140,7 @@ pub struct Display {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Inflight {
-    pub id: u32,
+    pub id: FrameId,
     pub bytes: usize,
     /// When it left, and what its viewer's path was asked to carry with it, as its window
     /// took it in.
@@ -468,11 +468,7 @@ impl Client {
             }
             Viewer::Started => {
                 let left = v.window.leave(now, bytes);
-                let frame = Inflight {
-                    id: id.get(),
-                    bytes,
-                    left,
-                };
+                let frame = Inflight { id, bytes, left };
                 v.inflight.push_back(frame);
                 self.trace.lock().sent(frame, key);
                 Takes::Frame
@@ -499,11 +495,11 @@ impl Client {
             window,
         } = &mut *v;
         let mut said = None;
-        while let Some(&f) = inflight.front().filter(|f| wrapping_le(f.id, id)) {
+        while let Some(&f) = inflight.front().filter(|f| wrapping_le(f.id.get(), id)) {
             inflight.pop_front();
             let back = match hold {
                 Hold::Said(held)
-                    if f.id == id && held <= now.saturating_duration_since(f.left.at) =>
+                    if f.id.get() == id && held <= now.saturating_duration_since(f.left.at) =>
                 {
                     said = Some(held);
                     now - held
@@ -541,7 +537,7 @@ impl Client {
 impl Client {
     /// Frame `id` of `bytes` leaves for it at `at`, whatever it is to the stream: in
     /// flight, and on its way in its window.
-    pub fn fly(&self, id: u32, at: Instant, bytes: usize) {
+    pub fn fly(&self, id: FrameId, at: Instant, bytes: usize) {
         let mut v = self.viewing.lock();
         let left = v.window.leave(at, bytes);
         v.inflight.push_back(Inflight { id, bytes, left });
@@ -1085,7 +1081,7 @@ mod tests {
                     let c = hub.add_client(mpsc::unbounded_channel().0, t0);
                     c.viewing.lock().viewer = viewer;
                     for _ in 0..inflight {
-                        c.fly(hub.timeline.number().get(), t0, 1000);
+                        c.fly(hub.timeline.number(), t0, 1000);
                     }
                     c
                 })
@@ -1131,7 +1127,7 @@ mod tests {
                 }
             }
             Step::Ack(i) => {
-                let last = c[i].viewing.lock().inflight.back().map(|f| f.id);
+                let last = c[i].viewing.lock().inflight.back().map(|f| f.id.get());
                 if let Some(id) = last {
                     c[i].on_ack(t0 + Duration::from_millis(50), id, Hold::Unsaid);
                 }

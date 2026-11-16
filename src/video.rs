@@ -5929,7 +5929,7 @@ mod tests {
         counting::arm();
         for k in 0..3 * FRAMES_KEPT as u64 {
             let at = t0 + Duration::from_millis(k * 16);
-            let id = hub.timeline.number().get();
+            let id = hub.timeline.number();
             let bytes = (mix(k) % 100_000) as usize;
             let frame = Inflight {
                 id,
@@ -5956,9 +5956,10 @@ mod tests {
                 1 => Hold::Said(Duration::from_micros(mix(k) % 10_000)),
                 _ => Hold::Unreadable,
             };
+            // What a viewer's ack says: a number on the wire.
             let named = match mix(k) % 50 {
-                0 => id + 5000,
-                n => id.wrapping_sub((n % 4) as u32),
+                0 => id.get().wrapping_add(5000),
+                n => id.get().wrapping_sub((n % 4) as u32),
             };
             let acked = at + Duration::from_millis(mix(k) % 400);
             for viewer in &viewers[gone..] {
@@ -6009,9 +6010,9 @@ mod tests {
                 let mut at = now - age;
                 let mut sent = vec![];
                 for _ in 0..next(31) {
-                    let id = hub.timeline.number().get();
+                    let id = hub.timeline.number();
                     c.fly(id, at, 200 + next(60_000) as usize);
-                    sent.push((at, id));
+                    sent.push((at, id.get()));
                     at = (at + Duration::from_micros(next(30_000))).min(now);
                 }
                 // The first few acknowledged, as they came back.
@@ -6131,7 +6132,7 @@ mod tests {
                 for (c, frames) in viewers.iter().zip(&picked) {
                     c.start_over(now - Duration::from_secs(40));
                     for &(age, bytes) in frames.iter() {
-                        c.fly(hub.timeline.number().get(), now - age, bytes);
+                        c.fly(hub.timeline.number(), now - age, bytes);
                     }
                 }
                 let asked = &viewers[..n as usize];

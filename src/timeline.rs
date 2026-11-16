@@ -389,7 +389,8 @@ impl Trace {
     /// names no such frame (covered already, never sent, or no longer kept) covers nothing.
     pub fn acked(&mut self, at: Instant, id: u32, hold: Hold) {
         let first = self.covered.max(self.sent - self.ring.len() as u64);
-        let Some(named) = (first..self.sent).find(|&k| self.ring[Self::slot(k)].frame.id == id)
+        let Some(named) =
+            (first..self.sent).find(|&k| self.ring[Self::slot(k)].frame.id.get() == id)
         else {
             return;
         };
@@ -475,7 +476,7 @@ impl Timeline {
     /// A viewer's frames as `/stats/trace` gives them, oldest first.
     pub fn rows(&self, trace: &Trace) -> Vec<SentRow> {
         let row = |s: &Sent| SentRow {
-            frame: s.frame.id,
+            frame: s.frame.id.get(),
             sent_us: self.us(s.frame.left.at),
             bytes: s.frame.bytes,
             asked: s.frame.left.asked,
@@ -713,7 +714,7 @@ mod tests {
         let kept = &mut sent[from..];
         let open = |s: &&mut Sent| s.ack.is_none();
         let Some(named) =
-            (0..kept.len()).find(|&i| kept[i].ack.is_none() && kept[i].frame.id == id)
+            (0..kept.len()).find(|&i| kept[i].ack.is_none() && kept[i].frame.id.get() == id)
         else {
             return false;
         };
@@ -748,7 +749,7 @@ mod tests {
                     serde_json::json!({"at_us": us(a.at), "hold": hold})
                 });
                 serde_json::json!({
-                    "frame": s.frame.id,
+                    "frame": s.frame.id.get(),
                     "sent_us": us(s.frame.left.at),
                     "bytes": s.frame.bytes,
                     "asked": s.frame.left.asked,
@@ -831,8 +832,8 @@ mod tests {
                     w.heard_from = w.heard_from.max(step + rng.below(12_000) as u32);
                 }
                 100..=5999 => {
-                    let number = hub.timeline.number().get();
-                    newest = number;
+                    let number = hub.timeline.number();
+                    newest = number.get();
                     let (bytes, key) = (rng.below(1 << 20) as usize, rng.below(30) == 0);
                     for w in &mut watchers {
                         // One waiting for a keyframe is not sent the frames before it.
@@ -893,7 +894,7 @@ mod tests {
                     };
                     let id = match (kind, named) {
                         (3, _) | (_, None) => newest.wrapping_add(1 + rng.below(1000) as u32),
-                        (_, Some(i)) => w.sent[i].frame.id,
+                        (_, Some(i)) => w.sent[i].frame.id.get(),
                     };
                     let hold = match rng.below(3) {
                         0 => Hold::Unsaid,
