@@ -1,0 +1,570 @@
+"""A headless voxl viewer behind an emulated link, for measuring rate control.
+
+Speaks voxl's protocol (web/src/protocol.ts): turns video on, answers pings and acks
+every frame. It does not decode. Instead it models what a viewer behind a bottleneck sees:
+
+- The link is bench/link.py's, the one shaper.py imposes on a real connection: a rate of
+  `--kbps` through an unbounded queue served in order, half the round trip each way, and
+  with options a one-sided jitter after the bottleneck (`--jitter`) and periodic stalls
+  both ways (`--stall`). Pings and every other message take their turn on it.
+- A frame is acknowledged once its last part has arrived (parts = the header's
+  "parts in frame"), never at its first.
+- Before the ack the viewer holds the frame for its decode and draw: 3 ms, or with
+  `--hold` a software decoder's time (2 ms + 0.1 ms per KB + 0 to 8 ms at random). The
+  ack carries that hold (`a,<id>,<ms>`), as the page's does: the same number the ack was
+  delayed by, on the viewer's own monotonic clock, measured from the moment the frame's
+  last part arrived on the emulated link.
+- With `--late page` every ack and pong then leaves later still, by a lateness drawn
+  (seeded by `--seed`) from the page's own measured answers (`page-late.txt`, 4,091 of
+  them: median 13.2 ms, p90 18.9, p99 41.8, at most 424), in the order the page gave
+  them; `--late page-99` draws from all but their top 1 %.
+- The ack then takes the other half of the round trip, on the same monotonic clock.
+
+All of it runs on one asyncio loop, so a busy machine only ever makes messages arrive
+and acks leave later than the model says, never earlier.
+
+It can also drive the desktop while it watches: trackpad-like scroll gestures (`sp`
+commands at 60 Hz) and shell commands written to a FIFO that a terminal on the
+benchmark display reads (`--fifo`; a terminal running `while read -r l < FIFO; do eval
+"$l"; done`). Scenarios name what to do; `{page}` in their commands is `--page`. A
+scenario that prints to the terminal does not start without `--fifo`.
+
+The `hold` scenario holds a key (`--keysym`) for `--key-hold` seconds as a browser does:
+a down, a repeat after the first `--key-repeat` delay and then every interval, an up. Key
+messages leave `--key-delay` ms late, and the up `--key-stall` ms later still, as when the
+segment carrying it is lost and sent again. What lands is counted on the desktop (xev);
+OUT.marks.tsv says how many characters were sent (`sent`: the down and its repeats).
+
+The `cold` scenario is a first load: the terminal is filled with dense text before the
+viewer connects, and everything is measured from the connect, with no input.
+
+At the end, still connected, it reads the server's /stats once (`--stats`): this viewer's
+lowest `carries` since it connected (`lowest_carries_bytes`: what its window said the path
+carries in `LATENESS`, at its least), and the window's own `LATENESS`, `START`, `FALL` and
+`PACKET`.
+The run fails (exit status 1) when:
+- the window went below what it may: `START`, or what the emulated link carries in
+  `LATENESS` if less, and over `FALL` once if any stall began (`floor_of` says why once;
+  a floor under one packet, as on a link under about 195 kbit/s, is not measured);
+- a frame waited behind the link's queue more than `3 x LATENESS` (a stall is not a wait);
+- or it was not measured: no /stats, a /stats without those fields, or this viewer not in it.
+
+Writes OUT.msgs.tsv (each video message: when received, when it arrived on the link,
+frame, key, paint-over, bytes, server pipeline ms, ms it waited behind the queue),
+OUT.acks.tsv (frame, when it arrived, when its ack reached the server, the hold, the
+lateness in ms), OUT.marks.tsv (the scenario's phases),
+OUT.scroll.tsv (scroll input), OUT.keys.tsv (key messages, when each was due and when it
+was sent) and OUT.stats.json (the /stats it read at the end).
+
+usage: linkviewer.py HOST:PORT SCENARIO OUT [--kbps N] [--rtt MS] [--jitter MS]
+       [--stall EVERY_S,LENGTH_MS] [--late page|page-99] [--hold]
+       [--seed N] [--fifo PATH] [--page FILE] [--passive SECS] [--stats URL]
+       [--keysym K] [--key-hold S] [--key-repeat MS,MS] [--key-delay MS] [--key-stall MS]
+       linkviewer.py --check-header   (the standard library alone; python3 -I runs it)
+"""
+
+import argparse
+import asyncio
+import heapq
+import json
+import math
+import os
+import random
+import sys
+import time
+import typing
+import urllib.request
+
+sys.dont_write_bytecode = True  # nothing written beside the bench
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import link  # noqa: E402  (beside this file; python3 -I leaves the script's directory off the path)
+
+# Messages, and the fields they mean, that the server's and the web client's header
+# readers are checked against too.
+HEADER_FIXTURE = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "web", "src", "video-header.json"))
+VIDEO = 0x01  # a video message's type byte
+HEADER_LEN = 16
+
+
+def read_header(m):
+    """A video message's header (src/video.rs `Header`), None for any other message."""
+    if len(m) <= HEADER_LEN or m[0] != VIDEO:
+        return None
+    return {
+        "key": m[1] & 1 == 1,
+        "sharpens": m[1] & 2 == 2,
+        "frame": int.from_bytes(m[2:6], "big"),
+        "pipe": int.from_bytes(m[6:10], "big"),
+        "stripe": m[10],
+        "stripes": m[11],
+        "parts": m[12],
+        "y": int.from_bytes(m[14:16], "big"),
+    }
+
+
+def check_header():
+    with open(HEADER_FIXTURE) as f:
+        cases = json.load(f)
+    for c in cases:
+        h = read_header(bytes.fromhex(c["header"] + c["picture"]))
+        # Every field the fixture names, and nothing else.
+        if h != {field: v for field, v in c.items() if field not in ("header", "picture")}:
+            sys.exit(f"{c['header']} reads as {h}")
+    print(f"read_header: {len(cases)} messages as {HEADER_FIXTURE} says")
+
+
+def flick(peak_px_s, tau_s, sign):
+    """Per-frame deltas of a trackpad flick: 100 ms of push, then momentum decaying with tau."""
+    out = [sign * peak_px_s * (i + 1) / 6 / 60 for i in range(6)]
+    v = peak_px_s
+    while v > 30:
+        out.append(sign * v / 60)
+        v *= math.exp(-1 / 60 / tau_s)
+    return out
+
+
+def steady(px_s, secs, sign):
+    return [sign * px_s / 60] * int(secs * 60)
+
+
+# What a scenario prepares on the desktop before the viewer connects.
+PREPARE = {
+    # A terminal filled to its last row with dense text, then left to settle.
+    "cold": [
+        ("term", "clear; tr -s '\\n\\t' '  ' < {page} | fold -w $(tput cols) | head -n $(( $(tput lines) - 1 ))"),
+        ("wait", 3.0),
+    ],
+}
+
+SCENARIOS = {
+    # A first load, measured from the connect: the screen PREPARE left, watched for a minute.
+    "cold": [
+        ("mark", "watch"),
+        ("wait", 60.0),
+        ("mark", "end"),
+    ],
+    # Fill the scrollback, let it settle, then scroll back through it as a person does.
+    "scroll": [
+        ("term", "clear; cat {page}"),
+        ("wait", 4.0),
+        ("mark", "flick1"),
+        ("scroll", flick(6000, 0.35, -1)),
+        ("wait", 1.5),
+        ("mark", "flick2"),
+        ("scroll", flick(3000, 0.35, -1)),
+        ("wait", 1.5),
+        ("mark", "read"),
+        ("scroll", steady(600, 3.0, -1)),
+        ("wait", 2.0),
+        ("mark", "end"),
+    ],
+    # Output streaming in: one line every 40 ms.
+    "stream": [
+        ("term", "clear; head -400 {page}"),
+        ("wait", 3.0),
+        ("mark", "stream"),
+        ("term", "head -150 {page} | while IFS= read -r l; do printf '%s\\n' \"$l\"; sleep 0.04; done"),
+        ("wait", 8.0),
+        ("mark", "end"),
+    ],
+    # Motion, then 4 s of stillness each time: how sharp it gets, how soon, for how much.
+    "sharpen": [
+        ("mark", "page"),
+        ("term", "clear; cat {page}"),
+        ("wait", 4.5),
+        ("mark", "flick"),
+        ("scroll", flick(6000, 0.35, -1)),
+        ("wait", 4.0),
+        ("mark", "read"),
+        ("scroll", steady(600, 2.0, -1)),
+        ("wait", 4.0),
+        ("mark", "end"),
+    ],
+    # A key held for --key-hold seconds, repeated as a browser does, behind the link.
+    "hold": [
+        ("wait", 1.0),
+        ("mark", "down"),
+        ("key", None),
+        ("mark", "end"),
+    ],
+    # A burst of output, then stillness, then a flick.
+    "idle": [
+        ("term", "clear; head -300 {page}"),
+        ("wait", 1.5),
+        ("mark", "still"),
+        ("wait", 10.0),
+        ("mark", "after"),
+        ("scroll", flick(6000, 0.35, -1)),
+        ("wait", 1.5),
+        ("mark", "end"),
+    ],
+}
+
+
+def fetch_stats(url):
+    with urllib.request.urlopen(url, timeout=2) as r:
+        return json.loads(r.read())
+
+
+def arguments(argv):
+    """The run `argv` asks for, and the link it sits behind: `(options, path)`."""
+    ap = argparse.ArgumentParser()
+    ap.add_argument("hostport")
+    ap.add_argument("scenario", choices=sorted(SCENARIOS))
+    ap.add_argument("out")
+    ap.add_argument("--kbps", type=float, default=0, help="bottleneck rate (0: none)")
+    ap.add_argument("--rtt", type=float, default=0, help="round trip (ms)")
+    link.add_options(ap)
+    ap.add_argument("--hold", action="store_true", help="hold frames as a software decoder would")
+    ap.add_argument("--fifo", help="FIFO a terminal on the benchmark display reads commands from")
+    ap.add_argument("--page", default="/etc/services", help="file the scenarios print")
+    ap.add_argument("--settle", type=float, default=3.0, help="seconds to watch before the scenario")
+    ap.add_argument("--passive", type=float, default=0, help="only watch, for this many seconds")
+    ap.add_argument("--stats", help="the server's /stats (default: http://HOST:PORT/stats)")
+    ap.add_argument("--keysym", type=lambda v: int(v, 0), default=0x61, help="key the hold scenario holds")
+    ap.add_argument("--key-hold", type=float, default=3.0, help="seconds the key is held")
+    # Not X's own schedule (500 ms then 50 ms under xfsettingsd, 660 then 40 bare), so the
+    # count of characters says whose repeats landed.
+    ap.add_argument("--key-repeat", default="300,33", help="the browser's repeat: delay,interval in ms")
+    ap.add_argument("--key-delay", type=float, default=0, help="one-way delay of every key message (ms)")
+    ap.add_argument("--key-stall", type=float, default=0, help="extra delay of the key-up alone (ms)")
+    a = ap.parse_args(argv)
+    # A scenario that writes to the terminal measures nothing it meant to without one: the
+    # screen would be whatever was on it.
+    if a.fifo is None and any(kind == "term" for kind, _ in PREPARE.get(a.scenario, []) + SCENARIOS[a.scenario]):
+        ap.error(f"{a.scenario} prints to a terminal on the benchmark display: give --fifo")
+    return a, link.Path(a, link.rate(a.kbps * 1000.0), a.rtt / 2000.0)
+
+
+async def main():
+    a, path = arguments(sys.argv[1:])
+    down, up = path.down, path.up
+    stats_url = a.stats or f"http://{a.hostport}/stats"
+    t0 = time.monotonic()
+    clock = lambda: time.monotonic() - t0
+    sendq = []
+    seq = 0
+    frames = {}
+    got_key = asyncio.Event()
+    msgs = open(f"{a.out}.msgs.tsv", "w")
+    msgs.write("t_recv\tt_arrive\tframe\tkey\tpaintover\tbytes\tpipe_ms\twait_ms\n")
+    acks = open(f"{a.out}.acks.tsv", "w")
+    marks = open(f"{a.out}.marks.tsv", "w")
+    scrolls = open(f"{a.out}.scroll.tsv", "w")
+    keys = open(f"{a.out}.keys.tsv", "w")
+    keys.write("t_intended\tt_sent\tmsg\n")
+    waits = []  # (from the connect, ms behind the queue) of each video message
+
+    def schedule(at, msg):
+        nonlocal seq
+        seq += 1
+        heapq.heappush(sendq, (at, seq, msg))
+
+    def term(cmd):
+        with open(a.fifo, "w") as f:
+            f.write(cmd.replace("{page}", a.page) + "\n")
+
+    async def run(steps):
+        for kind, arg in steps:
+            if kind == "term":
+                term(arg)
+            elif kind == "wait":
+                await asyncio.sleep(arg)
+            elif kind == "mark":
+                marks.write(f"{arg}\t{clock():.4f}\n")
+            elif kind == "key":
+                # Down, the browser's repeats, up: each leaves after --key-delay, and
+                # the up --key-stall later still (a lost segment, retransmitted).
+                delay, interval = (float(v) / 1000 for v in a.key_repeat.split(","))
+                t = clock()
+                d = a.key_delay / 1000
+                schedule(t + d, f"k,{a.keysym},1")
+                n = 0
+                r = t + delay
+                while r < t + a.key_hold:
+                    schedule(r + d, f"k,{a.keysym},2")
+                    n += 1
+                    r += interval
+                up_at = t + a.key_hold + d + a.key_stall / 1000
+                schedule(up_at, f"k,{a.keysym},0")
+                marks.write(f"sent\t{n + 1}\n")
+                # Stay until the up has landed: closing the socket releases every key.
+                await asyncio.sleep(up_at - clock() + 1.0)
+            elif kind == "scroll":
+                start = time.monotonic()
+                for i, d in enumerate(arg):
+                    await ws.send(f"sp,0.0,{d:.1f}")
+                    scrolls.write(f"{clock():.4f}\t{d:.1f}\n")
+                    await asyncio.sleep(max(0, start + (i + 1) / 60 - time.monotonic()))
+
+    import websockets
+
+    await run(PREPARE.get(a.scenario, []))
+    try:
+        before = {c["id"] for c in (await asyncio.to_thread(fetch_stats, stats_url))["clients"]}
+    except OSError as e:
+        sys.exit(f"no /stats at {stats_url} ({e}): nothing could be measured")
+    async with websockets.connect(f"ws://{a.hostport}/ws", max_size=None, compression=None) as ws:
+        connected = clock()
+        marks.write(f"connect\t{connected:.4f}\n")
+
+        async def sender():
+            # Sends each scheduled message once its time has come (at most 2 ms late).
+            while True:
+                if sendq and sendq[0][0] <= clock():
+                    at, _, msg = heapq.heappop(sendq)
+                    await ws.send(msg)
+                    if msg.startswith("k,"):
+                        keys.write(f"{at:.4f}\t{clock():.4f}\t{msg}\n")
+                    continue
+                wait = sendq[0][0] - clock() if sendq else 0.002
+                await asyncio.sleep(min(max(wait, 0), 0.002))
+
+        async def receiver():
+            async for m in ws:
+                if isinstance(m, str):
+                    j = json.loads(m)
+                    at, _ = down.send(clock(), len(m))
+                    if j.get("t") == "ping":
+                        schedule(up.send(at)[1], f"po,{j['s']}")
+                    continue
+                now = clock()
+                at, wait = down.send(now, len(m))
+                h = read_header(m)
+                if h is None:
+                    continue
+                waits.append((now - connected, wait * 1000))
+                fid, key, parts = h["frame"], h["key"], h["parts"]
+                msgs.write(f"{now:.4f}\t{at:.4f}\t{fid}\t{key:d}\t{h['sharpens']:d}\t{len(m)}\t{h['pipe'] / 10:.1f}\t{wait * 1000:.1f}\n")
+                f = frames.setdefault(fid, {"need": parts, "got": 0, "bytes": 0})
+                f["got"] += 1
+                f["bytes"] += len(m)
+                if key:
+                    got_key.set()
+                if f["got"] < f["need"]:
+                    continue
+                # The frame's last part is in: hold it for decode and draw, then ack.
+                del frames[fid]
+                hold = 0.002 + f["bytes"] / 1e7 + path.holds.uniform(0, 0.008) if a.hold else 0.003
+                leaves, ack_at = up.send(at + hold)
+                acks.write(f"{fid}\t{at:.4f}\t{ack_at:.4f}\t{hold * 1000:.1f}\t{(leaves - at - hold) * 1000:.1f}\n")
+                schedule(ack_at, f"a,{fid},{hold * 1000:.1f}")
+
+        async def watch():
+            """The scenario, then the /stats read that ends it, while the viewer is still
+            connected so /stats still lists it: (when it ended, that read)."""
+            await ws.send("v,1")
+            await asyncio.wait_for(got_key.wait(), 30)
+            if a.passive:
+                marks.write(f"watch\t{clock():.4f}\n")
+                await asyncio.sleep(a.passive)
+                marks.write(f"end\t{clock():.4f}\n")
+            elif a.scenario in PREPARE:
+                # Measured from the connect: no pointer, no settling.
+                await run(SCENARIOS[a.scenario])
+            else:
+                await ws.send("m,1512,1000")
+                await asyncio.sleep(a.settle)
+                await run(SCENARIOS[a.scenario])
+            ended = clock()
+            try:
+                return ended, await asyncio.to_thread(fetch_stats, stats_url)
+            except OSError as e:
+                raise NotMeasured(f"no /stats at {stats_url} at the end ({e})") from None
+
+        # One group: the viewer's sending and receiving last as long as the scenario, and
+        # whichever of the three ends first ends the run; only the scenario may.
+        watching = asyncio.create_task(watch())
+        group = [watching, asyncio.create_task(sender()), asyncio.create_task(receiver())]
+        done, _ = await asyncio.wait(group, return_when=asyncio.FIRST_COMPLETED)
+        for t in group:
+            t.cancel()
+        first = watching if watching in done else done.pop()
+        stopped = clock()
+    for f in (msgs, acks, marks, scrolls, keys):
+        f.close()
+    if first is not watching or first.exception():
+        why = first.exception() or "the server closed the connection"
+        print(f"the run ended early, {stopped - connected:.1f} s from the connect: {why!r}: FAIL")
+        return False
+    ended, final = first.result()
+    with open(f"{a.out}.stats.json", "w") as f:
+        json.dump(final, f)
+    return verdict(final, before, waits, a, path, path.stalls.begun(connected, ended))
+
+
+class NotMeasured(Exception):
+    """What a run needed /stats to say, and it did not."""
+
+
+class Window(typing.NamedTuple):
+    """What /stats said of a viewer's window at the end of a run."""
+
+    lateness: float  # its `LATENESS`, in seconds
+    start: int  # `START`
+    fall: int  # `FALL`
+    packet: int  # `PACKET`: the least it ever says a path carries
+    lowest: float  # its lowest `carries` since the viewer connected
+
+
+def window_of(final, before):
+    """The `Window` /stats said this viewer had at the end."""
+    mine = [c for c in final["clients"] if c["id"] not in before]
+    if len(mine) != 1:
+        raise NotMeasured(f"/stats lists {len(mine)} viewers that came after the run's start, not one")
+    try:
+        return Window(final["lateness_us"] / 1e6, final["start_bytes"], final["fall"], final["packet_bytes"],
+                      mine[0]["lowest_carries_bytes"])
+    except KeyError as e:
+        raise NotMeasured(f"/stats has no {e}") from None
+
+
+def floor_of(window, path, rtt, began):
+    """The least the window may say the path carries: `START`, or what the link carries in
+    `LATENESS` if less; and if a stall began during the run, that over `FALL`, once.
+
+    Why once, for any number of stalls: a stall holds the acks back, so the round it falls
+    in reads too low, and in one round the window falls by no more than `FALL`. That is the
+    fall a stall may cost. A second fall before the first is won back is the stall talking
+    the window down twice, which is what the bench is here to catch, so it fails. A schedule
+    whose stalls leave less than one round (the round trip and `LATENESS`) between them has
+    no round that is not a stall's, so nothing can be said of it: not measured. Nor of a
+    floor under one packet: the window never says less than one, so no window could fail it."""
+    if began == 0:
+        floor = min(window.start, path.rate.carries(window.lateness))
+        why = "START, or what the link carries in LATENESS if less"
+    else:
+        between = path.stalls.every - path.stalls.length
+        round_ = rtt + window.lateness
+        if between < round_:
+            raise NotMeasured(f"stalls {between * 1000:.0f} ms apart leave no round ({round_ * 1000:.0f} ms) between them")
+        floor = min(window.start, path.rate.carries(window.lateness)) / window.fall
+        why = f"START, or what the link carries in LATENESS if less, over FALL {window.fall} once for {began} stalls"
+    if floor < window.packet:
+        raise NotMeasured(f"the floor, {floor:.0f} B, is under one packet ({window.packet} B): no window could fail it")
+    return floor, why
+
+
+def verdict(final, before, waits, a, path, began):
+    """Prints the run's bounds and whether it kept them; True when it did. `final` is the
+    /stats read at the end, `a` and `path` the run's options and link, `began` how many
+    stalls began since the viewer connected."""
+    try:
+        window = window_of(final, before)
+        floor, why = floor_of(window, path, a.rtt / 1000, began)
+    except NotMeasured as e:
+        print(f"not measured: {e}: FAIL")
+        return False
+    kept_floor = window.lowest >= floor
+    print(f"carries: lowest {window.lowest} B since the connect; bound {floor:.0f} B ({why}): {'pass' if kept_floor else 'FAIL'}")
+    t, longest = max(waits, key=lambda tw: tw[1])
+    bound = 3 * window.lateness * 1000
+    kept_wait = longest <= bound
+    print(f"wait behind the queue: longest {longest:.1f} ms, {t:.1f} s from the connect;"
+          f" bound {bound:.0f} ms (3 x LATENESS): {'pass' if kept_wait else 'FAIL'}")
+    return kept_floor and kept_wait
+
+
+# The windows the table is for, as /stats reports them: (lateness_us, start_bytes, fall,
+# packet_bytes), with their wait bound, three times LATENESS, in ms. Today's; today's with a
+# jumbo packet; and one whose every constant is different, so that a verdict that kept
+# constants of its own could not follow it.
+TODAY = ((60_000, 14_600, 2, 1_460), 180.0)
+JUMBO = ((60_000, 14_600, 2, 9_000), 180.0)
+OTHER = ((40_000, 20_000, 4, 1_000), 120.0)
+
+# The verdict's rule as a table, behind a 110 ms round trip: for a window, a link (kbit/s, 0
+# for none) and a stall schedule, the floor the window must keep when no stall began and
+# when one did, worked out by hand from the rule (None: not measured). A round is 110 ms
+# and the window's LATENESS: 170 ms for today's, 150 ms for the other.
+VERDICT_TABLE = [
+    # window, kbit/s, --stall, no stall, a stall
+    (TODAY, 0, "10,100", 14_600, 7_300),  # no bottleneck: START, and half of it
+    (TODAY, 20_000, "10,100", 14_600, 7_300),  # 150,000 B in LATENESS: START is less
+    (TODAY, 1_000, "10,100", 7_500, 3_750),  # 7,500 B in LATENESS
+    (TODAY, 400, "10,100", 3_000, 1_500),  # half of 3,000 is still a packet
+    (TODAY, 300, "10,100", 2_250, None),  # half of 2,250 is under a packet
+    (TODAY, 195, "10,100", 1_462.5, None),  # just over a packet; half is under
+    (TODAY, 194, "10,100", None, None),  # 1,455 B: under a packet
+    (TODAY, 20_000, "0.271,100", 14_600, 7_300),  # 171 ms between stalls: a round fits
+    (TODAY, 20_000, "0.269,100", 14_600, None),  # 169 ms: none does
+    (JUMBO, 20_000, "10,100", 14_600, None),  # half of START is under a jumbo packet
+    (JUMBO, 1_000, "10,100", None, None),  # 7,500 B: under one
+    (OTHER, 20_000, "10,100", 20_000, 5_000),  # START 20,000 B, and a quarter of it
+    (OTHER, 1_000, "10,100", 5_000, 1_250),  # 5,000 B in its LATENESS; a quarter is over a packet
+    (OTHER, 800, "10,100", 4_000, 1_000),  # a quarter of 4,000 is exactly a packet
+    (OTHER, 200, "10,100", 1_000, None),  # 1,000 B in its LATENESS: exactly a packet
+    (OTHER, 20_000, "0.255,100", 20_000, 5_000),  # 155 ms between stalls: its round (150) fits
+    (OTHER, 20_000, "0.245,100", 20_000, None),  # 145 ms: none does
+]
+
+
+def check_verdict(seed=0x5EED):
+    """`verdict`, through the options as `main` parses them, against `VERDICT_TABLE`: each
+    run reads as the table says, for windows whose lowest and longest wait are drawn at,
+    just either side of and well away from their bounds, after 0 or any number of stalls,
+    and for a /stats that lacks a field or lists the wrong viewers. Prints how often each
+    outcome was reached; exits on the first miss or on an outcome never reached.
+
+    It kills: stalls costing FALL once a stall (`fall**began`), a round without
+    `LATENESS`, `>` for `>=` on the floor and `<` for `<=` on the wait, a floor that is
+    `START` whatever the link, a floor under a packet that is measured, a floor of exactly
+    a packet taken as under one, `lateness_us` read as milliseconds, two new viewers
+    measured, the round trip halved on its way to the floor, `--kbps` read as kilobytes,
+    a /stats without `packet_bytes` measured, and any of `LATENESS`, `START`, `FALL` and
+    `PACKET` taken as today's value rather than read (the other window's rows). It does not
+    kill a wait bound of three `LATENESS` plus a twentieth of a millisecond: the waits drawn
+    just over it are a tenth over."""
+    import contextlib
+    import io
+
+    rng = random.Random(seed)
+    reach = {"pass": 0, "fail on carries": 0, "fail on the wait": 0, "not measured": 0,
+             "a field missing": 0, "not one new viewer": 0}
+    for _ in range(4_000):
+        ((lateness_us, start, fall, packet), wait_bound), kbps, schedule, floor_still, floor_stalled = rng.choice(VERDICT_TABLE)
+        began = rng.choice([0, 1, rng.randint(2, 50)])
+        floor = floor_still if began == 0 else floor_stalled
+        argv = ["127.0.0.1:1", "cold", "out", "--fifo", "fifo", "--rtt", "110", "--kbps", str(kbps), "--stall", schedule]
+        a, path = arguments(argv)
+        bound = floor if floor is not None else start
+        lowest = rng.choice([bound, int(bound) - 1, bound + 1, rng.uniform(0, 2 * bound)])
+        wait = rng.choice([wait_bound, wait_bound + 0.1, rng.uniform(0, 2 * wait_bound)])
+        final = {"lateness_us": lateness_us, "start_bytes": start, "fall": fall, "packet_bytes": packet,
+                 "clients": [{"id": 7, "lowest_carries_bytes": lowest}]}
+        want = "not measured" if floor is None else "pass" if lowest >= floor and wait <= wait_bound else "fail"
+        broken = rng.random() < 0.1
+        if broken and rng.random() < 0.5:
+            if rng.random() < 0.75:
+                del final[rng.choice(["lateness_us", "start_bytes", "fall", "packet_bytes"])]
+            else:
+                del final["clients"][0]["lowest_carries_bytes"]
+            want = "not measured"
+            reach["a field missing"] += 1
+        elif broken:
+            final["clients"] = rng.choice([[], final["clients"] + [{"id": 8, "lowest_carries_bytes": lowest}]])
+            want = "not measured"
+            reach["not one new viewer"] += 1
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            kept = verdict(final, {1}, [(1.0, wait)], a, path, began)
+        got = "not measured" if out.getvalue().startswith("not measured") else "pass" if kept else "fail"
+        if got != want:
+            sys.exit(f"{kbps} kbit/s, --stall {schedule}, {began} stalls, lowest {lowest}, wait {wait}:"
+                     f" {got}, the table says {want}\n{out.getvalue()}")
+        if want == "fail":
+            reach["fail on carries" if lowest < floor else "fail on the wait"] += 1
+        else:
+            reach[want] += 1
+    if not all(reach.values()):
+        sys.exit(f"an outcome never reached: {reach}")
+    print("verdict: 4,000 runs read as the rule's table says. Reached: " + ", ".join(f"{k} {v:,}" for k, v in reach.items()))
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--check-header"]:
+        check_header()
+    elif sys.argv[1:] == ["--check-verdict"]:
+        check_verdict()
+    else:
+        sys.exit(0 if asyncio.run(main()) else 1)

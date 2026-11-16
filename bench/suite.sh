@@ -7,9 +7,27 @@
 # Configs: py_picom py_nopicom (selkies), voxl voxl_picom, kasm kasm_picom.
 # *_picom runs picom from env/picom-start.sh (PICOM, PICOM_CONF; selkies' picom config
 # by default, PICOM_CONF=picom-damage.conf for today's Computer preview).
+# The cold workload (voxl only) is linkviewer.py's first load of a dense page, which it prints
+# through a terminal on the benchmark display: start env/term.sh FIFO and set COLD_FIFO=FIFO.
+# Each cold run that fails its bounds counts, and the suite exits 1 if any did.
 cd "$(dirname "$(readlink -f "$0")")"
 OUT=${OUT:-/tmp/suite.jsonl}
 SECS=${SECS:-20}
+failed=0
+cold() { # config port net: linkviewer.py's cold load behind the link NET names, judged by its bounds
+  local cfg=$1 port=$2 net=$3 link="" mbps rtt jitter res status
+  local fifo=${COLD_FIFO:?cold prints through a terminal: start env/term.sh FIFO and set COLD_FIFO}
+  if [ "$net" != "lan" ]; then
+    IFS=/ read -r mbps rtt jitter <<< "$net"; link="--kbps $((mbps * 1000)) --rtt $rtt --jitter ${jitter:-0}"
+  fi
+  res=$(./py.sh linkviewer.py localhost:$port cold "${OUT%.jsonl}-$cfg-cold-${net//\//_}" \
+    --fifo "$fifo" \
+    --late page $link 2>&1)
+  status=$?
+  res=${res//$'\n'/ }
+  [ "$status" = 0 ] || failed=$((failed + 1))
+  echo "{\"config\":\"$cfg\",\"workload\":\"cold\",\"net\":\"$net\",\"pass\":$([ "$status" = 0 ] && echo true || echo false),\"verdict\":\"${res//\"/\\\"}\"}" | tee -a $OUT
+}
 run_one() { # config client port workload net
   local cfg=$1 cli=$2 port=$3 wl=$4 net=$5 mbps rtt mx my target=$3
   case $wl in
@@ -18,8 +36,8 @@ run_one() { # config client port workload net
     animfull) mx=0; my=0; (DISPLAY=$BD ./loadgen 2560 1600 60 $((SECS+12)) 0 0 >/dev/null 2>&1 &) ;;
   esac
   if [ "$net" != "lan" ]; then
-    mbps=${net%/*}; rtt=${net#*/}; target=$((port+1000))
-    ./py.sh shaper.py $target localhost:$port $mbps $rtt >/dev/null 2>&1 &
+    local jitter; IFS=/ read -r mbps rtt jitter <<< "$net"; target=$((port+1000))
+    ./py.sh shaper.py $target localhost:$port $mbps $rtt --jitter ${jitter:-0} >/dev/null 2>&1 &
   fi
   sleep 4
   case $cli in
@@ -40,11 +58,18 @@ for cfg in ${CONFIGS:-py_picom py_nopicom voxl}; do
   env/picom-stop.sh
   case $cfg in *_picom) env/picom-start.sh ;; esac
   sleep 2
-  for wl in ${WORKLOADS:-scroll anim1080 animfull}; do
-    for net in ${NETS:-lan 10/40 5/60}; do
+  for wl in ${WORKLOADS:-scroll anim1080 animfull cold}; do
+    # NETS: lan, or MBPS/RTT_MS[/JITTER_MS] through shaper.py; 50/20/10 is a fast link
+    # whose arrivals jitter by up to 10 ms.
+    for net in ${NETS:-lan 10/40 5/60 50/20/10}; do
       [ $wl = animfull ] && [ $net != lan ] && continue
+      if [ $wl = cold ]; then
+        [ $cli = voxl ] && cold $cfg $port $net
+        continue
+      fi
       run_one $cfg $cli $port $wl $net
     done
   done
 done
 env/picom-stop.sh
+exit $((failed > 0))
