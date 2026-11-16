@@ -15,6 +15,7 @@ clock is read): `python3 -I bench/link.py`.
 """
 
 import bisect
+import math
 import os
 import random
 import sys
@@ -31,39 +32,103 @@ def page_late(share):
     return values[: round(len(values) * share)]
 
 
-# The page's lateness models: none, all of its measured answers, or all but their top 1 %.
-LATE = {"none": None, "page": 1.0, "page-99": 0.99}
+class OnTime:
+    """No lateness: an answer leaves as soon as it is given."""
+
+    def draw(self):
+        return 0.0
 
 
-def lateness(model):
-    """The lateness `model` (a key of `LATE`) draws from."""
-    return drawn_from(page_late(LATE[model])) if LATE[model] else None
+class Measured:
+    """A lateness drawn from `values` (seconds), each as likely as any other."""
+
+    def __init__(self, values, rng):
+        self.values, self.rng = values, rng
+
+    def draw(self):
+        return self.rng.choice(self.values)
 
 
-def drawn_from(values):
-    """A lateness drawn from `values`, each as likely as any other."""
-    return lambda rng: rng.choice(values)
+# The page's lateness models, by name: none, all of its measured answers, or all but their
+# top 1 %; each made from the random stream it draws from.
+LATE = {
+    "none": lambda rng: OnTime(),
+    "page": lambda rng: Measured(page_late(1.0), rng),
+    "page-99": lambda rng: Measured(page_late(0.99), rng),
+}
 
 
-class Stalls:
+class Jitter:
+    """A one-sided delay of up to `most` seconds, uniform."""
+
+    def __init__(self, most, rng):
+        self.most, self.rng = most, rng
+
+    def draw(self):
+        return self.rng.uniform(0, self.most)
+
+
+class Unlimited:
+    """A link with no bottleneck."""
+
+    def busy(self, nbytes):
+        return 0.0
+
+    def carries(self, seconds):
+        return math.inf
+
+
+class Rate:
+    """A bottleneck of `bps` bits a second."""
+
+    def __init__(self, bps):
+        self.bps = bps
+
+    def busy(self, nbytes):
+        """Seconds it takes to carry `nbytes`."""
+        return nbytes * 8 / self.bps
+
+    def carries(self, seconds):
+        """Bytes it carries in `seconds`."""
+        return self.bps / 8 * seconds
+
+
+def rate(bps):
+    """A link of `bps` bits a second, as the tools are told it (0: no bottleneck)."""
+    return Rate(bps) if bps > 0 else Unlimited()
+
+
+class Never:
+    """A link that never stalls."""
+
+    def resume(self, t):
+        return t
+
+    def carry(self, t, busy):
+        return t + busy
+
+    def begun(self, a, b):
+        return 0
+
+    def within(self, a, b):
+        return 0.0
+
+
+class Every:
     """The link carries nothing for `length` seconds every `every` seconds, the first stall
-    beginning at `every`. With `every` 0 it never stalls."""
+    beginning at `every`."""
 
-    def __init__(self, every=0.0, length=0.0):
+    def __init__(self, every, length):
         self.every, self.length = every, length
 
     def resume(self, t):
         """`t`, or the end of the stall `t` falls in."""
-        if not self.every:
-            return t
         start = (t // self.every) * self.every
         return start + self.length if start > 0 and t < start + self.length else t
 
     def carry(self, t, busy):
         """When `busy` seconds of carrying, begun at `t`, end; a stall stops the carrying."""
         t = self.resume(t)
-        if not self.every:
-            return t + busy
         while True:
             stall = (t // self.every + 1) * self.every
             if t + busy <= stall:
@@ -73,15 +138,11 @@ class Stalls:
 
     def begun(self, a, b):
         """How many stalls begin in [a, b)."""
-        if not self.every:
-            return 0
         first = max(1, -(-a // self.every))  # the first stall at or after a
         return max(0, int(-(-b // self.every) - first))
 
     def within(self, a, b):
         """Seconds of stall in [a, b)."""
-        if not self.every or b <= a:
-            return 0.0
         total, k = 0.0, max(1, int(a // self.every))
         while k * self.every < b:
             total += max(0.0, min(b, k * self.every + self.length) - max(a, k * self.every))
@@ -90,10 +151,11 @@ class Stalls:
 
 
 class Down:
-    """Server to viewer. `bps` 0: no bottleneck."""
+    """Server to viewer: `rate` (`Rate` or `Unlimited`), half the round trip `owd`, the
+    link's `stalls` (`Every` or `Never`), and a `Jitter` after the bottleneck."""
 
-    def __init__(self, bps, owd, stalls, jitter=0.0, rng=None):
-        self.bps, self.owd, self.stalls, self.jitter, self.rng = bps, owd, stalls, jitter, rng
+    def __init__(self, rate, owd, stalls, jitter):
+        self.rate, self.owd, self.stalls, self.jitter = rate, owd, stalls, jitter
         self.free = 0.0  # when the queue is next empty
         self.last = 0.0  # the latest arrival so far
 
@@ -103,32 +165,65 @@ class Down:
         queue (a stall is not counted as waiting)."""
         start = self.stalls.resume(max(now, self.free))
         wait = start - now - self.stalls.within(now, start)
-        self.free = self.stalls.carry(start, nbytes * 8 / self.bps) if self.bps else start
-        jitter = self.rng.uniform(0, self.jitter) if self.jitter else 0.0
-        self.last = max(self.last, self.free + self.owd + jitter)
+        self.free = self.stalls.carry(start, self.rate.busy(nbytes))
+        self.last = max(self.last, self.free + self.owd + self.jitter.draw())
         return self.last, wait
 
 
 class Up:
-    """Viewer to server: the page's answers (acks, pongs), in the order it gave them."""
+    """Viewer to server: the page's answers (acks, pongs), in the order it gave them, each
+    late by its `late` (`OnTime` or `Measured`)."""
 
-    def __init__(self, owd, stalls, late=None, rng=None):
-        self.owd, self.stalls, self.late, self.rng = owd, stalls, late, rng
+    def __init__(self, owd, stalls, late):
+        self.owd, self.stalls, self.late = owd, stalls, late
         self.leaving = 0.0  # when the last answer left the page
 
     def send(self, now):
         """`(leaves, arrival)` of an answer the page gives at `now`: when it leaves the
         page (at its own lateness, or with the answer before it if that one is later
         still), and when it reaches the server."""
-        late = self.late(self.rng) if self.late else 0.0
-        self.leaving = max(now + late, self.leaving)
+        self.leaving = max(now + self.late.draw(), self.leaving)
         return self.leaving, self.stalls.resume(self.leaving) + self.owd
+
+
+def stall_schedule(text):
+    """`--stall`'s EVERY_S,LENGTH_MS."""
+    every, length = (float(v) for v in text.split(","))
+    return Every(every, length / 1000)
+
+
+def add_options(ap):
+    """The options both tools take for the link, parsed once, here."""
+    ap.add_argument("--jitter", type=float, default=0, help="one-sided jitter after the bottleneck, at most this many ms")
+    ap.add_argument("--stall", type=stall_schedule, default=Never(),
+                    help="EVERY_S,LENGTH_MS: the link carries nothing for LENGTH_MS every EVERY_S seconds")
+    ap.add_argument("--late", choices=sorted(LATE), default="none", help="answers leave late as a page's measured ones did")
+    ap.add_argument("--seed", type=int, default=0, help="seed of every kind of draw, each its own stream")
+
+
+class Path:
+    """One connection's link, as `add_options` parsed it: `down`, `up`, the `rate` and
+    the `stalls` both directions share."""
+
+    def __init__(self, a, rate, owd):
+        self.rate, self.stalls = rate, a.stall
+        self.down = Down(rate, owd, a.stall, Jitter(a.jitter / 1000, random.Random(f"{a.seed}:jitter")))
+        self.up = Up(owd, a.stall, LATE[a.late](random.Random(f"{a.seed}:late")))
 
 
 # How far the oracle may differ from the model: a message is handed over within one tick
 # of the oracle's grid, and served to within one more.
 TICK = 1e-4
 TOLERANCE = 2 * TICK
+
+
+def _stalled(every, length):
+    """When a link that stalls for `length` every `every` is stalled, by its definition."""
+    return lambda t: t >= every - 1e-9 and (t + 1e-9) % every < length
+
+
+# The stall schedules the check draws from: the model, and the oracle's account of it.
+SCHEDULES = [(Never(), lambda t: False), (Every(0.5, 0.05), _stalled(0.5, 0.05)), (Every(0.3, 0.12), _stalled(0.3, 0.12))]
 
 
 def _check(seed=0x5EED):
@@ -155,10 +250,10 @@ def _check(seed=0x5EED):
              "crossed after a stall": 0}
     for case in range(300):
         bps = rng.choice([1e6, 5e6, 20e6, 1e9])
-        every, length = rng.choice([(0.0, 0.0), (0.5, 0.05), (0.3, 0.12)])
+        # The link's stalls, and the oracle's own account of when it is stalled.
+        stalls, stalled = rng.choice(SCHEDULES)
         jitter = rng.choice([0.0, 0.005, 0.02])
-        stalls = Stalls(every, length)
-        down = Down(bps, rng.uniform(0, 0.1), stalls, jitter, random.Random(case))
+        down = Down(Rate(bps), rng.uniform(0, 0.1), stalls, Jitter(jitter, random.Random(case)))
         now, sent = 0.0, []
         for _ in range(30):
             now += rng.expovariate(1 / rng.choice([0.001, 0.016, 0.1]))
@@ -167,7 +262,6 @@ def _check(seed=0x5EED):
         # The oracle: the link a tick at a time. In a tick that is not stalled it serves
         # the queue as a fluid, from where it stood, each message once the one before it is
         # done and once it has been handed over; a stalled tick serves nothing.
-        stalled = lambda t: every > 0 and t >= every - 1e-9 and (t + 1e-9) % every < length
         k, i, left, pos, began, before = 0, 0, None, 0.0, None, 0.0
         while i < len(sent):
             t = k * TICK
@@ -215,8 +309,8 @@ def _check(seed=0x5EED):
     whole, cut = page_late(1.0), page_late(0.99)
     top = set(whole[len(cut):])
     for name, values in (("all", whole), ("without the top 1 %", cut)):
-        draw = drawn_from(values)
-        draws = sorted(draw(rng) for _ in range(n))
+        late = Measured(values, rng)
+        draws = sorted(late.draw() for _ in range(n))
         if not set(draws) <= set(values):
             sys.exit(f"{name}: a lateness that was never measured")
         for d in range(1, 10):
@@ -229,8 +323,8 @@ def _check(seed=0x5EED):
             sys.exit(f"{name}: drew from the top 1 % {len(top & set(draws))} times")
     # Answers given in order, each with its own lateness, and a stall on the way up.
     twin = random.Random(seed)
-    stalls = Stalls(1.0, 0.25)
-    up = Up(0.055, stalls, drawn_from(whole), random.Random(seed))
+    stalls = Every(1.0, 0.25)
+    up = Up(0.055, stalls, Measured(whole, random.Random(seed)))
     now, last = 0.0, 0.0
     for _ in range(20_000):
         now += rng.expovariate(1 / 0.01)

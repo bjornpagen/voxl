@@ -210,16 +210,13 @@ async def main():
     ap.add_argument("out")
     ap.add_argument("--kbps", type=float, default=0, help="bottleneck rate (0: none)")
     ap.add_argument("--rtt", type=float, default=0, help="round trip (ms)")
-    ap.add_argument("--jitter", type=float, default=0, help="one-sided jitter after the bottleneck, at most this many ms")
-    ap.add_argument("--stall", help="EVERY_S,LENGTH_MS: the link carries nothing for LENGTH_MS every EVERY_S seconds")
-    ap.add_argument("--late", choices=sorted(link.LATE), default="none", help="acks and pongs leave late as the page's measured ones did")
+    link.add_options(ap)
     ap.add_argument("--hold", action="store_true", help="hold frames as a software decoder would")
     ap.add_argument("--fifo", help="FIFO a terminal on the benchmark display reads commands from")
     ap.add_argument("--page", default="/etc/services", help="file the scenarios print")
     ap.add_argument("--settle", type=float, default=3.0, help="seconds to watch before the scenario")
     ap.add_argument("--passive", type=float, default=0, help="only watch, for this many seconds")
     ap.add_argument("--stats", help="the server's /stats (default: http://HOST:PORT/stats)")
-    ap.add_argument("--seed", type=int, default=0, help="seed of the holds, the lateness and the jitter, each its own stream")
     ap.add_argument("--keysym", type=lambda v: int(v, 0), default=0x61, help="key the hold scenario holds")
     ap.add_argument("--key-hold", type=float, default=3.0, help="seconds the key is held")
     # Not X's own schedule (500 ms then 50 ms under xfsettingsd, 660 then 40 bare), so the
@@ -229,12 +226,8 @@ async def main():
     ap.add_argument("--key-stall", type=float, default=0, help="extra delay of the key-up alone (ms)")
     a = ap.parse_args()
     holds = random.Random(f"{a.seed}:hold")
-    owd = a.rtt / 2000.0
-    rate = a.kbps * 1000.0
-    every, length = (float(v) for v in a.stall.split(",")) if a.stall else (0.0, 0.0)
-    stalls = link.Stalls(every, length / 1000)
-    down = link.Down(rate, owd, stalls, a.jitter / 1000, random.Random(f"{a.seed}:jitter"))
-    up = link.Up(owd, stalls, link.lateness(a.late), random.Random(f"{a.seed}:late"))
+    path = link.Path(a, link.rate(a.kbps * 1000.0), a.rtt / 2000.0)
+    down, up = path.down, path.up
     stats_url = a.stats or f"http://{a.hostport}/stats"
     t0 = time.monotonic()
     clock = lambda: time.monotonic() - t0
@@ -387,7 +380,7 @@ async def main():
     ended, final = first.result()
     with open(f"{a.out}.stats.json", "w") as f:
         json.dump(final, f)
-    return verdict(final, before, waits, rate, stalls.begun(connected, ended))
+    return verdict(final, before, waits, path.rate, path.stalls.begun(connected, ended))
 
 
 class NotMeasured(Exception):
@@ -414,7 +407,7 @@ def verdict(final, before, waits, rate, stalls):
     except NotMeasured as e:
         print(f"not measured: {e}: FAIL")
         return False
-    floor = (min(start, rate / 8 * lateness) if rate else start) / fall**stalls
+    floor = min(start, rate.carries(lateness)) / fall**stalls
     kept_floor = lowest >= floor
     print(f"carries: lowest {lowest} B since the connect; bound {floor:.0f} B (START {start} B, or what the link"
           f" carries in LATENESS if less, / FALL {fall} for each of {stalls} stalls): {'pass' if kept_floor else 'FAIL'}")
