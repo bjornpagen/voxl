@@ -2,8 +2,9 @@
 //! be on its way to that viewer at once.
 //!
 //! The transport is in order and loses nothing, so the server knows what it has sent that
-//! the viewer has not acknowledged, and when each frame left and came back. That is enough
-//! to hold the stream to the path with no estimate of a rate and nothing steered:
+//! the viewer has not acknowledged, and when each frame left and came back. From that it
+//! reads what the path delivered, as a TCP sender reads its delivery rate, and steers the
+//! window by how long frames waited behind the queue:
 //!
 //! - **One value**, `carries`: the bytes the path carries in `LATENESS`, from a packet up.
 //!   A path that carries less than a packet in it is outside the window's range.
@@ -630,8 +631,9 @@ mod tests {
         /// Since `reset`: the bytes sent, and the longest a frame waited behind the queue.
         sent: usize,
         worst: Duration,
-        /// The most `fastest` has been over the path's own trip, and the window over what
-        /// the path carries (`carries` over it, less one), since `reset`.
+        /// Since `reset`: the most `fastest` has been over the path's own trip, and the most
+        /// the window was over what the path carries (`carries` over it, less one) while the
+        /// path held more than `LATENESS / 2` of queue.
         over: Duration,
         past: f64,
     }
@@ -706,8 +708,10 @@ mod tests {
             if let Some(fastest) = self.window.fastest() {
                 self.over = self.over.max(fastest.saturating_sub(self.path.trip));
             }
-            let past = self.window.carries() as f64 / self.path.carries() as f64 - 1.0;
-            self.past = self.past.max(past);
+            if self.path.free.saturating_duration_since(self.now) > LATENESS / 2 {
+                let past = self.window.carries() as f64 / self.path.carries() as f64 - 1.0;
+                self.past = self.past.max(past);
+            }
             let bytes = match want {
                 Want::Nothing => return,
                 Want::Key(bytes) => bytes.min(scale(
@@ -783,24 +787,26 @@ mod tests {
     /// slowest hundredth, stretches a reading's time (of `LATENESS / 2` at least) by `δ`, so the
     /// bound is that times `(LATENESS / 2) / (LATENESS / 2 + δ)`.
     ///
-    /// And no frame waits behind the queue longer than `3 * LATENESS`, plus `E`, the most the
-    /// fastest ping's trip was over the path's own (a frame's queue is measured `E` short, so
-    /// the window sees a queue only past `H = LATENESS / 2 + E`), plus what the window adds
-    /// while `E` hides it. Over the path by `x` (its most `carries` over what the path
-    /// carries, less one), the queue grows by `x` of every moment, for as long as it takes a
-    /// whole round of frames to show it: two rounds at most, each the trip and the queue. So
-    /// `wait <= 3 * LATENESS + E + 2 * (trip + wait) * x`, which bounds the wait only while
-    /// `x < 1/2`; past that it says nothing. No bound from the constants alone closes it: a
-    /// round grows the window by up to `LATENESS / (4 * round)` while the queue is hidden, and
-    /// the `n`-th such round adds about `n * LATENESS / 4` of queue, so up to
-    /// `sqrt(8 * H / LATENESS)` of them fit under `H`, and `x` may reach
-    /// `(1 + LATENESS / (4 * trip))^n - 1`, over a half on short trips (on a 34 ms trip
-    /// with `E` 43 ms, 3.3). So the property takes the `x` the window reached.
+    /// And how long a frame waits behind the queue, `wait`, is bounded by the trip, `E` (the
+    /// most the fastest ping's trip was over the path's own) and `x` (the most the window was
+    /// over what the path carries, less one, while the path held more than `LATENESS / 2` of
+    /// queue), two ways, both asserted:
+    ///
+    /// - `wait <= 3 * LATENESS + E + 2 * (trip + wait) * x`. A frame's queue is measured `E`
+    ///   short, so the window sees a queue only past `H = LATENESS / 2 + E`; over the path by
+    ///   `x`, the queue grows by `x` of every moment, and a fall needs a whole round of frames
+    ///   that show it: two rounds at most, each the trip and the queue. This bounds `wait`
+    ///   only while `x < 1/2`.
+    /// - `x <= g^(n + 1) - 1`, `g` the most a round may grow the window,
+    ///   `min(FALL, 1 + LATENESS / (4 * trip))`, and `n` the rounds that fit while the queue
+    ///   is hidden, `ceil(sqrt(8 * H / LATENESS))`: the `j`-th round over the path adds at
+    ///   least `j * LATENESS / 4` of queue, and these add up to `H`; one more round grows it
+    ///   as the queue crosses `H`. This bounds the window wherever the first says nothing.
     #[test]
     fn a_cold_load_keeps_the_window_at_start_or_what_the_path_carries() {
         let mut rng = Xorshift::new(0x3C6E_F372_FE94_F82B);
         let ms = Duration::from_millis;
-        let (mut late_pong, mut pong_after_key, mut over) = (0, 0, 0);
+        let (mut late_pong, mut pong_after_key, mut over, mut vacuous) = (0, 0, 0, 0);
         for case in 0..201 {
             let t0 = Instant::now();
             let carries = any_carries(&mut rng);
@@ -856,12 +862,21 @@ mod tests {
                 "{what}, over it by {:.2}",
                 v.past
             );
+            let hidden = (LATENESS / 2 + v.over).as_secs_f64() / LATENESS.as_secs_f64();
+            let rounds = (8.0 * hidden).sqrt().ceil() as i32 + 1;
+            let grow = (1.0 + LATENESS.as_secs_f64() / (4.0 * trip.as_secs_f64())).min(FALL as f64);
+            assert!(
+                v.past <= grow.powi(rounds) - 1.0,
+                "{what}, over it by {:.2}",
+                v.past
+            );
             over += usize::from(v.worst > LATENESS * 3 + v.over);
+            vacuous += usize::from(v.past >= 0.5);
         }
         assert!(
-            late_pong > 50 && pong_after_key > 50 && over > 0,
+            late_pong > 50 && pong_after_key > 50 && over > 0 && vacuous > 0,
             "{late_pong} first pongs before the keyframe's ack, {pong_after_key} after, {over} \
-             waits past 3 LATENESS and E"
+             waits past 3 LATENESS and E, {vacuous} windows half again over the path"
         );
     }
 
