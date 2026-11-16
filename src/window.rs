@@ -520,110 +520,10 @@ impl Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oracle::{measured, Late, Path, PING};
     use crate::xorshift::Xorshift;
 
     const FRAME: Duration = Duration::from_micros(16_667);
-
-    /// How late answers come back, past the path's own trip: as the page's acks in
-    /// `acks-late-us.txt` did, in their order from anywhere among them, those without their
-    /// slowest hundredth, or not at all.
-    #[derive(Clone, Copy, Debug, PartialEq)]
-    enum Late {
-        Page,
-        PageBelowTop,
-        None,
-    }
-
-    /// The page's measured lates, in their order, and those under the 99th hundredth of them.
-    fn measured() -> &'static (Vec<Duration>, Vec<Duration>) {
-        static MEASURED: std::sync::OnceLock<(Vec<Duration>, Vec<Duration>)> =
-            std::sync::OnceLock::new();
-        MEASURED.get_or_init(|| {
-            let all: Vec<Duration> = include_str!("acks-late-us.txt")
-                .lines()
-                .filter(|l| !l.starts_with('#'))
-                .map(|l| Duration::from_micros(l.parse().unwrap()))
-                .collect();
-            let mut sorted = all.clone();
-            sorted.sort();
-            let top = sorted[sorted.len() * 99 / 100];
-            let below = all.iter().copied().filter(|&l| l < top).collect();
-            (all, below)
-        })
-    }
-
-    /// What a ping weighs on the path: its JSON, a token of 16 hex digits.
-    const PING: usize = 40;
-
-    /// The oracle: what a viewer's path does with what the server sends it.
-    struct Path {
-        /// Bytes a second through its bottleneck, and its own round trip.
-        rate: f64,
-        trip: Duration,
-        /// (from, to): its bottleneck carries nothing.
-        stalls: Vec<(Instant, Instant)>,
-        /// (from, to): the viewer holds its answers, and sends them all at `to`.
-        held: Vec<(Instant, Instant)>,
-        /// When its bottleneck has carried everything it was given.
-        free: Instant,
-        /// When the last answer on its way back comes back: answers come back in order.
-        last: Instant,
-        /// How late answers come back, and where among the measured lates the next is.
-        late: Late,
-        next: usize,
-        rng: Xorshift,
-    }
-
-    impl Path {
-        /// How late the next answer comes back.
-        fn late(&mut self) -> Duration {
-            let (all, below) = measured();
-            let lates = match self.late {
-                Late::Page => all,
-                Late::PageBelowTop => below,
-                Late::None => return Duration::ZERO,
-            };
-            self.next += 1;
-            lates[self.next % lates.len()]
-        }
-
-        /// `bytes` given at `at`: when its bottleneck has carried them.
-        fn through(&mut self, at: Instant, bytes: usize) -> Instant {
-            let mut t = self.free.max(at);
-            let mut left = Duration::from_secs_f64(bytes as f64 / self.rate);
-            for &(a, b) in &self.stalls {
-                if b <= t {
-                    continue;
-                }
-                if a > t {
-                    if a - t >= left {
-                        break;
-                    }
-                    left -= a - t;
-                }
-                t = b;
-            }
-            self.free = t + left;
-            self.free
-        }
-
-        /// What was through at `through`, answered `held` after it reached the viewer: when
-        /// the answer comes back, late by a draw, behind every answer before it.
-        fn answer(&mut self, through: Instant, held: Duration) -> Instant {
-            let sent = through + self.trip / 2 + held;
-            let sent = match self.held.iter().find(|h| h.0 <= sent && sent < h.1) {
-                Some(&(_, to)) => to,
-                None => sent,
-            };
-            self.last = self.last.max(sent + self.trip / 2 + self.late());
-            self.last
-        }
-
-        /// What the path carries in `LATENESS`.
-        fn carries(&self) -> usize {
-            (self.rate * LATENESS.as_secs_f64()) as usize
-        }
-    }
 
     /// What the screen wants sent in a frame time.
     #[derive(Clone, Copy)]
@@ -761,22 +661,6 @@ mod tests {
         }
     }
 
-    /// A path that carries `carries` bytes in `LATENESS`, a round trip of `trip`, from `t0`.
-    fn path(t0: Instant, carries: f64, trip: Duration, late: Late, seed: u64) -> Path {
-        let mut rng = Xorshift::new(seed);
-        Path {
-            rate: carries / LATENESS.as_secs_f64(),
-            trip,
-            stalls: Vec::new(),
-            held: Vec::new(),
-            free: t0,
-            last: t0,
-            late,
-            next: rng.below(measured().0.len() as u64) as usize,
-            rng,
-        }
-    }
-
     /// What a path from `START` to 1 Gbit/s carries in `LATENESS`, evenly spread in its
     /// logarithm.
     fn any_carries(rng: &mut Xorshift) -> f64 {
@@ -838,7 +722,7 @@ mod tests {
             let carries = any_carries(&mut rng);
             let trip = ms(2 + rng.below(299));
             let late = LATES[case % LATES.len()];
-            let path = path(t0, carries, trip, late, rng.next());
+            let path = Path::new(t0, carries, trip, late, rng.next());
             let extra = ms(rng.below(121));
             // In half the cases the first pong is held until after the keyframe's ack.
             let after_key = rng.below(2) == 1;
@@ -1090,7 +974,7 @@ mod tests {
             let rate = slow * (fast / slow).powf(rng.below(1001) as f64 / 1000.0);
             let trip = ms(2 + rng.below(299));
             let late = LATES[case % LATES.len()];
-            let path = path(t0, rate * LATENESS.as_secs_f64(), trip, late, rng.next());
+            let path = Path::new(t0, rate * LATENESS.as_secs_f64(), trip, late, rng.next());
             let mut v = Viewer::connect(t0, path, rng.below(17_000) as usize, Duration::ZERO);
             v.tick(Want::Key(usize::MAX));
             for _ in 0..600 {

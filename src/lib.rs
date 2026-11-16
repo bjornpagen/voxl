@@ -29,6 +29,8 @@ mod login;
 mod mac;
 mod mic;
 mod mp4;
+#[cfg(test)]
+mod oracle;
 mod path;
 mod rate;
 mod record;
