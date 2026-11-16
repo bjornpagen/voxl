@@ -543,7 +543,9 @@ mod tests {
     /// of its number in the ring and within 2^32 us of its damage. Over a long run of
     /// frames, writes from viewers (the newest frames, older ones, frames long gone and
     /// frames not yet recorded, in any order) and reads of any length, the ring returns
-    /// exactly the model's newest frames.
+    /// exactly the model's newest frames. The count starts within a ring's length of its
+    /// wrap at 2^32, so the run records, writes and reads across it, and the crossing is
+    /// counted.
     #[test]
     fn the_ring_returns_the_newest_frames_as_recorded() {
         let start = Instant::now();
@@ -552,9 +554,10 @@ mod tests {
         // The model: frame number -> (what was recorded, its write).
         let mut model: Vec<(u32, Recorded)> = vec![];
         let mut at = 0u64;
-        // The count from anywhere, its wrap at 2^32 among them.
-        let first = rng.below(u32::MAX as u64) as u32;
+        // The count a ring's length or less short of its wrap.
+        let first = 0u32.wrapping_sub(1 + rng.below(FRAMES_KEPT as u64) as u32);
         ring.newest.store(first.wrapping_sub(1), Ordering::Relaxed);
+        let mut crossed = 0;
         for k in 0..3 * FRAMES_KEPT as u32 + 777 {
             let number = ring.number();
             let id = number.get();
@@ -563,6 +566,7 @@ mod tests {
                 first.wrapping_add(k),
                 "frames are numbered one after another"
             );
+            crossed += u32::from(id == 0);
             at += rng.below(40_000);
             let gaps: [u64; MARKS.len() - 1] = std::array::from_fn(|_| rng.below(9_000));
             let (rows, bytes) = (rng.below(2000) as u32, rng.below(1 << 20) as usize);
@@ -632,6 +636,7 @@ mod tests {
                 }
             }
         }
+        assert_eq!(crossed, 1, "the count crossed its wrap");
     }
 
     /// A reader never takes a frame that is being recorded as it reads: every frame it
@@ -826,12 +831,12 @@ mod tests {
                     hub.remove_client(leavers[w].0.client.id, at);
                     again += 1;
                 }
-                90..=99 if !watchers.is_empty() => {
+                63..=72 if !watchers.is_empty() => {
                     let w = rng.below(watchers.len() as u64) as usize;
                     let w = &mut watchers[w];
                     w.heard_from = w.heard_from.max(step + rng.below(12_000) as u32);
                 }
-                100..=5999 => {
+                73..=5972 => {
                     let number = hub.timeline.number();
                     newest = number.get();
                     let (bytes, key) = (rng.below(1 << 20) as usize, rng.below(30) == 0);
@@ -871,7 +876,7 @@ mod tests {
                         late += 1;
                     }
                 }
-                6000.. if !watchers.is_empty() => {
+                5973.. if !watchers.is_empty() => {
                     let w = rng.below(watchers.len() as u64) as usize;
                     let w = &mut watchers[w];
                     if step < w.heard_from || w.sent.is_empty() {
