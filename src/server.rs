@@ -170,31 +170,43 @@ pub fn router(state: AppState) -> Router {
 
 async fn stats(State(s): State<AppState>) -> Response {
     let st = &s.hub.stats;
+    // One moment, and one read of each client at it: every number about a client, and the
+    // least of their paths, come from that read.
     let now = Instant::now();
-    let viewers = s.hub.clients.lock().clone();
-    let clients: Vec<_> = viewers
+    let read: Vec<_> = s
+        .hub
+        .clients
+        .lock()
         .iter()
-        .map(|c| {
-            let backlog = c.backlog(now);
-            let (n, age) = backlog.map_or((0, 0), |b| (b.frames.get(), b.oldest.as_millis()));
-            let (carries, lowest, flying, fastest) =
-                c.window(|w| (w.carries(), w.lowest(), w.flying(), w.fastest()));
-            serde_json::json!({"id": c.id, "video": c.viewer() != crate::hub::Viewer::NotWatching, "inflight": n, "oldest_ms": age,
-                "min_rtt_ms": c.min_rtt_ms.load(Ordering::Relaxed), "carries_bytes": carries,
-                "lowest_carries_bytes": lowest, "flying_bytes": flying,
-                "fastest_ms": fastest.map(|t| t.as_secs_f64() * 1000.0),
-                "client_ms": (*c.client_ms.lock() * 10.0).round() / 10.0})
+        .map(|c| (c.id, c.stats(now)))
+        .collect();
+    let watching = |c: &crate::hub::ClientStats| c.viewer != crate::hub::Viewer::NotWatching;
+    let clients: Vec<_> = read
+        .iter()
+        .map(|(id, c)| {
+            // Nothing on its way has no oldest: null, not 0.
+            let inflight = c.backlog.map_or(0, |b| b.frames.get());
+            let oldest = c.backlog.map(|b| b.oldest.as_millis() as u64);
+            serde_json::json!({"id": id, "video": watching(c), "inflight": inflight, "oldest_ms": oldest,
+                "carries_bytes": c.carries, "lowest_carries_bytes": c.lowest, "flying_bytes": c.flying,
+                "fastest_ms": c.fastest.map(|t| t.as_secs_f64() * 1000.0),
+                "client_ms": c.client_ms.map(|ms| (ms * 10.0).round() / 10.0)})
         })
         .collect();
     // What the slowest watching viewer's path carries, as a rate.
-    let target = viewers
+    let target = read
         .iter()
-        .filter(|c| c.viewer() != crate::hub::Viewer::NotWatching)
-        .map(|c| c.window(|w| w.carries()))
+        .filter(|(_, c)| watching(c))
+        .map(|(_, c)| c.carries)
         .min()
         .map(|bytes| bytes as f64 * 8.0 / crate::window::LATENESS.as_secs_f64() / 1000.0);
     let body = serde_json::json!({
-        "now_us": s.hub.timeline.us(Instant::now()),
+        "now_us": s.hub.timeline.us(now),
+        // What a window's numbers are in: the time it carries `carries` bytes in, where it
+        // starts, and the most it falls in a round.
+        "lateness_us": crate::window::LATENESS.as_micros() as u64,
+        "start_bytes": crate::window::START,
+        "fall": crate::window::FALL,
         "captured": st.captured.load(Ordering::Relaxed),
         "encoded": st.encoded.load(Ordering::Relaxed),
         "bytes": st.bytes.load(Ordering::Relaxed),
@@ -355,10 +367,9 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
             }
         })
     };
-    let mut rtts: std::collections::VecDeque<u32> = Default::default();
     while let Some(Ok(msg)) = stream.next().await {
         match msg {
-            Message::Text(t) => handle_text(&s, &client, t.as_str(), &mut rtts),
+            Message::Text(t) => handle_text(&s, &client, t.as_str()),
             // Every binary message from a viewer acts on the desktop (clipboard images,
             // microphone audio), so a read-only viewer's are all dropped.
             Message::Binary(_) if s.read_only => {}
@@ -614,7 +625,7 @@ impl Command {
     }
 }
 
-fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collections::VecDeque<u32>) {
+fn handle_text(s: &AppState, c: &Arc<Client>, t: &str) {
     let Some(command) = Command::parse(t) else {
         return;
     };
@@ -697,14 +708,6 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
                 return;
             };
             c.pinged(now, rtt, ahead);
-            // Whole ms, and at least 1: a client's min_rtt_ms is 0 until it has one. A
-            // ping in the record went out at most a few seconds ago, so a u32 holds it.
-            rtts.push_back((rtt.as_millis() as u32).max(1));
-            if rtts.len() > 20 {
-                rtts.pop_front();
-            }
-            c.min_rtt_ms
-                .store(*rtts.iter().min().unwrap(), Ordering::Relaxed);
         }
     }
 }
@@ -777,9 +780,8 @@ mod tests {
         let s = app(&hub, read_only, Some(mic_tx));
         let (tx, _rx) = mpsc::unbounded_channel();
         let client = hub.add_client(tx, Instant::now());
-        let mut rtts = Default::default();
         for c in ALL {
-            handle_text(&s, &client, c, &mut rtts);
+            handle_text(&s, &client, c);
         }
         let resized = hub.resize_req.lock().is_some();
         (
@@ -832,7 +834,6 @@ mod tests {
         s: AppState,
         screen: Screen,
         pages: Vec<Page>,
-        rtts: std::collections::VecDeque<u32>,
         rebuilds: usize,
         /// The newest ask that changed what its connection asks for: the oracle's rule.
         newest: Option<(u32, u32)>,
@@ -851,7 +852,7 @@ mod tests {
             }
             p.asked = Some(p.window);
             let sz = format!("sz,{},{}", p.window.0, p.window.1);
-            handle_text(&self.s, &c, &sz, &mut self.rtts);
+            handle_text(&self.s, &c, &sz);
         }
 
         /// The capture loop's turn: it takes the request, gives it to the screen, and if
@@ -939,7 +940,6 @@ mod tests {
                         window: sizes[rng.below(5) as usize],
                     })
                     .collect(),
-                rtts: Default::default(),
                 rebuilds: 0,
                 newest: None,
                 repeats: 0,
@@ -1048,18 +1048,14 @@ mod tests {
         };
         let (tx, _rx) = mpsc::unbounded_channel();
         let client = hub.add_client(tx, Instant::now());
-        let mut rtts = Default::default();
         // No ping was sent to this viewer. It names a moment just past, as replies did when
         // pings were named by the microsecond they went out, then a token.
         for reply in ["po,9999000", "po,0123456789abcdef"] {
-            handle_text(&s, &client, reply, &mut rtts);
+            handle_text(&s, &client, reply);
         }
         assert_eq!(
-            (
-                client.min_rtt_ms.load(Ordering::Relaxed),
-                client.window(|w| w.fastest())
-            ),
-            (0, None),
+            client.window(|w| w.fastest()),
+            None,
             "a reply to no ping read as a round trip"
         );
     }
@@ -1090,13 +1086,11 @@ mod tests {
         };
         let (tx, _rx) = mpsc::unbounded_channel();
         let client = hub.add_client(tx, Instant::now());
-        let mut rtts = Default::default();
         let token = crate::hub::Token::random();
         client.ping(Instant::now(), token);
-        handle_text(&s, &client, &format!("po,{token}"), &mut rtts);
+        handle_text(&s, &client, &format!("po,{token}"));
         assert!(
-            client.min_rtt_ms.load(Ordering::Relaxed) > 0
-                && client.window(|w| w.fastest()).is_some(),
+            client.window(|w| w.fastest()).is_some(),
             "the reply to a ping was no round trip"
         );
     }

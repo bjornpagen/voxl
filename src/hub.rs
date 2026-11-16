@@ -315,13 +315,17 @@ fn restarted(viewer: Viewer) -> Viewer {
     }
 }
 
-/// What a client is to the stream, the frames sent to it and not yet acked, and what its
-/// path carries, read from those frames: under one lock, so that every change to the three
-/// is one step.
+/// What a client is to the stream, the frames sent to it and not yet acked, what its path
+/// carries, read from those frames, and how long it says it holds a frame: under one lock,
+/// so that every change to them is one step, and every read of them one state.
 struct Viewing {
     viewer: Viewer,
     inflight: VecDeque<Inflight>,
     window: Window,
+    /// How long the client keeps a frame between its arrival and the ack (decode, draw,
+    /// frames ahead of it), as it reports it: smoothed ms, once it has said a hold that
+    /// could be true.
+    client_ms: Option<f64>,
 }
 
 impl Viewing {
@@ -330,6 +334,14 @@ impl Viewing {
     fn forget(&mut self, now: Instant) {
         self.inflight.clear();
         self.window.forget(now);
+    }
+
+    /// What it has in flight at `now`, if anything.
+    fn backlog(&self, now: Instant) -> Option<Backlog> {
+        Some(Backlog {
+            frames: NonZeroUsize::new(self.inflight.len())?,
+            oldest: now.saturating_duration_since(self.inflight.front()?.left),
+        })
     }
 }
 
@@ -355,13 +367,8 @@ pub struct Client {
     pub tx: mpsc::UnboundedSender<Out>,
     viewing: Mutex<Viewing>,
     pub audio: AtomicBool,
-    /// Smoothed min RTT (ms), from pings.
-    pub min_rtt_ms: AtomicU32,
     /// The pings sent to it that it has not answered.
     pub pings: Mutex<Pings>,
-    /// How long the client keeps a frame between its arrival and the ack (decode, draw,
-    /// frames ahead of it), as it reports it: smoothed ms, 0 for a client that doesn't.
-    pub client_ms: Mutex<f64>,
     /// Its last frames as they were sent and acked (`/stats/trace`), kept a while once it
     /// has left.
     pub trace: Arc<Mutex<crate::timeline::Trace>>,
@@ -383,6 +390,7 @@ impl Client {
     }
 
     /// What its window says, as one read sees it.
+    #[cfg(test)]
     pub fn window<R>(&self, read: impl FnOnce(&Window) -> R) -> R {
         read(&self.viewing.lock().window)
     }
@@ -530,6 +538,7 @@ impl Client {
             viewer,
             inflight,
             window,
+            client_ms,
         } = &mut *v;
         let Some(named) = inflight.iter().position(|f| f.id.get() == id) else {
             return;
@@ -547,10 +556,9 @@ impl Client {
         if let (Viewer::Behind, true) = (*viewer, inflight.is_empty()) {
             *viewer = Viewer::Waiting;
         }
-        drop(v);
         if let Some(held) = said {
-            let mut m = self.client_ms.lock();
-            *m = *m * 0.9 + held.as_secs_f64() * 100.0;
+            let ms = held.as_secs_f64() * 1000.0;
+            *client_ms = Some(client_ms.map_or(ms, |m| m * 0.9 + ms * 0.1));
         }
     }
 
@@ -567,18 +575,43 @@ impl Client {
         self.pings.lock().send(now, token, ahead);
     }
 
-    /// What it has in flight at `now`, if anything.
-    pub fn backlog(&self, now: Instant) -> Option<Backlog> {
-        let q = &self.viewing.lock().inflight;
-        Some(Backlog {
-            frames: NonZeroUsize::new(q.len())?,
-            oldest: now.saturating_duration_since(q.front()?.left),
-        })
+    /// What `/stats` reports of it at `now`, as one read sees it.
+    pub fn stats(&self, now: Instant) -> ClientStats {
+        let v = self.viewing.lock();
+        ClientStats {
+            viewer: v.viewer,
+            backlog: v.backlog(now),
+            carries: v.window.carries(),
+            lowest: v.window.lowest(),
+            flying: v.window.flying(),
+            fastest: v.window.fastest(),
+            client_ms: v.client_ms,
+        }
     }
+}
+
+/// What `/stats` reports of a client, as one read of it saw it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClientStats {
+    pub viewer: Viewer,
+    pub backlog: Option<Backlog>,
+    /// What its path carries in `LATENESS`, the least it has carried since the client
+    /// joined, what is on its way, and its fastest round trip (window.rs).
+    pub carries: usize,
+    pub lowest: usize,
+    pub flying: usize,
+    pub fastest: Option<Duration>,
+    /// How long it says it holds a frame: smoothed ms, once it has said one.
+    pub client_ms: Option<f64>,
 }
 
 #[cfg(test)]
 impl Client {
+    /// What it has in flight at `now`, if anything.
+    pub fn backlog(&self, now: Instant) -> Option<Backlog> {
+        self.viewing.lock().backlog(now)
+    }
+
     /// Frame `id` of `bytes` leaves for it at `at`, whatever it is to the stream: in
     /// flight, and on its way in its window.
     pub fn fly(&self, id: FrameId, at: Instant, bytes: usize) {
@@ -817,11 +850,10 @@ impl Hub {
                 viewer: Viewer::NotWatching,
                 inflight: VecDeque::new(),
                 window: Window::new(now, self.paths.least, self.paths.most),
+                client_ms: None,
             }),
             audio: AtomicBool::new(false),
-            min_rtt_ms: AtomicU32::new(0),
             pings: Mutex::new(Pings::default()),
-            client_ms: Mutex::new(0.0),
             trace: Arc::new(Mutex::new(crate::timeline::Trace::with_room())),
             asked: Mutex::new(None),
         });
@@ -1565,7 +1597,8 @@ mod tests {
                     },
                 );
                 assert_eq!(said(&c, end), said(&twin, end), "seed {seed}");
-                assert_eq!(*c.client_ms.lock(), *twin.client_ms.lock(), "seed {seed}");
+                let client_ms = |c: &Client| c.stats(end).client_ms;
+                assert_eq!(client_ms(&c), client_ms(&twin), "seed {seed}");
             }
         }
     }
@@ -1979,5 +2012,57 @@ mod tests {
             popped > 100 && stale > 100 && unnamed > 100,
             "popped {popped}, stale {stale}, unnamed {unnamed}"
         );
+    }
+
+    /// `/stats` reports each viewer's lowest `carries` since it joined from the window's
+    /// own record, not from samples: over runs of frames sent into a path that serves them
+    /// in order at a rate that swings from 20 KB/s to 20 MB/s, acked as they arrive, and
+    /// pings, the lowest reported after every step is the least `carries` reported at any
+    /// step so far, the window's start included. Counted, and each must happen: steps that
+    /// set a new low, and steps at which `carries` stood above it.
+    #[test]
+    fn the_lowest_carries_is_the_least_the_window_ever_carried() {
+        let mut rng = Rng(crate::xorshift::Xorshift::new(0xA076_1D64_78BD_642F));
+        let (mut lows, mut above) = (0u32, 0u32);
+        for _ in 0..200 {
+            let hub = Hub::new(Paths::ANY);
+            let mut t = Instant::now();
+            let c = hub.add_client(mpsc::unbounded_channel().0, t);
+            c.viewing.lock().viewer = Viewer::Started;
+            let mut least = c.stats(t).carries;
+            // The path: its delay each way, its rate in bytes a second, when it is free
+            // again, and the acks on their way back, in order.
+            let delay = Duration::from_millis(1 + rng.below(100));
+            let mut rate = 1_000_000.0;
+            let mut free = t;
+            let mut acks: VecDeque<(Instant, u32)> = VecDeque::new();
+            c.pinged(t, 2 * delay, window::Ahead::Nothing);
+            for _ in 0..3000 {
+                t += Duration::from_millis(1 + rng.below(20));
+                while let Some(&(at, id)) = acks.front().filter(|a| a.0 <= t) {
+                    c.on_ack(at, id, Hold::Unsaid);
+                    acks.pop_front();
+                }
+                match rng.below(50) {
+                    0 => rate = (20_000 + rng.below(20_000_000)) as f64,
+                    1..=4 => c.pinged(t, 2 * delay, c.window(|w| w.ahead())),
+                    _ => {
+                        let id = hub.timeline.number();
+                        let bytes = 200 + rng.below(60_000) as usize;
+                        if c.takes(id, t, bytes, false, usize::MAX) == Takes::Frame {
+                            free =
+                                free.max(t + delay) + Duration::from_secs_f64(bytes as f64 / rate);
+                            acks.push_back((free + delay, id.get()));
+                        }
+                    }
+                }
+                let read = c.stats(t);
+                lows += u32::from(read.carries < least);
+                least = least.min(read.carries);
+                above += u32::from(read.carries > least);
+                assert_eq!(read.lowest, least, "the lowest reported");
+            }
+        }
+        assert!(lows > 100 && above > 1000, "unreached: {lows}, {above}");
     }
 }
