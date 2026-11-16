@@ -2,10 +2,13 @@
 //! viewer's window instead of being scaled down into it.
 //!
 //! Xvfb only offers the mode it started with, and that size is its maximum, so start
-//! it at the largest size to allow. Each new size gets a mode of its own. RandR
-//! modes belong to the client that created them and the server reverts when it
-//! disconnects, so this keeps its connection for voxl's lifetime. Xvfb keeps the
-//! same `-shmem` framebuffer (and stride) across sizes; the screen is its top-left.
+//! it at the largest size to allow. A mode outlives the client that made it: when voxl
+//! exits, Xvfb keeps every mode it made, still on the output, and the screen at the size
+//! it last set. So the mode for a size is found among the screen's modes, whoever made
+//! it, and made only when the screen has none of that size: a mode left behind by an
+//! earlier voxl, or made by another tool, is the mode for its size, and none is ever made
+//! twice. Xvfb keeps the same `-shmem` framebuffer (and stride) across sizes; the screen
+//! is its top-left.
 
 use x11rb::connection::Connection;
 use x11rb::protocol::randr::{self, ConnectionExt as _};
@@ -34,10 +37,6 @@ pub struct Screen {
     crtc: randr::Crtc,
     max: (u32, u32),
     current: (u32, u32),
-    /// The mode the server started with (the maximum size); never destroyed.
-    initial_mode: randr::Mode,
-    /// Mode we created for the current size, destroyed when the size changes again.
-    custom_mode: Option<randr::Mode>,
     /// Millimetres per pixel, kept constant so the DPI doesn't change with the size.
     mm_per_px: (f64, f64),
 }
@@ -69,11 +68,6 @@ impl Screen {
             .first()
             .zip(res.crtcs.first())
             .ok_or("RandR: no output")?;
-        let crtc_info = conn
-            .randr_get_crtc_info(crtc, res.config_timestamp)
-            .map_err(err)?
-            .reply()
-            .map_err(err)?;
         let range = conn
             .randr_get_screen_size_range(root)
             .map_err(err)?
@@ -86,8 +80,6 @@ impl Screen {
             crtc,
             max: (range.max_width as u32, range.max_height as u32),
             current: (w, h),
-            initial_mode: crtc_info.mode,
-            custom_mode: None,
             mm_per_px,
         })
     }
@@ -118,37 +110,30 @@ impl Screen {
             .map_err(err)?
             .reply()
             .map_err(err)?;
-        let mode = if (w, h) == self.max {
-            self.initial_mode
-        } else {
-            let name = format!("voxl-{w}x{h}");
-            let info = randr::ModeInfo {
-                id: 0,
-                width: w as u16,
-                height: h as u16,
-                dot_clock: w * h * 60,
-                hsync_start: w as u16 + 1,
-                hsync_end: w as u16 + 2,
-                htotal: w as u16 + 3,
-                hskew: 0,
-                vsync_start: h as u16 + 1,
-                vsync_end: h as u16 + 2,
-                vtotal: h as u16 + 3,
-                name_len: name.len() as u16,
-                mode_flags: randr::ModeFlag::from(0u32),
-            };
-            let mode = c
-                .randr_create_mode(self.root, info, name.as_bytes())
-                .map_err(err)?
-                .reply()
-                .map_err(err)?
-                .mode;
+        // The screen's mode of this size, or one made for it: by size, not by name, as the
+        // CRTC shows a size and a mode of it under any name shows it.
+        let mode = match res
+            .modes
+            .iter()
+            .find(|m| (u32::from(m.width), u32::from(m.height)) == (w, h))
+        {
+            Some(m) => m.id,
+            None => self.make_mode(w, h)?,
+        };
+        // A mode the output lacks (made by a voxl that ended before it gave it, or by a
+        // tool that never did) is given to it: a CRTC shows only its output's modes.
+        let on_output = c
+            .randr_get_output_info(self.output, res.config_timestamp)
+            .map_err(err)?
+            .reply()
+            .map_err(err)?
+            .modes;
+        if !on_output.contains(&mode) {
             c.randr_add_output_mode(self.output, mode)
                 .map_err(err)?
                 .check()
                 .map_err(err)?;
-            mode
-        };
+        }
         let mm = |px: u32, per: f64| ((px as f64 * per).round() as u32).max(1);
         let set_size = |w: u32, h: u32| {
             c.randr_set_screen_size(
@@ -184,17 +169,39 @@ impl Screen {
             return Err(format!("RandR: set mode {w}x{h}: {:?}", reply.status));
         }
         set_size(w, h)?;
-        if let Some(old) = self.custom_mode.take() {
-            let _ = c.randr_delete_output_mode(self.output, old);
-            let _ = c.randr_destroy_mode(old);
-        }
-        if mode != self.initial_mode {
-            self.custom_mode = Some(mode);
-        }
         c.flush().map_err(err)?;
         self.current = (w, h);
         log::info!("desktop resized to {w}x{h}");
         Ok(())
+    }
+
+    /// A new mode of `w`x`h`, named for its size. Called only when the screen has no mode
+    /// of that size, so a name of ours is taken only by a mode of another size someone
+    /// else named so, and then making it fails.
+    fn make_mode(&self, w: u32, h: u32) -> Result<randr::Mode, String> {
+        let name = format!("voxl-{w}x{h}");
+        let info = randr::ModeInfo {
+            id: 0,
+            width: w as u16,
+            height: h as u16,
+            dot_clock: w * h * 60,
+            hsync_start: w as u16 + 1,
+            hsync_end: w as u16 + 2,
+            htotal: w as u16 + 3,
+            hskew: 0,
+            vsync_start: h as u16 + 1,
+            vsync_end: h as u16 + 2,
+            vtotal: h as u16 + 3,
+            name_len: name.len() as u16,
+            mode_flags: randr::ModeFlag::from(0u32),
+        };
+        Ok(self
+            .conn
+            .randr_create_mode(self.root, info, name.as_bytes())
+            .map_err(err)?
+            .reply()
+            .map_err(err)?
+            .mode)
     }
 }
 
@@ -215,5 +222,162 @@ mod tests {
         assert_eq!(fit(1920, 1080, (800, 450)), (800, 450));
         assert_eq!(fit(100, 100, (800, 450)), (640, 450));
         assert_eq!(fit(1920, 1080, (600, 400)), (600, 400));
+    }
+
+    /// An Xvfb of the test's own, on a display it picks itself, kept as the desktop's is
+    /// (`-noreset`: it does not start over when its last client leaves); stopped when dropped.
+    struct Xvfb {
+        child: std::process::Child,
+        display: String,
+    }
+
+    impl Xvfb {
+        fn start((w, h): (u32, u32)) -> Xvfb {
+            use std::io::BufRead;
+            let mut child = std::process::Command::new("Xvfb")
+                .args([
+                    "-displayfd",
+                    "1",
+                    "-noreset",
+                    "-nolisten",
+                    "tcp",
+                    "-screen",
+                    "0",
+                ])
+                .arg(format!("{w}x{h}x24"))
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("Xvfb on PATH");
+            let mut n = String::new();
+            std::io::BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut n)
+                .unwrap();
+            Xvfb {
+                child,
+                display: format!(":{}", n.trim()),
+            }
+        }
+    }
+
+    impl Drop for Xvfb {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// The X server's own answer: the screen's size, and each size's modes.
+    fn seen(display: &str) -> ((u32, u32), Vec<(u32, u32)>) {
+        let (conn, n) = RustConnection::connect(Some(display)).unwrap();
+        let root = conn.setup().roots[n].root;
+        let g = conn.get_geometry(root).unwrap().reply().unwrap();
+        let res = conn
+            .randr_get_screen_resources(root)
+            .unwrap()
+            .reply()
+            .unwrap();
+        let sizes = res
+            .modes
+            .iter()
+            .map(|m| (u32::from(m.width), u32::from(m.height)))
+            .collect();
+        ((u32::from(g.width), u32::from(g.height)), sizes)
+    }
+
+    /// A mode another tool made, `on_output` or not, as a voxl that ended between making a
+    /// mode and giving it to the output leaves it.
+    fn foreign_mode(display: &str, (w, h): (u32, u32), name: &str, on_output: bool) {
+        let (conn, n) = RustConnection::connect(Some(display)).unwrap();
+        let root = conn.setup().roots[n].root;
+        let res = conn
+            .randr_get_screen_resources(root)
+            .unwrap()
+            .reply()
+            .unwrap();
+        let info = randr::ModeInfo {
+            id: 0,
+            width: w as u16,
+            height: h as u16,
+            dot_clock: w * h * 60,
+            hsync_start: w as u16 + 1,
+            hsync_end: w as u16 + 2,
+            htotal: w as u16 + 3,
+            hskew: 0,
+            vsync_start: h as u16 + 1,
+            vsync_end: h as u16 + 2,
+            vtotal: h as u16 + 3,
+            name_len: name.len() as u16,
+            mode_flags: randr::ModeFlag::from(0u32),
+        };
+        let mode = conn
+            .randr_create_mode(root, info, name.as_bytes())
+            .unwrap()
+            .reply()
+            .unwrap()
+            .mode;
+        if on_output {
+            conn.randr_add_output_mode(res.outputs[0], mode)
+                .unwrap()
+                .check()
+                .unwrap();
+        }
+        conn.flush().unwrap();
+    }
+
+    /// A mode outlives the voxl that made it, and a later voxl still gets every size: over
+    /// 200 generated asks among sizes that another tool left a mode of (on the output, and
+    /// not), sizes earlier connections made, and the screen's start size, with a restart
+    /// (a new connection, as a new voxl process has) before one ask in four, the X server
+    /// says after each ask that the screen has the size asked for, and at the end that no
+    /// size has two modes. Each kind of ask is counted, so none passes unasked. Needs Xvfb
+    /// on PATH: `cargo test -- --ignored modes_left`.
+    #[test]
+    #[ignore = "needs Xvfb on PATH"]
+    fn modes_left_behind_are_found_and_no_size_is_made_twice() {
+        let max = (1600, 1000);
+        let x = Xvfb::start(max);
+        let sizes = [
+            (640, 480),
+            (800, 600),
+            (960, 600),
+            (1024, 640),
+            (1200, 800),
+            (1456, 868),
+            max,
+        ];
+        let foreign = [(1200, 800), (1024, 640)];
+        foreign_mode(&x.display, foreign[0], "other-1200x800", true);
+        foreign_mode(&x.display, foreign[1], "other-1024x640", false);
+        let mut rng = crate::xorshift::Xorshift::new(0x2545_F491_4F6C_DD1D);
+        let mut screen = Screen::open(Some(&x.display)).unwrap();
+        // Sizes a connection before this one took the screen to, and the asks counted by
+        // kind: another tool's mode on the output, one not on it, the start size, and a
+        // size an earlier connection made, asked after a restart.
+        let (mut earlier, mut made_here) = (Vec::new(), Vec::new());
+        let mut reach = [0usize; 4];
+        for _ in 0..200 {
+            if rng.below(4) == 0 {
+                drop(screen);
+                screen = Screen::open(Some(&x.display)).unwrap();
+                earlier.append(&mut made_here);
+            }
+            let want = sizes[rng.below(sizes.len() as u64) as usize];
+            reach[0] += usize::from(want == foreign[0]);
+            reach[1] += usize::from(want == foreign[1]);
+            reach[2] += usize::from(want == max);
+            reach[3] += usize::from(earlier.contains(&want) && !foreign.contains(&want));
+            made_here.push(want);
+            if let Err(e) = screen.resize(want.0, want.1) {
+                panic!("{}x{} refused: {e}", want.0, want.1);
+            }
+            assert_eq!(seen(&x.display).0, want);
+        }
+        assert!(reach.iter().all(|&n| n > 0), "unreached: {reach:?}");
+        let (_, modes) = seen(&x.display);
+        for size in sizes {
+            let n = modes.iter().filter(|&&m| m == size).count();
+            assert_eq!(n, 1, "{}x{} has {n} modes", size.0, size.1);
+        }
     }
 }
