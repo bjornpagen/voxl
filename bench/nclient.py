@@ -69,7 +69,7 @@ async def main():
                 got[fid] = got.get(fid, 0) + 1
                 if got[fid] >= parts:
                     del got[fid]
-                    await ws.send(f'a,{fid}')
+                    await ws.send(f'a,{fid},0.0')
             else:
                 await ws.send(f'CLIENT_FRAME_ACK {fid}')
             for fr in frames:

@@ -139,11 +139,9 @@ pub struct Display {
 }
 
 /// How long a client says it kept a frame between its arrival and the ack (decode,
-/// draw, frames ahead of it), as the ack's optional last field.
+/// draw, frames ahead of it), as the ack's last field.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Hold {
-    /// An older client, or the recorder: its delay samples include its own time.
-    Unsaid,
     Said(Duration),
     /// The field isn't a time (not a number, negative, more than a Duration holds):
     /// the frame is acknowledged and says nothing about the path.
@@ -151,7 +149,7 @@ pub enum Hold {
 }
 
 impl Hold {
-    /// From the ack's hold field, in milliseconds. An ack without one is `Unsaid`.
+    /// From the ack's hold field, in milliseconds.
     pub fn parse(field: &str) -> Hold {
         field
             .trim()
@@ -539,7 +537,7 @@ impl Client {
             Hold::Said(held) if held <= now.saturating_duration_since(oldest.left) => {
                 (now - held, Some(held))
             }
-            Hold::Unsaid | Hold::Said(_) | Hold::Unreadable => (now, None),
+            Hold::Said(_) | Hold::Unreadable => (now, None),
         };
         window.came_back(at);
         self.trace.lock().acked(now, hold);
@@ -1283,7 +1281,11 @@ mod tests {
             Step::Ack(i) => {
                 let oldest = c[i].window(|w| w.oldest().map(|f| f.id.get()));
                 if let Some(id) = oldest {
-                    let acked = c[i].on_ack(t0 + Duration::from_millis(50), id, Hold::Unsaid);
+                    let acked = c[i].on_ack(
+                        t0 + Duration::from_millis(50),
+                        id,
+                        Hold::Said(Duration::ZERO),
+                    );
                     assert_eq!(acked, Acked::Oldest, "{step:?}");
                 }
             }
@@ -1540,8 +1542,8 @@ mod tests {
             let frames = run(&hub, seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
             let end = frames.last().unwrap().acks + Duration::from_secs(1);
             let says = acked(&hub, &frames, |f| f.acks, |f| Hold::Said(f.held()));
-            let twin = acked(&hub, &frames, |f| f.arrives, |_| Hold::Unsaid);
-            let silent = acked(&hub, &frames, |f| f.acks, |_| Hold::Unsaid);
+            let twin = acked(&hub, &frames, |f| f.arrives, |_| Hold::Said(Duration::ZERO));
+            let silent = acked(&hub, &frames, |f| f.acks, |_| Hold::Said(Duration::ZERO));
             assert_eq!(said(&says, end), said(&twin, end), "seed {seed}");
             otherwise += u32::from(said(&silent, end) != said(&twin, end));
         }
@@ -1578,9 +1580,10 @@ mod tests {
 
     /// The hold is whatever a client sends. A field that isn't a time parses to
     /// `Unreadable`, whatever it is; and an ack whose hold is unreadable, or longer than
-    /// the trip it is part of, is read as one that says none: the window reads it as a
-    /// twin's that says nothing, and the client's hold is the twin's. Over 50 generated
-    /// runs, each lie in place of every other frame's hold.
+    /// the trip it is part of, says nothing of the client's time: the window reads it as a
+    /// twin's that acked it then holding it for no time, and the client's hold is that of
+    /// a twin sent only the frames whose holds are true. Over 50 generated runs, each lie
+    /// in place of every other frame's hold.
     #[test]
     fn a_hold_that_cannot_be_true_says_nothing() {
         let unreadable = [
@@ -1615,13 +1618,20 @@ mod tests {
                     &frames,
                     |f| f.acks,
                     |f| match f.id.get() % 2 {
-                        0 => Hold::Unsaid,
+                        0 => Hold::Said(Duration::ZERO),
                         _ => truth(f),
                     },
                 );
+                // Sent the truthful frames alone, and acking each with its true hold.
+                let truthful: Vec<Sent> = frames
+                    .iter()
+                    .filter(|f| f.id.get() % 2 == 1)
+                    .copied()
+                    .collect();
+                let told = acked(&hub, &truthful, |f| f.acks, truth);
                 assert_eq!(said(&c, end), said(&twin, end), "seed {seed}");
                 let client_ms = |c: &Client| c.stats(end).client_ms;
-                assert_eq!(client_ms(&c), client_ms(&twin), "seed {seed}");
+                assert_eq!(client_ms(&c), client_ms(&told), "seed {seed}");
             }
         }
     }
@@ -1994,7 +2004,7 @@ mod tests {
                                 (Some(k), numbered[k])
                             }
                         };
-                        let took = c[i].on_ack(now, id, Hold::Unsaid);
+                        let took = c[i].on_ack(now, id, Hold::Said(Duration::ZERO));
                         let front = model[i].front().copied();
                         match (named.is_some() && named == front, front) {
                             (true, _) => {
@@ -2071,7 +2081,7 @@ mod tests {
             for _ in 0..3000 {
                 t += Duration::from_millis(1 + rng.below(20));
                 while let Some(&(at, id)) = acks.front().filter(|a| a.0 <= t) {
-                    c.on_ack(at, id, Hold::Unsaid);
+                    c.on_ack(at, id, Hold::Said(Duration::ZERO));
                     acks.pop_front();
                 }
                 match rng.below(50) {

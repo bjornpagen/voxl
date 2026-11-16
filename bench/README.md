@@ -34,7 +34,7 @@ is its log. CBR from 30 Mbps, with congestion control down to 2 Mbps.
 - `linkviewer.py host:port scenario out`: a headless viewer behind an emulated link (a
   rate and a round trip, an unbounded queue served in order, like `shaper.py`). It acks
   each frame once its last part has crossed the link, after a decode hold (3 ms, or a
-  software decoder's with `--hold`, reported in the ack with `--report-hold`), and can
+  software decoder's with `--hold`, carried in the ack as the page's is), and can
   scroll and type into a terminal on the benchmark display (`--fifo`). It does not decode:
   it is for rate control, and writes when each message arrived and each ack left.
 - `keyhold.py host:port keysym repeat`: holds a key as a browser does, behind a link: the

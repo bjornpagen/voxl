@@ -41,7 +41,7 @@ ws.onmessage = ({ data }) => {
   if (received.size === partCount) {
     frames.delete(id);
     frameSize = latest;
-    ws.send(`a,${id}`);
+    ws.send(`a,${id},0.0`);
   }
 };
 const waitFor = async (condition) => {

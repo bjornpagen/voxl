@@ -39,7 +39,7 @@ function connect() {
 					else if (j.t === 'ping') c.send('po,' + j.s);
 				} else if (op === 2) {
 					c.bin[p[0]] = (c.bin[p[0]] || 0) + 1;
-					if (p[0] === 1) { if (p[1] & 1) c.keys++; c.send('a,' + p.readUInt32BE(2)); }
+					if (p[0] === 1) { if (p[1] & 1) c.keys++; c.send('a,' + p.readUInt32BE(2) + ',0.0'); }
 					if (p[0] === 3) c.cursor = { w: p.readUInt16BE(2), h: p.readUInt16BE(4), hx: p.readUInt16BE(6), hy: p.readUInt16BE(8), bytes: p.length - 14 };
 					if (p[0] === 4) c.clipImage = p.length - 1;
 				}

@@ -551,7 +551,7 @@ fn send_input(hub: &Hub, client: &Client, event: InputEvent) {
 
 /// A text command from a viewer (web/src/protocol.ts), parsed once where it arrives.
 enum Command {
-    /// `a,<frame>[,<hold ms>]`
+    /// `a,<frame>,<hold ms>`
     Ack { frame: u32, hold: crate::hub::Hold },
     /// `m,<x>,<y>`: a desktop pixel, from the top left. X's coordinates are 16-bit (XTest
     /// takes them as they are); macOS's CGFloat and Windows's LONG hold every one.
@@ -607,10 +607,6 @@ impl Command {
             _ => None,
         };
         Some(match (name, fields.as_slice()) {
-            ("a", [frame]) => Command::Ack {
-                frame: num(frame)?,
-                hold: crate::hub::Hold::Unsaid,
-            },
             ("a", [frame, hold]) => Command::Ack {
                 frame: num(frame)?,
                 hold: crate::hub::Hold::parse(hold),
@@ -786,7 +782,6 @@ mod tests {
 
     /// Every command the web client sends (web/src/protocol.ts), with arguments.
     const ALL: &[&str] = &[
-        "a,1",
         "a,2,3.5",
         "m,10,20",
         "b,1,1",
@@ -1252,13 +1247,11 @@ mod tests {
         }
     }
 
-    /// How many fields each command has, written apart from `parse`: an ack's hold is the
-    /// one field that may be left out. A clipboard is not here: its one field is the rest
-    /// of the line, commas and all.
+    /// How many fields each command has, written apart from `parse`. A clipboard is not
+    /// here: its one field is the rest of the line, commas and all.
     fn fields_of(name: &str) -> &'static [usize] {
         match name {
-            "a" => &[1, 2],
-            "m" | "b" | "sp" | "k" | "sz" => &[2],
+            "a" | "m" | "b" | "sp" | "k" | "sz" => &[2],
             "v" | "au" | "mi" | "po" | "ds" => &[1],
             "r" | "kf" => &[0],
             _ => &[],
@@ -1302,8 +1295,8 @@ mod tests {
 
     /// One rule for every command: its name and exactly its fields. Each command the web
     /// client sends, with none to four well-formed fields (its own, then copies of its
-    /// last), parses exactly when that is a count `fields_of` gives it; an ack without its
-    /// hold is `Unsaid`, and with it, the hold as the field says. A clipboard takes one
+    /// last), parses exactly when that is a count `fields_of` gives it; an ack's hold is as
+    /// its field says. A clipboard takes one
     /// field or more, and its text is all of them, commas and all.
     #[test]
     fn a_command_is_exactly_its_fields() {
@@ -1337,8 +1330,7 @@ mod tests {
                 assert_eq!(parsed.is_some(), has, "{line}");
                 match parsed {
                     Some(Command::Ack { hold, .. }) => {
-                        let said = fields.get(1).map_or(Hold::Unsaid, |f| Hold::parse(f));
-                        assert_eq!(hold, said, "{line}");
+                        assert_eq!(hold, Hold::parse(fields[1]), "{line}");
                     }
                     Some(Command::Clipboard(text)) => assert_eq!(text, fields.join(","), "{line}"),
                     _ => {}

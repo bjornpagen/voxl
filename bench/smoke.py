@@ -44,7 +44,7 @@ async def frames(ws, secs, stats):
         if msg[0] == 1:
             stats['video'] += 1
             stats['key'] += msg[1] & 1
-            await ws.send(f'a,{int.from_bytes(msg[2:6], "big")}')
+            await ws.send(f'a,{int.from_bytes(msg[2:6], "big")},0.0')
         elif msg[0] == 3:
             stats['cursor'] += 1
 

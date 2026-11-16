@@ -9,10 +9,10 @@ every frame. It does not decode. Instead it models what a viewer behind a bottle
 - A frame is acknowledged once its last part has arrived (parts = the header's
   "parts in frame"), never at its first.
 - Before the ack the viewer holds the frame for its decode and draw: 3 ms, or with
-  `--hold` a software decoder's time (2 ms + 0.1 ms per KB + 0 to 8 ms at random).
-  `--report-hold` sends that hold in the ack (`a,<id>,<ms>`). It is the same number the
-  ack was delayed by, on the viewer's own monotonic clock, measured from the moment the
-  frame's last part arrived on the emulated link.
+  `--hold` a software decoder's time (2 ms + 0.1 ms per KB + 0 to 8 ms at random). The
+  ack carries that hold (`a,<id>,<ms>`), as the page's does: the same number the ack was
+  delayed by, on the viewer's own monotonic clock, measured from the moment the frame's
+  last part arrived on the emulated link.
 - The ack then takes the other half of the round trip, on the same monotonic clock.
 
 All of it runs on one asyncio loop, so a busy machine only ever makes messages arrive
@@ -34,7 +34,7 @@ frame, key, paint-over, bytes, server pipeline ms), OUT.acks.tsv, OUT.marks.tsv 
 scenario's phases), OUT.scroll.tsv (scroll input) and OUT.keys.tsv (key messages, when
 each was due and when it was sent).
 
-usage: linkviewer.py HOST:PORT SCENARIO OUT [--kbps N] [--rtt MS] [--hold] [--report-hold]
+usage: linkviewer.py HOST:PORT SCENARIO OUT [--kbps N] [--rtt MS] [--hold]
        [--seed N] [--fifo PATH] [--page FILE] [--passive SECS]
        [--keysym K] [--key-hold S] [--key-repeat MS,MS] [--key-delay MS] [--key-stall MS]
        linkviewer.py --check-header   (the standard library alone; python3 -I runs it)
@@ -165,7 +165,6 @@ async def main():
     ap.add_argument("--kbps", type=float, default=0, help="bottleneck rate (0: none)")
     ap.add_argument("--rtt", type=float, default=0, help="round trip (ms)")
     ap.add_argument("--hold", action="store_true", help="hold frames as a software decoder would")
-    ap.add_argument("--report-hold", action="store_true", help="send the hold in the ack")
     ap.add_argument("--fifo", help="FIFO a terminal on the benchmark display reads commands from")
     ap.add_argument("--page", default="/etc/services", help="file the scenarios print")
     ap.add_argument("--settle", type=float, default=3.0, help="seconds to watch before the scenario")
@@ -257,7 +256,7 @@ async def main():
                 hold = 0.002 + f["bytes"] / 1e7 + rng.uniform(0, 0.008) if a.hold else 0.003
                 ack_at = at + hold + owd
                 acks.write(f"{fid}\t{at:.4f}\t{ack_at:.4f}\t{hold * 1000:.1f}\n")
-                schedule(ack_at, f"a,{fid},{hold * 1000:.1f}" if a.report_hold else f"a,{fid}")
+                schedule(ack_at, f"a,{fid},{hold * 1000:.1f}")
 
         tasks = [asyncio.create_task(sender()), asyncio.create_task(receiver())]
         await ws.send("v,1")
