@@ -46,7 +46,8 @@ is its log. CBR from 30 Mbps, with congestion control down to 2 Mbps.
   run fails (exit 1) when the window went below `START` (or the link's own rate, if less),
   over `FALL` once if any stall began, when a frame waited more than three times
   `LATENESS` behind the link's queue, or when any of that was not measured (stalls with
-  less than a round between them, and a floor under one packet, among it). It does not decode: it
+  less than a round between them, and a floor under one packet, among it). `linkviewer.py
+  --check-verdict` checks that verdict against the rule written as a table. It does not decode: it
   is for rate control, and writes when each message arrived and each ack left.
 - `link.py`: the link model both use: a rate through an unbounded queue served in order,
   half the round trip each way, one-sided jitter, a page's lateness, periodic stalls.

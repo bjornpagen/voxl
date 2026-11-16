@@ -68,6 +68,7 @@ import heapq
 import json
 import math
 import os
+import random
 import sys
 import time
 import urllib.request
@@ -206,7 +207,8 @@ def fetch_stats(url):
         return json.loads(r.read())
 
 
-async def main():
+def arguments(argv):
+    """The run `argv` asks for, and the link it sits behind: `(options, path)`."""
     ap = argparse.ArgumentParser()
     ap.add_argument("hostport")
     ap.add_argument("scenario", choices=sorted(SCENARIOS))
@@ -227,12 +229,16 @@ async def main():
     ap.add_argument("--key-repeat", default="300,33", help="the browser's repeat: delay,interval in ms")
     ap.add_argument("--key-delay", type=float, default=0, help="one-way delay of every key message (ms)")
     ap.add_argument("--key-stall", type=float, default=0, help="extra delay of the key-up alone (ms)")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     # A scenario that writes to the terminal measures nothing it meant to without one: the
     # screen would be whatever was on it.
     if a.fifo is None and any(kind == "term" for kind, _ in PREPARE.get(a.scenario, []) + SCENARIOS[a.scenario]):
         ap.error(f"{a.scenario} prints to a terminal on the benchmark display: give --fifo")
-    path = link.Path(a, link.rate(a.kbps * 1000.0), a.rtt / 2000.0)
+    return a, link.Path(a, link.rate(a.kbps * 1000.0), a.rtt / 2000.0)
+
+
+async def main():
+    a, path = arguments(sys.argv[1:])
     down, up = path.down, path.up
     stats_url = a.stats or f"http://{a.hostport}/stats"
     t0 = time.monotonic()
@@ -385,7 +391,7 @@ async def main():
     ended, final = first.result()
     with open(f"{a.out}.stats.json", "w") as f:
         json.dump(final, f)
-    return verdict(final, before, waits, path, a.rtt / 1000, path.stalls.begun(connected, ended))
+    return verdict(final, before, waits, a, path, path.stalls.begun(connected, ended))
 
 
 class NotMeasured(Exception):
@@ -428,13 +434,13 @@ def floor_of(start, fall, lateness, path, rtt, began):
     return floor, why
 
 
-def verdict(final, before, waits, path, rtt, began):
+def verdict(final, before, waits, a, path, began):
     """Prints the run's bounds and whether it kept them; True when it did. `final` is the
-    /stats read at the end, `rtt` the emulated round trip in seconds, `began` how many
+    /stats read at the end, `a` and `path` the run's options and link, `began` how many
     stalls began since the viewer connected."""
     try:
         lateness, start, fall, lowest = window_of(final, before)
-        floor, why = floor_of(start, fall, lateness, path, rtt, began)
+        floor, why = floor_of(start, fall, lateness, path, a.rtt / 1000, began)
     except NotMeasured as e:
         print(f"not measured: {e}: FAIL")
         return False
@@ -448,8 +454,89 @@ def verdict(final, before, waits, path, rtt, began):
     return kept_floor and kept_wait
 
 
+# The verdict's rule as a table, for a window that reports LATENESS 60 ms, START 14,600 B
+# and FALL 2, behind a 110 ms round trip: for a link (kbit/s, 0 for none) and a stall
+# schedule, the floor the window must keep when no stall began and when one did, worked
+# out by hand from the rule (None: not measured). A round is 110 + 60 = 170 ms.
+VERDICT_TABLE = [
+    # kbit/s, --stall,     no stall, a stall
+    (0, "10,100", 14_600, 7_300),  # no bottleneck: START, and half of it
+    (20_000, "10,100", 14_600, 7_300),  # 150,000 B in LATENESS: START is less
+    (1_000, "10,100", 7_500, 3_750),  # 7,500 B in LATENESS
+    (400, "10,100", 3_000, 1_500),  # half of 3,000 is still a packet
+    (300, "10,100", 2_250, None),  # half of 2,250 is under a packet
+    (195, "10,100", 1_462.5, None),  # just over a packet; half is under
+    (194, "10,100", None, None),  # 1,455 B: under a packet
+    (20_000, "0.271,100", 14_600, 7_300),  # 171 ms between stalls: a round fits
+    (20_000, "0.269,100", 14_600, None),  # 169 ms: none does
+]
+# The wait bound for that window: three times its LATENESS, in ms.
+VERDICT_WAIT = 180.0
+
+
+def check_verdict(seed=0x5EED):
+    """`verdict`, through the options as `main` parses them, against `VERDICT_TABLE`: each
+    run reads as the table says, for windows whose lowest and longest wait are drawn at,
+    just either side of and well away from their bounds, after 0 or any number of stalls,
+    and for a /stats that lacks a field or lists the wrong viewers. Prints how often each
+    outcome was reached; exits on the first miss or on an outcome never reached.
+
+    It kills: stalls costing FALL once a stall (`fall**began`), a round without
+    `LATENESS`, `>` for `>=` on the floor and `<` for `<=` on the wait, a floor that is
+    `START` whatever the link, a floor under a packet that is measured, `lateness_us` read
+    as milliseconds, two new viewers measured, the round trip halved on its way to the
+    floor, and `--kbps` read as kilobytes. It does not kill a floor of exactly one packet
+    taken as under one (no row's floor is exactly 1,460 B)."""
+    import contextlib
+    import io
+
+    rng = random.Random(seed)
+    reach = {"pass": 0, "fail on carries": 0, "fail on the wait": 0, "not measured": 0,
+             "a field missing": 0, "not one new viewer": 0}
+    window = {"lateness_us": 60_000, "start_bytes": 14_600, "fall": 2}
+    for _ in range(4_000):
+        kbps, schedule, floor_still, floor_stalled = rng.choice(VERDICT_TABLE)
+        began = rng.choice([0, 1, rng.randint(2, 50)])
+        floor = floor_still if began == 0 else floor_stalled
+        argv = ["127.0.0.1:1", "cold", "out", "--fifo", "fifo", "--rtt", "110", "--kbps", str(kbps), "--stall", schedule]
+        a, path = arguments(argv)
+        bound = floor if floor is not None else 14_600
+        lowest = rng.choice([bound, int(bound) - 1, bound + 1, rng.uniform(0, 2 * bound)])
+        wait = rng.choice([VERDICT_WAIT, VERDICT_WAIT + 0.1, rng.uniform(0, 2 * VERDICT_WAIT)])
+        final = dict(window, clients=[{"id": 7, "lowest_carries_bytes": lowest}])
+        want = "not measured" if floor is None else "pass" if lowest >= floor and wait <= VERDICT_WAIT else "fail"
+        broken = rng.random() < 0.1
+        if broken and rng.random() < 0.5:
+            if rng.random() < 0.75:
+                del final[rng.choice(list(window))]
+            else:
+                del final["clients"][0]["lowest_carries_bytes"]
+            want = "not measured"
+            reach["a field missing"] += 1
+        elif broken:
+            final["clients"] = rng.choice([[], final["clients"] + [{"id": 8, "lowest_carries_bytes": lowest}]])
+            want = "not measured"
+            reach["not one new viewer"] += 1
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            kept = verdict(final, {1}, [(1.0, wait)], a, path, began)
+        got = "not measured" if out.getvalue().startswith("not measured") else "pass" if kept else "fail"
+        if got != want:
+            sys.exit(f"{kbps} kbit/s, --stall {schedule}, {began} stalls, lowest {lowest}, wait {wait}:"
+                     f" {got}, the table says {want}\n{out.getvalue()}")
+        if want == "fail":
+            reach["fail on carries" if lowest < floor else "fail on the wait"] += 1
+        else:
+            reach[want] += 1
+    if not all(reach.values()):
+        sys.exit(f"an outcome never reached: {reach}")
+    print("verdict: 4,000 runs read as the rule's table says. Reached: " + ", ".join(f"{k} {v:,}" for k, v in reach.items()))
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["--check-header"]:
         check_header()
+    elif sys.argv[1:] == ["--check-verdict"]:
+        check_verdict()
     else:
         sys.exit(0 if asyncio.run(main()) else 1)
