@@ -172,7 +172,7 @@ pub fn display() -> u32 {
 
 pub struct DisplayRequest {
     pub id: u32,
-    pub sender: std::sync::mpsc::Sender<input::InputEvent>,
+    pub sender: std::sync::mpsc::Sender<crate::event::InputEvent>,
     pub ready: std::sync::mpsc::Receiver<()>,
 }
 

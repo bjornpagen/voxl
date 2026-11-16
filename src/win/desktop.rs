@@ -25,17 +25,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorInfo, GetIconInfo, CURSORINFO, CURSOR_SHOWING, HICON, ICONINFO,
 };
 
-/// Clipboard contents exchanged with clients.
-pub enum ClipContent {
-    Text(String),
-    /// PNG bytes.
-    Image(Vec<u8>),
-}
-
-pub struct ClipboardMode {
-    pub to_server: bool,
-    pub to_client: bool,
-}
+pub use crate::clipboard::{ClipContent, ClipboardMode};
 
 /// Largest image moved through the clipboard.
 const MAX_IMAGE: usize = 15 << 20;

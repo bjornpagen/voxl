@@ -17,12 +17,7 @@ use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
-/// Clipboard contents exchanged with clients.
-pub enum ClipContent {
-    Text(String),
-    /// PNG bytes.
-    Image(Vec<u8>),
-}
+pub use crate::clipboard::{ClipContent, ClipboardMode};
 
 /// Largest image moved through the clipboard (X requests are capped near 16 MiB).
 const MAX_IMAGE: usize = 15 << 20;
@@ -43,11 +38,6 @@ impl ClipboardHandle {
             let _ = done_rx.recv_timeout(std::time::Duration::from_millis(300));
         }
     }
-}
-
-pub struct ClipboardMode {
-    pub to_server: bool,
-    pub to_client: bool,
 }
 
 struct Atoms {

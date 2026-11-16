@@ -7,6 +7,7 @@
 //! typed characters the viewer never sent. While voxl runs, no keyboard on its X server
 //! autorepeats (see `repeat_off`).
 
+use crate::event::{InputEvent, KeyAct};
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -16,41 +17,6 @@ use x11rb::protocol::xproto::{self, ConnectionExt as _};
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
-
-/// What a viewer's key did. Its own keyboard decides when a held key repeats.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum KeyAct {
-    Down,
-    /// The viewer's keyboard repeated the key it holds.
-    Repeat,
-    Up,
-}
-
-pub enum InputEvent {
-    /// A desktop pixel, in X's own 16-bit coordinates.
-    Move {
-        x: i16,
-        y: i16,
-    },
-    Button {
-        button: crate::server::Button,
-        down: bool,
-    },
-    /// Precise scroll in desktop pixels (trackpads, smooth wheels).
-    ScrollPx {
-        dx: f64,
-        dy: f64,
-    },
-    Key {
-        keysym: u32,
-        act: KeyAct,
-    },
-    /// Remote clipboard update, ordered with the key events around it.
-    Clipboard(crate::desktop::ClipContent),
-    ReleaseAll,
-    /// Undo keymap changes before exit.
-    Shutdown,
-}
 
 /// Where a key's symbol is on its keycode, which decides the Shift it is pressed with.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -610,8 +576,8 @@ impl Injector {
             }
             InputEvent::ScrollPx { dx, dy } => {
                 let k = NOTCH / self.px_per_notch;
-                self.scroll_acc.0 += dx * k;
-                self.scroll_acc.1 += dy * k;
+                self.scroll_acc.0 += dx.get() * k;
+                self.scroll_acc.1 += dy.get() * k;
                 if let Some(sm) = &self.smooth {
                     let (ux, uy) = (self.scroll_acc.0.trunc(), self.scroll_acc.1.trunc());
                     if ux != 0.0 || uy != 0.0 {
@@ -661,6 +627,17 @@ impl Injector {
     }
 }
 
+impl crate::event::Inject for Injector {
+    fn inject(&mut self, ev: InputEvent) {
+        self.handle(ev);
+    }
+
+    /// X keeps requests in the connection's buffer until it is flushed.
+    fn flush(&mut self) {
+        let _ = self.conn.flush();
+    }
+}
+
 pub fn spawn(
     display: Option<String>,
     clipboard: Option<crate::desktop::ClipboardHandle>,
@@ -670,35 +647,7 @@ pub fn spawn(
     let mut inj = Injector::new(display.as_deref(), runtime_dir)?;
     inj.clipboard = clipboard;
     inj.px_per_notch = px_per_notch.max(1.0);
-    let (tx, rx) = mpsc::channel::<InputEvent>();
-    std::thread::Builder::new()
-        .name("input".into())
-        .spawn(move || {
-            while let Ok(first) = rx.recv() {
-                let mut pending_move: Option<(i16, i16)> = None;
-                let handle =
-                    |inj: &mut Injector, ev: InputEvent, pm: &mut Option<(i16, i16)>| match ev {
-                        InputEvent::Move { x, y } => *pm = Some((x, y)),
-                        other => {
-                            if let Some((x, y)) = pm.take() {
-                                inj.handle(InputEvent::Move { x, y });
-                            }
-                            inj.handle(other);
-                        }
-                    };
-                handle(&mut inj, first, &mut pending_move);
-                // Coalesce whatever queued up meanwhile; moves collapse to the latest.
-                while let Ok(ev) = rx.try_recv() {
-                    handle(&mut inj, ev, &mut pending_move);
-                }
-                if let Some((x, y)) = pending_move {
-                    inj.handle(InputEvent::Move { x, y });
-                }
-                let _ = inj.conn.flush();
-            }
-        })
-        .unwrap();
-    Ok(tx)
+    Ok(crate::event::spawn(move || inj))
 }
 
 #[cfg(test)]

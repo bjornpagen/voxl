@@ -9,6 +9,7 @@ mod access;
 mod audio;
 #[cfg(target_os = "linux")]
 mod capture;
+mod clipboard;
 mod convert;
 #[cfg(target_os = "linux")]
 mod corners;
@@ -16,6 +17,7 @@ mod corners;
 mod desktop;
 mod encoder;
 mod env;
+mod event;
 mod files;
 mod help;
 mod hub;
@@ -448,7 +450,7 @@ async fn serve(a: HashMap<String, String>, env: env::Env) {
         let _ = tokio::signal::ctrl_c().await;
         log::info!("shutting down");
         if let Some(tx) = shutdown_hub.input.lock().as_ref() {
-            let _ = tx.send(input::InputEvent::Shutdown);
+            let _ = tx.send(event::InputEvent::Shutdown);
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         std::process::exit(0);
