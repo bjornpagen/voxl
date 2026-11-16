@@ -157,6 +157,7 @@ function main() {
 				if (m.s === 'closed') {
 					app.desk.w = 0;
 					mic.stop();
+					resize.closed();
 					statusEl.style.display = '';
 					statusEl.textContent = 'Reconnecting…';
 				}
