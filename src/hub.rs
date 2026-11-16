@@ -272,8 +272,9 @@ pub enum Viewer {
     /// Its path stalled beside others' and it was left behind (`left_behind`): it waits
     /// for a keyframe, but frames are still on their way to it. It is sent nothing, and
     /// wants its keyframe once all of them have come back, so that no keyframe goes into a
-    /// path that is still clogged. A viewer that asks for a keyframe is not left behind:
-    /// like any viewer that asks, it wants one at once, whatever is on its way (`asked`).
+    /// path that is still clogged. Asking for a keyframe changes nothing (`asked`): the
+    /// page acknowledges every frame it is sent, decoded or not (web/src/frames.ts), so
+    /// what is on its way does come back.
     Behind,
     /// A keyframe has been planned for it: it starts on that keyframe if it comes out
     /// whole, and waits again if it does not. One still `Waiting` is not started by it, as
@@ -296,13 +297,16 @@ pub enum Takes {
 }
 
 /// What asking for a keyframe makes of a viewer: one that watches wants one, at once,
-/// whatever is on its way. One already promised a keyframe keeps that promise: a request
-/// already granted changes nothing, and asking again would plan a second keyframe.
+/// whatever is on its way, unless its request is already granted, which asking again does
+/// not change. One promised a keyframe keeps that promise: asking again would plan a
+/// second keyframe. One left behind keeps waiting for what is on its way to come back,
+/// which the page's acks bring: a keyframe sent at once would go into a path still clogged.
 fn asked(viewer: Viewer) -> Viewer {
     match viewer {
         Viewer::NotWatching => Viewer::NotWatching,
         Viewer::Promised => Viewer::Promised,
-        Viewer::Waiting | Viewer::Behind | Viewer::Started => Viewer::Waiting,
+        Viewer::Behind => Viewer::Behind,
+        Viewer::Waiting | Viewer::Started => Viewer::Waiting,
     }
 }
 
@@ -440,7 +444,7 @@ impl Client {
     }
 
     /// It asks for a keyframe (`kf`): if it watches, it wants one at once, whatever is on
-    /// its way, unless one is already promised it.
+    /// its way, unless one is already promised it or it was left behind (`asked`).
     pub fn ask_keyframe(&self) {
         let mut v = self.viewing.lock();
         v.viewer = asked(v.viewer);
@@ -1142,11 +1146,12 @@ mod tests {
         let c = &mut m.c;
         let (mut planned, mut sent) = (false, vec![]);
         // Asking for a keyframe: one that watches wants it at once, unless one is already
-        // promised it.
+        // promised it, or it was left behind and waits for its frames to come back.
         let asked = |(v, n): (Viewer, usize)| match v {
             NotWatching => (NotWatching, n),
             Promised => (Promised, n),
-            Waiting | Behind | Started => (Waiting, n),
+            Behind => (Behind, n),
+            Waiting | Started => (Waiting, n),
         };
         match step {
             Step::Watch(i) | Step::Record(i) => c[i] = (Waiting, 0),
@@ -1371,9 +1376,10 @@ mod tests {
         let mut seen = std::collections::HashSet::from([start.clone()]);
         let mut frontier = vec![start];
         let mut steps = 0;
-        // Viewers that asked for a keyframe with frames on their way, and while one was
-        // promised them.
+        // Viewers that asked for a keyframe with frames on their way, while one was promised
+        // them, and while they were left behind.
         let (mut asked_with_frames, mut asked_while_promised) = (0, 0);
+        let mut asked_while_behind = 0;
         // Clients whose stream started over while a keyframe was promised them.
         let mut started_over_while_promised = 0;
         for _depth in 0..12 {
@@ -1408,7 +1414,8 @@ mod tests {
                     );
                     // A viewer that asks for a keyframe is promised one by the next capture,
                     // whatever is on its way; one already promised one keeps that promise,
-                    // and its request changes nothing.
+                    // and one left behind keeps waiting for its frames: for either its
+                    // request changes nothing.
                     // One whose stream starts over waits for a keyframe of what follows,
                     // even one promised a keyframe that may already be on its way.
                     if let Step::StartOver(i) = step {
@@ -1418,10 +1425,11 @@ mod tests {
                         }
                     }
                     if let Step::AskKeyframe(i) = step {
-                        if before.c[i].0 == Viewer::Promised {
+                        if let Viewer::Promised | Viewer::Behind = before.c[i].0 {
                             assert_eq!(after.c, before.c, "{what}");
                             assert_eq!(after.held, before.held, "{what}");
-                            asked_while_promised += 1;
+                            asked_while_promised += usize::from(before.c[i].0 == Viewer::Promised);
+                            asked_while_behind += usize::from(before.c[i].0 == Viewer::Behind);
                         } else if after.c[i].0 != Viewer::NotWatching
                             && applies(&after, Step::Capture)
                         {
@@ -1474,8 +1482,10 @@ mod tests {
             steps > 0
                 && asked_with_frames > 0
                 && asked_while_promised > 0
+                && asked_while_behind > 0
                 && started_over_while_promised > 0,
-            "{asked_with_frames} {asked_while_promised} {started_over_while_promised}"
+            "{asked_with_frames} {asked_while_promised} {asked_while_behind} \
+             {started_over_while_promised}"
         );
     }
 
