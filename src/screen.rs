@@ -92,7 +92,8 @@ impl Screen {
         fit(w, h, self.max)
     }
 
-    pub fn resize(&mut self, w: u32, h: u32) -> Result<(), String> {
+    /// Sets the screen to `w`x`h` (fitted): the size it has now.
+    pub fn resize(&mut self, w: u32, h: u32) -> Result<(u32, u32), String> {
         let (w, h) = self.fit(w, h);
         let geometry = self
             .conn
@@ -102,7 +103,7 @@ impl Screen {
             .map_err(err)?;
         self.current = (u32::from(geometry.width), u32::from(geometry.height));
         if (w, h) == self.current {
-            return Ok(());
+            return Ok(self.current);
         }
         let c = &self.conn;
         let res = c
@@ -172,7 +173,7 @@ impl Screen {
         c.flush().map_err(err)?;
         self.current = (w, h);
         log::info!("desktop resized to {w}x{h}");
-        Ok(())
+        Ok(self.current)
     }
 
     /// A new mode of `w`x`h`, named for its size. Called only when the screen has no mode
@@ -368,8 +369,9 @@ mod tests {
             reach[2] += usize::from(want == max);
             reach[3] += usize::from(earlier.contains(&want) && !foreign.contains(&want));
             made_here.push(want);
-            if let Err(e) = screen.resize(want.0, want.1) {
-                panic!("{}x{} refused: {e}", want.0, want.1);
+            match screen.resize(want.0, want.1) {
+                Ok(size) => assert_eq!(size, want),
+                Err(e) => panic!("{}x{} refused: {e}", want.0, want.1),
             }
             assert_eq!(seen(&x.display).0, want);
         }

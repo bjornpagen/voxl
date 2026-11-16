@@ -646,8 +646,10 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
                 });
             }
         }
-        // The desktop size this client's window wants (dynamic resolution). The latest
-        // request wins; the video thread clamps it and applies it.
+        // The desktop size this client's window wants (dynamic resolution). The newest new
+        // ask wins: it is the request until a newer one, and no ask clears another, so the
+        // screen ends at the size asked last whatever the capture loop was doing. The
+        // capture loop gives it to the screen, which changes nothing if it has it already.
         Command::Resize { w, h } => {
             if !s.resize {
                 return;
@@ -660,12 +662,10 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
             }
             if let Some(max) = *s.hub.resize_max.lock() {
                 let want = crate::screen::fit(w, h, max);
-                let current = (
-                    s.hub.width.load(Ordering::Relaxed),
-                    s.hub.height.load(Ordering::Relaxed),
-                );
-                *s.hub.resize_req.lock() = (want != current).then_some(want);
-                s.hub.wake();
+                if c.asks_for(want) {
+                    *s.hub.resize_req.lock() = Some(want);
+                    s.hub.wake();
+                }
             }
         }
         Command::Keyframe => {
@@ -718,6 +718,33 @@ mod tests {
         "ds,4294967295",
     ];
 
+    /// A server for `hub` with resizing wired up, and a microphone if `mic`.
+    fn app(
+        hub: &Arc<Hub>,
+        read_only: bool,
+        mic: Option<std::sync::mpsc::Sender<crate::mic::MicMsg>>,
+    ) -> AppState {
+        AppState {
+            hub: hub.clone(),
+            audio: true,
+            files: Arc::new(crate::files::Files {
+                root: std::env::temp_dir(),
+                upload: false,
+                download: false,
+                default_dir: String::new(),
+                max_upload_bytes: 0,
+            }),
+            mic,
+            resize: true,
+            read_only,
+            recorder: crate::record::Recorder::new(hub.clone(), Duration::from_secs(1)),
+            index: Bytes::new(),
+            favicon: Bytes::new(),
+            favicon_type: "image/x-icon",
+            debug: crate::env::Debugging::read(|_| None).0,
+        }
+    }
+
     /// Sends every command to a server that has input, a microphone and resizing wired
     /// up, and returns (input events, microphone messages, a resize was asked for).
     fn drive(read_only: bool) -> (usize, usize, bool) {
@@ -728,25 +755,7 @@ mod tests {
         let (input_tx, input_rx) = std::sync::mpsc::channel();
         *hub.input.lock() = Some(input_tx);
         let (mic_tx, mic_rx) = std::sync::mpsc::channel();
-        let s = AppState {
-            hub: hub.clone(),
-            audio: true,
-            files: Arc::new(crate::files::Files {
-                root: std::env::temp_dir(),
-                upload: false,
-                download: false,
-                default_dir: String::new(),
-                max_upload_bytes: 0,
-            }),
-            mic: Some(mic_tx),
-            resize: true,
-            read_only,
-            recorder: crate::record::Recorder::new(hub.clone(), Duration::from_secs(1)),
-            index: Bytes::new(),
-            favicon: Bytes::new(),
-            favicon_type: "image/x-icon",
-            debug: crate::env::Debugging::read(|_| None).0,
-        };
+        let s = app(&hub, read_only, Some(mic_tx));
         let (tx, _rx) = mpsc::unbounded_channel();
         let client = hub.add_client(tx, Instant::now());
         let mut rtts = Default::default();
@@ -759,6 +768,211 @@ mod tests {
             mic_rx.try_iter().count(),
             resized,
         )
+    }
+
+    /// A screen as dynamic resolution sees it: its size, the sizes it refuses (a CRTC that
+    /// will not take them), how many times its size really changed, and how many asks it
+    /// refused and found already met.
+    struct Screen {
+        size: (u32, u32),
+        refuses: Vec<(u32, u32)>,
+        changes: usize,
+        refused: usize,
+        met: usize,
+    }
+
+    impl crate::video::Resize for Screen {
+        fn resize(&mut self, w: u32, h: u32) -> Result<(u32, u32), String> {
+            if self.refuses.contains(&(w, h)) {
+                self.refused += 1;
+                return Err("refused".into());
+            }
+            if (w, h) == self.size {
+                self.met += 1;
+            } else {
+                self.size = (w, h);
+                self.changes += 1;
+            }
+            Ok(self.size)
+        }
+    }
+
+    /// A page: as the web client is now (`resize.ts` asks on connect and when its window
+    /// changes), or a tab still running the client from before (it also asks on every
+    /// hello); its connection, if it has one, what it asked on it, and its window.
+    struct Page {
+        asks_on_hello: bool,
+        client: Option<Arc<crate::hub::Client>>,
+        asked: Option<(u32, u32)>,
+        window: (u32, u32),
+    }
+
+    /// The pages and the screen, driven through the server's own `sz` handling and the
+    /// capture loop's own decision (`video::rebuilds_for`).
+    struct Desk {
+        s: AppState,
+        screen: Screen,
+        pages: Vec<Page>,
+        rtts: std::collections::VecDeque<u32>,
+        rebuilds: usize,
+        /// The newest ask that changed what its connection asks for: the oracle's rule.
+        newest: Option<(u32, u32)>,
+        /// Asks that repeated what their connection last asked for.
+        repeats: usize,
+    }
+
+    impl Desk {
+        /// Page `i`, connected, asks for its window.
+        fn ask(&mut self, i: usize) {
+            let p = &mut self.pages[i];
+            let c = p.client.clone().expect("only a connected page asks");
+            match p.asked == Some(p.window) {
+                true => self.repeats += 1,
+                false => self.newest = Some(p.window),
+            }
+            p.asked = Some(p.window);
+            let sz = format!("sz,{},{}", p.window.0, p.window.1);
+            handle_text(&self.s, &c, &sz, &mut self.rtts);
+        }
+
+        /// The capture loop's turn: it takes the request, gives it to the screen, and if
+        /// the stream is rebuilt, every page is said hello.
+        fn capture(&mut self) {
+            let hub = self.s.hub.clone();
+            let Some(want) = hub.resize_req.lock().take() else {
+                return;
+            };
+            let streamed = (
+                hub.width.load(Ordering::Relaxed),
+                hub.height.load(Ordering::Relaxed),
+            );
+            if crate::video::rebuilds_for(&mut self.screen, want, streamed) {
+                self.rebuilds += 1;
+                hub.width.store(self.screen.size.0, Ordering::Relaxed);
+                hub.height.store(self.screen.size.1, Ordering::Relaxed);
+                for i in 0..self.pages.len() {
+                    if self.pages[i].asks_on_hello && self.pages[i].client.is_some() {
+                        self.ask(i);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Dynamic resolution takes the screen to the size asked last and rests there. Over 500
+    /// generated runs of 1 to 4 pages (each new or old, as `Page` says) connecting, leaving
+    /// and changing their windows among 5 sizes, 40 events each, with the screen refusing
+    /// each size in one run of four and the capture loop taking the request at generated
+    /// moments between the events (each rebuild saying hello to every page):
+    /// - the stream is rebuilt exactly as often as the screen's size really changed: a
+    ///   refused ask, or one for the size it has, rebuilds nothing;
+    /// - after the last connect or window change the capture loop rebuilds at most once,
+    ///   and then never again: a hello brings no new ask, an old page's included;
+    /// - the screen then has the size of the newest ask that changed what its connection
+    ///   asks for, unless it refuses that size: no page's ask clears another's.
+    ///
+    /// Each clause is counted over the runs (refused asks, asks already met, repeated asks,
+    /// rests reached with one rebuild and with none, newest asks met and refused), so none
+    /// holds unreached.
+    #[test]
+    fn resizing_rebuilds_once_per_size_granted_and_rests_after_the_last_ask() {
+        let sizes = [
+            (1280, 800),
+            (1456, 868),
+            (1920, 1080),
+            (2560, 1600),
+            (2912, 1736),
+        ];
+        let max = (3024, 1898);
+        let mut rng = crate::xorshift::Xorshift::new(0x9E37_79B9_7F4A_7C15);
+        // refused, met, repeated, rested after one rebuild, after none, newest met, newest
+        // refused
+        let mut reach = [0usize; 7];
+        for run in 0..500 {
+            let hub = Hub::new(crate::hub::Paths::ANY);
+            hub.width.store(max.0, Ordering::Relaxed);
+            hub.height.store(max.1, Ordering::Relaxed);
+            *hub.resize_max.lock() = Some(max);
+            let mut d = Desk {
+                s: app(&hub, false, None),
+                screen: Screen {
+                    size: max,
+                    refuses: sizes
+                        .iter()
+                        .copied()
+                        .filter(|_| rng.below(4) == 0)
+                        .collect(),
+                    changes: 0,
+                    refused: 0,
+                    met: 0,
+                },
+                pages: (0..rng.range(1, 5))
+                    .map(|_| Page {
+                        asks_on_hello: rng.below(2) == 0,
+                        client: None,
+                        asked: None,
+                        window: sizes[rng.below(5) as usize],
+                    })
+                    .collect(),
+                rtts: Default::default(),
+                rebuilds: 0,
+                newest: None,
+                repeats: 0,
+            };
+            for _ in 0..40 {
+                let i = rng.below(d.pages.len() as u64) as usize;
+                match (rng.below(4), d.pages[i].client.clone()) {
+                    // It connects: it is said hello, and asks once, new or old.
+                    (0, None) => {
+                        let (tx, _rx) = mpsc::unbounded_channel();
+                        d.pages[i].client = Some(hub.add_client(tx, Instant::now()));
+                        d.pages[i].asked = None;
+                        d.ask(i);
+                    }
+                    // It leaves.
+                    (0, Some(c)) => {
+                        hub.remove_client(c.id, Instant::now());
+                        d.pages[i].client = None;
+                    }
+                    // Its window changes, and it asks if it is connected.
+                    (1, client) => {
+                        d.pages[i].window = sizes[rng.below(5) as usize];
+                        if client.is_some() {
+                            d.ask(i);
+                        }
+                    }
+                    // The capture loop takes its turn.
+                    (_, _) => d.capture(),
+                }
+            }
+            let before = d.rebuilds;
+            for _ in 0..10 {
+                d.capture();
+            }
+            let after = d.rebuilds - before;
+            assert!(after <= 1, "run {run}: {after} rebuilds after the last ask");
+            assert!(
+                hub.resize_req.lock().is_none(),
+                "run {run}: still asking after rest"
+            );
+            assert_eq!(
+                d.rebuilds, d.screen.changes,
+                "run {run}: rebuilds against the screen's real changes"
+            );
+            match d.newest {
+                Some(n) if d.screen.refuses.contains(&n) => reach[6] += 1,
+                Some(n) => {
+                    assert_eq!(d.screen.size, n, "run {run}: the newest ask was lost");
+                    reach[5] += 1;
+                }
+                None => {}
+            }
+            reach[0] += d.screen.refused;
+            reach[1] += d.screen.met;
+            reach[2] += d.repeats;
+            reach[3 + usize::from(after == 0)] += 1;
+        }
+        assert!(reach.iter().all(|&n| n > 0), "unreached: {reach:?}");
     }
 
     #[test]

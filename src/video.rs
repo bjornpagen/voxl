@@ -440,9 +440,10 @@ impl Stream {
     }
 }
 
-/// Runs the pipeline. With a `Screen` (dynamic resolution), a client's size request
-/// ends the capture loop: the encoder drains, the screen is resized and the pipeline
-/// is rebuilt at the new size, and clients get the new geometry and a keyframe.
+/// Runs the pipeline. With a `Screen` (dynamic resolution), the capture loop gives a
+/// client's size request to the screen; only if the screen's size really changes does
+/// the loop end: the encoder drains, the pipeline is rebuilt at the new size, and clients
+/// get the new geometry and a keyframe.
 pub fn spawn(
     cfg: VideoConfig,
     hub: Arc<Hub>,
@@ -455,7 +456,7 @@ pub fn spawn(
     std::thread::Builder::new()
         .name("capture".into())
         .spawn(move || loop {
-            if let Err(e) = capture_loop(&mut cap, cfg.clone(), hub.clone()) {
+            if let Err(e) = capture_loop(&mut cap, cfg.clone(), hub.clone(), screen.as_mut()) {
                 #[cfg(target_os = "linux")]
                 let resized = cap.geometry_changed();
                 #[cfg(not(target_os = "linux"))]
@@ -479,12 +480,6 @@ pub fn spawn(
                     crate::logging::exit(1);
                 });
                 continue;
-            }
-            let req = hub.resize_req.lock().take();
-            if let (Some(s), Some((w, h))) = (screen.as_mut(), req) {
-                if let Err(e) = s.resize(w, h) {
-                    log::warn!("resize to {w}x{h} failed: {e}");
-                }
             }
             cap = match build(&cfg, &hub) {
                 Ok(cap) => cap,
@@ -1280,7 +1275,43 @@ impl Capture for Capturer {
     }
 }
 
-fn capture_loop(cap: &mut impl Capture, cfg: VideoConfig, hub: Arc<Hub>) -> Result<(), String> {
+/// What sets the screen's size for dynamic resolution: the platform's `screen::Screen`.
+pub(crate) trait Resize {
+    /// Asks for `w`x`h`: the size the screen has now.
+    fn resize(&mut self, w: u32, h: u32) -> Result<(u32, u32), String>;
+}
+
+impl Resize for crate::screen::Screen {
+    fn resize(&mut self, w: u32, h: u32) -> Result<(u32, u32), String> {
+        crate::screen::Screen::resize(self, w, h)
+    }
+}
+
+/// A size asked for, given to the screen: whether the stream, at `streamed`, is rebuilt.
+/// Only a screen whose size really changed rebuilds it and says hello to the viewers; an
+/// ask the screen refuses, or one for the size it has, changes nothing. A rebuild for
+/// either said hello for nothing, and a page that answered each hello by asking again
+/// kept the stream starting over for as long as the screen refused it.
+pub(crate) fn rebuilds_for(
+    screen: &mut impl Resize,
+    (w, h): (u32, u32),
+    streamed: (u32, u32),
+) -> bool {
+    match screen.resize(w, h) {
+        Ok(size) => size != streamed,
+        Err(e) => {
+            log::warn!("resize to {w}x{h} failed: {e}");
+            false
+        }
+    }
+}
+
+fn capture_loop(
+    cap: &mut impl Capture,
+    cfg: VideoConfig,
+    hub: Arc<Hub>,
+    mut screen: Option<&mut crate::screen::Screen>,
+) -> Result<(), String> {
     let (w, h) = cap.size();
     let (w, h) = (w as usize, h as usize);
     let interval = Duration::from_secs_f64(1.0 / cfg.fps.get() as f64);
@@ -1322,8 +1353,14 @@ fn capture_loop(cap: &mut impl Capture, cfg: VideoConfig, hub: Arc<Hub>) -> Resu
         if hub.display_req.lock().is_some() {
             return Ok(());
         }
-        if hub.resize_req.lock().is_some() || cap.needs_rebuild() {
+        if cap.needs_rebuild() {
             return Ok(());
+        }
+        let asked = hub.resize_req.lock().take();
+        if let (Some(s), Some(want)) = (screen.as_deref_mut(), asked) {
+            if rebuilds_for(s, want, cap.size()) {
+                return Ok(());
+            }
         }
         cap.pump()?;
         if cap.needs_rebuild() {
@@ -5327,6 +5364,8 @@ mod tests {
         drawn: parking_lot::Mutex<Drawn>,
         /// Readable when something was drawn: the capture's fd.
         news: crate::hub::Wake,
+        /// The test is done: the capture loop ends, as at a change of the screen's size.
+        done: std::sync::atomic::AtomicBool,
     }
 
     #[cfg(target_os = "linux")]
@@ -5397,7 +5436,7 @@ mod tests {
             Ok(())
         }
         fn needs_rebuild(&self) -> bool {
-            false
+            self.canvas.done.load(Ordering::Relaxed)
         }
         fn changes(&mut self) -> &mut Vec<(u32, u32, u32, u32)> {
             &mut self.changes
@@ -5637,6 +5676,7 @@ mod tests {
                 rows: None,
             }),
             news: crate::hub::Wake::new().unwrap(),
+            done: std::sync::atomic::AtomicBool::new(false),
         });
         let (cols, rows) = ((w as usize).div_ceil(16), (h as usize).div_ceil(16));
         let mut drawing = Drawing {
@@ -5650,7 +5690,7 @@ mod tests {
             let (cfg, hub) = (cfg.clone(), hub.clone());
             std::thread::Builder::new()
                 .name("capture".into())
-                .spawn(move || capture_loop(&mut drawing, cfg, hub))
+                .spawn(move || capture_loop(&mut drawing, cfg, hub, None))
                 .unwrap()
         };
         // The viewer: it takes frames until one of the kind waited for, writing each as its
@@ -5750,7 +5790,7 @@ mod tests {
         }
         let (threads, others) = counting::disarm();
         let counted = viewer.frames - before;
-        *hub.resize_req.lock() = Some((w, h));
+        canvas.done.store(true, Ordering::Relaxed);
         hub.wake();
         capture.join().unwrap().unwrap();
         Some(Counted {

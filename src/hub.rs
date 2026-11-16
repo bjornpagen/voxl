@@ -350,11 +350,21 @@ pub struct Client {
     /// Its last frames as they were sent and acked (`/stats/trace`), kept a while once it
     /// has left.
     pub trace: Arc<Mutex<crate::timeline::Trace>>,
+    /// The desktop size it last asked for (`sz`, fitted to the screen), if it has asked.
+    asked: Mutex<Option<(u32, u32)>>,
 }
 
 impl Client {
     pub fn send(&self, m: Out) {
         let _ = self.tx.send(m);
+    }
+
+    /// It asks for the desktop to be `size`: whether that is a new ask. Asking again for the
+    /// size it last asked for asks nothing, so a page that repeats its size on every hello
+    /// (as the web client did before it asked only on connect and when its window changes)
+    /// cannot move the screen back and forth by repeating it.
+    pub fn asks_for(&self, size: (u32, u32)) -> bool {
+        self.asked.lock().replace(size) != Some(size)
     }
 
     /// What its window says, as one read sees it.
@@ -693,7 +703,8 @@ pub struct Hub {
     pub waker: Wake,
     pub input: Mutex<Option<std::sync::mpsc::Sender<crate::event::InputEvent>>>,
     pub last_clipboard: Mutex<Option<String>>,
-    /// Desktop size a client asked for (dynamic resolution), applied by the video thread.
+    /// The newest new ask for a desktop size (dynamic resolution), until the capture loop
+    /// takes it and gives it to the screen.
     pub resize_req: Mutex<Option<(u32, u32)>>,
     /// Largest desktop size (Some when dynamic resolution is on).
     pub resize_max: Mutex<Option<(u32, u32)>>,
@@ -760,6 +771,7 @@ impl Hub {
             pings: Mutex::new(Pings::default()),
             client_ms: Mutex::new(0.0),
             trace: Arc::new(Mutex::new(crate::timeline::Trace::with_room())),
+            asked: Mutex::new(None),
         });
         self.clients.lock().push(c.clone());
         c
