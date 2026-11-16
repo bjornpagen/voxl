@@ -100,6 +100,7 @@ x11rb = { version = "0.13", features = [
 	"shape",
 	"xinput",
 	"randr",
+	"xkb",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

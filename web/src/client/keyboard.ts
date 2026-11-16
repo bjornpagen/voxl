@@ -101,17 +101,17 @@ export function setupKeyboard(
 	} | null = null;
 	const press = (code: string, ks: number) => {
 		down.set(code, ks);
-		send(cmd.key(ks, true));
+		send(cmd.key(ks, 'down'));
 	};
 	const tap = (ks: number) => {
-		send(cmd.key(ks, true));
-		send(cmd.key(ks, false));
+		send(cmd.key(ks, 'down'));
+		send(cmd.key(ks, 'up'));
 	};
 	function release(code: string) {
 		const ks = down.get(code);
 		if (ks === undefined) return;
 		down.delete(code);
-		send(cmd.key(ks, false));
+		send(cmd.key(ks, 'up'));
 	}
 	function releaseAll() {
 		down.clear();
@@ -140,7 +140,7 @@ export function setupKeyboard(
 		e.preventDefault();
 		const held = down.get(e.code);
 		if (e.repeat && held !== undefined) {
-			send(cmd.key(held, true));
+			send(cmd.key(held, 'repeat'));
 			return;
 		}
 		press(e.code, ks);

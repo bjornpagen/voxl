@@ -1,7 +1,7 @@
 //! HTTP + WebSocket front end. Serves the embedded web client and the media/input socket.
 
 use crate::hub::{Client, Hub, Out, ServerMessage};
-use crate::input::InputEvent;
+use crate::input::{InputEvent, KeyAct};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::header;
@@ -401,8 +401,8 @@ enum Command {
     Button { button: Button, down: bool },
     /// `sp,<dx>,<dy>`: desktop pixels.
     ScrollPx { dx: Pixels, dy: Pixels },
-    /// `k,<keysym>,<1|0>`
-    Key { keysym: u32, down: bool },
+    /// `k,<keysym>,<1|2|0>`: down, repeat, up.
+    Key { keysym: u32, act: KeyAct },
     /// `r`
     ReleaseAll,
     /// `c,<text>`: the text is everything after the first comma.
@@ -441,6 +441,12 @@ impl Command {
             "0" => Some(false),
             _ => None,
         };
+        let key = |v: &str| match v {
+            "1" => Some(KeyAct::Down),
+            "2" => Some(KeyAct::Repeat),
+            "0" => Some(KeyAct::Up),
+            _ => None,
+        };
         Some(match (name, fields.as_slice()) {
             ("a", [frame]) => Command::Ack { frame: num(frame)? },
             ("m", [x, y]) => Command::Move {
@@ -455,9 +461,9 @@ impl Command {
                 dx: Pixels::parse(dx)?,
                 dy: Pixels::parse(dy)?,
             },
-            ("k", [keysym, down]) => Command::Key {
+            ("k", [keysym, act]) => Command::Key {
                 keysym: num(keysym)?,
-                down: flag(down)?,
+                act: key(act)?,
             },
             ("r", []) => Command::ReleaseAll,
             ("v", [on]) => Command::Video(flag(on)?),
@@ -531,7 +537,7 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
         Command::Move { x, y } => input(InputEvent::Move { x, y }),
         Command::Button { button, down } => input(InputEvent::Button { button, down }),
         Command::ScrollPx { dx, dy } => input(InputEvent::ScrollPx { dx: dx.0, dy: dy.0 }),
-        Command::Key { keysym, down } => input(InputEvent::Key { keysym, down }),
+        Command::Key { keysym, act } => input(InputEvent::Key { keysym, act }),
         Command::ReleaseAll => input(InputEvent::ReleaseAll),
         Command::Clipboard(text) => input(InputEvent::Clipboard(
             crate::desktop::ClipContent::Text(text),
@@ -610,6 +616,7 @@ mod tests {
         "b,1,0",
         "sp,0.0,12.0",
         "k,65,1",
+        "k,65,2",
         "k,65,0",
         "r",
         "c,text",
@@ -678,7 +685,7 @@ mod tests {
         // The same commands do reach the desktop without --read-only, so the test above
         // checks the guard rather than an unwired server.
         let (input, mic, resized) = drive(false);
-        assert!(input >= 8, "{input} input events");
+        assert!(input >= 9, "{input} input events");
         assert_eq!(mic, 1);
         assert!(resized);
     }
@@ -695,7 +702,7 @@ mod tests {
             );
         }
         for c in [
-            "v,2", "v", "a", "a,x", "k,65", "b,1,7", "sp,1", "po,-1", "zz,1",
+            "v,2", "v", "a", "a,x", "k,65", "k,65,3", "b,1,7", "sp,1", "po,-1", "zz,1",
         ] {
             assert!(Command::parse(c).is_none(), "{c} parsed");
         }
@@ -804,6 +811,21 @@ mod tests {
             "sp,0,nan",
         ] {
             assert!(Command::parse(c).is_none(), "{c} parsed");
+        }
+    }
+
+    /// A key's last field says whether it went down, repeated or came up.
+    #[test]
+    fn a_key_says_what_it_did() {
+        for (line, said) in [
+            ("k,65,1", KeyAct::Down),
+            ("k,65,2", KeyAct::Repeat),
+            ("k,65,0", KeyAct::Up),
+        ] {
+            assert!(
+                matches!(Command::parse(line), Some(Command::Key { keysym: 65, act }) if act == said),
+                "{line}"
+            );
         }
     }
 
@@ -1051,7 +1073,7 @@ mod tests {
             &old,
             InputEvent::Key {
                 keysym: 65,
-                down: true,
+                act: KeyAct::Down,
             },
         );
         assert!(
