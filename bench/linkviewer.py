@@ -43,8 +43,7 @@ lowest `carries` since it connected (`lowest_carries_bytes`: what its window sai
 carries in `LATENESS`, at its least), and the window's own `LATENESS`, `START` and `FALL`.
 The run fails (exit status 1) when:
 - the window went below what it may: `START`, or what the emulated link carries in
-  `LATENESS` if less, divided by `FALL` once for each stall begun since the connect (a
-  stall is the one thing that may cost the window a fall it cannot win back at rest);
+  `LATENESS` if less, and over `FALL` once if any stall began (`floor_of` says why once);
 - a frame waited behind the link's queue more than `3 x LATENESS` (a stall is not a wait);
 - or it was not measured: no /stats, a /stats without those fields, or this viewer not in it.
 
@@ -384,7 +383,7 @@ async def main():
     ended, final = first.result()
     with open(f"{a.out}.stats.json", "w") as f:
         json.dump(final, f)
-    return verdict(final, before, waits, path.rate, path.stalls.begun(connected, ended))
+    return verdict(final, before, waits, path, a.rtt / 1000, path.stalls.begun(connected, ended))
 
 
 class NotMeasured(Exception):
@@ -403,18 +402,37 @@ def window_of(final, before):
         raise NotMeasured(f"/stats has no {e}") from None
 
 
-def verdict(final, before, waits, rate, stalls):
+def floor_of(start, fall, lateness, path, rtt, began):
+    """The least the window may say the path carries: `START`, or what the link carries in
+    `LATENESS` if less; and if a stall began during the run, that over `FALL`, once.
+
+    Why once, for any number of stalls: a stall holds the acks back, so the round it falls
+    in reads too low, and in one round the window falls by no more than `FALL`. That is the
+    fall a stall may cost. A second fall before the first is won back is the stall talking
+    the window down twice, which is what the bench is here to catch, so it fails. A schedule
+    whose stalls leave less than one round (the round trip and `LATENESS`) between them has
+    no round that is not a stall's, so nothing can be said of it: not measured."""
+    floor = min(start, path.rate.carries(lateness))
+    if began == 0:
+        return floor, "START, or what the link carries in LATENESS if less"
+    between = path.stalls.every - path.stalls.length
+    if between < rtt + lateness:
+        raise NotMeasured(f"stalls {between * 1000:.0f} ms apart leave no round ({(rtt + lateness) * 1000:.0f} ms) between them")
+    return floor / fall, f"START, or what the link carries in LATENESS if less, over FALL {fall} once for {began} stalls"
+
+
+def verdict(final, before, waits, path, rtt, began):
     """Prints the run's bounds and whether it kept them; True when it did. `final` is the
-    /stats read at the end, `stalls` how many stalls began since the viewer connected."""
+    /stats read at the end, `rtt` the emulated round trip in seconds, `began` how many
+    stalls began since the viewer connected."""
     try:
         lateness, start, fall, lowest = window_of(final, before)
+        floor, why = floor_of(start, fall, lateness, path, rtt, began)
     except NotMeasured as e:
         print(f"not measured: {e}: FAIL")
         return False
-    floor = min(start, rate.carries(lateness)) / fall**stalls
     kept_floor = lowest >= floor
-    print(f"carries: lowest {lowest} B since the connect; bound {floor:.0f} B (START {start} B, or what the link"
-          f" carries in LATENESS if less, / FALL {fall} for each of {stalls} stalls): {'pass' if kept_floor else 'FAIL'}")
+    print(f"carries: lowest {lowest} B since the connect; bound {floor:.0f} B ({why}): {'pass' if kept_floor else 'FAIL'}")
     t, longest = max(waits, key=lambda tw: tw[1])
     bound = 3 * lateness * 1000
     kept_wait = longest <= bound
