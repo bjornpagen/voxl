@@ -10,7 +10,7 @@
 //! CPU and never slows real viewers down. Like the stream, it holds frames only when
 //! the screen changes, and it doesn't include the cursor (viewers draw it locally).
 
-use crate::hub::{Client, Hub, Out, ServerMessage};
+use crate::hub::{Hub, Out, ServerMessage};
 use crate::mp4;
 use crate::video::{Header, NotVideo, Video};
 use axum::extract::{Query, State};
@@ -146,12 +146,12 @@ fn begin(
         ));
     }
     let (tx, rx) = mpsc::unbounded_channel();
-    let client = r.hub.add_client(tx, Instant::now());
+    let client = r.hub.add_recorder(tx);
     client.watch(Instant::now());
     r.hub.wake();
     let hub = r.hub.clone();
     Ok(tokio::spawn(async move {
-        let res = collect(&hub, &client, rx, stop, max).await;
+        let res = collect(&hub, rx, stop, max).await;
         hub.remove_client(client.id, Instant::now());
         res
     }))
@@ -159,7 +159,6 @@ fn begin(
 
 async fn collect(
     hub: &Hub,
-    client: &Client,
     mut rx: mpsc::UnboundedReceiver<Out>,
     mut stop: oneshot::Receiver<()>,
     max: Duration,
@@ -182,9 +181,6 @@ async fn collect(
                         // is for the viewers.
                         Ok(Video::Empty(_)) | Err(NotVideo::Other | NotVideo::Short) => continue,
                     };
-                    // Acknowledge at once, so the recorder never holds the stream back.
-                    client.on_ack(Instant::now(), h.frame, crate::hub::Hold::Unsaid);
-                    hub.wake();
                     if frames.is_empty() {
                         size = (hub.width.load(Ordering::Relaxed), hub.height.load(Ordering::Relaxed));
                     }
@@ -325,8 +321,6 @@ mod tests {
             "x",
         ];
         let hub = Hub::new(crate::hub::Paths::ANY);
-        let (tx, _) = mpsc::unbounded_channel();
-        let client = hub.add_client(tx, Instant::now());
         let mut rng = crate::xorshift::Xorshift::new(0x9e37_79b9_7f4a_7c15);
         for _ in 0..2_000 {
             let (tx, rx) = mpsc::unbounded_channel();
@@ -354,7 +348,7 @@ mod tests {
             }
             drop(tx);
             let (_keep, stop) = oneshot::channel();
-            let mp4 = collect(&hub, &client, rx, stop, Duration::from_secs(3600)).await;
+            let mp4 = collect(&hub, rx, stop, Duration::from_secs(3600)).await;
             match held {
                 0 => assert!(mp4.is_err()),
                 n => assert_eq!(samples(&mp4.unwrap()), n),

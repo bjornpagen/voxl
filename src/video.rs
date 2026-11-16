@@ -7,7 +7,7 @@ use crate::encoder::{
 };
 use crate::env::{Debugging, Marker};
 use crate::hub::{wait_any, Waitable};
-use crate::hub::{Client, Hub, Out, ServerMessage, Takes, Viewer};
+use crate::hub::{Client, Hub, Out, Reach, ServerMessage, Takes, Viewer};
 use crate::path::{Bits, Kbps};
 use crate::rate::Bounds;
 use crate::timeline::{CaptureMarks, Coded};
@@ -589,11 +589,7 @@ impl Gated {
     /// What the look at the viewers saw of their ways, in the hub's order, but those left
     /// behind, which are sent nothing.
     fn ask(seen: &[(Arc<Client>, Seen)]) -> Gated {
-        Gated::of(
-            seen.iter()
-                .filter(|(_, v)| v.viewer != Viewer::Behind)
-                .map(|(_, v)| v.way),
-        )
+        Gated::of(sent(seen).map(|v| v.way))
     }
 
     /// What the viewers' ways let a frame take: the least room of those that have not
@@ -881,6 +877,25 @@ enum Key {
     NotWanted,
 }
 
+impl Key {
+    /// What the look at the viewers saw: a keyframe is wanted if one waits for it, and it
+    /// goes to every viewer but those left behind, so the slowest of their paths bounds it.
+    fn of(seen: &[(Arc<Client>, Seen)]) -> Key {
+        seen.iter()
+            .any(|(_, v)| v.viewer == Viewer::Waiting)
+            .then(|| sent(seen).map(|v| v.carries).min())
+            .flatten()
+            .map_or(Key::NotWanted, |carries| Key::Wanted { carries })
+    }
+}
+
+/// What the look saw of the viewers a frame goes to: all but those left behind.
+fn sent(seen: &[(Arc<Client>, Seen)]) -> impl Iterator<Item = &Seen> {
+    seen.iter()
+        .map(|(_, v)| v)
+        .filter(|v| v.viewer != Viewer::Behind)
+}
+
 /// When the areas a capturer holds were drawn: the first since it was last taken, and
 /// the latest.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -999,6 +1014,11 @@ impl InFlight {
             .max()
             .map_or(InFlight::Nothing, |until| InFlight::Frames(until - now))
     }
+
+    /// What the look at `now` saw of the queues of the viewers a pass would go to.
+    fn ask(seen: &[(Arc<Client>, Seen)], now: Instant) -> InFlight {
+        InFlight::of(now, sent(seen).map(|v| v.holds))
+    }
 }
 
 /// What the capture loop sees of one viewer when it looks, in one read of it
@@ -1016,19 +1036,31 @@ struct Seen {
 }
 
 impl Seen {
-    /// A viewer that is `viewer` to the stream, with window `w`, at `now`.
-    fn of(viewer: Viewer, w: &Window, now: Instant) -> Seen {
-        Seen {
-            viewer,
-            way: w.way(now, STALLED),
-            carries: w.carries(),
-            holds: holds_pass(w, now),
+    /// A viewer that is `viewer` to the stream, reached by `reach`, at `now`, `ceiling`
+    /// being the most any window carries. The recorder takes every frame as it is sent: it
+    /// is seen with all the room any window may have, so beside viewers it bounds nothing,
+    /// and alone it lets a capture take the ceiling.
+    fn of(viewer: Viewer, reach: &Reach, now: Instant, ceiling: usize) -> Seen {
+        match reach {
+            Reach::Path(w) => Seen {
+                viewer,
+                way: w.way(now, STALLED),
+                carries: w.carries(),
+                holds: holds_pass(w, now),
+            },
+            Reach::Recorder => Seen {
+                viewer,
+                way: Way::Room(ceiling),
+                carries: ceiling,
+                holds: None,
+            },
         }
     }
 
     /// One look at each watching viewer at `now`, into `into` in place of what it held.
     fn all(hub: &Hub, now: Instant, into: &mut Vec<(Arc<Client>, Seen)>) {
-        hub.look_into(into, |viewer, w| Seen::of(viewer, w, now));
+        let ceiling = hub.ceiling();
+        hub.look_into(into, |viewer, reach| Seen::of(viewer, reach, now, ceiling));
     }
 }
 
@@ -1464,15 +1496,7 @@ fn capture_loop(
             Wait::Change.wait(cap, &hub);
             continue;
         };
-        // A keyframe goes to every viewer but those left behind: what the slowest of their
-        // paths carries bounds it. A pass goes only into their empty queues.
-        let sent = || seen.iter().filter(|(_, v)| v.viewer != Viewer::Behind);
-        let key = seen
-            .iter()
-            .any(|(_, v)| v.viewer == Viewer::Waiting)
-            .then(|| sent().map(|(_, v)| v.carries).min())
-            .flatten()
-            .map_or(Key::NotWanted, |carries| Key::Wanted { carries });
+        let key = Key::of(&seen);
         let due = sharpening.due(now);
         let look = Look {
             key,
@@ -1485,7 +1509,7 @@ fn capture_loop(
             deadline: interval,
             gate: Gated::ask(&seen),
             buffer: std::mem::replace(&mut s.buf, Buffer::Away),
-            in_flight: InFlight::of(now, sent().map(|(_, v)| v.holds)),
+            in_flight: InFlight::ask(&seen, now),
         };
         let step = step(look);
         let (next, mut buf, allowance) = match step {
@@ -2643,6 +2667,7 @@ fn marker_age(ms: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hub::ReachStats;
     use crate::path::Kbps;
     use crate::xorshift::Xorshift;
 
@@ -6196,6 +6221,106 @@ mod tests {
         );
     }
 
+    /// The recorder is no path: beside viewers it changes nothing the look decides, and
+    /// alone it lets a capture take the ceiling. Hubs whose ceiling is anything from a
+    /// packet to as much as there is; none to three viewers on a path, not watching,
+    /// waiting or started, each on a clogged path or a light one (as in the test above);
+    /// and the recorder, waiting for its keyframe or started. With the recorder the gate is
+    /// the viewers' own when one of those a frame goes to was seen with room or full, and
+    /// open at the ceiling when none was; a keyframe is wanted when the recorder or a
+    /// viewer waits, of the least those viewers carry, or of the ceiling with none; the
+    /// pass's holds are the viewers'. The recorder, once started, takes each frame and
+    /// keeps nothing in flight. Counted, and each must happen: gates the viewers decided,
+    /// gates the recorder opened, and keyframes only the recorder waited for.
+    #[test]
+    fn the_recorder_bounds_no_viewer_and_alone_takes_the_ceiling() {
+        let mut rng = Xorshift::new(0x94D0_49BB_1331_11EB);
+        let mut next = |n: u64| rng.below(n);
+        let now = Instant::now() + Duration::from_secs(10);
+        let joined = now - Duration::from_secs(7);
+        let (mut theirs, mut opened, mut asked) = (0u32, 0u32, 0u32);
+        for case in 0..2_000 {
+            let most = match next(3) {
+                0 => usize::MAX,
+                _ => window::PACKET * (1 + next(200) as usize),
+            };
+            let hub = Hub::new(crate::hub::Paths { least: 0, most });
+            for _ in 0..next(4) {
+                let c = hub.add_client(tokio::sync::mpsc::unbounded_channel().0, joined);
+                match next(3) {
+                    0 => {}
+                    1 => c.watch(joined),
+                    _ => {
+                        c.watch(joined);
+                        c.keyframe_planned();
+                        c.keyframe_sent(true, joined);
+                    }
+                }
+                let (age, frames, bytes) = match next(4) {
+                    0 => (3_990_000 + next(10_000), 1 + next(30), 60_000),
+                    1 => (4_000_000 + next(10_000), 1 + next(30), 60_000),
+                    2 => (next(5_000_000), 1 + next(30), 60_000),
+                    _ => (next(100_000), next(3), 2_000),
+                };
+                let mut at = now - Duration::from_micros(age);
+                for _ in 0..frames {
+                    c.fly(hub.timeline.number(), at, 200 + next(bytes) as usize);
+                    at = (at + Duration::from_micros(next(30_000))).min(now);
+                }
+            }
+            let recorder = hub.add_recorder(tokio::sync::mpsc::unbounded_channel().0);
+            recorder.watch(joined);
+            if next(2) == 0 {
+                recorder.keyframe_planned();
+                recorder.keyframe_sent(true, joined);
+            }
+            let ceiling = hub.ceiling();
+            let all = looked(&hub, now);
+            let viewers: Vec<_> = all
+                .iter()
+                .filter(|(c, _)| !Arc::ptr_eq(c, &recorder))
+                .cloned()
+                .collect();
+            let at = format!("case {case}");
+            let decide = sent(&viewers).any(|v| v.way != Way::Stalled);
+            match decide {
+                true => assert_eq!(Gated::ask(&all), Gated::ask(&viewers), "{at}"),
+                false => assert_eq!(Gated::ask(&all), Gated::Open(ceiling), "{at}"),
+            }
+            theirs += u32::from(decide);
+            opened += u32::from(!decide);
+            let waits = |seen: &[(Arc<Client>, Seen)]| {
+                seen.iter().any(|(_, v)| v.viewer == Viewer::Waiting)
+            };
+            let least = sent(&viewers).map(|v| v.carries).min();
+            let want = match (waits(&all), least) {
+                (false, _) => Key::NotWanted,
+                (true, Some(carries)) => Key::Wanted { carries },
+                (true, None) => Key::Wanted { carries: ceiling },
+            };
+            assert_eq!(Key::of(&all), want, "{at}");
+            asked += u32::from(waits(&all) && !waits(&viewers));
+            assert_eq!(
+                InFlight::ask(&all, now),
+                InFlight::ask(&viewers, now),
+                "{at}"
+            );
+            let started = recorder.viewer() == Viewer::Started;
+            let took = recorder.takes(hub.timeline.number(), now, 1 << 20, false, 0);
+            assert_eq!(took == Takes::Frame, started, "{at}");
+            let read = recorder.stats(now);
+            assert_eq!(
+                (read.backlog, read.reach),
+                (None, ReachStats::Recorder),
+                "{at}"
+            );
+        }
+        assert!(
+            theirs > 100 && opened > 100 && asked > 100,
+            "unreached: {theirs}, {opened}, {asked}"
+        );
+    }
+
     /// A pass waits while a viewer's queue holds frames: a viewer holds it while its window
     /// has not room for all its path carries, until the newest frame on its way has had
     /// `STALLED`; the pass waits until the last viewer that holds it will have emptied or
@@ -7145,7 +7270,7 @@ mod tests {
                     if stalled || mid == Behind {
                         let others: Vec<_> = others
                             .iter()
-                            .map(|c| (c.clone(), c.look(|v, w| Seen::of(v, w, t))))
+                            .map(|c| (c.clone(), c.look(|v, r| Seen::of(v, r, t, hub.ceiling()))))
                             .collect();
                         assert_eq!(gate, Gated::ask(&others), "{at}");
                         seen[match (on_time, gate) {

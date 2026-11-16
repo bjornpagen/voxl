@@ -315,13 +315,26 @@ fn restarted(viewer: Viewer) -> Viewer {
     }
 }
 
-/// What a client is to the stream, the frames sent to it and not yet acked, what its path
-/// carries, read from those frames, and how long it says it holds a frame: under one lock,
-/// so that every change to them is one step, and every read of them one state.
+/// How a client's frames reach it. Each client has one, in its `Viewing`, already on the
+/// heap behind the client's `Arc`: boxing the window to shrink the recorder's variant
+/// would put every read of a window behind a second pointer.
+#[allow(clippy::large_enum_variant)]
+pub enum Reach {
+    /// Over a socket, through a path whose window says what it carries, read from the
+    /// frames' acks and the pings.
+    Path(Window),
+    /// Into the recorder, in this process: it takes each frame as it is sent. It has no
+    /// path, so no window, no ack and no ping.
+    Recorder,
+}
+
+/// What a client is to the stream, the frames sent to it and not yet acked, how they reach
+/// it, and how long it says it holds a frame: under one lock, so that every change to them
+/// is one step, and every read of them one state.
 struct Viewing {
     viewer: Viewer,
     inflight: VecDeque<Inflight>,
-    window: Window,
+    reach: Reach,
     /// How long the client keeps a frame between its arrival and the ack (decode, draw,
     /// frames ahead of it), as it reports it: smoothed ms, once it has said a hold that
     /// could be true.
@@ -333,7 +346,10 @@ impl Viewing {
     /// window forgets it.
     fn forget(&mut self, now: Instant) {
         self.inflight.clear();
-        self.window.forget(now);
+        match &mut self.reach {
+            Reach::Path(window) => window.forget(now),
+            Reach::Recorder => {}
+        }
     }
 
     /// What it has in flight at `now`, if anything.
@@ -392,14 +408,17 @@ impl Client {
     /// What its window says, as one read sees it.
     #[cfg(test)]
     pub fn window<R>(&self, read: impl FnOnce(&Window) -> R) -> R {
-        read(&self.viewing.lock().window)
+        match &self.viewing.lock().reach {
+            Reach::Path(window) => read(window),
+            Reach::Recorder => panic!("a recorder has no window"),
+        }
     }
 
-    /// What it is to the stream and what its window says, as one read sees both: what the
+    /// What it is to the stream and how frames reach it, as one read sees both: what the
     /// capture loop decides of it, it decides from this one state.
-    pub fn look<R>(&self, read: impl FnOnce(Viewer, &Window) -> R) -> R {
+    pub fn look<R>(&self, read: impl FnOnce(Viewer, &Reach) -> R) -> R {
         let v = self.viewing.lock();
-        read(v.viewer, &v.window)
+        read(v.viewer, &v.reach)
     }
 
     /// What it is to the stream, as one read sees it.
@@ -488,9 +507,10 @@ impl Client {
     }
 
     /// The encode loop has frame `id`, of `bytes`, to send at `now`; `key`: every stripe of
-    /// it is a keyframe. A client that has started takes it, and it is in flight until
-    /// acked and in its trace, unless it already has more than `behind` frames in flight:
-    /// then it stops watching, and is to be sent a close.
+    /// it is a keyframe. A client that has started takes it. On a path it is in flight
+    /// until acked and in its trace, unless the client already has more than `behind`
+    /// frames in flight: then it stops watching, and is to be sent a close. The recorder
+    /// takes it, and that is all.
     pub fn takes(
         &self,
         id: FrameId,
@@ -500,23 +520,30 @@ impl Client {
         behind: usize,
     ) -> Takes {
         let mut v = self.viewing.lock();
-        match v.viewer {
-            Viewer::Started if v.inflight.len() > behind => {
-                v.viewer = Viewer::NotWatching;
+        let Viewing {
+            viewer,
+            inflight,
+            reach,
+            ..
+        } = &mut *v;
+        match (*viewer, reach) {
+            (Viewer::Started, Reach::Path(_)) if inflight.len() > behind => {
+                *viewer = Viewer::NotWatching;
                 Takes::Close
             }
-            Viewer::Started => {
-                v.window.leave(now, bytes);
+            (Viewer::Started, Reach::Path(window)) => {
+                window.leave(now, bytes);
                 let frame = Inflight {
                     id,
                     bytes,
                     left: now,
                 };
-                v.inflight.push_back(frame);
+                inflight.push_back(frame);
                 self.trace.lock().sent(frame, key);
                 Takes::Frame
             }
-            Viewer::NotWatching | Viewer::Waiting | Viewer::Behind | Viewer::Promised => {
+            (Viewer::Started, Reach::Recorder) => Takes::Frame,
+            (Viewer::NotWatching | Viewer::Waiting | Viewer::Behind | Viewer::Promised, _) => {
                 Takes::Nothing
             }
         }
@@ -537,9 +564,14 @@ impl Client {
         let Viewing {
             viewer,
             inflight,
-            window,
+            reach,
             client_ms,
         } = &mut *v;
+        // The recorder is sent nothing it acks: nothing of it is in flight.
+        let window = match reach {
+            Reach::Path(window) => window,
+            Reach::Recorder => return,
+        };
         let Some(named) = inflight.iter().position(|f| f.id.get() == id) else {
             return;
         };
@@ -563,15 +595,21 @@ impl Client {
     }
 
     /// A ping came back at `now`, `trip` after it went with `ahead` on its way ahead of it:
-    /// a round trip that carried nothing.
+    /// a round trip that carried nothing. Only a client on a path is pinged.
     pub fn pinged(&self, now: Instant, trip: Duration, ahead: window::Ahead) {
-        self.viewing.lock().window.pinged(now, trip, ahead);
+        match &mut self.viewing.lock().reach {
+            Reach::Path(window) => window.pinged(now, trip, ahead),
+            Reach::Recorder => {}
+        }
     }
 
     /// A ping goes to it at `now`, named `token`: it is recorded with what is on its way
-    /// ahead of it.
+    /// ahead of it. Only a client on a path, over its socket, is pinged.
     pub fn ping(&self, now: Instant, token: Token) {
-        let ahead = self.viewing.lock().window.ahead();
+        let ahead = match &self.viewing.lock().reach {
+            Reach::Path(window) => window.ahead(),
+            Reach::Recorder => return,
+        };
         self.pings.lock().send(now, token, ahead);
     }
 
@@ -581,10 +619,15 @@ impl Client {
         ClientStats {
             viewer: v.viewer,
             backlog: v.backlog(now),
-            carries: v.window.carries(),
-            lowest: v.window.lowest(),
-            flying: v.window.flying(),
-            fastest: v.window.fastest(),
+            reach: match &v.reach {
+                Reach::Path(w) => ReachStats::Path {
+                    carries: w.carries(),
+                    lowest: w.lowest(),
+                    flying: w.flying(),
+                    fastest: w.fastest(),
+                },
+                Reach::Recorder => ReachStats::Recorder,
+            },
             client_ms: v.client_ms,
         }
     }
@@ -595,14 +638,23 @@ impl Client {
 pub struct ClientStats {
     pub viewer: Viewer,
     pub backlog: Option<Backlog>,
-    /// What its path carries in `LATENESS`, the least it has carried since the client
-    /// joined, what is on its way, and its fastest round trip (window.rs).
-    pub carries: usize,
-    pub lowest: usize,
-    pub flying: usize,
-    pub fastest: Option<Duration>,
+    pub reach: ReachStats,
     /// How long it says it holds a frame: smoothed ms, once it has said one.
     pub client_ms: Option<f64>,
+}
+
+/// What `/stats` reports of how frames reach a client.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ReachStats {
+    /// What its path carries in `LATENESS`, the least it has carried since the client
+    /// joined, what is on its way, and its fastest round trip (window.rs).
+    Path {
+        carries: usize,
+        lowest: usize,
+        flying: usize,
+        fastest: Option<Duration>,
+    },
+    Recorder,
 }
 
 #[cfg(test)]
@@ -616,7 +668,10 @@ impl Client {
     /// flight, and on its way in its window.
     pub fn fly(&self, id: FrameId, at: Instant, bytes: usize) {
         let mut v = self.viewing.lock();
-        v.window.leave(at, bytes);
+        let Reach::Path(window) = &mut v.reach else {
+            panic!("a recorder has no path");
+        };
+        window.leave(at, bytes);
         v.inflight.push_back(Inflight {
             id,
             bytes,
@@ -841,15 +896,31 @@ impl Hub {
         self.waker.drain();
     }
 
-    /// A client joins at `now`, with a window of its own from then.
+    /// A client joins at `now` over a socket, with a window of its own from then.
     pub fn add_client(&self, tx: mpsc::UnboundedSender<Out>, now: Instant) -> Arc<Client> {
+        let window = Window::new(now, self.paths.least, self.paths.most);
+        self.join(tx, Reach::Path(window))
+    }
+
+    /// The recorder joins: frames reach it in this process, with no path.
+    pub fn add_recorder(&self, tx: mpsc::UnboundedSender<Out>) -> Arc<Client> {
+        self.join(tx, Reach::Recorder)
+    }
+
+    /// The most any viewer's window carries in `LATENESS`: what the recorder, which takes
+    /// every frame at once, is taken to carry.
+    pub fn ceiling(&self) -> usize {
+        window::ceiling(self.paths.most)
+    }
+
+    fn join(&self, tx: mpsc::UnboundedSender<Out>, reach: Reach) -> Arc<Client> {
         let c = Arc::new(Client {
             id: self.next_id.fetch_add(1, Ordering::Relaxed),
             tx,
             viewing: Mutex::new(Viewing {
                 viewer: Viewer::NotWatching,
                 inflight: VecDeque::new(),
-                window: Window::new(now, self.paths.least, self.paths.most),
+                reach,
                 client_ms: None,
             }),
             audio: AtomicBool::new(false),
@@ -914,11 +985,12 @@ impl Hub {
     pub fn look_into<R>(
         &self,
         into: &mut Vec<(Arc<Client>, R)>,
-        read: impl Fn(Viewer, &Window) -> R,
+        read: impl Fn(Viewer, &Reach) -> R,
     ) {
         into.clear();
         for c in self.clients.lock().iter() {
-            let seen = c.look(|viewer, w| (viewer != Viewer::NotWatching).then(|| read(viewer, w)));
+            let seen = c
+                .look(|viewer, reach| (viewer != Viewer::NotWatching).then(|| read(viewer, reach)));
             into.extend(seen.map(|seen| (c.clone(), seen)));
         }
     }
@@ -1249,10 +1321,14 @@ mod tests {
             }
         }
         after.c = [0, 1].map(|i| {
-            let v = c[i].viewing.lock();
             // The window has on its way what is in flight, whatever the step did.
-            let bytes: usize = v.inflight.iter().map(|f| f.bytes).sum();
-            assert_eq!(v.window.flying(), bytes, "client {i}'s window, {step:?}");
+            let bytes: usize = c[i].viewing.lock().inflight.iter().map(|f| f.bytes).sum();
+            assert_eq!(
+                c[i].window(|w| w.flying()),
+                bytes,
+                "client {i}'s window, {step:?}"
+            );
+            let v = c[i].viewing.lock();
             (v.viewer, v.inflight.len())
         });
         after.fresh = rule(m, step).2.fresh;
@@ -2029,7 +2105,15 @@ mod tests {
             let mut t = Instant::now();
             let c = hub.add_client(mpsc::unbounded_channel().0, t);
             c.viewing.lock().viewer = Viewer::Started;
-            let mut least = c.stats(t).carries;
+            // What the client's path carries, and the least it has carried, as /stats reads
+            // them.
+            let path = |c: &Client, t| match c.stats(t).reach {
+                ReachStats::Path {
+                    carries, lowest, ..
+                } => (carries, lowest),
+                ReachStats::Recorder => panic!("a client on a path"),
+            };
+            let mut least = path(&c, t).0;
             // The path: its delay each way, its rate in bytes a second, when it is free
             // again, and the acks on their way back, in order.
             let delay = Duration::from_millis(1 + rng.below(100));
@@ -2056,11 +2140,11 @@ mod tests {
                         }
                     }
                 }
-                let read = c.stats(t);
-                lows += u32::from(read.carries < least);
-                least = least.min(read.carries);
-                above += u32::from(read.carries > least);
-                assert_eq!(read.lowest, least, "the lowest reported");
+                let (carries, lowest) = path(&c, t);
+                lows += u32::from(carries < least);
+                least = least.min(carries);
+                above += u32::from(carries > least);
+                assert_eq!(lowest, least, "the lowest reported");
             }
         }
         assert!(lows > 100 && above > 1000, "unreached: {lows}, {above}");

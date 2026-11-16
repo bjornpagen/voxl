@@ -186,6 +186,12 @@ pub enum Ahead {
     Frames,
 }
 
+/// The most a window carries in `LATENESS` when the path is allowed `most`: never under
+/// one packet.
+pub fn ceiling(most: usize) -> usize {
+    most.max(PACKET)
+}
+
 /// `bytes * a / b`, for durations.
 pub fn scale(bytes: usize, a: Duration, b: Duration) -> usize {
     (bytes as u128 * a.as_nanos() / b.as_nanos().max(1)).min(usize::MAX as u128) as usize
@@ -196,7 +202,7 @@ impl Window {
     /// `most` bytes in `LATENESS` (`--min-kbps` and `--max-kbps`); never under one packet,
     /// and where the two cross `most` wins.
     pub fn new(now: Instant, least: usize, most: usize) -> Self {
-        let most = most.max(PACKET);
+        let most = ceiling(most);
         let least = least.clamp(PACKET, most);
         Window {
             carries: START.clamp(least, most),

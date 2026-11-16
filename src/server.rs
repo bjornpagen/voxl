@@ -169,6 +169,31 @@ pub fn router(state: AppState) -> Router {
 }
 
 async fn stats(State(s): State<AppState>) -> Response {
+    use crate::hub::ReachStats;
+    /// A client as `/stats` lists it.
+    #[derive(serde::Serialize)]
+    struct Row {
+        id: u64,
+        video: bool,
+        inflight: usize,
+        oldest_ms: Option<u64>,
+        client_ms: Option<f64>,
+        #[serde(flatten)]
+        reach: Reached,
+    }
+    /// How frames reach it: a path, and what the path carries, or the recorder, which has
+    /// none.
+    #[derive(serde::Serialize)]
+    #[serde(tag = "reach", rename_all = "lowercase")]
+    enum Reached {
+        Path {
+            carries_bytes: usize,
+            lowest_carries_bytes: usize,
+            flying_bytes: usize,
+            fastest_ms: Option<f64>,
+        },
+        Recorder,
+    }
     let st = &s.hub.stats;
     // One moment, and one read of each client at it: every number about a client, and the
     // least of their paths, come from that read.
@@ -187,17 +212,37 @@ async fn stats(State(s): State<AppState>) -> Response {
             // Nothing on its way has no oldest: null, not 0.
             let inflight = c.backlog.map_or(0, |b| b.frames.get());
             let oldest = c.backlog.map(|b| b.oldest.as_millis() as u64);
-            serde_json::json!({"id": id, "video": watching(c), "inflight": inflight, "oldest_ms": oldest,
-                "carries_bytes": c.carries, "lowest_carries_bytes": c.lowest, "flying_bytes": c.flying,
-                "fastest_ms": c.fastest.map(|t| t.as_secs_f64() * 1000.0),
-                "client_ms": c.client_ms.map(|ms| (ms * 10.0).round() / 10.0)})
+            Row {
+                id: *id,
+                video: watching(c),
+                inflight,
+                oldest_ms: oldest,
+                client_ms: c.client_ms.map(|ms| (ms * 10.0).round() / 10.0),
+                reach: match c.reach {
+                    ReachStats::Path {
+                        carries,
+                        lowest,
+                        flying,
+                        fastest,
+                    } => Reached::Path {
+                        carries_bytes: carries,
+                        lowest_carries_bytes: lowest,
+                        flying_bytes: flying,
+                        fastest_ms: fastest.map(|t| t.as_secs_f64() * 1000.0),
+                    },
+                    ReachStats::Recorder => Reached::Recorder,
+                },
+            }
         })
         .collect();
     // What the slowest watching viewer's path carries, as a rate.
     let target = read
         .iter()
         .filter(|(_, c)| watching(c))
-        .map(|(_, c)| c.carries)
+        .filter_map(|(_, c)| match c.reach {
+            ReachStats::Path { carries, .. } => Some(carries),
+            ReachStats::Recorder => None,
+        })
         .min()
         .map(|bytes| bytes as f64 * 8.0 / crate::window::LATENESS.as_secs_f64() / 1000.0);
     let body = serde_json::json!({
