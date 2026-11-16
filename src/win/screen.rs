@@ -119,13 +119,14 @@ impl Screen {
         fit(w, h, self.max)
     }
 
-    pub fn resize(&mut self, w: u32, h: u32) -> Result<(), String> {
+    /// Sets the display to `w`x`h` (fitted): the size it has now.
+    pub fn resize(&mut self, w: u32, h: u32) -> Result<(u32, u32), String> {
         let want = self.fit(w, h);
         if let Some(c) = current(&self.device) {
             self.current = c;
         }
         if want == self.current {
-            return Ok(());
+            return Ok(self.current);
         }
         let mut m = *self
             .modes
@@ -152,6 +153,6 @@ impl Screen {
         }
         self.current = want;
         log::info!("display set to {}x{}", want.0, want.1);
-        Ok(())
+        Ok(self.current)
     }
 }

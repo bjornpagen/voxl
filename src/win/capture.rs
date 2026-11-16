@@ -8,6 +8,7 @@
 use super::Geometry;
 use crate::env::Debugging;
 use crate::hub::{Waitable, Wake};
+use crate::video::Damage;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -55,10 +56,7 @@ pub struct Capturer {
     wake: Arc<Wake>,
     /// The frame conversions read from: rows are copied from `shared` at each grab.
     frame: Vec<u8>,
-    pub damaged: bool,
-    /// When the first damage since the last take arrived.
-    pub damaged_at: Option<Instant>,
-    acc: Option<(u32, u32)>,
+    pub damage: Damage,
     mb_dirty: Vec<u8>,
     pub mb_cols: usize,
     /// Areas (x0, y0, x1, y1) changed since the video thread last took them, for `/wait`.
@@ -368,9 +366,7 @@ impl Capturer {
             shared,
             wake,
             frame: vec![0; geometry.width as usize * geometry.height as usize * 4],
-            damaged: true,
-            damaged_at: None,
-            acc: None,
+            damage: Damage::Unreported,
             mb_dirty: vec![0; (width as usize).div_ceil(16) * (height as usize).div_ceil(16)],
             mb_cols: (width as usize).div_ceil(16),
             changes: Vec::new(),
@@ -438,27 +434,14 @@ impl Capturer {
             for row in (y0 as usize / 16)..(y1 as usize).div_ceil(16) {
                 self.mb_dirty[row * self.mb_cols + c0..row * self.mb_cols + c1].fill(1);
             }
-            self.acc = Some(match self.acc {
-                Some((a, b)) => (a.min(y0), b.max(y1)),
-                None => (y0, y1),
-            });
+            self.damage.add(y0, y1, Instant::now());
             self.changes.push((x0, y0, x1, y1));
-            self.damaged = true;
-            self.damaged_at.get_or_insert_with(Instant::now);
         }
     }
 
     /// Take accumulated damage as a row band.
     pub fn take_damage(&mut self) -> Result<Option<Band>, String> {
-        self.damaged = false;
-        self.damaged_at = None;
-        let Some((y0, y1)) = self.acc.take() else {
-            return Ok(None);
-        };
-        Ok(Some(Band {
-            y0: y0 & !1,
-            y1: ((y1 + 1) & !1).min(self.height),
-        }))
+        Ok(self.damage.take(self.height))
     }
 
     /// Take the dirty-macroblock map accumulated with the current damage.

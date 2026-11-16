@@ -143,23 +143,16 @@ mod tests {
         }
     }
 
-    fn xorshift(seed: &mut u64) -> u64 {
-        *seed ^= *seed << 13;
-        *seed ^= *seed >> 7;
-        *seed ^= *seed << 17;
-        *seed
-    }
-
     /// Of each run of moves only the last goes out, and every other event goes out as it
     /// came: 2,000 streams of up to 40 events against a model that cuts the stream into
     /// runs.
     #[test]
     fn of_a_run_of_moves_only_the_last_goes_out() {
-        let mut seed = 0x2545_F491_4F6C_DD1D;
+        let mut rng = crate::xorshift::Xorshift::new(0x2545_F491_4F6C_DD1D);
         let mut dropped = 0;
         for _ in 0..2_000 {
-            let n = xorshift(&mut seed) % 40;
-            let rs: Vec<u64> = (0..n).map(|_| xorshift(&mut seed)).collect();
+            let n = rng.below(40);
+            let rs: Vec<u64> = (0..n).map(|_| rng.next()).collect();
             let sent: Vec<String> = rs.iter().map(|&r| said(&event(r))).collect();
             let moves = |a: &String, b: &String| a.starts_with("move") && b.starts_with("move");
             let model: Vec<&String> = sent

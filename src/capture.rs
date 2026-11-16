@@ -1,6 +1,7 @@
 //! X11 screen capture: MIT-SHM GetImage into a persistent BGRX frame, driven by XDamage.
 
 use crate::env::Debugging;
+use crate::video::Damage;
 use std::os::fd::{AsFd, BorrowedFd};
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::damage::{self, ConnectionExt as _};
@@ -95,11 +96,8 @@ pub struct Capturer {
     pub direct: bool,
     /// Kept for the connection's lifetime; raw-rectangle events need no further requests.
     _damage: u32,
-    pub damaged: bool,
-    /// When the first damage since the last take arrived.
-    pub damaged_at: Option<std::time::Instant>,
     /// Rows touched since the last take (raw damage rectangles, no server round trip).
-    acc: Option<(u32, u32)>,
+    pub damage: Damage,
     /// Macroblocks (16x16) touched since the last take, row-major.
     mb_dirty: Vec<u8>,
     pub mb_cols: usize,
@@ -191,9 +189,7 @@ impl Capturer {
             offset,
             direct,
             _damage: damage,
-            damaged: true,
-            damaged_at: None,
-            acc: None,
+            damage: Damage::Unreported,
             mb_dirty: vec![0; (width as usize).div_ceil(16) * (height as usize).div_ceil(16)],
             mb_cols: (width as usize).div_ceil(16),
             changes: Vec::new(),
@@ -246,12 +242,7 @@ impl Capturer {
                         self.mb_dirty[row * self.mb_cols + x0..row * self.mb_cols + x1].fill(1);
                     }
                     self.changes.push((left, top, right, bot));
-                    self.acc = Some(match self.acc {
-                        Some((a, b)) => (a.min(top), b.max(bot)),
-                        None => (top, bot),
-                    });
-                    self.damaged = true;
-                    self.damaged_at.get_or_insert_with(std::time::Instant::now);
+                    self.damage.add(top, bot, std::time::Instant::now());
                 }
             }
         }
@@ -261,16 +252,7 @@ impl Capturer {
     /// Take accumulated damage as a row band. Raw-rectangle reporting delivers the
     /// areas in the events themselves, so this never waits on the X server.
     pub fn take_damage(&mut self) -> Result<Option<Band>, String> {
-        self.damaged = false;
-        self.damaged_at = None;
-        let Some((y0, y1)) = self.acc.take() else {
-            return Ok(None);
-        };
-        // Align to even rows for 4:2:0.
-        Ok(Some(Band {
-            y0: y0 & !1,
-            y1: ((y1 + 1) & !1).min(self.height),
-        }))
+        Ok(self.damage.take(self.height))
     }
 
     /// Take the dirty-macroblock map accumulated with the current damage.

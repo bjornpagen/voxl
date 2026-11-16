@@ -31,14 +31,13 @@ Video:
   --framerate                   max frames per second (default 60)
   --crf                         base quality (default 24)
   --max-kbps, --min-kbps        adaptive bitrate ceiling and floor
-                                (default 30000, 2000)
+                                (default 30000, 0; ceiling 0: none;
+                                a ceiling under the floor wins)
   --preset                      x264 preset (default ultrafast)
   --encoder-threads             x264 sliced threads (default min(4, cores/4))
-  --adaptive-threads            encode on one thread, fanning out only under
-                                sustained heavy motion (default false)
-  --paintover-crf, --paintover-burst, --paintover-delay-ms
+  --paintover-crf, --paintover-delay-ms
                                 sharpening once the screen goes still
-                                (default 16, 3, 150)
+                                (default 16, 150)
   --stripes                     encode the screen as N independent streams
                                 (experimental, default 1)
   --convert-threads, --coalesce-us

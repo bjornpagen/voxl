@@ -10,8 +10,9 @@
 //! CPU and never slows real viewers down. Like the stream, it holds frames only when
 //! the screen changes, and it doesn't include the cursor (viewers draw it locally).
 
-use crate::hub::{Client, Hub, Out, ServerMessage};
+use crate::hub::{Hub, Out, ServerMessage};
 use crate::mp4;
+use crate::video::{Header, NotVideo, Video};
 use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -145,20 +146,19 @@ fn begin(
         ));
     }
     let (tx, rx) = mpsc::unbounded_channel();
-    let client = r.hub.add_client(tx);
-    client.video.store(true, Ordering::Relaxed);
+    let client = r.hub.add_recorder(tx);
+    client.watch();
     r.hub.wake();
     let hub = r.hub.clone();
     Ok(tokio::spawn(async move {
-        let res = collect(&hub, &client, rx, stop, max).await;
-        hub.remove_client(client.id);
+        let res = collect(&hub, rx, stop, max).await;
+        hub.remove_client(client.id, Instant::now());
         res
     }))
 }
 
 async fn collect(
     hub: &Hub,
-    client: &Client,
     mut rx: mpsc::UnboundedReceiver<Out>,
     mut stop: oneshot::Receiver<()>,
     max: Duration,
@@ -174,21 +174,23 @@ async fn collect(
             _ = &mut deadline => break,
             m = rx.recv() => match m {
                 None => break,
-                Some(Out::Bin(b)) if b.len() > 16 && b[0] == 0x01 => {
-                    // Acknowledge at once, so the recorder never holds the stream back.
-                    client.on_ack(u32::from_be_bytes([b[2], b[3], b[4], b[5]]));
-                    hub.wake();
+                Some(Out::Bin(b)) => {
+                    let h = match Header::read(&b) {
+                        Ok(Video::Stripe(h, _)) => h,
+                        // Not a picture: the stream sends no empty stripe, and the rest
+                        // is for the viewers.
+                        Ok(Video::Empty(_)) | Err(NotVideo::Other | NotVideo::Short) => continue,
+                    };
                     if frames.is_empty() {
                         size = (hub.width.load(Ordering::Relaxed), hub.height.load(Ordering::Relaxed));
                     }
                     // Time the frame was captured: now, less the pipeline time in its header.
-                    let pipe = u32::from_be_bytes([b[6], b[7], b[8], b[9]]) as u64 / 10;
-                    let ms = (start.elapsed().as_millis() as u64).saturating_sub(pipe);
+                    let ms = (start.elapsed().as_millis() as u64).saturating_sub(h.pipe.millis());
                     let ms = frames.last().map_or(ms, |l: &mp4::Frame| ms.max(l.ms + 1));
                     frames.push(mp4::Frame {
                         ms,
-                        key: b[1] & 1 == 1,
-                        data: b.slice(16..),
+                        key: h.key,
+                        data: b.slice(Header::LEN..),
                     });
                 }
                 // A capture restart or closed subscription ends this recording.
@@ -287,13 +289,6 @@ pub async fn stop(
 mod tests {
     use super::*;
 
-    fn next(rng: &mut u64) -> u64 {
-        *rng ^= *rng << 13;
-        *rng ^= *rng >> 7;
-        *rng ^= *rng << 17;
-        *rng
-    }
-
     /// Video frame `id`: a keyframe, its SPS and PPS as mp4.rs's own test writes them.
     fn video(id: u32) -> Out {
         let mut m = vec![0x01, 1];
@@ -325,23 +320,21 @@ mod tests {
             "",
             "x",
         ];
-        let hub = Hub::new();
-        let (tx, _) = mpsc::unbounded_channel();
-        let client = hub.add_client(tx);
-        let mut rng = 0x9e37_79b9_7f4a_7c15;
+        let hub = Hub::new(crate::hub::Paths::ANY);
+        let mut rng = crate::xorshift::Xorshift::new(0x9e37_79b9_7f4a_7c15);
         for _ in 0..2_000 {
             let (tx, rx) = mpsc::unbounded_channel();
             let (mut held, mut ended) = (0, false);
-            for id in 0..next(&mut rng) % 12 {
-                let m = match next(&mut rng) % 7 {
+            for id in 0..rng.next() % 12 {
+                let m = match rng.next() % 7 {
                     0..=2 => video(id as u32),
                     3 => Out::Text(hub.hello()),
                     4 => Out::Text(ServerMessage::Close),
                     5 => Out::Text(ServerMessage::Clip {
-                        d: CLIPS[(next(&mut rng) % CLIPS.len() as u64) as usize].into(),
+                        d: CLIPS[(rng.next() % CLIPS.len() as u64) as usize].into(),
                     }),
                     _ => Out::Text(ServerMessage::Mic {
-                        on: next(&mut rng) & 1 == 1,
+                        on: rng.next() & 1 == 1,
                     }),
                 };
                 match &m {
@@ -355,7 +348,7 @@ mod tests {
             }
             drop(tx);
             let (_keep, stop) = oneshot::channel();
-            let mp4 = collect(&hub, &client, rx, stop, Duration::from_secs(3600)).await;
+            let mp4 = collect(&hub, rx, stop, Duration::from_secs(3600)).await;
             match held {
                 0 => assert!(mp4.is_err()),
                 n => assert_eq!(samples(&mp4.unwrap()), n),

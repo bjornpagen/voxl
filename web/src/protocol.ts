@@ -64,7 +64,9 @@ const KEY_ACT: Record<KeyAct, number> = { down: 1, repeat: 2, up: 0 };
 
 /** Text commands to the server. */
 export const cmd = {
-	ack: (frame: number) => `a,${frame}`,
+	/** A frame was shown, `held` ms after it finished arriving (decode, draw, frames
+	 * ahead of it): the server takes that out of the path's delay. */
+	ack: (frame: number, held: number) => `a,${frame},${held.toFixed(1)}`,
 	move: (x: number, y: number) => `m,${x},${y}`,
 	button: (button: number, down: boolean) => `b,${button},${down ? 1 : 0}`,
 	/** Scroll in desktop pixels; the server turns it into smooth scrolling or wheel clicks. */
@@ -83,15 +85,23 @@ export const cmd = {
 	pong: (token: string) => `po,${token}`,
 } as const;
 
-/** Header of a video message (after the type byte). */
+/** The header of a video message, as src/video.rs's `Header` writes it. Checked
+ * against video-header.json, as the server's and the bench's readers are:
+ * `node web/src/video-header.test.ts`. */
 export interface VideoHeader {
 	key: boolean;
+	/** The frame sharpens what it codes. */
+	sharpens: boolean;
 	frame: number;
 	/** Server-side pipeline time (capture to send), in 0.1 ms. */
 	pipe: number;
 	stripe: number;
+	/** How many stripes the screen is cut into. */
+	stripes: number;
 	/** Stripe updates that make up this frame. */
 	parts: number;
+	/** The stripe's top row. */
+	y: number;
 }
 
 export function parseVideoHeader(b: Uint8Array): VideoHeader {
@@ -99,10 +109,13 @@ export function parseVideoHeader(b: Uint8Array): VideoHeader {
 		((b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3]) >>> 0;
 	return {
 		key: (b[1] & 1) === 1,
+		sharpens: (b[1] & 2) === 2,
 		frame: u32(2),
 		pipe: u32(6),
 		stripe: b[10],
+		stripes: b[11],
 		parts: b[12],
+		y: (b[14] << 8) | b[15],
 	};
 }
 export const VIDEO_HEADER_BYTES = 16;

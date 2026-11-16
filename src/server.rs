@@ -1,7 +1,7 @@
 //! HTTP + WebSocket front end. Serves the embedded web client and the media/input socket.
 
 use crate::event::{InputEvent, KeyAct};
-use crate::hub::{Client, Hub, Out, ServerMessage};
+use crate::hub::{Acked, Client, Hub, Out, ServerMessage};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::header;
@@ -160,6 +160,7 @@ pub fn router(state: AppState) -> Router {
         .route("/inter.woff2", asset!("inter.woff2", "font/woff2"))
         .route("/healthz", get(|| async { "ok" }))
         .route("/stats", get(stats))
+        .route("/stats/trace", get(trace))
         .route("/ws", get(ws_handler))
         .with_state(state)
         .merge(file_routes)
@@ -168,19 +169,90 @@ pub fn router(state: AppState) -> Router {
 }
 
 async fn stats(State(s): State<AppState>) -> Response {
+    use crate::hub::ReachStats;
+    /// A client as `/stats` lists it.
+    #[derive(serde::Serialize)]
+    struct Row {
+        id: u64,
+        video: bool,
+        inflight: usize,
+        oldest_ms: Option<u64>,
+        client_ms: Option<f64>,
+        #[serde(flatten)]
+        reach: Reached,
+    }
+    /// How frames reach it: a path, and what the path carries, or the recorder, which has
+    /// none.
+    #[derive(serde::Serialize)]
+    #[serde(tag = "reach", rename_all = "lowercase")]
+    enum Reached {
+        Path {
+            carries_bytes: usize,
+            lowest_carries_bytes: usize,
+            flying_bytes: usize,
+            fastest_ms: Option<f64>,
+        },
+        Recorder,
+    }
     let st = &s.hub.stats;
-    let clients: Vec<_> = s
+    // One moment, and one read of each client at it: every number about a client, and the
+    // least of their paths, come from that read.
+    let now = Instant::now();
+    let read: Vec<_> = s
         .hub
         .clients
         .lock()
         .iter()
-        .map(|c| {
-            let (n, age) = c.backlog();
-            serde_json::json!({"id": c.id, "video": c.video.load(Ordering::Relaxed), "inflight": n, "oldest_ms": age,
-                "min_rtt_ms": c.min_rtt_ms.load(Ordering::Relaxed), "queue_ms": c.delay.lock().queue_ms as u64, "delivered_kbps": (c.delivered.lock().rate_bps / 1000.0) as u64})
+        .map(|c| (c.id, c.stats(now)))
+        .collect();
+    let watching = |c: &crate::hub::ClientStats| c.viewer != crate::hub::Viewer::NotWatching;
+    let clients: Vec<_> = read
+        .iter()
+        .map(|(id, c)| {
+            // Nothing on its way has no oldest: null, not 0.
+            let inflight = c.backlog.map_or(0, |b| b.frames.get());
+            let oldest = c.backlog.map(|b| b.oldest.as_millis() as u64);
+            Row {
+                id: *id,
+                video: watching(c),
+                inflight,
+                oldest_ms: oldest,
+                client_ms: c.client_ms.map(|ms| (ms * 10.0).round() / 10.0),
+                reach: match c.reach {
+                    ReachStats::Path {
+                        carries,
+                        lowest,
+                        flying,
+                        fastest,
+                    } => Reached::Path {
+                        carries_bytes: carries,
+                        lowest_carries_bytes: lowest,
+                        flying_bytes: flying,
+                        fastest_ms: fastest.map(|t| t.as_secs_f64() * 1000.0),
+                    },
+                    ReachStats::Recorder => Reached::Recorder,
+                },
+            }
         })
         .collect();
+    // What the slowest watching viewer's path carries, as a rate.
+    let target = read
+        .iter()
+        .filter(|(_, c)| watching(c))
+        .filter_map(|(_, c)| match c.reach {
+            ReachStats::Path { carries, .. } => Some(carries),
+            ReachStats::Recorder => None,
+        })
+        .min()
+        .map(|bytes| bytes as f64 * 8.0 / crate::window::LATENESS.as_secs_f64() / 1000.0);
     let body = serde_json::json!({
+        "now_us": s.hub.timeline.us(now),
+        // What a window's numbers are in: the time it carries `carries` bytes in, the least
+        // it carries, where it starts, and the most it falls in a round.
+        "lateness_us": crate::window::LATENESS.as_micros() as u64,
+        "packet_bytes": crate::window::PACKET,
+        "start_bytes": crate::window::START,
+        "fall": crate::window::FALL,
         "captured": st.captured.load(Ordering::Relaxed),
         "encoded": st.encoded.load(Ordering::Relaxed),
         "bytes": st.bytes.load(Ordering::Relaxed),
@@ -191,7 +263,7 @@ async fn stats(State(s): State<AppState>) -> Response {
         "paintovers": st.paintovers.load(Ordering::Relaxed),
         "keyframes": st.keyframes.load(Ordering::Relaxed),
         "refines": st.refines.load(Ordering::Relaxed),
-        "target_kbps": s.hub.target_kbps.load(Ordering::Relaxed),
+        "target_kbps": target.map(|kbps| kbps as u64),
         "damage_events": crate::capture::DAMAGE_EVENTS.load(Ordering::Relaxed),
         "damage_wait_us_total": st.damage_wait_us.load(Ordering::Relaxed),
         "send_lat_us_total": st.send_lat_us.load(Ordering::Relaxed),
@@ -204,9 +276,84 @@ async fn stats(State(s): State<AppState>) -> Response {
         .into_response()
 }
 
+/// What the server remembers of the last frames, every time in microseconds on the
+/// timeline's clock (`Timeline::us`), as `/stats`'s `now_us` is: each frame's way from
+/// the screen to the sockets, and each viewer's frames as they were sent and acked, those
+/// of the last viewers to leave with when they left (crate::timeline).
+async fn trace(State(s): State<AppState>) -> Response {
+    use crate::timeline::{Recorded, SentRow, MARKS};
+    /// Written by serde straight, not through a `serde_json::Value`, whose numbers stop
+    /// at 64 bits: a viewer may report a hold of more microseconds than that.
+    #[derive(serde::Serialize)]
+    struct Body {
+        now_us: u64,
+        marks: [&'static str; MARKS.len()],
+        frames: Vec<Recorded>,
+        viewers: Vec<Viewer>,
+        left: Vec<Gone>,
+    }
+    #[derive(serde::Serialize)]
+    struct Viewer {
+        id: u64,
+        frames: Vec<SentRow>,
+    }
+    #[derive(serde::Serialize)]
+    struct Gone {
+        id: u64,
+        left_us: u64,
+        frames: Vec<SentRow>,
+    }
+    let timeline = &s.hub.timeline;
+    let frames = timeline.newest(crate::timeline::FRAMES_KEPT);
+    let viewers = s.hub.traces();
+    let left = s.hub.left_traces();
+    axum::Json(Body {
+        now_us: timeline.us(Instant::now()),
+        marks: MARKS,
+        frames,
+        viewers: viewers
+            .iter()
+            .map(|(id, trace)| Viewer {
+                id: *id,
+                frames: timeline.rows(trace),
+            })
+            .collect(),
+        left: left
+            .iter()
+            .map(|(id, at, trace)| Gone {
+                id: *id,
+                left_us: timeline.us(*at),
+                frames: timeline.rows(trace),
+            })
+            .collect(),
+    })
+    .into_response()
+}
+
 async fn ws_handler(ws: WebSocketUpgrade, State(s): State<AppState>) -> Response {
     ws.max_message_size(64 << 20)
         .on_upgrade(move |socket| handle_socket(socket, s))
+}
+
+/// What a viewer is sent as it connects, in this order: a ping, its hello, and the cursor's
+/// image. The ping goes first so that nothing is on the path ahead of it: the window takes
+/// the path's fastest trip from pings alone, and under motion from the first frame no later
+/// ping may have the path to itself. Behind the hello and the cursor's image (4 bytes a
+/// pixel: 16.4 KB at 64 px) its trip would hold their crossing for as long as the motion
+/// lasts.
+pub(crate) fn greet(hub: &Hub, c: &Client) {
+    ping(c);
+    c.send(Out::Text(hub.hello()));
+    if let Some(cursor) = hub.cursor.lock().clone() {
+        c.send(Out::Bin(cursor));
+    }
+}
+
+/// Pings `c`: the ping goes into its record, then to it.
+fn ping(c: &Client) {
+    let token = crate::hub::Token::random();
+    c.ping(Instant::now(), token);
+    c.send(Out::Text(ServerMessage::Ping { s: token }));
 }
 
 async fn handle_socket(socket: WebSocket, s: AppState) {
@@ -221,24 +368,29 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
         if input.is_none() && s.hub.input_floor.load(Ordering::Relaxed) != 0 {
             return;
         }
-        s.hub.add_client(tx)
+        s.hub.add_client(tx, Instant::now())
     };
     log::info!("client {} connected", client.id);
-    client.send(Out::Text(s.hub.hello()));
-    if let Some(c) = s.hub.cursor.lock().clone() {
-        client.send(Out::Bin(c));
-    }
+    greet(&s.hub, &client);
     let dbg = s.debug.marker.is_some();
+    let hub = s.hub.clone();
     let writer = tokio::spawn(async move {
         while let Some(m) = rx.recv().await {
             let t = Instant::now();
             let big = matches!(&m, Out::Bin(b) if b.len() > 2000);
+            let frame = match &m {
+                Out::Bin(b) => crate::video::frame_of(b),
+                Out::Text(_) => None,
+            };
             let msg = match m {
                 Out::Bin(b) => Message::Binary(b),
                 Out::Text(m) => Message::Text(m.json().into()),
             };
             if sink.send(msg).await.is_err() {
                 break;
+            }
+            if let Some(frame) = frame {
+                hub.timeline.written(frame, Instant::now());
             }
             if dbg && big {
                 log::info!(
@@ -249,22 +401,25 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
             }
         }
     });
+    // The first ping went with the greeting; the next goes a `PING_EVERY` after it.
     let pinger = {
         let c = client.clone();
         tokio::spawn(async move {
-            let mut iv = tokio::time::interval(crate::hub::PING_EVERY);
+            let every = crate::hub::PING_EVERY;
+            let mut iv = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
             loop {
                 iv.tick().await;
-                let token = crate::hub::Token::random();
-                c.pings.lock().send(Instant::now(), token);
-                c.send(Out::Text(ServerMessage::Ping { s: token }));
+                ping(&c);
             }
         })
     };
-    let mut rtts: std::collections::VecDeque<u32> = Default::default();
     while let Some(Ok(msg)) = stream.next().await {
         match msg {
-            Message::Text(t) => handle_text(&s, &client, t.as_str(), &mut rtts),
+            Message::Text(t) => {
+                if handle_text(&s, &client, t.as_str()) == Flow::Close {
+                    break;
+                }
+            }
             // Every binary message from a viewer acts on the desktop (clipboard images,
             // microphone audio), so a read-only viewer's are all dropped.
             Message::Binary(_) if s.read_only => {}
@@ -297,7 +452,7 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
     if let Some(tx) = &s.mic {
         let _ = tx.send(crate::mic::MicMsg::Stop(client.id));
     }
-    s.hub.remove_client(client.id);
+    s.hub.remove_client(client.id, Instant::now());
     log::info!("client {} disconnected", client.id);
 }
 
@@ -396,8 +551,8 @@ fn send_input(hub: &Hub, client: &Client, event: InputEvent) {
 
 /// A text command from a viewer (web/src/protocol.ts), parsed once where it arrives.
 enum Command {
-    /// `a,<frame>`
-    Ack { frame: u32 },
+    /// `a,<frame>[,<hold ms>]`
+    Ack { frame: u32, hold: crate::hub::Hold },
     /// `m,<x>,<y>`: a desktop pixel, from the top left. X's coordinates are 16-bit (XTest
     /// takes them as they are); macOS's CGFloat and Windows's LONG hold every one.
     Move { x: i16, y: i16 },
@@ -452,7 +607,14 @@ impl Command {
             _ => None,
         };
         Some(match (name, fields.as_slice()) {
-            ("a", [frame]) => Command::Ack { frame: num(frame)? },
+            ("a", [frame]) => Command::Ack {
+                frame: num(frame)?,
+                hold: crate::hub::Hold::Unsaid,
+            },
+            ("a", [frame, hold]) => Command::Ack {
+                frame: num(frame)?,
+                hold: crate::hub::Hold::parse(hold),
+            },
             ("m", [x, y]) => Command::Move {
                 x: num(x)?,
                 y: num(y)?,
@@ -513,12 +675,19 @@ impl Command {
     }
 }
 
-fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collections::VecDeque<u32>) {
+/// What the socket does after a viewer's message: reads on, or closes the connection.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Flow {
+    Go,
+    Close,
+}
+
+fn handle_text(s: &AppState, c: &Arc<Client>, t: &str) -> Flow {
     let Some(command) = Command::parse(t) else {
-        return;
+        return Flow::Go;
     };
     if s.read_only && !command.watches() {
-        return;
+        return Flow::Go;
     }
     let input = |ev| send_input(&s.hub, c, ev);
     match command {
@@ -529,15 +698,25 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
                 if let Err(e) = result {
                     log::warn!("display switch: {e}");
                 }
-                c.needs_keyframe.store(true, Ordering::Relaxed);
-                c.send(Out::Text(s.hub.hello()));
+                // The page is told the stream again, which resets its decoders: for this
+                // viewer the stream starts over. A keyframe that reached the page ahead of
+                // the hello would be lost there, with the viewer counted as started.
+                c.start_over(s.hub.hello());
                 s.hub.wake();
             }
         },
-        Command::Ack { frame } => {
-            c.on_ack(frame);
-            s.hub.wake();
-        }
+        // The page acknowledges every frame it is sent, once and in order: an ack of any
+        // other frame is from a client that is not the page, and its connection closes.
+        Command::Ack { frame, hold } => match c.on_ack(Instant::now(), frame, hold) {
+            Acked::Oldest => s.hub.wake(),
+            Acked::Broken => {
+                log::warn!(
+                    "client {} acked frame {frame}, not its oldest; closing",
+                    c.id
+                );
+                return Flow::Close;
+            }
+        },
         Command::Move { x, y } => input(InputEvent::Move { x, y }),
         Command::Button { button, down } => input(InputEvent::Button { button, down }),
         Command::ScrollPx { dx, dy } => input(InputEvent::ScrollPx { dx, dy }),
@@ -547,11 +726,10 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
             crate::desktop::ClipContent::Text(text),
         )),
         Command::Video(on) => {
-            c.video.store(on, Ordering::Relaxed);
             if on {
-                c.inflight.lock().clear();
-                c.started.store(false, Ordering::Relaxed);
-                c.needs_keyframe.store(true, Ordering::Relaxed);
+                c.watch();
+            } else {
+                c.stop_watching();
             }
             s.hub.wake();
         }
@@ -565,56 +743,51 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
                 });
             }
         }
-        // The desktop size this client's window wants (dynamic resolution). The latest
-        // request wins; the video thread clamps it and applies it.
+        // The desktop size this client's window wants (dynamic resolution). The newest new
+        // ask wins: it is the request until a newer one, and no ask clears another, so the
+        // screen ends at the size asked last whatever the capture loop was doing. The
+        // capture loop gives it to the screen, which fits it to a size it can take (each
+        // platform has its own rule) and changes nothing if it has that size already.
         Command::Resize { w, h } => {
             if !s.resize {
-                return;
+                return Flow::Go;
             }
             #[cfg(target_os = "macos")]
             let input = s.hub.input.lock();
             #[cfg(target_os = "macos")]
             if input.is_none() || c.id < s.hub.input_floor.load(Ordering::Relaxed) {
-                return;
+                return Flow::Go;
             }
-            if let Some(max) = *s.hub.resize_max.lock() {
-                let want = crate::screen::fit(w, h, max);
-                let current = (
-                    s.hub.width.load(Ordering::Relaxed),
-                    s.hub.height.load(Ordering::Relaxed),
-                );
-                *s.hub.resize_req.lock() = (want != current).then_some(want);
+            if s.hub.resize_max.lock().is_some() && c.asks_for((w, h)) {
+                *s.hub.resize_req.lock() = Some((w, h));
                 s.hub.wake();
             }
         }
         Command::Keyframe => {
-            c.started.store(false, Ordering::Relaxed);
-            c.needs_keyframe.store(true, Ordering::Relaxed);
+            c.ask_keyframe();
             s.hub.wake();
         }
         Command::Pong { token } => {
-            let Some(rtt) = c.pings.lock().answer(Instant::now(), token) else {
-                return;
+            let now = Instant::now();
+            let Some((rtt, ahead)) = c.pings.lock().answer(now, token) else {
+                return Flow::Go;
             };
-            let rtt = u32::try_from(rtt.as_millis()).unwrap_or(u32::MAX);
-            rtts.push_back(rtt.max(1));
-            if rtts.len() > 20 {
-                rtts.pop_front();
-            }
-            c.min_rtt_ms
-                .store(*rtts.iter().min().unwrap(), Ordering::Relaxed);
+            c.pinged(now, rtt, ahead);
         }
     }
+    Flow::Go
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hub::Hold;
     use std::time::Duration;
 
     /// Every command the web client sends (web/src/protocol.ts), with arguments.
     const ALL: &[&str] = &[
         "a,1",
+        "a,2,3.5",
         "m,10,20",
         "b,1,1",
         "b,1,0",
@@ -633,17 +806,13 @@ mod tests {
         "ds,4294967295",
     ];
 
-    /// Sends every command to a server that has input, a microphone and resizing wired
-    /// up, and returns (input events, microphone messages, a resize was asked for).
-    fn drive(read_only: bool) -> (usize, usize, bool) {
-        let hub = Hub::new();
-        hub.width.store(1280, Ordering::Relaxed);
-        hub.height.store(800, Ordering::Relaxed);
-        *hub.resize_max.lock() = Some((2560, 1600));
-        let (input_tx, input_rx) = std::sync::mpsc::channel();
-        *hub.input.lock() = Some(input_tx);
-        let (mic_tx, mic_rx) = std::sync::mpsc::channel();
-        let s = AppState {
+    /// A server for `hub` with resizing wired up, and a microphone if `mic`.
+    fn app(
+        hub: &Arc<Hub>,
+        read_only: bool,
+        mic: Option<std::sync::mpsc::Sender<crate::mic::MicMsg>>,
+    ) -> AppState {
+        AppState {
             hub: hub.clone(),
             audio: true,
             files: Arc::new(crate::files::Files {
@@ -653,7 +822,7 @@ mod tests {
                 default_dir: String::new(),
                 max_upload_bytes: 0,
             }),
-            mic: Some(mic_tx),
+            mic,
             resize: true,
             read_only,
             recorder: crate::record::Recorder::new(hub.clone(), Duration::from_secs(1)),
@@ -661,12 +830,24 @@ mod tests {
             favicon: Bytes::new(),
             favicon_type: "image/x-icon",
             debug: crate::env::Debugging::read(|_| None).0,
-        };
+        }
+    }
+
+    /// Sends every command to a server that has input, a microphone and resizing wired
+    /// up, and returns (input events, microphone messages, a resize was asked for).
+    fn drive(read_only: bool) -> (usize, usize, bool) {
+        let hub = Hub::new(crate::hub::Paths::ANY);
+        hub.width.store(1280, Ordering::Relaxed);
+        hub.height.store(800, Ordering::Relaxed);
+        *hub.resize_max.lock() = Some((2560, 1600));
+        let (input_tx, input_rx) = std::sync::mpsc::channel();
+        *hub.input.lock() = Some(input_tx);
+        let (mic_tx, mic_rx) = std::sync::mpsc::channel();
+        let s = app(&hub, read_only, Some(mic_tx));
         let (tx, _rx) = mpsc::unbounded_channel();
-        let client = hub.add_client(tx);
-        let mut rtts = Default::default();
+        let client = hub.add_client(tx, Instant::now());
         for c in ALL {
-            handle_text(&s, &client, c, &mut rtts);
+            handle_text(&s, &client, c);
         }
         let resized = hub.resize_req.lock().is_some();
         (
@@ -674,6 +855,216 @@ mod tests {
             mic_rx.try_iter().count(),
             resized,
         )
+    }
+
+    /// A screen as dynamic resolution sees it: its size, the sizes it refuses (a CRTC that
+    /// will not take them), how many times its size really changed, and how many asks it
+    /// refused and found already met.
+    struct Screen {
+        size: (u32, u32),
+        refuses: Vec<(u32, u32)>,
+        changes: usize,
+        refused: usize,
+        met: usize,
+    }
+
+    impl crate::video::Resize for Screen {
+        fn resize(&mut self, w: u32, h: u32) -> Result<(u32, u32), String> {
+            if self.refuses.contains(&(w, h)) {
+                self.refused += 1;
+                return Err("refused".into());
+            }
+            if (w, h) == self.size {
+                self.met += 1;
+            } else {
+                self.size = (w, h);
+                self.changes += 1;
+            }
+            Ok(self.size)
+        }
+    }
+
+    /// A page: as the web client is now (`resize.ts` asks on connect and when its window
+    /// changes), or a tab still running the client from before (it also asks on every
+    /// hello); its connection, if it has one, what it asked on it, and its window.
+    struct Page {
+        asks_on_hello: bool,
+        client: Option<Arc<crate::hub::Client>>,
+        asked: Option<(u32, u32)>,
+        window: (u32, u32),
+    }
+
+    /// The pages and the screen, driven through the server's own `sz` handling and the
+    /// capture loop's own decision (`video::rebuilds_for`).
+    struct Desk {
+        s: AppState,
+        screen: Screen,
+        pages: Vec<Page>,
+        rebuilds: usize,
+        /// The newest ask that changed what its connection asks for: the oracle's rule.
+        newest: Option<(u32, u32)>,
+        /// Asks that repeated what their connection last asked for.
+        repeats: usize,
+    }
+
+    impl Desk {
+        /// Page `i`, connected, asks for its window.
+        fn ask(&mut self, i: usize) {
+            let p = &mut self.pages[i];
+            let c = p.client.clone().expect("only a connected page asks");
+            match p.asked == Some(p.window) {
+                true => self.repeats += 1,
+                false => self.newest = Some(p.window),
+            }
+            p.asked = Some(p.window);
+            let sz = format!("sz,{},{}", p.window.0, p.window.1);
+            handle_text(&self.s, &c, &sz);
+        }
+
+        /// The capture loop's turn: it takes the request, gives it to the screen, and if
+        /// the stream is rebuilt, every page is said hello.
+        fn capture(&mut self) {
+            let hub = self.s.hub.clone();
+            let Some(want) = hub.resize_req.lock().take() else {
+                return;
+            };
+            let streamed = (
+                hub.width.load(Ordering::Relaxed),
+                hub.height.load(Ordering::Relaxed),
+            );
+            if crate::video::rebuilds_for(&mut self.screen, want, streamed) {
+                self.rebuilds += 1;
+                hub.width.store(self.screen.size.0, Ordering::Relaxed);
+                hub.height.store(self.screen.size.1, Ordering::Relaxed);
+                for i in 0..self.pages.len() {
+                    if self.pages[i].asks_on_hello && self.pages[i].client.is_some() {
+                        self.ask(i);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Dynamic resolution takes the screen to the size asked last and rests there. Over 500
+    /// generated runs of 1 to 4 pages (each new or old, as `Page` says) connecting, leaving
+    /// and changing their windows among 5 sizes, 40 events each, with the screen refusing
+    /// each size in one run of four and the capture loop taking the request at generated
+    /// moments between the events (each rebuild saying hello to every page):
+    /// - the stream is rebuilt exactly as often as the screen's size really changed: a
+    ///   refused ask, or one for the size it has, rebuilds nothing;
+    /// - after the last connect or window change the capture loop rebuilds at most once,
+    ///   and then never again: a hello brings no new ask, an old page's included;
+    /// - the screen then has the size of the newest ask that changed what its connection
+    ///   asks for, unless it refuses that size: no page's ask clears another's.
+    ///
+    /// Each clause is counted over the runs (refused asks, asks already met, repeated asks,
+    /// rests reached with one rebuild and with none, newest asks met and refused, and real
+    /// changes of the screen's size), so none holds unreached. The screen is the test's own,
+    /// fit and all: the server gives it the size as asked, so the property is the same on
+    /// every platform, whatever its screen's rule for fitting a size.
+    #[test]
+    fn resizing_rebuilds_once_per_size_granted_and_rests_after_the_last_ask() {
+        let sizes = [
+            (1280, 800),
+            (1456, 868),
+            (1920, 1080),
+            (2560, 1600),
+            (2912, 1736),
+        ];
+        let max = (3024, 1898);
+        let mut rng = crate::xorshift::Xorshift::new(0x9E37_79B9_7F4A_7C15);
+        // refused, met, repeated, rested after one rebuild, after none, newest met, newest
+        // refused, real changes of the screen's size
+        let mut reach = [0usize; 8];
+        for run in 0..500 {
+            let hub = Hub::new(crate::hub::Paths::ANY);
+            hub.width.store(max.0, Ordering::Relaxed);
+            hub.height.store(max.1, Ordering::Relaxed);
+            *hub.resize_max.lock() = Some(max);
+            // An input thread, as `run` gives the hub: on macOS a client may resize only
+            // while the hub has input, and every client here joins at or over its floor.
+            let (input, _input_thread) = std::sync::mpsc::channel();
+            *hub.input.lock() = Some(input);
+            let mut d = Desk {
+                s: app(&hub, false, None),
+                screen: Screen {
+                    size: max,
+                    refuses: sizes
+                        .iter()
+                        .copied()
+                        .filter(|_| rng.below(4) == 0)
+                        .collect(),
+                    changes: 0,
+                    refused: 0,
+                    met: 0,
+                },
+                pages: (0..rng.range(1, 5))
+                    .map(|_| Page {
+                        asks_on_hello: rng.below(2) == 0,
+                        client: None,
+                        asked: None,
+                        window: sizes[rng.below(5) as usize],
+                    })
+                    .collect(),
+                rebuilds: 0,
+                newest: None,
+                repeats: 0,
+            };
+            for _ in 0..40 {
+                let i = rng.below(d.pages.len() as u64) as usize;
+                match (rng.below(4), d.pages[i].client.clone()) {
+                    // It connects: it is said hello, and asks once, new or old.
+                    (0, None) => {
+                        let (tx, _rx) = mpsc::unbounded_channel();
+                        d.pages[i].client = Some(hub.add_client(tx, Instant::now()));
+                        d.pages[i].asked = None;
+                        d.ask(i);
+                    }
+                    // It leaves.
+                    (0, Some(c)) => {
+                        hub.remove_client(c.id, Instant::now());
+                        d.pages[i].client = None;
+                    }
+                    // Its window changes, and it asks if it is connected.
+                    (1, client) => {
+                        d.pages[i].window = sizes[rng.below(5) as usize];
+                        if client.is_some() {
+                            d.ask(i);
+                        }
+                    }
+                    // The capture loop takes its turn.
+                    (_, _) => d.capture(),
+                }
+            }
+            let before = d.rebuilds;
+            for _ in 0..10 {
+                d.capture();
+            }
+            let after = d.rebuilds - before;
+            assert!(after <= 1, "run {run}: {after} rebuilds after the last ask");
+            assert!(
+                hub.resize_req.lock().is_none(),
+                "run {run}: still asking after rest"
+            );
+            assert_eq!(
+                d.rebuilds, d.screen.changes,
+                "run {run}: rebuilds against the screen's real changes"
+            );
+            match d.newest {
+                Some(n) if d.screen.refuses.contains(&n) => reach[6] += 1,
+                Some(n) => {
+                    assert_eq!(d.screen.size, n, "run {run}: the newest ask was lost");
+                    reach[5] += 1;
+                }
+                None => {}
+            }
+            reach[0] += d.screen.refused;
+            reach[1] += d.screen.met;
+            reach[2] += d.repeats;
+            reach[7] += d.screen.changes;
+            reach[3 + usize::from(after == 0)] += 1;
+        }
+        assert!(reach.iter().all(|&n| n > 0), "unreached: {reach:?}");
     }
 
     #[test]
@@ -694,6 +1085,167 @@ mod tests {
         assert!(resized);
     }
 
+    /// A reply to no ping is no round trip. With no record of
+    /// the pings sent, a reply naming a moment just past read as a 1 ms round trip on a
+    /// viewer that was never pinged: its frames were then overdue at 81 ms, and the flow
+    /// check held every viewer's frames once one of its own was 121 ms old. A read-only
+    /// viewer may send it.
+    #[test]
+    fn a_reply_to_no_ping_is_no_round_trip() {
+        let hub = Hub::new(crate::hub::Paths::ANY);
+        let s = AppState {
+            hub: hub.clone(),
+            audio: true,
+            files: Arc::new(crate::files::Files {
+                root: std::env::temp_dir(),
+                upload: false,
+                download: false,
+                default_dir: String::new(),
+                max_upload_bytes: 0,
+            }),
+            mic: None,
+            resize: false,
+            read_only: true,
+            recorder: crate::record::Recorder::new(hub.clone(), Duration::from_secs(1)),
+            index: Bytes::new(),
+            favicon: Bytes::new(),
+            favicon_type: "image/x-icon",
+            debug: crate::env::Debugging::read(|_| None).0,
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let client = hub.add_client(tx, Instant::now());
+        // No ping was sent to this viewer. It names a moment just past, as replies did when
+        // pings were named by the microsecond they went out, then a token.
+        for reply in ["po,9999000", "po,0123456789abcdef"] {
+            handle_text(&s, &client, reply);
+        }
+        assert_eq!(
+            client.window(|w| w.fastest()),
+            None,
+            "a reply to no ping read as a round trip"
+        );
+    }
+
+    /// The other half of the one above, so it checks the record rather than a server that
+    /// ignores every reply: the reply to a ping the pinger recorded is a round trip.
+    #[test]
+    fn a_reply_to_the_ping_sent_is_a_round_trip() {
+        let hub = Hub::new(crate::hub::Paths::ANY);
+        let s = AppState {
+            hub: hub.clone(),
+            audio: true,
+            files: Arc::new(crate::files::Files {
+                root: std::env::temp_dir(),
+                upload: false,
+                download: false,
+                default_dir: String::new(),
+                max_upload_bytes: 0,
+            }),
+            mic: None,
+            resize: false,
+            read_only: true,
+            recorder: crate::record::Recorder::new(hub.clone(), Duration::from_secs(1)),
+            index: Bytes::new(),
+            favicon: Bytes::new(),
+            favicon_type: "image/x-icon",
+            debug: crate::env::Debugging::read(|_| None).0,
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let client = hub.add_client(tx, Instant::now());
+        let token = crate::hub::Token::random();
+        client.ping(Instant::now(), token);
+        handle_text(&s, &client, &format!("po,{token}"));
+        assert!(
+            client.window(|w| w.fastest()).is_some(),
+            "the reply to a ping was no round trip"
+        );
+    }
+
+    /// The page acknowledges every frame it is sent once, in order: an ack of the oldest
+    /// frame on its way reads on, and an ack of any other frame (one behind it, one acked
+    /// already, a number never given), or with nothing on its way, closes the connection and
+    /// takes nothing out. Over 4,000 steps on a started client: frames sent, and acks of
+    /// the oldest, of any frame numbered, and of numbers past the newest. Counted, and both
+    /// must happen: acks read on, and connections closed.
+    #[test]
+    fn an_ack_of_any_frame_but_the_oldest_closes_the_connection() {
+        let hub = Hub::new(crate::hub::Paths::ANY);
+        let s = app(&hub, false, None);
+        let client = hub.add_client(mpsc::unbounded_channel().0, Instant::now());
+        client.watch();
+        client.keyframe_planned();
+        client.keyframe_sent(true);
+        let mut rng = crate::xorshift::Xorshift::new(0xA076_1D64_78BD_642F);
+        // The frames on their way, oldest first, and every number given.
+        let (mut flying, mut given) = (std::collections::VecDeque::new(), vec![]);
+        let (mut read_on, mut closed) = (0, 0);
+        for _ in 0..4_000 {
+            if rng.below(2) == 0 || given.is_empty() {
+                let id = hub.timeline.number();
+                client.takes(id, Instant::now(), 1000, false, usize::MAX);
+                flying.push_back(id.get());
+                given.push(id.get());
+                continue;
+            }
+            let last = given[given.len() - 1];
+            let id = match (rng.below(3), flying.front()) {
+                (0, Some(&oldest)) => oldest,
+                (1, _) => given[rng.below(given.len() as u64) as usize],
+                _ => last.wrapping_add(1 + rng.below(9) as u32),
+            };
+            let flow = handle_text(&s, &client, &format!("a,{id},1.5"));
+            let oldest = flying.front() == Some(&id);
+            let want = match oldest {
+                true => Flow::Go,
+                false => Flow::Close,
+            };
+            assert_eq!(flow, want, "the ack of {id}, {flying:?} on their way");
+            if oldest {
+                flying.pop_front();
+            }
+            assert_eq!(client.window(|w| w.frames()), flying.len(), "after {id}");
+            read_on += usize::from(oldest);
+            closed += usize::from(!oldest);
+        }
+        assert!(
+            read_on > 100 && closed > 100,
+            "{read_on} read on, {closed} closed"
+        );
+    }
+
+    /// A connecting viewer is sent a ping before anything else, so that nothing is on the
+    /// path ahead of it, then its hello and the cursor's image if there is one; and the
+    /// ping is in its record, with nothing ahead of it, so its reply is a round trip. With
+    /// no cursor and with cursors of 24 to 64 px.
+    #[test]
+    fn a_viewer_is_pinged_before_anything_else_is_sent() {
+        for cursor in [None, Some(24), Some(32), Some(48), Some(64)] {
+            let hub = Hub::new(crate::hub::Paths::ANY);
+            *hub.cursor.lock() = cursor.map(|px: usize| Bytes::from(vec![3u8; px * px * 4 + 14]));
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let client = hub.add_client(tx, Instant::now());
+            greet(&hub, &client);
+            let sent: Vec<Out> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            let Some(Out::Text(ServerMessage::Ping { s: token })) = sent.first() else {
+                panic!("cursor {cursor:?}: the first message is no ping");
+            };
+            assert!(matches!(
+                sent.get(1),
+                Some(Out::Text(ServerMessage::Hello(_)))
+            ));
+            assert_eq!(
+                sent.len(),
+                2 + usize::from(cursor.is_some()),
+                "cursor {cursor:?}"
+            );
+            let answer = client.pings.lock().answer(Instant::now(), *token);
+            assert!(
+                answer.is_some_and(|(_, ahead)| ahead == crate::window::Ahead::Nothing),
+                "cursor {cursor:?}: the ping is not in the record, or not alone: {answer:?}"
+            );
+        }
+    }
+
     /// Every command the web client sends parses here (a display switch only on
     /// macOS), and one that is malformed is no command at all.
     #[test]
@@ -712,12 +1264,14 @@ mod tests {
         }
     }
 
-    /// How many fields each command has, written apart from `parse`. A clipboard is not
-    /// here: its one field is the rest of the line, commas and all.
+    /// How many fields each command has, written apart from `parse`: an ack's hold is the
+    /// one field that may be left out. A clipboard is not here: its one field is the rest
+    /// of the line, commas and all.
     fn fields_of(name: &str) -> &'static [usize] {
         match name {
+            "a" => &[1, 2],
             "m" | "b" | "sp" | "k" | "sz" => &[2],
-            "a" | "v" | "au" | "mi" | "po" | "ds" => &[1],
+            "v" | "au" | "mi" | "po" | "ds" => &[1],
             "r" | "kf" => &[0],
             _ => &[],
         }
@@ -760,8 +1314,9 @@ mod tests {
 
     /// One rule for every command: its name and exactly its fields. Each command the web
     /// client sends, with none to four well-formed fields (its own, then copies of its
-    /// last), parses exactly when that is a count `fields_of` gives it. A clipboard takes
-    /// one field or more, and its text is all of them, commas and all.
+    /// last), parses exactly when that is a count `fields_of` gives it; an ack without its
+    /// hold is `Unsaid`, and with it, the hold as the field says. A clipboard takes one
+    /// field or more, and its text is all of them, commas and all.
     #[test]
     fn a_command_is_exactly_its_fields() {
         for c in ALL {
@@ -792,8 +1347,13 @@ mod tests {
                     name => fields_of(name).contains(&count),
                 };
                 assert_eq!(parsed.is_some(), has, "{line}");
-                if let Some(Command::Clipboard(text)) = parsed {
-                    assert_eq!(text, fields.join(","), "{line}");
+                match parsed {
+                    Some(Command::Ack { hold, .. }) => {
+                        let said = fields.get(1).map_or(Hold::Unsaid, |f| Hold::parse(f));
+                        assert_eq!(hold, said, "{line}");
+                    }
+                    Some(Command::Clipboard(text)) => assert_eq!(text, fields.join(","), "{line}"),
+                    _ => {}
                 }
             }
         }
@@ -960,13 +1520,8 @@ mod tests {
             "1e3",
             "18446744073709551616",
         ];
-        let mut seed = 0x9E3779B97F4A7C15u64;
-        let mut next = move || {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed
-        };
+        let mut rng = crate::xorshift::Xorshift::new(0x9E3779B97F4A7C15);
+        let mut next = move || rng.next();
         // Lines that parsed into a position, a button and a pixel scroll.
         let mut parsed = [0; 3];
         let mut out = vec![];
@@ -1054,11 +1609,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn display_switch_drains_input_and_retires_old_connections() {
-        let hub = Hub::new();
+        let hub = Hub::new(crate::hub::Paths::ANY);
         let (sender, events) = std::sync::mpsc::channel();
         *hub.input.lock() = Some(sender);
         let (out, _messages) = mpsc::unbounded_channel();
-        let old = hub.add_client(out);
+        let old = hub.add_client(out, Instant::now());
         send_input(&hub, &old, InputEvent::Move { x: 1, y: 2 });
         let request = hub.pause_display_input(20, old.id).unwrap();
         assert!(
@@ -1094,89 +1649,11 @@ mod tests {
         );
         assert!(hub.pause_display_input(30, old.id).is_none());
         let (out, _messages) = mpsc::unbounded_channel();
-        let fresh = hub.add_client(out);
+        let fresh = hub.add_client(out, Instant::now());
         send_input(&hub, &fresh, InputEvent::Move { x: 3, y: 4 });
         assert!(matches!(
             events.try_recv(),
             Ok(InputEvent::Move { x: 3, y: 4 })
         ));
-    }
-
-    /// A reply to no ping is no round trip. With no record of
-    /// the pings sent, a reply naming a moment just past read as a 1 ms round trip on a
-    /// viewer that was never pinged: its frames were then overdue at 81 ms, and the flow
-    /// check held every viewer's frames once one of its own was 121 ms old. A read-only
-    /// viewer may send it.
-    #[test]
-    fn a_reply_to_no_ping_is_no_round_trip() {
-        let hub = Hub::new();
-        let s = AppState {
-            hub: hub.clone(),
-            audio: true,
-            files: Arc::new(crate::files::Files {
-                root: std::env::temp_dir(),
-                upload: false,
-                download: false,
-                default_dir: String::new(),
-                max_upload_bytes: 0,
-            }),
-            mic: None,
-            resize: false,
-            read_only: true,
-            recorder: crate::record::Recorder::new(hub.clone(), Duration::from_secs(1)),
-            index: Bytes::new(),
-            favicon: Bytes::new(),
-            favicon_type: "image/x-icon",
-            debug: crate::env::Debugging::read(|_| None).0,
-        };
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let client = hub.add_client(tx);
-        let mut rtts = Default::default();
-        // No ping was sent to this viewer. It names a moment just past, as replies did when
-        // pings were named by the microsecond they went out, then a token.
-        for reply in ["po,9999000", "po,0123456789abcdef"] {
-            handle_text(&s, &client, reply, &mut rtts);
-        }
-        assert_eq!(
-            client.min_rtt_ms.load(Ordering::Relaxed),
-            0,
-            "a reply to no ping read as a round trip"
-        );
-    }
-
-    /// The other half of the one above, so it checks the record rather than a server that
-    /// ignores every reply: the reply to a ping the pinger recorded is a round trip.
-    #[test]
-    fn a_reply_to_the_ping_sent_is_a_round_trip() {
-        let hub = Hub::new();
-        let s = AppState {
-            hub: hub.clone(),
-            audio: true,
-            files: Arc::new(crate::files::Files {
-                root: std::env::temp_dir(),
-                upload: false,
-                download: false,
-                default_dir: String::new(),
-                max_upload_bytes: 0,
-            }),
-            mic: None,
-            resize: false,
-            read_only: true,
-            recorder: crate::record::Recorder::new(hub.clone(), Duration::from_secs(1)),
-            index: Bytes::new(),
-            favicon: Bytes::new(),
-            favicon_type: "image/x-icon",
-            debug: crate::env::Debugging::read(|_| None).0,
-        };
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let client = hub.add_client(tx);
-        let mut rtts = Default::default();
-        let token = crate::hub::Token::random();
-        client.pings.lock().send(Instant::now(), token);
-        handle_text(&s, &client, &format!("po,{token}"), &mut rtts);
-        assert!(
-            client.min_rtt_ms.load(Ordering::Relaxed) > 0,
-            "the reply to a ping was no round trip"
-        );
     }
 }

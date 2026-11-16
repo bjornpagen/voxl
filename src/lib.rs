@@ -23,20 +23,29 @@ mod help;
 mod hub;
 #[cfg(target_os = "linux")]
 mod input;
+mod logging;
 mod login;
 #[cfg(target_os = "macos")]
 mod mac;
 mod mic;
 mod mp4;
+#[cfg(test)]
+mod oracle;
+mod path;
+mod rate;
 mod record;
 #[cfg(target_os = "linux")]
 mod screen;
 mod server;
+mod timeline;
 mod tls;
 mod video;
 mod wait;
 #[cfg(windows)]
 mod win;
+mod window;
+#[cfg(test)]
+mod xorshift;
 
 // The macOS and Windows backends provide the same modules with the same interfaces.
 #[cfg(target_os = "macos")]
@@ -75,6 +84,72 @@ fn range_max(v: Option<&String>, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
+/// A rate flag's value in whole kbit/s: a number, or a Selkies range of two numbers from
+/// low to high, whose upper bound is the rate. Anything else is no rate.
+fn whole_kbps(v: &str) -> Option<u32> {
+    let whole = |s: &str| s.trim().parse::<u32>().ok();
+    match v.split_once('-') {
+        None => whole(v),
+        Some((low, high)) => whole(low)
+            .zip(whole(high))
+            .and_then(|(low, high)| (low <= high).then_some(high)),
+    }
+}
+
+/// A rate flag in whole kbit/s; `default` when it is not given.
+fn rate_flag(flag: &str, v: Option<&String>, default: u32) -> Result<u32, String> {
+    let Some(v) = v else {
+        return Ok(default);
+    };
+    whole_kbps(v).ok_or_else(|| {
+        format!("--{flag} {v:?}: not a whole number of kbit/s, or a range of two from low to high")
+    })
+}
+
+/// `--preset`: a preset x264 has, `ultrafast` when not given. x264 is asked here, where
+/// the flag is read, so a name it does not have starts nothing.
+fn preset(flag: Option<&String>) -> Result<encoder::Preset, String> {
+    let name = flag.map_or("ultrafast", String::as_str);
+    encoder::Preset::parse(name).ok_or_else(|| format!("--preset {name}: x264 has no such preset"))
+}
+
+/// The most frames a second when `--framerate` is not given, or is not a number:
+/// upstream's default.
+const FRAMERATE: encoder::Fps = encoder::Fps::new(60).unwrap();
+
+/// `--framerate` (or a Selkies range, whose upper bound is the rate): the most frames a
+/// second, 1 to `Fps::MAX`. Under one (0, or a fraction of one) the capture loop would
+/// space its frames an endless time apart; from 2^30 up, four frames' worth of the rate
+/// no longer fits the VBV buffer's arithmetic. Both stopped the server; now neither
+/// starts it.
+fn framerate(v: Option<&String>) -> Result<encoder::Fps, String> {
+    let Some(v) = v else {
+        return Ok(FRAMERATE);
+    };
+    encoder::Fps::new(range_max(Some(v), FRAMERATE.get() as f64) as u32).ok_or_else(|| {
+        format!(
+            "--framerate {v:?}: not 1 to {} frames a second",
+            encoder::Fps::MAX
+        )
+    })
+}
+
+/// `--min-kbps` and `--max-kbps` (or Selkies' `--video-bitrate`), read together: what a
+/// viewer's path is taken to carry, at least and at most; 0 and 30000 kbit/s when not
+/// given. A floor of 0 is a packet in the window's `LATENESS`: 2000 kbit/s, the floor
+/// before, is 15 KB in it, three times what a slow link was measured to carry. A ceiling
+/// of 0 is none: a path is taken to carry as much as its frames show, and encoders open
+/// without a rate cap.
+fn bounds(min: Option<&String>, max: Option<&String>) -> Result<rate::Bounds, String> {
+    let floor = rate_flag("min-kbps", min, 0)?;
+    let ceiling = rate_flag("max-kbps", max, 30000)?;
+    let kbps = |kbps: u32| path::Kbps::new(kbps as f64);
+    Ok(rate::Bounds::new(
+        kbps(floor),
+        (ceiling > 0).then(|| kbps(ceiling)),
+    ))
+}
+
 pub(crate) fn truthy(v: Option<&String>, default: bool) -> bool {
     v.map(|s| matches!(s.as_str(), "true" | "1" | "yes" | "on"))
         .unwrap_or(default)
@@ -96,7 +171,9 @@ pub fn run(args: impl IntoIterator<Item = String>) {
     if let Some(style) = &env.log.style {
         log.parse_write_style(style);
     }
-    let _ = log.try_init();
+    // x264 says what VOXL_X264_INFO asks of it (its own level), and all of that is written.
+    log.filter_module("x264", log::LevelFilter::Debug);
+    logging::init(log.build());
     if let Some(refused) = &env.refused {
         log::error!("{refused}");
     }
@@ -151,15 +228,25 @@ async fn serve(a: HashMap<String, String>, env: env::Env) {
     let ncpu = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4) as u32;
+    let max = a.get("max-kbps").or(a.get("video-bitrate"));
+    let bounds = bounds(a.get("min-kbps"), max).unwrap_or_else(|e| {
+        log::error!("{e}");
+        logging::exit(1);
+    });
+    let preset = preset(a.get("preset")).unwrap_or_else(|e| {
+        log::error!("{e}");
+        logging::exit(1);
+    });
+    let fps = framerate(a.get("framerate")).unwrap_or_else(|e| {
+        log::error!("{e}");
+        logging::exit(1);
+    });
     let vcfg = video::VideoConfig {
         display: display.clone(),
         #[cfg(target_os = "macos")]
         enable_resize: truthy(a.get("enable-resize"), false) && !truthy(a.get("read-only"), false),
-        fps: range_max(a.get("framerate"), 60.0) as u32,
-        preset: a
-            .get("preset")
-            .cloned()
-            .unwrap_or_else(|| "ultrafast".into()),
+        fps,
+        preset,
         // Four sliced threads: lower latency than one, and x264's slicing overhead grows
         // with thread count, so more threads only add CPU (measured on 2560x1600).
         threads: a
@@ -171,17 +258,10 @@ async fn serve(a: HashMap<String, String>, env: env::Env) {
             .and_then(|v| v.parse().ok())
             .unwrap_or(4),
         crf: range_max(a.get("crf"), 24.0) as f32,
-        // Selkies' --video-bitrate becomes the ceiling for adaptive bitrate.
-        max_kbps: range_max(a.get("max-kbps").or(a.get("video-bitrate")), 30000.0) as u32,
+        bounds,
         paintover_crf: range_max(a.get("paintover-crf"), 16.0) as f32,
-        paintover_burst: range_max(a.get("paintover-burst"), 3.0) as u32,
         paintover_delay_ms: range_max(a.get("paintover-delay-ms"), 150.0) as u64,
-        min_kbps: range_max(a.get("min-kbps"), 2000.0) as u32,
         stripes: range_max(a.get("stripes"), 1.0) as u32,
-        // Opt-in: one thread unless a frame would miss the frame budget. x264's sliced
-        // threads cost ~3x the CPU on desktop content, so this saves 20-55% CPU, but
-        // small updates encode a few ms slower on one thread.
-        adaptive_threads: truthy(a.get("adaptive-threads"), false),
         coalesce: std::time::Duration::from_micros(range_max(a.get("coalesce-us"), 0.0) as u64),
         debug: env.debug,
     };
@@ -200,7 +280,7 @@ async fn serve(a: HashMap<String, String>, env: env::Env) {
         false
     };
 
-    let hub = hub::Hub::new();
+    let hub = hub::Hub::new(bounds.paths());
     // --read-only: the viewer watches the desktop, it does not drive it. Only the
     // commands watching needs are accepted (see server::READ_ONLY_COMMANDS), uploads
     // are refused, and the page hides the controls that would send anything else.
@@ -237,7 +317,7 @@ async fn serve(a: HashMap<String, String>, env: env::Env) {
     let resize_scale = range_max(a.get("resize-scale"), default_scale);
     if let Err(e) = video::spawn(vcfg, hub.clone(), screen) {
         log::error!("video init failed: {e}");
-        std::process::exit(1);
+        logging::exit(1);
     }
     let radius = range_max(a.get("round-corners"), 0.0) as u16;
     // --round-windows=title:radius,...: round specific windows (docks included) by title.
@@ -349,7 +429,7 @@ async fn serve(a: HashMap<String, String>, env: env::Env) {
     let (favicon, favicon_type) = server::favicon(a.get("favicon").map(|s| s.as_str()))
         .unwrap_or_else(|e| {
             log::error!("{e}");
-            std::process::exit(1);
+            logging::exit(1);
         });
     let state = server::AppState {
         hub: hub.clone(),
@@ -453,7 +533,7 @@ async fn serve(a: HashMap<String, String>, env: env::Env) {
             let _ = tx.send(event::InputEvent::Shutdown);
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        std::process::exit(0);
+        logging::exit(0);
     });
     if let Some(config) = tls {
         return tls::serve(listener, app, config).await;
@@ -463,4 +543,251 @@ async fn serve(a: HashMap<String, String>, env: env::Env) {
         let _ = tcp.set_nodelay(true);
     });
     axum::serve(listener, app).await.unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use path::Kbps;
+    use rate::Bounds;
+
+    /// A preset is one x264 has, asked where the flag is read. Each of x264's presets
+    /// (x264.h's `x264_preset_names`), by its name, in capitals and by its number, starts
+    /// voxl and opens an encoder; each name with a letter added or its first taken away
+    /// starts nothing; and no flag is `ultrafast`.
+    #[test]
+    fn a_preset_is_one_x264_has() {
+        const X264: [&str; 10] = [
+            "ultrafast",
+            "superfast",
+            "veryfast",
+            "faster",
+            "fast",
+            "medium",
+            "slow",
+            "slower",
+            "veryslow",
+            "placebo",
+        ];
+        for (i, name) in X264.iter().enumerate() {
+            for given in [name.to_string(), name.to_uppercase(), i.to_string()] {
+                let preset = preset(Some(&given)).unwrap_or_else(|e| panic!("{e}"));
+                let cfg = encoder::EncoderConfig {
+                    pictures: encoder::Pictures {
+                        width: 64,
+                        height: 64,
+                        fps: encoder::Fps::new(60).unwrap(),
+                        preset,
+                        threads: 1,
+                        debug: env::Debugging::read(|_| None).0,
+                    },
+                    crf: 24.0,
+                    max_kbps: None,
+                };
+                assert!(encoder::Encoder::new(&cfg).is_ok(), "{given}");
+            }
+            for not in [format!("{name}x"), name[1..].to_string()] {
+                assert!(preset(Some(&not)).is_err(), "{not}");
+            }
+        }
+        assert_eq!(
+            preset(None),
+            Ok(encoder::Preset::parse("ultrafast").unwrap())
+        );
+    }
+
+    fn read(min: Option<&str>, max: Option<&str>) -> Result<Bounds, String> {
+        bounds(
+            min.map(String::from).as_ref(),
+            max.map(String::from).as_ref(),
+        )
+    }
+
+    /// `--max-kbps` is a ceiling or none, decided where the flags are read: 0 is none, and
+    /// what is not a whole number of kbit/s starts nothing.
+    #[test]
+    fn the_ceiling_is_a_rate_or_none() {
+        let at = |kbps: f64| Ok(Some(Kbps::new(kbps)));
+        for (flag, want) in [
+            (None, at(30000.0)),
+            (Some("0"), Ok(None)),
+            (Some("12000"), at(12000.0)),
+            (Some(" 12000 "), at(12000.0)),
+            (Some("8000-12000"), at(12000.0)),
+            (Some("0-0"), Ok(None)),
+        ] {
+            assert_eq!(read(None, flag).map(Bounds::ceiling), want, "{flag:?}");
+        }
+        for flag in [
+            "",
+            "fast",
+            "12k",
+            "1.5",
+            "NaN",
+            "inf",
+            "8000-",
+            "99999999999",
+            "true",
+        ] {
+            assert!(read(None, Some(flag)).is_err(), "{flag:?} parsed");
+        }
+    }
+
+    /// A range is two whole numbers from low to high. A leading `-` is no range with
+    /// nothing before it (`--max-kbps -5` reaches the parse: it does not start with `--`),
+    /// a lower bound is read, and a range has two ends. (RED's finding 19.)
+    #[test]
+    fn a_ceiling_that_is_not_a_rate_starts_nothing() {
+        for flag in ["-5", "-0", "fast-12000", "1-2-3", "12000-8000"] {
+            assert!(
+                read(None, Some(flag)).is_err(),
+                "{flag:?} parsed as {:?}",
+                read(None, Some(flag))
+            );
+        }
+    }
+
+    /// `--min-kbps` is read the same way, 0 when not given, and with the ceiling into
+    /// one value: a ceiling under the floor brings the floor down to it.
+    #[test]
+    fn the_floor_is_read_with_the_ceiling() {
+        let kbps = Kbps::new;
+        let default = Some(kbps(30000.0));
+        for (min, max, want) in [
+            (None, None, Bounds::new(kbps(0.0), default)),
+            (Some("0"), None, Bounds::new(kbps(0.0), default)),
+            (Some("1000-3000"), None, Bounds::new(kbps(3000.0), default)),
+            (Some("5000"), Some("0"), Bounds::new(kbps(5000.0), None)),
+            (
+                None,
+                Some("1000"),
+                Bounds::new(kbps(0.0), Some(kbps(1000.0))),
+            ),
+            (
+                Some("9000"),
+                Some("4000"),
+                Bounds::new(kbps(4000.0), Some(kbps(4000.0))),
+            ),
+        ] {
+            assert_eq!(
+                read(min, max),
+                Ok(want),
+                "--min-kbps {min:?} --max-kbps {max:?}"
+            );
+        }
+        for min in ["", "fast", "1.5", "-5", "3000-1000"] {
+            assert!(read(Some(min), None).is_err(), "--min-kbps {min:?} parsed");
+        }
+    }
+
+    /// A viewer's path is taken to carry, in the window's `LATENESS` (60 ms), what the
+    /// flags carry in it: 7.5 bytes a kbit/s, whole bytes, rounded down; and with no
+    /// ceiling, as much as there is. The floor is never over the ceiling. Over whole rates
+    /// from 0 to past what a 32-bit kbit/s holds, either way round.
+    #[test]
+    fn a_path_is_taken_to_carry_what_the_flags_carry_in_the_lateness() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut draw = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let bytes = |kbps: u64| (kbps * 15 / 2) as usize;
+        for _ in 0..10_000 {
+            let (floor, ceiling) = (draw(1 << 33), draw(1 << 33));
+            let none = draw(4) == 0;
+            let bounds = Bounds::new(
+                Kbps::new(floor as f64),
+                (!none).then(|| Kbps::new(ceiling as f64)),
+            );
+            let want = match none {
+                true => crate::hub::Paths {
+                    least: bytes(floor),
+                    most: usize::MAX,
+                },
+                false => crate::hub::Paths {
+                    least: bytes(floor.min(ceiling)),
+                    most: bytes(ceiling),
+                },
+            };
+            assert_eq!(bounds.paths(), want, "{bounds:?}");
+        }
+    }
+
+    /// `--framerate` reads as it did wherever that was 1 to 240 frames a second, and starts
+    /// nothing anywhere else: over whole and fractional numbers, ranges, a leading `-`,
+    /// words, and numbers of every size a u32 holds and past it.
+    #[test]
+    fn a_framerate_outside_1_to_240_starts_nothing() {
+        let mut rng = crate::xorshift::Xorshift::new(0x2545F4914F6CDD1D);
+        let mut draw = |n: u64| rng.below(n);
+        for _ in 0..20_000 {
+            let v = match draw(6) {
+                0 => format!("{}", draw(300)),
+                1 => format!("{}.{}", draw(3), draw(100)),
+                2 => format!("{}-{}", draw(200), draw(300)),
+                3 => format!("-{}.{}", draw(3), draw(10)),
+                4 => {
+                    let bits = draw(40);
+                    format!("{}", draw(1 << bits))
+                }
+                _ => ["", "fast", "NaN", "inf", "-0", "0-0", " 0 ", "0.0"][draw(8) as usize].into(),
+            };
+            let before = range_max(Some(&v), 60.0) as u32;
+            assert_eq!(
+                framerate(Some(&v)).map(encoder::Fps::get),
+                match before {
+                    1..=240 => Ok(before),
+                    _ => Err(format!("--framerate {v:?}: not 1 to 240 frames a second")),
+                },
+                "{v:?}"
+            );
+        }
+        assert_eq!(framerate(None).map(encoder::Fps::get), Ok(60));
+    }
+
+    /// Every frame rate `--framerate` lets through is one an encoder opens at under a cap,
+    /// and sets a new cap at: over the edges (240 and 241; 2^30 - 1 and 2^30, where four
+    /// frames' worth of the rate leaves a u32; u32::MAX and past it) and over rates drawn
+    /// across every magnitude a u32 holds.
+    #[test]
+    fn every_framerate_read_opens_an_encoder() {
+        let mut rng = crate::xorshift::Xorshift::new(0x9E3779B97F4A7C15);
+        let mut draw = |n: u64| rng.below(n);
+        let edges = [
+            "240",
+            "241",
+            "1073741823",
+            "1073741824",
+            "4294967295",
+            "4294967296",
+            "1e12",
+        ];
+        let drawn: Vec<String> = (0..200)
+            .map(|_| {
+                let bits = draw(33);
+                draw(1 << bits).to_string()
+            })
+            .collect();
+        for v in edges.into_iter().map(String::from).chain(drawn) {
+            let Ok(fps) = framerate(Some(&v)) else {
+                continue;
+            };
+            let mut enc = encoder::Encoder::new(&encoder::EncoderConfig {
+                pictures: encoder::Pictures {
+                    width: 64,
+                    height: 64,
+                    fps,
+                    preset: encoder::Preset::parse("ultrafast").unwrap(),
+                    threads: 1,
+                    debug: env::Debugging::read(|_| None).0,
+                },
+                crf: 24.0,
+                max_kbps: Some(Kbps::new(2000.0)),
+            })
+            .unwrap_or_else(|e| panic!("--framerate {v:?}: {e}"));
+            enc.set_rate(24.0, 3000);
+        }
+    }
 }

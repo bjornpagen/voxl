@@ -2,11 +2,17 @@
 
 use crate::capture::{Band, Capturer};
 use crate::convert::I420;
-use crate::encoder::{Encoded, Encoder, EncoderConfig, Planes};
+use crate::encoder::{
+    Encoded, Encoder, EncoderConfig, Fps, Pictures, Planes, Preset, Quality, Settling,
+};
 use crate::env::{Debugging, Marker};
-use crate::hub::wait_any;
-use crate::hub::{Hub, Inflight, Out, ServerMessage};
-use bytes::Bytes;
+use crate::hub::{wait_any, Waitable};
+use crate::hub::{Client, Hub, Out, Reach, ServerMessage, Takes, Viewer};
+use crate::path::{Bits, Kbps};
+use crate::rate::Bounds;
+use crate::timeline::{CaptureMarks, Coded};
+use crate::window::{self, Way, Window};
+use bytes::{BufMut, Bytes, BytesMut};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -17,38 +23,303 @@ pub struct VideoConfig {
     pub display: Option<String>,
     #[cfg(target_os = "macos")]
     pub enable_resize: bool,
-    pub fps: u32,
-    pub preset: String,
+    pub fps: Fps,
+    pub preset: Preset,
     pub threads: u32,
     pub convert_threads: usize,
     pub crf: f32,
-    pub max_kbps: u32,
+    /// What the stream is steered between (`--min-kbps`, `--max-kbps`).
+    pub bounds: Bounds,
     pub paintover_crf: f32,
-    pub paintover_burst: u32,
     pub paintover_delay_ms: u64,
-    pub min_kbps: u32,
+    /// How long the drawing must have been quiet before it is captured (`--coalesce-us`).
     pub coalesce: Duration,
     pub stripes: u32,
-    pub adaptive_threads: bool,
     /// The debugging variables (`VOXL_*`), read when voxl started.
     pub debug: Debugging,
 }
 
+/// What a video message says before its stripe's H.264. The encode loop writes it; the
+/// recorder, web/src/protocol.ts and bench/linkviewer.py read it, and each checks its
+/// reader against web/src/video-header.json: messages, and the fields they mean.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Header {
+    /// This stripe is a keyframe.
+    pub key: bool,
+    /// The frame sharpens what it codes (the bench's "paint-over").
+    pub sharpens: bool,
+    /// The frame's number: every stripe of a frame carries it, and a viewer acks it.
+    pub frame: u32,
+    pub pipe: Pipe,
+    /// This stripe, of `stripes`.
+    pub stripe: u8,
+    pub stripes: u8,
+    /// How many stripes' messages make up the frame.
+    pub parts: u8,
+    /// The stripe's top row.
+    pub y: u16,
+}
+
+/// Capture to send, as a video message carries it: in tenths of a millisecond, at most
+/// `u32::MAX` of them (119 hours).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pipe(u32);
+
+impl Pipe {
+    pub fn of(d: Duration) -> Pipe {
+        Pipe((d.as_micros() / 100).min(u32::MAX as u128) as u32)
+    }
+
+    /// In whole milliseconds, rounded down.
+    pub fn millis(self) -> u64 {
+        self.0 as u64 / 10
+    }
+}
+
+impl Header {
+    /// A stripe's H.264 starts this far into its message.
+    pub const LEN: usize = 16;
+    /// A video message's type byte (`Bin.Video` in web/src/protocol.ts).
+    const VIDEO: u8 = 0x01;
+    /// The flags byte's bits.
+    const KEY: u8 = 1;
+    const SHARPENS: u8 = 2;
+
+    /// Type, flags, frame, pipe, stripe, stripe count, parts in frame, a reserved 0, y.
+    pub fn bytes(&self) -> [u8; Header::LEN] {
+        let mut b = [0; Header::LEN];
+        b[0] = Header::VIDEO;
+        b[1] = if self.key { Header::KEY } else { 0 }
+            | if self.sharpens { Header::SHARPENS } else { 0 };
+        b[2..6].copy_from_slice(&self.frame.to_be_bytes());
+        b[6..10].copy_from_slice(&self.pipe.0.to_be_bytes());
+        b[10] = self.stripe;
+        b[11] = self.stripes;
+        b[12] = self.parts;
+        b[14..16].copy_from_slice(&self.y.to_be_bytes());
+        b
+    }
+
+    /// What message `m` is to a reader of video.
+    pub fn read(m: &[u8]) -> Result<Video<'_>, NotVideo> {
+        match m.split_first_chunk::<{ Header::LEN }>() {
+            _ if m.first() != Some(&Header::VIDEO) => Err(NotVideo::Other),
+            None => Err(NotVideo::Short),
+            Some((b, [])) => Ok(Video::Empty(Header::of(b))),
+            Some((b, picture)) => Ok(Video::Stripe(Header::of(b), picture)),
+        }
+    }
+
+    fn of(b: &[u8; Header::LEN]) -> Header {
+        let u32_at = |i: usize| u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+        Header {
+            key: b[1] & Header::KEY != 0,
+            sharpens: b[1] & Header::SHARPENS != 0,
+            frame: u32_at(2),
+            pipe: Pipe(u32_at(6)),
+            stripe: b[10],
+            stripes: b[11],
+            parts: b[12],
+            y: u16::from_be_bytes([b[14], b[15]]),
+        }
+    }
+}
+
+/// A video message, read.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Video<'a> {
+    /// A stripe's header, and its H.264 after it.
+    Stripe(Header, &'a [u8]),
+    /// A header with nothing after it. The encode loop sends no stripe that coded nothing.
+    Empty(Header),
+}
+
+/// A message that is not a video message.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NotVideo {
+    /// Another kind: its first byte is not video's type byte, or it has no byte at all.
+    Other,
+    /// Video's type byte, and fewer bytes than a header.
+    Short,
+}
+
 struct Job {
-    buf: Box<I420>,
-    idx: usize,
-    force_idr: bool,
-    paintover: bool,
-    /// Last pass of a paint-over burst.
-    paintover_final: bool,
-    /// Rows that changed in this capture.
-    band: Option<Band>,
-    /// Per-macroblock change map for this capture (None: analyse everything).
-    mb_dirty: Option<Arc<Vec<u8>>>,
-    captured_at: Instant,
+    /// The picture, shared with the stripe workers while they code it, and the capture
+    /// loop's alone again once it comes back.
+    buf: Arc<I420>,
+    frame: Frame,
+    /// The bytes it may take, as the viewers' windows had it when it was captured.
+    allowance: usize,
+    /// When the capture loop's part of it happened.
+    captured: CaptureMarks,
     /// What the bench loadgen's marker said when the frame was captured, while
     /// `VOXL_DEBUG_MARKER` is set (see `marker_reading`).
     marker_ms: Option<u32>,
+}
+
+/// What a captured frame is for. Each kind carries what only it has.
+enum Frame {
+    /// A new viewer, or a decoder that lost its place: every stripe, from nothing.
+    /// `blocks`: it went out in place of a sharpening pass, so it is coded at paint-over
+    /// quality and sharpens every block, as that pass would have.
+    /// `starts`: the viewers its plan promised it to, which it starts if it comes out whole.
+    Key {
+        blocks: Option<Sharpen>,
+        starts: Vec<Arc<Client>>,
+    },
+    /// What changed on screen, and which blocks.
+    Motion { band: Band, dirty: Arc<Vec<u8>> },
+    /// The screen is still: re-encode `blocks` at paint-over quality.
+    Sharpen { band: Band, blocks: Sharpen },
+    /// Motion, plus blocks elsewhere that have gone still, at paint-over quality.
+    MotionAndSharpen {
+        band: Band,
+        dirty: Arc<Vec<u8>>,
+        blocks: Sharpen,
+    },
+}
+
+impl Frame {
+    /// Whether it encodes any of the rows `y..y + h`. A keyframe encodes them all.
+    fn touches(&self, y: usize, h: usize) -> bool {
+        match self {
+            Frame::Key { .. } => true,
+            Frame::Motion { band, .. }
+            | Frame::Sharpen { band, .. }
+            | Frame::MotionAndSharpen { band, .. } => {
+                (band.y0 as usize) < y + h && (band.y1 as usize) > y
+            }
+        }
+    }
+
+    /// How a stripe codes it.
+    fn coding(&self) -> Coding {
+        match self {
+            Frame::Key { blocks, .. } => Coding::Key {
+                still: blocks.is_some(),
+            },
+            Frame::Motion { .. } => Coding::Motion,
+            Frame::Sharpen { .. } | Frame::MotionAndSharpen { .. } => Coding::Sharpen,
+        }
+    }
+
+    /// Whether it is coded at paint-over quality (a flag in each message's header).
+    fn sharpens(&self) -> bool {
+        match self {
+            Frame::Key { blocks, .. } => blocks.is_some(),
+            Frame::Motion { .. } => false,
+            Frame::Sharpen { .. } | Frame::MotionAndSharpen { .. } => true,
+        }
+    }
+
+    /// The blocks x264 analyses.
+    fn mb_dirty(&self) -> Dirty {
+        match self {
+            Frame::Key { .. } => Dirty::All,
+            Frame::Motion { dirty, .. } | Frame::MotionAndSharpen { dirty, .. } => {
+                Dirty::Blocks(dirty.clone())
+            }
+            Frame::Sharpen { blocks, .. } => Dirty::Blocks(blocks.map.clone()),
+        }
+    }
+
+    /// The blocks it sharpens, cleared once it came out sharp, and the viewers it starts.
+    fn into_parts(self) -> (Option<Sharpen>, Vec<Arc<Client>>) {
+        match self {
+            Frame::Motion { .. } => (None, vec![]),
+            Frame::Key { blocks, starts } => (blocks, starts),
+            Frame::Sharpen { blocks, .. } | Frame::MotionAndSharpen { blocks, .. } => {
+                (Some(blocks), vec![])
+            }
+        }
+    }
+}
+
+/// The blocks a frame's encoders analyse.
+#[derive(Clone)]
+enum Dirty {
+    /// Every block: a keyframe.
+    All,
+    /// Those the map marks (1 = changed), one byte per 16x16 block, row-major.
+    Blocks(Arc<Vec<u8>>),
+}
+
+/// What a stripe worker is asked to code. The worker turns the kind into a CRF.
+#[derive(Clone, Copy)]
+enum Coding {
+    /// An IDR, which may take what the slowest viewer's path carries in `KEY_TIME`. `still`:
+    /// in place of a sharpening pass, so at paint-over quality.
+    Key { still: bool },
+    /// Motion, at the configured CRF, which MotionQuality may lower.
+    Motion,
+    /// Sharpening, at the paint-over CRF.
+    Sharpen,
+}
+
+/// How long a keyframe may take on the slowest viewer's path, at what its window says the
+/// path carries: what a viewer waits for its first picture on a path the stream fills.
+/// Measured (at the rate controller's target, before the window) on a 3024x1898 terminal
+/// page (CRF
+/// 24, a viewer behind an emulated 6 Mbit/s, 80 ms link): a reload's first picture is
+/// 41-44 dB (246-284 KB, 369-419 ms after its encode), against 36 dB (154-170 KB, 246-268
+/// ms) at 250 ms and 27.5-27.7 dB (55-57 KB, 114-118 ms) from the frame budget alone; the
+/// page is sharp (59 dB) after 1.1-1.4 s, 0.9-1.0 s and 1.4-1.6 s. At 1 s the page's whole
+/// keyframe at its CRF (386 KB, 51 dB) would fit there, in about 0.6 s (its bytes at the
+/// target; not run), and anything that wants more (a photo) would wait twice as long. At
+/// 40 Mbit/s that keyframe fits in either.
+pub(crate) const KEY_TIME: Duration = Duration::from_millis(500);
+
+impl Coding {
+    /// The ceiling a frame's own encoder opens at, if it gets one: a keyframe under a cap.
+    /// The running encoder can give a keyframe only what its last frame left; with no
+    /// cap there is nothing to give, and an encoder opened capped would cap the stream
+    /// for good.
+    fn own_encoder(self, ceiling: Option<Kbps>) -> Option<Kbps> {
+        match self {
+            Coding::Key { .. } => ceiling,
+            Coding::Motion | Coding::Sharpen => None,
+        }
+    }
+}
+
+/// The two CRFs a pipeline codes at, for its whole life.
+#[derive(Clone, Copy)]
+struct Crfs {
+    configured: f32,
+    paintover: f32,
+}
+
+impl Crfs {
+    fn of(&self, coding: Coding) -> f32 {
+        match coding {
+            Coding::Key { still: false } | Coding::Motion => self.configured,
+            Coding::Key { still: true } | Coding::Sharpen => self.paintover,
+        }
+    }
+}
+
+/// What a capture is sent as, decided before a buffer is taken for it.
+enum Plan {
+    /// A keyframe, and what it is to sharpening.
+    Key(Keyframe),
+    /// Something moved in this band.
+    Motion(Band),
+    /// The screen is still and a pass is due: these pending blocks.
+    Sharpen { map: Vec<u8>, band: Band },
+}
+
+/// Blocks a frame sharpens, as the Refiner saw them when the frame was captured.
+struct Sharpen {
+    map: Arc<Vec<u8>>,
+    /// When the frame was captured: blocks that changed after it stay pending.
+    at: Instant,
+}
+
+/// A buffer back from the encoder, with the blocks it sharpened if it came out at
+/// paint-over quality.
+struct Returned {
+    buf: Arc<I420>,
+    sharpened: Option<Sharpen>,
 }
 
 fn union(a: Option<Band>, b: Band) -> Band {
@@ -61,17 +332,118 @@ fn union(a: Option<Band>, b: Band) -> Band {
     }
 }
 
-/// One capture/encode setup for the current screen size.
-struct Pipeline {
-    cap: Capturer,
+/// What the viewers watching are sent: the encoders, and the buffer captures are
+/// converted into for them. There is one only while somebody watches.
+///
+/// One buffer, since a capture goes only to an idle encoder (`step`): a second, filled
+/// while the encoder codes the first, only queued a frame behind it, and converted every
+/// band twice, once into each.
+struct Stream {
+    /// Dropped first (fields drop in order), which ends the encode loop once it has sent
+    /// what it was given.
     job_tx: mpsc::SyncSender<Job>,
-    ret_rx: mpsc::Receiver<(usize, Box<I420>)>,
-    encode: std::thread::JoinHandle<()>,
+    ret_rx: mpsc::Receiver<Returned>,
+    buf: Buffer<Arc<I420>>,
+    /// The rows that changed on screen since the buffer was last converted into: the
+    /// whole screen, until the first capture.
+    pending: Option<Band>,
+    /// Dropped last: waits until the encode loop has stopped.
+    _encode: Stopped,
 }
 
-/// Runs the pipeline. With a `Screen` (dynamic resolution), a client's size request
-/// ends the capture loop: the encoder drains, the screen is resized and the pipeline
-/// is rebuilt at the new size, and clients get the new geometry and a keyframe.
+/// A thread that is waited for when this is dropped. The thread holds the sending side
+/// of a channel nothing is sent on, which closes when the thread's work returns.
+struct Stopped(mpsc::Receiver<std::convert::Infallible>);
+
+impl Stopped {
+    /// `work` on a thread named `name`.
+    fn spawn(name: &str, work: impl FnOnce() + Send + 'static) -> Stopped {
+        let (running, stopped) = mpsc::channel();
+        std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || {
+                let _running = running;
+                work()
+            })
+            .unwrap();
+        Stopped(stopped)
+    }
+}
+
+impl Drop for Stopped {
+    fn drop(&mut self) {
+        let _ = self.0.recv();
+    }
+}
+
+impl Stream {
+    /// The encoders for a screen of `w` x `h`, one for each stripe the hub's hello names,
+    /// on their thread, and the buffer, which holds nothing of it yet.
+    fn new(cfg: &VideoConfig, hub: &Arc<Hub>, w: u32, h: u32) -> Result<Self, String> {
+        log::info!("streaming");
+        let (job_tx, job_rx) = mpsc::sync_channel::<Job>(1);
+        // One picture goes round, so no more than one comes back at once.
+        let (ret_tx, ret_rx) = mpsc::sync_channel::<Returned>(1);
+        // The stripes the hub's hello names, in the types a header names a stripe by.
+        let layout = Layout::of(&hub.stripes.lock())
+            .ok_or("the hub's stripes do not fit a video message's header")?;
+        let mut stripes = Vec::new();
+        for (y, sh) in layout.rows() {
+            let ecfg = EncoderConfig {
+                pictures: Pictures {
+                    width: w,
+                    height: sh,
+                    fps: cfg.fps,
+                    preset: cfg.preset.clone(),
+                    threads: (cfg.threads / u32::from(layout.count)).max(1),
+                    debug: cfg.debug,
+                },
+                crf: cfg.crf,
+                max_kbps: cfg.bounds.ceiling(),
+            };
+            stripes.push(Stripe {
+                y: y as usize,
+                h: sh as usize,
+                cfg: ecfg,
+                running: None,
+            });
+        }
+        let hub = hub.clone();
+        let crfs = Crfs {
+            configured: cfg.crf,
+            paintover: cfg.paintover_crf,
+        };
+        let frames = Frames {
+            layout,
+            fps: cfg.fps,
+        };
+        let debug = cfg.debug;
+        let encode = encoder_thread(hub.clone(), move || {
+            encode_loop(stripes, frames, job_rx, ret_tx, hub, crfs, debug)
+        });
+        Ok(Stream {
+            job_tx,
+            ret_rx,
+            buf: Buffer::Home(Arc::new(I420::new(w as usize, h as usize))),
+            pending: Some(Band { y0: 0, y1: h }),
+            _encode: encode,
+        })
+    }
+
+    /// The buffer the encoder is done with: back home, and the blocks it sharpened are
+    /// sharp.
+    fn returned(&mut self, r: Returned, refiner: &mut Refiner) {
+        self.buf = Buffer::Home(r.buf);
+        if let Some(sharp) = r.sharpened {
+            refiner.sharpened(&sharp.map, sharp.at);
+        }
+    }
+}
+
+/// Runs the pipeline. With a `Screen` (dynamic resolution), the capture loop gives a
+/// client's size request to the screen; only if the screen's size really changes does
+/// the loop end: the encoder drains, the pipeline is rebuilt at the new size, and clients
+/// get the new geometry and a keyframe.
 pub fn spawn(
     cfg: VideoConfig,
     hub: Arc<Hub>,
@@ -80,17 +452,11 @@ pub fn spawn(
     if let Some(s) = &screen {
         *hub.resize_max.lock() = Some(s.max());
     }
-    let mut p = build(&cfg, &hub)?;
+    let mut cap = build(&cfg, &hub)?;
     std::thread::Builder::new()
         .name("capture".into())
         .spawn(move || loop {
-            let Pipeline {
-                mut cap,
-                job_tx,
-                ret_rx,
-                encode,
-            } = p;
-            if let Err(e) = capture_loop(&mut cap, cfg.clone(), hub.clone(), job_tx, ret_rx) {
+            if let Err(e) = capture_loop(&mut cap, cfg.clone(), hub.clone(), screen.as_mut()) {
                 #[cfg(target_os = "linux")]
                 let resized = cap.geometry_changed();
                 #[cfg(not(target_os = "linux"))]
@@ -99,34 +465,27 @@ pub fn spawn(
                     log::info!("capture geometry changed: {e}");
                 } else {
                     log::error!("capture loop ended: {e}");
-                    std::process::exit(1);
+                    crate::logging::exit(1);
                 }
             }
             drop(cap);
-            let _ = encode.join();
             #[cfg(target_os = "macos")]
             let display_request = hub.display_req.lock().take();
             #[cfg(target_os = "macos")]
             if let Some(request) = display_request {
                 // A resize for the old monitor must not be applied to the new one.
                 hub.resize_req.lock().take();
-                p = switch_display(request, &cfg, &hub, &mut screen).unwrap_or_else(|e| {
+                cap = switch_display(request, &cfg, &hub, &mut screen).unwrap_or_else(|e| {
                     log::error!("display switch failed: {e}");
-                    std::process::exit(1);
+                    crate::logging::exit(1);
                 });
                 continue;
             }
-            let req = hub.resize_req.lock().take();
-            if let (Some(s), Some((w, h))) = (screen.as_mut(), req) {
-                if let Err(e) = s.resize(w, h) {
-                    log::warn!("resize to {w}x{h} failed: {e}");
-                }
-            }
-            p = match build(&cfg, &hub) {
-                Ok(p) => p,
+            cap = match build(&cfg, &hub) {
+                Ok(cap) => cap,
                 Err(e) => {
                     log::error!("video restart failed: {e}");
-                    std::process::exit(1);
+                    crate::logging::exit(1);
                 }
             };
         })
@@ -140,7 +499,7 @@ fn switch_display(
     cfg: &VideoConfig,
     hub: &Arc<Hub>,
     screen: &mut Option<crate::screen::Screen>,
-) -> Result<Pipeline, String> {
+) -> Result<Capturer, String> {
     let previous = crate::mac::display();
     let mut open = |id| {
         // Best effort: an app-only mode change is undone by macOS when voxl exits.
@@ -167,17 +526,23 @@ fn switch_display(
         .recv_timeout(Duration::from_secs(2))
         .map_err(|e| e.to_string())
         .and_then(|_| open(request.id));
-    let pipeline = attempt.or_else(|e| {
+    let cap = attempt.or_else(|e| {
         log::warn!("display switch: {e}; restoring the previous display");
         open(previous)
     })?;
     *hub.input.lock() = Some(request.sender);
-    Ok(pipeline)
+    Ok(cap)
 }
 
-fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
+/// The capture of the screen as it is now, and its geometry for the viewers.
+fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Capturer, String> {
     let cap = Capturer::new(cfg.display.as_deref(), cfg.debug)?;
     let (w, h) = (cap.width, cap.height);
+    // A video message places its stripe by the stripe's top row, in 16 bits.
+    let rows = u16::try_from(h).map_err(|_| {
+        let most = u16::MAX;
+        format!("a screen of {h} rows is taller than a video message can place ({most})")
+    })?;
     hub.width.store(w, Ordering::Relaxed);
     hub.height.store(h, Ordering::Relaxed);
     hub.activity.reset(w, h);
@@ -185,54 +550,11 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
         "capturing {}x{} @ {} fps, preset {} threads {}",
         w,
         h,
-        cfg.fps,
+        cfg.fps.get(),
         cfg.preset,
         cfg.threads
     );
-
-    let (job_tx, job_rx) = mpsc::sync_channel::<Job>(1);
-    let (ret_tx, ret_rx) = mpsc::channel::<(usize, Box<I420>)>();
-    let layout = stripe_layout(h, cfg.stripes);
-    let mut stripes = Vec::new();
-    for &(y, sh) in &layout {
-        let fixed = if cfg.adaptive_threads {
-            1
-        } else {
-            (cfg.threads / layout.len() as u32).max(1)
-        };
-        let ecfg = EncoderConfig {
-            width: w,
-            height: sh,
-            fps: cfg.fps,
-            preset: cfg.preset.clone(),
-            threads: fixed,
-            debug: cfg.debug,
-            crf: cfg.crf,
-            max_kbps: cfg.max_kbps,
-            me_range: crate::encoder::ME_RANGE,
-        };
-        let max_threads = if cfg.adaptive_threads {
-            (cfg.threads / layout.len() as u32).max(1)
-        } else {
-            1
-        };
-        stripes.push(Stripe {
-            y: y as usize,
-            h: sh as usize,
-            enc: Encoder::new(&ecfg)?,
-            cfg: ecfg,
-            max_threads,
-            applied_kbps: 0,
-            applied_crf: -1.0,
-        });
-    }
-    *hub.stripes.lock() = layout;
-    let hub2 = hub.clone();
-    let (crf, po_crf, debug) = (cfg.crf, cfg.paintover_crf, cfg.debug);
-    let encode = std::thread::Builder::new()
-        .name("encode".into())
-        .spawn(move || encode_loop(stripes, job_rx, ret_tx, hub2, crf, po_crf, debug))
-        .unwrap();
+    *hub.stripes.lock() = stripe_layout(rows, cfg.stripes).rows().collect();
     #[cfg(target_os = "macos")]
     {
         let resizing = hub.resize_max.lock().is_some();
@@ -245,315 +567,828 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
     }
     // New geometry (and a keyframe) for clients already connected; no-op at startup.
     hub.restart_clients();
-    Ok(Pipeline {
-        cap,
-        job_tx,
-        ret_rx,
-        encode,
-    })
+    Ok(cap)
 }
 
-fn flow_ok(hub: &Hub, interval_ms: f64) -> bool {
-    for c in hub.video_clients() {
-        let (n, age) = c.backlog();
-        if n == 0 {
-            continue;
-        }
-        let rtt = match c.min_rtt_ms.load(Ordering::Relaxed) {
-            0 => 40,
-            r => r,
-        } as f64;
-        // Enough frames in flight to cover one RTT plus decode, but never more than ~rtt+120ms of queue.
-        let max_n = (((rtt + 40.0) / interval_ms).ceil() as usize + 2).clamp(3, 40);
-        let max_age = rtt as u128 + 120;
-        if age > 4000 {
-            // Stalled client (hidden tab, dead socket): stop letting it gate everyone.
-            log::warn!(
-                "client {} stalled ({} frames, {} ms); resyncing",
-                c.id,
-                n,
-                age
-            );
-            c.inflight.lock().clear();
-            c.needs_keyframe.store(true, Ordering::Relaxed);
-            c.started.store(false, Ordering::Relaxed);
-            continue;
-        }
-        if n >= max_n || age > max_age {
-            return false;
-        }
-    }
-    true
-}
+/// A viewer whose oldest frame on its way has been on its way this long has stalled (a
+/// dead socket, a path queued for seconds): 4 s. Upstream's guess (051bb63), unmeasured.
+/// Until then a viewer whose window has no room holds every viewer's picture; from then
+/// it holds no other viewer's: a capture that goes to the others leaves it behind
+/// (`Viewer::Behind`), sent nothing more, until everything on its way has come back, and
+/// then it is sent one keyframe. Alone, it holds the capture until its acks come. On TCP
+/// its frames are late, not lost, and a keyframe, the largest thing the stream sends, sent
+/// into its path would reach it last. At half
+/// (2 s), a path whose round trip swings by 2 s (a slow link's reached 2.7 s) stops holding
+/// the others at every swing; at double (8 s), one stopped viewer freezes every other
+/// viewer's picture for 8 s. It is also the longest a sharpening pass waits for one
+/// viewer's ack (`InFlight`): at double, a viewer that answers nothing slows every other
+/// viewer's sharpening to a pass per 8 s.
+pub const STALLED: Duration = Duration::from_millis(4000);
 
-/// Delay-based bitrate adaptation: back off toward the measured delivery rate when
-/// acks show queueing, probe upward slowly when the path is clear.
-struct RateCtl {
-    target: f64,
-    max: f64,
-    min: f64,
-    last_eval: Instant,
-    last_dec: Instant,
-    last_inc: Instant,
-    /// Ramp multiplicatively until the first sign of congestion (like TCP slow start),
-    /// so a session neither starts by flooding a slow link nor crawls up on a fast one.
-    slow_start: bool,
-    /// Delivery rate observed at the last congestion: the path's likely capacity.
-    ceiling: f64,
-    ceiling_at: Instant,
-}
-
-/// Starting point for a new session's bitrate cap (kbit/s).
-const START_KBPS: f64 = 8000.0;
-
-impl RateCtl {
-    fn new(max: f64, min: f64) -> Self {
-        let past = Instant::now() - Duration::from_secs(10);
-        RateCtl {
-            target: START_KBPS.min(max),
-            max,
-            min,
-            last_eval: past,
-            last_dec: past,
-            last_inc: past,
-            slow_start: true,
-            ceiling: f64::MAX,
-            ceiling_at: past,
-        }
+impl Gated {
+    /// What the look at the viewers saw of their ways, in the hub's order, but those left
+    /// behind, which are sent nothing.
+    fn ask(seen: &[(Arc<Client>, Seen)]) -> Gated {
+        Gated::of(sent(seen).map(|v| v.way))
     }
 
-    fn update(&mut self, hub: &Hub, clients: &[Arc<crate::hub::Client>]) {
-        if self.last_eval.elapsed() < Duration::from_millis(100) {
-            return;
-        }
-        self.last_eval = Instant::now();
-        let mut congested = false;
-        let mut clear = true;
-        let mut rate = f64::MAX;
-        let mut delivered = 0f64;
-        for c in clients {
-            if !c.started.load(Ordering::Relaxed) {
-                continue;
-            }
-            let q = c.delay.lock().queue_ms;
-            let (_, age) = c.backlog();
-            let rtt = match c.min_rtt_ms.load(Ordering::Relaxed) {
-                0 => 40,
-                r => r,
-            } as f64;
-            if q > 30.0 || age as f64 > rtt + 80.0 {
-                congested = true;
-                let r = c.delivered.lock().rate_bps / 1000.0;
-                if r > 0.0 {
-                    rate = rate.min(r);
+    /// What the viewers' ways let a frame take: the least room of those that have not
+    /// stalled; held by the first with no room, until an ack makes some or it stalls. A
+    /// stalled viewer holds no other: the gate opens while another has room. Alone, or
+    /// beside only stalled ones, it holds the capture until its acks come, so a viewer
+    /// alone is never sent more than its window allows.
+    fn of(ways: impl IntoIterator<Item = Way>) -> Gated {
+        let mut gated = Gated::Held { until: None };
+        for way in ways {
+            gated = match (way, gated) {
+                (Way::Full { stalls }, _) => {
+                    return Gated::Held {
+                        until: Some(stalls),
+                    }
                 }
-            }
-            if q > 15.0 {
-                clear = false;
-            }
-            delivered = delivered.max(c.delivered.lock().rate_bps / 1000.0);
+                (Way::Room(room), Gated::Open(least)) => Gated::Open(room.min(least)),
+                (Way::Room(room), Gated::Held { .. }) => Gated::Open(room),
+                (Way::Stalled, gated) => gated,
+            };
         }
-        let now = Instant::now();
-        if congested && self.last_dec.elapsed() >= Duration::from_millis(300) {
-            let mut t = self.target * 0.85;
-            // Delivery rate only says something about capacity when we were actually
-            // pushing near the target; congestion from one big frame on an idle screen
-            // would otherwise pin the ceiling at a few kbps.
-            if rate.is_finite() && rate >= self.target * 0.5 {
-                self.ceiling = rate;
-                self.ceiling_at = now;
-                t = t.min(rate * 0.85);
-            }
-            self.target = t.max(self.min);
-            self.last_dec = now;
-            self.slow_start = false;
-            log::debug!(
-                "rate: congested, target {:.0} kbps (delivered {:.0})",
-                self.target,
-                rate
-            );
-        } else if self.slow_start
-            && !congested
-            && clear
-            && self.last_inc.elapsed() >= Duration::from_millis(250)
-        {
-            // Only probe upward once the content actually presses against the cap.
-            if delivered >= self.target * 0.5 {
-                self.target = (self.target * 1.5).min(self.max);
-                self.last_inc = now;
-                log::debug!(
-                    "rate: slow start, target {:.0} kbps (delivered {:.0})",
-                    self.target,
-                    delivered
-                );
-            }
-        } else if !congested
-            && clear
-            && self.last_dec.elapsed() >= Duration::from_secs(1)
-            && delivered >= self.target * 0.5
-        {
-            // Only raise the cap while the content actually uses it: an idle screen says
-            // nothing about the path, and an inflated cap overshoots the next burst.
-            // Paths change; forget a capacity estimate that hasn't been confirmed lately.
-            if self.ceiling_at.elapsed() >= Duration::from_secs(15) {
-                self.ceiling = f64::MAX;
-            }
-            // Recover quickly to just under the known capacity, then probe past it gently
-            // so a busy link isn't driven into the queue every couple of seconds.
-            if self.target < self.ceiling * 0.9
-                && self.last_inc.elapsed() >= Duration::from_millis(200)
-            {
-                self.target = (self.target * 1.06 + 100.0)
-                    .min(self.ceiling * 0.9)
-                    .min(self.max);
-                self.last_inc = now;
-            } else if self.target >= self.ceiling * 0.9
-                && self.last_inc.elapsed() >= Duration::from_millis(1000)
-            {
-                self.target = (self.target * 1.02).min(self.max);
-                self.last_inc = now;
-            }
-        }
-        hub.target_kbps.store(self.target as u32, Ordering::Relaxed);
+        gated
     }
 }
 
 /// Regional sharpening. Blocks encoded while they changed carry motion-level quality;
 /// once a block has been still for a while it is re-encoded at paint-over quality,
 /// even while other parts of the screen keep moving (a playing video would otherwise
-/// keep the frame-level paint-over from ever running).
+/// keep the frame-level paint-over from ever running). A block stays pending until a
+/// frame that re-encoded it came out at paint-over quality (`sharpened`): one the rate
+/// cap squeezed leaves it for the next pass, which motion elsewhere does not put off.
 struct Refiner {
-    epoch: Instant,
-    changed_ms: Vec<u32>,
-    pending: Vec<bool>,
+    blocks: Vec<Block>,
     last_refine: Instant,
     cols: usize,
 }
 
-const REFINE_STILL_MS: u32 = 300;
+/// A macroblock, as sharpening sees it.
+#[derive(Clone, Copy)]
+enum Block {
+    Sharp,
+    /// Sent at motion quality, or by a pass the cap squeezed, last changed at `changed`.
+    Pending {
+        changed: Instant,
+    },
+}
+
+const REFINE_STILL: Duration = Duration::from_millis(300);
 const REFINE_EVERY: Duration = Duration::from_millis(250);
 
 impl Refiner {
-    fn new(blocks: usize, cols: usize) -> Self {
+    fn new(blocks: usize, cols: usize, now: Instant) -> Self {
         Refiner {
-            epoch: Instant::now(),
-            changed_ms: vec![0; blocks],
-            pending: vec![false; blocks],
-            last_refine: Instant::now(),
+            blocks: vec![Block::Sharp; blocks],
+            last_refine: now,
             cols,
         }
     }
-    fn now(&self) -> u32 {
-        self.epoch.elapsed().as_millis() as u32
-    }
-    fn mark(&mut self, dirty: &[u8]) {
-        let now = self.now();
-        for (i, &d) in dirty.iter().enumerate() {
+    fn mark(&mut self, dirty: &[u8], now: Instant) {
+        for (b, &d) in self.blocks.iter_mut().zip(dirty) {
             if d != 0 {
-                self.pending[i] = true;
-                self.changed_ms[i] = now;
+                *b = Block::Pending { changed: now };
             }
         }
     }
-    fn mark_all(&mut self) {
-        let now = self.now();
-        self.pending.fill(true);
-        self.changed_ms.fill(now);
+    fn mark_all(&mut self, now: Instant) {
+        self.blocks.fill(Block::Pending { changed: now });
     }
-    fn clear_all(&mut self) {
-        self.pending.fill(false);
+    /// Every block, as the blocks a frame captured at `now` sharpens: a keyframe codes
+    /// them all.
+    fn every_block(&self, now: Instant) -> Sharpen {
+        Sharpen {
+            map: Arc::new(vec![1; self.blocks.len()]),
+            at: now,
+        }
+    }
+    /// A frame captured at `at` coded `map`'s blocks at paint-over quality: they are
+    /// sharp now, unless they changed again since.
+    fn sharpened(&mut self, map: &[u8], at: Instant) {
+        for (b, &m) in self.blocks.iter_mut().zip(map) {
+            if let Block::Pending { changed } = *b {
+                if m != 0 && changed <= at {
+                    *b = Block::Sharp;
+                }
+            }
+        }
+    }
+    /// The rows of 16 px the blocks `map` marks span, if it marks any.
+    fn band(&self, map: &[u8]) -> Option<Band> {
+        let mut rows = map
+            .iter()
+            .enumerate()
+            .filter(|&(_, &m)| m != 0)
+            .map(|(i, _)| i / self.cols);
+        let first = rows.next()?;
+        let last = rows.next_back().unwrap_or(first);
+        Some(Band {
+            y0: (first * 16) as u32,
+            y1: ((last + 1) * 16) as u32,
+        })
     }
     /// Every block not yet sharpened (1 = encode) and the row band they span.
     fn pending_map(&self) -> Option<(Vec<u8>, Band)> {
-        let (mut r0, mut r1) = (usize::MAX, 0);
         let map: Vec<u8> = self
-            .pending
+            .blocks
             .iter()
-            .enumerate()
-            .map(|(i, &p)| {
-                if p {
-                    r0 = r0.min(i / self.cols);
-                    r1 = r1.max(i / self.cols + 1);
+            .map(|b| matches!(b, Block::Pending { .. }) as u8)
+            .collect();
+        self.band(&map).map(|band| (map, band))
+    }
+    /// Blocks due for sharpening on a frame that carries motion (1 = refine): pending and
+    /// still for `REFINE_STILL`. At most every `REFINE_EVERY`, so a block whose pass came
+    /// back squeezed goes again that long after it, until one comes back sharp.
+    fn due(&mut self, now: Instant) -> Option<(Vec<u8>, Band)> {
+        if now.saturating_duration_since(self.last_refine) < REFINE_EVERY {
+            return None;
+        }
+        let map: Vec<u8> = self
+            .blocks
+            .iter()
+            .map(|b| match *b {
+                Block::Pending { changed }
+                    if now.saturating_duration_since(changed) >= REFINE_STILL =>
+                {
+                    1
                 }
-                p as u8
+                Block::Sharp | Block::Pending { .. } => 0,
             })
             .collect();
-        (r1 > r0).then(|| {
-            (
-                map,
-                Band {
-                    y0: (r0 * 16) as u32,
-                    y1: (r1 * 16) as u32,
-                },
-            )
-        })
+        let band = self.band(&map)?;
+        self.last_refine = now;
+        Some((map, band))
     }
-    /// Blocks due for sharpening (1 = refine) and the row band they span.
-    fn due(&mut self) -> Option<(Vec<u8>, Band)> {
-        if self.last_refine.elapsed() < REFINE_EVERY {
-            return None;
+}
+
+/// When the next sharpening pass may go: once the screen has been still for `delay`, and
+/// from then on with every capture, until nothing is pending. A pass spends what the frame
+/// budget allows, as any frame does, so passes one after another send what the target
+/// carries and no more.
+#[derive(Debug, PartialEq)]
+struct Sharpening {
+    /// Stillness before the first pass (`--paintover-delay-ms`).
+    delay: Duration,
+    state: Schedule,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Schedule {
+    Idle,
+    /// Something moved: passes are due from this instant on.
+    From(Instant),
+}
+
+/// What a keyframe is to sharpening.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Keyframe {
+    /// For a viewer or a decoder that needs one: every block at keyframe quality, to be
+    /// sharpened once the screen has been still for the delay.
+    Fresh,
+    /// In place of a due pass: coded at paint-over quality and sharpening every block,
+    /// and passes go on.
+    Pass,
+}
+
+/// When a sharpening pass is due.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Due {
+    Now,
+    In(Duration),
+    Never,
+}
+
+impl Sharpening {
+    fn new(delay: Duration) -> Self {
+        Sharpening {
+            delay,
+            state: Schedule::Idle,
         }
-        let now = self.now();
-        let mut map = vec![0u8; self.pending.len()];
-        let (mut r0, mut r1, mut any) = (usize::MAX, 0, false);
-        for (i, m) in map.iter_mut().enumerate() {
-            if self.pending[i] && now.saturating_sub(self.changed_ms[i]) >= REFINE_STILL_MS {
-                *m = 1;
-                self.pending[i] = false;
-                let row = i / self.cols;
-                r0 = r0.min(row);
-                r1 = r1.max(row + 1);
-                any = true;
-            }
+    }
+    /// Something moved: passes once the screen has been still for `delay`.
+    fn on_motion(&mut self, now: Instant) {
+        self.state = Schedule::From(now + self.delay);
+    }
+    /// A keyframe went out, every block of it at keyframe quality. In place of a due
+    /// pass it is that pass, and passes go on. Otherwise it is, to the schedule, what
+    /// motion is: the Refiner counts every block as changed at `now`, so passes follow
+    /// once the screen has been still for `delay`, though nothing on it moved.
+    fn on_key(&mut self, key: Keyframe, now: Instant) {
+        match key {
+            Keyframe::Pass => {}
+            Keyframe::Fresh => self.on_motion(now),
         }
-        if !any {
-            return None;
+    }
+    fn on_nothing_pending(&mut self) {
+        self.state = Schedule::Idle;
+    }
+    fn due(&self, now: Instant) -> Due {
+        match self.state {
+            Schedule::Idle => Due::Never,
+            Schedule::From(at) if now >= at => Due::Now,
+            Schedule::From(at) => Due::In(at - now),
         }
-        self.last_refine = Instant::now();
-        Some((
-            map,
-            Band {
-                y0: (r0 * 16) as u32,
-                y1: (r1 * 16) as u32,
+    }
+}
+
+/// Captures may come this share of the frame interval apart, so that a source's jitter
+/// does not alias into dropped frames. Upstream's guess, unmeasured. It caps the capture
+/// rate at the frame rate over it (70.6 a second at 60): at 1, a frame that lands a
+/// little early waits a whole interval; at 0.7, up to 86 captures a second.
+const MIN_INTERVAL_SHARE: f64 = 0.85;
+
+/// What the capture loop does next.
+#[derive(Debug, PartialEq)]
+enum Step<B> {
+    /// Wait, the buffer where it was.
+    Wait(Wait, Buffer<B>),
+    /// Capture a change or a pass into the buffer that was home, a frame that may take this
+    /// many bytes.
+    Capture(Next, B, usize),
+}
+
+/// What the capture loop waits for before it looks again. Damage wakes it through the
+/// capturer; the hub's waker, through a viewer's command or ack, a viewer leaving, a
+/// screenshot or recording asked for, or a buffer coming home from the encoder.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Wait {
+    /// Damage or a wake: nothing is due.
+    Change,
+    /// The sharpening pass due in this long, or damage or a wake: an ack that empties the
+    /// viewers' paths sooner is one.
+    Pass(Duration),
+    /// The rest of the least interval since the capture that gates this one (`Captured`),
+    /// or what the capture it holds back is woken by (`Next::interval_ends`).
+    Interval { rest: Duration, next: Next },
+    /// The drawing, until it has been quiet long enough or the frame's deadline comes,
+    /// in this long: damage (which may push the quiet on), or a wake, or that time.
+    Settle(Duration),
+    /// The flow gate: an ack, a viewer going or a keyframe asked for (a wake), or damage
+    /// to take in, or in this long, when the viewer it holds for will have stalled.
+    Gate(Option<Duration>),
+    /// A buffer back from the encoder, which wakes the waker as it hands it back; damage
+    /// waits for the capture this leads to.
+    Buffer,
+}
+
+/// What a wait wakes on besides its time.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum On {
+    /// Damage or the hub's waker.
+    Event,
+    /// The hub's waker only.
+    Wake,
+}
+
+impl Wait {
+    fn wait(self, cap: &impl Capture, hub: &Hub) {
+        let poll = |on, timeout| match on {
+            On::Event => wait_any([cap.fd(), hub.waker.waitable()], timeout),
+            On::Wake => wait_any([hub.waker.waitable()], timeout),
+        };
+        self.through(poll);
+    }
+
+    /// The wait, made through `poll`: until its time, or with no limit.
+    fn through(self, poll: impl FnOnce(On, Option<Duration>)) {
+        match self {
+            Wait::Change => poll(On::Event, None),
+            Wait::Pass(due) => poll(On::Event, Some(due)),
+            Wait::Interval { rest, next } => poll(next.interval_ends(), Some(rest)),
+            Wait::Settle(rest) => poll(On::Event, Some(rest)),
+            Wait::Gate(stalls) => poll(On::Event, stalls),
+            Wait::Buffer => poll(On::Wake, None),
+        }
+    }
+}
+
+/// Whether a viewer waits for a keyframe.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Key {
+    /// One does: the keyframe goes to every viewer, and the slowest of their paths carries
+    /// this many bytes in `window::LATENESS`.
+    Wanted {
+        carries: usize,
+    },
+    NotWanted,
+}
+
+impl Key {
+    /// What the look at the viewers saw: a keyframe is wanted if one waits for it, and it
+    /// goes to every viewer but those left behind, so the slowest of their paths bounds it.
+    fn of(seen: &[(Arc<Client>, Seen)]) -> Key {
+        seen.iter()
+            .any(|(_, v)| v.viewer == Viewer::Waiting)
+            .then(|| sent(seen).map(|v| v.carries).min())
+            .flatten()
+            .map_or(Key::NotWanted, |carries| Key::Wanted { carries })
+    }
+}
+
+/// What the look saw of the viewers a frame goes to: all but those left behind.
+fn sent(seen: &[(Arc<Client>, Seen)]) -> impl Iterator<Item = &Seen> {
+    seen.iter()
+        .map(|(_, v)| v)
+        .filter(|v| v.viewer != Viewer::Behind)
+}
+
+/// When the areas a capturer holds were drawn: the first since it was last taken, and
+/// the latest.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Drawing {
+    pub first: Instant,
+    pub last: Instant,
+}
+
+/// What changed on screen since the last capture, as each platform's capturer holds it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Damage {
+    None,
+    /// To be captured though no area was reported: a new capturer, or the screen grabbed
+    /// whole for a new stream.
+    Unreported,
+    /// Rows `y0..y1` drawn, over `drawing`.
+    Rows {
+        drawing: Drawing,
+        y0: u32,
+        y1: u32,
+    },
+}
+
+impl Damage {
+    /// Rows `top..bot` were drawn at `now`.
+    pub(crate) fn add(&mut self, top: u32, bot: u32, now: Instant) {
+        *self = match *self {
+            Damage::Rows { drawing, y0, y1 } => Damage::Rows {
+                drawing: Drawing {
+                    first: drawing.first,
+                    last: now,
+                },
+                y0: y0.min(top),
+                y1: y1.max(bot),
             },
-        ))
+            Damage::None | Damage::Unreported => Damage::Rows {
+                drawing: Drawing {
+                    first: now,
+                    last: now,
+                },
+                y0: top,
+                y1: bot,
+            },
+        };
+    }
+
+    /// To be captured whether or not anything is drawn.
+    pub(crate) fn mark(&mut self) {
+        if let Damage::None = self {
+            *self = Damage::Unreported;
+        }
+    }
+
+    /// The rows drawn since the last take, aligned to even rows for 4:2:0 within a
+    /// picture `height` tall; nothing is left.
+    pub(crate) fn take(&mut self, height: u32) -> Option<Band> {
+        match std::mem::replace(self, Damage::None) {
+            Damage::Rows { y0, y1, .. } => Some(Band {
+                y0: y0 & !1,
+                y1: ((y1 + 1) & !1).min(height),
+            }),
+            Damage::None | Damage::Unreported => None,
+        }
+    }
+}
+
+/// Whether the flow gate lets a capture go: open while a viewer has room and none asked
+/// is `Full`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Gated {
+    /// With room for a frame of this many bytes.
+    Open(usize),
+    /// Held by a full viewer until it will have stalled, or, with none, because no viewer
+    /// has room (each has stalled). Before then only an ack, a viewer coming or going or
+    /// a keyframe asked for can open the gate, and each of those wakes the hub.
+    Held { until: Option<Instant> },
+}
+
+/// Where the capture loop's buffer is: home, with what is home (the buffer itself in the
+/// loop; nothing in a test of what the loop decides), or away at the encoder.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Buffer<B> {
+    Home(B),
+    Away,
+}
+
+/// What the viewers' paths hold queued, as a sharpening pass sees it. A pass goes out only
+/// into empty queues, each window's room all of what its path carries: on a path slower
+/// than what the encoder makes of a page, passes sent one after another queue on it, and
+/// the keystroke after them waits behind them all (a 0.3 to 0.66 Mbit/s path stayed busy
+/// with 743 passes for 36 s after a 12 s scroll). Motion is not held: the first place on
+/// an empty queue is the next keystroke's. On a path with a round trip, frames are in
+/// flight for all of it though nothing is queued, so waiting for every ack sent a pass
+/// once a round trip.
+///
+/// A viewer holds a pass until its queue empties, or until the newest frame on its way has
+/// had `STALLED`. One that answers nothing (a dead socket) so slows the others' sharpening
+/// to a pass per `STALLED`, and cannot stop it. One that answers but is seconds behind (a
+/// slow path's queue) holds every pass until it has caught up: the age of its oldest
+/// frame, which the flow gate reads, would let passes pour into that queue.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum InFlight {
+    /// Every viewer's queue is empty, or the newest frame on its way has had `STALLED`.
+    Nothing,
+    /// A viewer's queue holds frames: in this long every viewer's will have emptied, or
+    /// its newest frame will have had `STALLED`, unless an ack comes first.
+    Frames(Duration),
+}
+
+impl InFlight {
+    /// At `now`, from until when each viewer holds a pass, if it does (`holds_pass`).
+    fn of(now: Instant, holds: impl IntoIterator<Item = Option<Instant>>) -> InFlight {
+        holds
+            .into_iter()
+            .flatten()
+            .max()
+            .map_or(InFlight::Nothing, |until| InFlight::Frames(until - now))
+    }
+
+    /// What the look at `now` saw of the queues of the viewers a pass would go to.
+    fn ask(seen: &[(Arc<Client>, Seen)], now: Instant) -> InFlight {
+        InFlight::of(now, sent(seen).map(|v| v.holds))
+    }
+}
+
+/// What the capture loop sees of one viewer when it looks, in one read of it
+/// (`Client::look`): what it decides of the viewer, it decides from this, once.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Seen {
+    viewer: Viewer,
+    /// What a frame leaving finds on its way, a viewer whose oldest frame on its way has
+    /// had `STALLED` taken to have stalled.
+    way: Way,
+    /// What its path carries in `LATENESS`.
+    carries: usize,
+    /// Until when it holds a pass, if it does (`holds_pass`).
+    holds: Option<Instant>,
+}
+
+impl Seen {
+    /// A viewer that is `viewer` to the stream, reached by `reach`, at `now`, `ceiling`
+    /// being the most any window carries. The recorder takes every frame as it is sent: it
+    /// is seen with all the room any window may have, so beside viewers it bounds nothing,
+    /// and alone it lets a capture take the ceiling.
+    fn of(viewer: Viewer, reach: &Reach, now: Instant, ceiling: usize) -> Seen {
+        match reach {
+            Reach::Path(w) => Seen {
+                viewer,
+                way: w.way(now, STALLED),
+                carries: w.carries(),
+                holds: holds_pass(w, now),
+            },
+            Reach::Recorder => Seen {
+                viewer,
+                way: Way::Room(ceiling),
+                carries: ceiling,
+                holds: None,
+            },
+        }
+    }
+
+    /// One look at each watching viewer at `now`, into `into` in place of what it held.
+    fn all(hub: &Hub, now: Instant, into: &mut Vec<(Arc<Client>, Seen)>) {
+        let ceiling = hub.ceiling();
+        hub.look_into(into, |viewer, reach| Seen::of(viewer, reach, now, ceiling));
+    }
+}
+
+/// A capture goes to the viewers that had room when the loop looked, or to one that
+/// wanted a keyframe: one of them had not stalled. Each viewer the look saw started and
+/// stalled is left behind (`Client::left_behind`), as the gate that sized the capture
+/// without it took it to be.
+fn leave_behind(seen: &[(Arc<Client>, Seen)]) {
+    for (c, v) in seen {
+        if let (Viewer::Started, Way::Stalled) = (v.viewer, v.way) {
+            c.left_behind();
+        }
+    }
+}
+
+/// Until when one viewer's window holds a pass at `now`, if it does: until its queue
+/// empties, or the newest frame on its way has had `STALLED`, whichever is first.
+fn holds_pass(w: &Window, now: Instant) -> Option<Instant> {
+    let stalls = w.newest()? + STALLED;
+    let until = w.empties(now).map_or(stalls, |empties| empties.min(stalls));
+    (until > now).then_some(until)
+}
+
+/// What the capture loop knows when it looks, while somebody watches.
+struct Look<B> {
+    key: Key,
+    damage: Damage,
+    due: Due,
+    now: Instant,
+    captured: Captured,
+    /// The least time between two captures.
+    min_interval: Duration,
+    /// How long the drawing must have been quiet before it is captured (`--coalesce-us`).
+    quiet: Duration,
+    /// The frame's deadline: the longest a capture waits for the drawing to go quiet,
+    /// from its first damage. One frame interval, so a screen that never stops drawing
+    /// is still captured at the frame rate.
+    deadline: Duration,
+    gate: Gated,
+    buffer: Buffer<B>,
+    in_flight: InFlight,
+}
+
+/// What the loop does next, from what it knows. A capture takes the buffer, so one is
+/// made only when it is home; a wait leaves it where it was.
+fn step<B>(look: Look<B>) -> Step<B> {
+    let Look {
+        key,
+        damage,
+        due,
+        now,
+        captured,
+        min_interval,
+        quiet,
+        deadline,
+        gate,
+        buffer,
+        in_flight,
+    } = look;
+    let next = match (damage, key) {
+        // Nothing moved and no keyframe is wanted. A pass goes only to an idle encoder,
+        // as every capture does (below); until then a change may come, and with it the
+        // capture is motion's.
+        (Damage::None, Key::NotWanted) => match (due, &buffer, in_flight) {
+            (Due::Now, Buffer::Home(_), InFlight::Nothing) => Next::Pass,
+            // Nor onto a path that has frames on it: behind them, it would hold the next
+            // keystroke back by all of them.
+            (Due::Now, Buffer::Home(_), InFlight::Frames(last)) => {
+                return Step::Wait(Wait::Pass(last), buffer)
+            }
+            (Due::Now, Buffer::Away, _) | (Due::Never, _, _) => {
+                return Step::Wait(Wait::Change, buffer)
+            }
+            (Due::In(due), _, _) => return Step::Wait(Wait::Pass(due), buffer),
+        },
+        (Damage::Unreported | Damage::Rows { .. }, Key::Wanted { .. } | Key::NotWanted)
+        | (Damage::None, Key::Wanted { .. }) => Next::Change,
+    };
+    let since = now.saturating_duration_since(captured.gate(next));
+    if since < min_interval {
+        let rest = min_interval - since;
+        return Step::Wait(Wait::Interval { rest, next }, buffer);
+    }
+    // An app that presents a frame as a burst of puts is still drawing it until the puts
+    // stop: capture once the drawing has been quiet for `quiet`, or at the frame's
+    // deadline, whichever comes first.
+    if let Damage::Rows { drawing, .. } = damage {
+        let at = (drawing.last + quiet).min(drawing.first + deadline);
+        if now < at {
+            return Step::Wait(Wait::Settle(at - now), buffer);
+        }
+    }
+    // A keyframe is not held by the gate: it may take what the slowest path carries in
+    // `KEY_TIME`. Any other frame may take the room the viewers' windows leave.
+    let allowance = match (key, gate) {
+        (Key::Wanted { carries }, _) => window::scale(carries, KEY_TIME, window::LATENESS),
+        (Key::NotWanted, Gated::Open(room)) => room,
+        (Key::NotWanted, Gated::Held { until }) => {
+            return Step::Wait(Wait::Gate(until.map(|until| until - now)), buffer)
+        }
+    };
+    // A capture goes only to an idle encoder. One made while it codes the frame before
+    // would wait for it, a whole encode older by the time it is coded; made once it is
+    // done, it holds what changed meanwhile, and goes at once.
+    match buffer {
+        Buffer::Home(buf) => Step::Capture(next, buf, allowance),
+        Buffer::Away => Step::Wait(Wait::Buffer, Buffer::Away),
+    }
+}
+
+/// What a capture is sent as, or why nothing is.
+enum Planned {
+    Send(Plan),
+    /// A pass was due and nothing is pending: the screen is sharp.
+    Sharp,
+    /// The damage held no area after all, and no pass is due.
+    Empty,
+}
+
+/// What a capture whose damage came to `band` is sent as.
+fn plan(key: Key, band: Option<Band>, due: Due, refiner: &Refiner) -> Planned {
+    match (key, band, due) {
+        (Key::Wanted { .. }, Some(_), Due::Now | Due::In(_) | Due::Never) => {
+            Planned::Send(Plan::Key(Keyframe::Fresh))
+        }
+        (Key::Wanted { .. }, None, Due::Now) => Planned::Send(Plan::Key(Keyframe::Pass)),
+        (Key::Wanted { .. }, None, Due::In(_) | Due::Never) => {
+            Planned::Send(Plan::Key(Keyframe::Fresh))
+        }
+        (Key::NotWanted, Some(moved), Due::Now | Due::In(_) | Due::Never) => {
+            Planned::Send(Plan::Motion(moved))
+        }
+        // Sharpen only what was sent at motion quality; nothing pending, nothing to send.
+        (Key::NotWanted, None, Due::Now) => match refiner.pending_map() {
+            Some((map, band)) => Planned::Send(Plan::Sharpen { map, band }),
+            None => Planned::Sharp,
+        },
+        (Key::NotWanted, None, Due::In(_) | Due::Never) => Planned::Empty,
+    }
+}
+
+/// What the capture loop is about to capture.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Next {
+    /// Something moved, or a viewer wants a keyframe.
+    Change,
+    /// Nothing moved and a pass is due.
+    Pass,
+}
+
+impl Next {
+    /// What ends the wait for the frame interval before capturing this, besides its time.
+    /// Before a pass, damage too: it makes the capture a change, which the pass does not
+    /// hold back.
+    fn interval_ends(self) -> On {
+        match self {
+            Next::Change => On::Wake,
+            Next::Pass => On::Event,
+        }
+    }
+}
+
+/// When the last frames were captured: what holds the next one to the frame rate.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Captured {
+    /// Any frame, a pass included.
+    any: Instant,
+    /// The last change: motion or a keyframe.
+    change: Instant,
+}
+
+impl Captured {
+    fn new(at: Instant) -> Self {
+        Captured {
+            any: at,
+            change: at,
+        }
+    }
+    /// The capture the next frame waits a frame interval after. A pass waits after any
+    /// frame, so passes go at most at the frame rate and never right behind a change. A
+    /// change waits only after the last change: a keystroke that comes just after a pass
+    /// is captured at once and waits for that pass's encode at most, not for a frame.
+    fn gate(&self, next: Next) -> Instant {
+        match next {
+            Next::Pass => self.any,
+            Next::Change => self.change,
+        }
+    }
+    fn on_capture(&mut self, next: Next, at: Instant) {
+        self.any = at;
+        match next {
+            Next::Pass => {}
+            Next::Change => self.change = at,
+        }
     }
 }
 
 /// Notes the damage the capturer has taken for /wait, whether or not anyone is watching.
-fn note_changes(cap: &mut Capturer, hub: &Hub) {
-    if !cap.changes.is_empty() {
-        hub.activity.note(&cap.changes);
-        cap.changes.clear();
+fn note_changes(cap: &mut impl Capture, hub: &Hub) {
+    let changes = cap.changes();
+    if !changes.is_empty() {
+        hub.activity.note(changes);
+        changes.clear();
+    }
+}
+
+/// What the capture loop asks of the screen it captures: the platform's `Capturer`, or a
+/// screen a test draws on.
+trait Capture {
+    /// Width and height, in pixels.
+    fn size(&self) -> (u32, u32);
+    /// Readable when the screen has something to report.
+    fn fd(&self) -> Waitable<'_>;
+    /// Takes in what the screen reported.
+    fn pump(&mut self) -> Result<(), String>;
+    /// The screen changed size.
+    fn needs_rebuild(&self) -> bool;
+    /// The areas changed since `/wait` last took them.
+    fn changes(&mut self) -> &mut Vec<(u32, u32, u32, u32)>;
+    /// What changed since the last capture.
+    fn damage(&mut self) -> &mut Damage;
+    /// The rows damaged since the last take, if any were.
+    fn take_damage(&mut self) -> Result<Option<Band>, String>;
+    /// The macroblocks damaged since the last take, one byte each, row-major.
+    fn take_mb_map(&mut self) -> Vec<u8>;
+    /// Every row.
+    fn full(&self) -> Band;
+    /// Reads `band` of the screen into the frame `convert` reads.
+    fn grab(&mut self, band: Band) -> Result<(), String>;
+    /// Converts rows [y0, y1) of the grabbed frame into `dst`, on `threads` threads.
+    fn convert(&self, dst: &mut I420, y0: usize, y1: usize, threads: usize);
+    /// The whole screen as BGRX, for a screenshot.
+    fn snapshot(&mut self) -> Result<Vec<u8>, String>;
+    /// The grabbed frame as BGRX and its stride (the debug marker's probe).
+    fn bgrx(&self) -> Option<(&[u8], usize)>;
+}
+
+impl Capture for Capturer {
+    fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+    fn fd(&self) -> Waitable<'_> {
+        Capturer::fd(self)
+    }
+    fn pump(&mut self) -> Result<(), String> {
+        Capturer::pump(self)
+    }
+    fn needs_rebuild(&self) -> bool {
+        Capturer::needs_rebuild(self)
+    }
+    fn changes(&mut self) -> &mut Vec<(u32, u32, u32, u32)> {
+        &mut self.changes
+    }
+    fn damage(&mut self) -> &mut Damage {
+        &mut self.damage
+    }
+    fn take_damage(&mut self) -> Result<Option<Band>, String> {
+        Capturer::take_damage(self)
+    }
+    fn take_mb_map(&mut self) -> Vec<u8> {
+        Capturer::take_mb_map(self)
+    }
+    fn full(&self) -> Band {
+        Capturer::full(self)
+    }
+    fn grab(&mut self, band: Band) -> Result<(), String> {
+        Capturer::grab(self, band)
+    }
+    fn convert(&self, dst: &mut I420, y0: usize, y1: usize, threads: usize) {
+        Capturer::convert(self, dst, y0, y1, threads)
+    }
+    fn snapshot(&mut self) -> Result<Vec<u8>, String> {
+        Capturer::snapshot(self)
+    }
+    fn bgrx(&self) -> Option<(&[u8], usize)> {
+        Capturer::bgrx(self)
+    }
+}
+
+/// What sets the screen's size for dynamic resolution: the platform's `screen::Screen`.
+pub(crate) trait Resize {
+    /// Asks for `w`x`h`: the size the screen has now.
+    fn resize(&mut self, w: u32, h: u32) -> Result<(u32, u32), String>;
+}
+
+impl Resize for crate::screen::Screen {
+    fn resize(&mut self, w: u32, h: u32) -> Result<(u32, u32), String> {
+        crate::screen::Screen::resize(self, w, h)
+    }
+}
+
+/// A size asked for, given to the screen: whether the stream, at `streamed`, is rebuilt.
+/// Only a screen whose size really changed rebuilds it and says hello to the viewers; an
+/// ask the screen refuses, or one for the size it has, changes nothing. A rebuild for
+/// either said hello for nothing, and a page that answered each hello by asking again
+/// kept the stream starting over for as long as the screen refused it.
+pub(crate) fn rebuilds_for(
+    screen: &mut impl Resize,
+    (w, h): (u32, u32),
+    streamed: (u32, u32),
+) -> bool {
+    match screen.resize(w, h) {
+        Ok(size) => size != streamed,
+        Err(e) => {
+            log::warn!("resize to {w}x{h} failed: {e}");
+            false
+        }
     }
 }
 
 fn capture_loop(
-    cap: &mut Capturer,
+    cap: &mut impl Capture,
     cfg: VideoConfig,
     hub: Arc<Hub>,
-    job_tx: mpsc::SyncSender<Job>,
-    ret_rx: mpsc::Receiver<(usize, Box<I420>)>,
+    mut screen: Option<&mut crate::screen::Screen>,
 ) -> Result<(), String> {
-    let (w, h) = (cap.width as usize, cap.height as usize);
-    let mut pool: Vec<Option<Box<I420>>> = vec![
-        Some(Box::new(I420::new(w, h))),
-        Some(Box::new(I420::new(w, h))),
-    ];
-    let mut pending: [Option<Band>; 2] = [Some(cap.full()), Some(cap.full())];
-    let mut next_idx = 0usize;
-    let interval = Duration::from_secs_f64(1.0 / cfg.fps as f64);
-    // Allow slight early capture so source jitter doesn't alias into dropped frames.
-    let min_interval = interval.mul_f64(0.85);
-    let interval_ms = interval.as_secs_f64() * 1000.0;
-    let mut last_capture = Instant::now() - interval;
-    let mut last_motion = Instant::now();
-    let mut paintover_left = 0u32;
-    let mut rc = RateCtl::new(cfg.max_kbps as f64, cfg.min_kbps as f64);
-    hub.target_kbps.store(rc.target as u32, Ordering::Relaxed);
-    let mut had_clients = false;
-    let mut full_next = true;
-    let mut refiner = Refiner::new(w.div_ceil(16) * h.div_ceil(16), w.div_ceil(16));
+    let (w, h) = cap.size();
+    let (w, h) = (w as usize, h as usize);
+    let interval = Duration::from_secs_f64(1.0 / cfg.fps.get() as f64);
+    let min_interval = interval.mul_f64(MIN_INTERVAL_SHARE);
+    let mut captured = Captured::new(Instant::now() - interval);
+    let paintover_delay = Duration::from_millis(cfg.paintover_delay_ms);
+    let mut sharpening = Sharpening::new(paintover_delay);
+    let mut refiner = Refiner::new(
+        w.div_ceil(16) * h.div_ceil(16),
+        w.div_ceil(16),
+        Instant::now(),
+    );
     let marker = cfg.debug.marker;
     // The marker is read only where all of it fits this capture (a resize builds a new
     // loop): past an edge its squares are outside the picture or in the next row.
@@ -569,21 +1404,37 @@ fn capture_loop(
         }
         probe
     });
+    // The encoders, while somebody watches. Every way out of the loop drops it, and with it
+    // waits for the encoder to send what it holds.
+    let mut stream: Option<Stream> = None;
+    // What the loop saw of each watching viewer when it last looked: kept, so that a look
+    // allocates nothing once there is room for every viewer.
+    let mut seen: Vec<(Arc<Client>, Seen)> = Vec::new();
 
     loop {
+        // The wake is taken before anything it may stand for is read: a request that
+        // lands after this line wakes the next wait, and one that landed before it is
+        // seen below. Read first and drained after, a resize asked for in between lost
+        // its wake, and the waits below have no time limit.
+        hub.drain_wake();
         #[cfg(target_os = "macos")]
         if hub.display_req.lock().is_some() {
             return Ok(());
         }
-        if hub.resize_req.lock().is_some() || cap.needs_rebuild() {
+        if cap.needs_rebuild() {
             return Ok(());
+        }
+        let asked = hub.resize_req.lock().take();
+        if let (Some(s), Some(want)) = (screen.as_deref_mut(), asked) {
+            if rebuilds_for(s, want, cap.size()) {
+                return Ok(());
+            }
         }
         cap.pump()?;
         if cap.needs_rebuild() {
             return Ok(());
         }
         note_changes(cap, &hub);
-        hub.drain_wake();
         let snaps = std::mem::take(&mut *hub.snapshots.lock());
         if !snaps.is_empty() {
             // The whole current screen, whether or not anyone is watching. Damage
@@ -603,141 +1454,125 @@ fn capture_loop(
                 let _ = tx.send(shot.clone());
             }
         }
-        while let Ok((i, b)) = ret_rx.try_recv() {
-            pool[i] = Some(b);
-        }
-        let clients = hub.video_clients();
-        if clients.is_empty() {
-            if had_clients {
-                rc = RateCtl::new(cfg.max_kbps as f64, cfg.min_kbps as f64);
-                hub.target_kbps.store(rc.target as u32, Ordering::Relaxed);
+        // The encoder holds the sender for as long as it runs: once it is gone, no buffer
+        // will come back to wake the loop.
+        if let Some(s) = stream.as_mut() {
+            loop {
+                match s.ret_rx.try_recv() {
+                    Ok(r) => s.returned(r, &mut refiner),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => return Err("encoder gone".into()),
+                }
             }
-            had_clients = false;
-            wait_any(&[cap.fd(), hub.waker.waitable()], 500);
-            continue;
         }
-        rc.update(&hub, &clients);
-        let want_key = clients
-            .iter()
-            .any(|c| c.needs_keyframe.load(Ordering::Relaxed));
-        if !had_clients {
-            had_clients = true;
-            // Our shm copy may be stale: re-grab everything once.
-            cap.grab(cap.full())?;
-            pending = [Some(cap.full()), Some(cap.full())];
-            cap.damaged = true;
-            full_next = true;
-        }
-        let paintover_due = paintover_left > 0
-            && last_motion.elapsed() >= Duration::from_millis(cfg.paintover_delay_ms);
-        if !cap.damaged && !want_key && !paintover_due {
-            let timeout = if paintover_left == 0 {
-                100
-            } else {
-                cfg.paintover_delay_ms
-                    .saturating_sub(last_motion.elapsed().as_millis() as u64) as i32
-                    + 1
-            };
-            wait_any(&[cap.fd(), hub.waker.waitable()], timeout);
-            continue;
-        }
-        let since = last_capture.elapsed();
-        if since < min_interval {
-            let rem = min_interval - since;
-            wait_any(
-                &[hub.waker.waitable()],
-                (rem.as_micros() as i32 + 999) / 1000,
-            );
-            continue;
-        }
-        // Apps present a frame as a burst of puts; give the burst a moment to land so
-        // the capture holds one whole frame instead of its first tiles.
-        if let Some(t) = cap.damaged_at {
-            let el = t.elapsed();
-            if el < cfg.coalesce {
-                let rem = cfg.coalesce - el;
-                std::thread::sleep(rem);
+        // One reading of the clock and one look at each viewer: the stream, the keyframe and
+        // whom it is promised to, the gate, a pass and who is left behind are all decided
+        // from them. The capture itself is stamped `t0` below, after any wait for a buffer.
+        let now = Instant::now();
+        Seen::all(&hub, now, &mut seen);
+        match (stream.is_some(), seen.is_empty()) {
+            // Nobody watches: a stream is dropped here, once its encoder has sent what it
+            // holds.
+            (_, true) => stream = None,
+            (true, false) => {}
+            // A new stream starts from the whole screen: our shm copy may be stale, and
+            // none of it has been sent, so every block is pending.
+            (false, false) => {
+                let (cw, ch) = cap.size();
+                stream = Some(Stream::new(&cfg, &hub, cw, ch)?);
+                cap.grab(cap.full())?;
+                // The whole screen is grabbed and pending: it holds what was drawn while
+                // nobody watched, so that damage is taken with it, and the stream's first
+                // frame counts from its capture, not from damage no frame took.
+                let _ = cap.damage().take(ch);
+                cap.damage().mark();
+                refiner.mark_all(Instant::now());
+                // The look is older than the stream: its first capture is decided from the
+                // next.
                 continue;
             }
         }
-        if !want_key && !flow_ok(&hub, interval_ms) {
-            hub.stats.flow_blocked.fetch_add(1, Ordering::Relaxed);
-            wait_any(&[cap.fd(), hub.waker.waitable()], 4);
+        let Some(s) = stream.as_mut() else {
+            Wait::Change.wait(cap, &hub);
             continue;
-        }
-        // Need a free buffer (the encoder may still hold the other).
-        if pool[next_idx].is_none() {
-            match ret_rx.recv_timeout(Duration::from_millis(50)) {
-                Ok((i, b)) => pool[i] = Some(b),
-                Err(_) => continue,
-            }
-            if pool[next_idx].is_none() {
+        };
+        let key = Key::of(&seen);
+        let due = sharpening.due(now);
+        let look = Look {
+            key,
+            damage: *cap.damage(),
+            due,
+            now,
+            captured,
+            min_interval,
+            quiet: cfg.coalesce,
+            deadline: interval,
+            gate: Gated::ask(&seen),
+            buffer: std::mem::replace(&mut s.buf, Buffer::Away),
+            in_flight: InFlight::ask(&seen, now),
+        };
+        let step = step(look);
+        let (next, mut buf, allowance) = match step {
+            Step::Wait(wait, buffer) => {
+                s.buf = buffer;
+                if let Wait::Gate(_) = wait {
+                    hub.stats.flow_blocked.fetch_add(1, Ordering::Relaxed);
+                }
+                wait.wait(cap, &hub);
                 continue;
             }
-        }
+            Step::Capture(next, buf, allowance) => (next, buf, allowance),
+        };
+        leave_behind(&seen);
 
         let t0 = Instant::now();
-        let origin = cap.damaged_at.unwrap_or(t0);
+        let origin = match *cap.damage() {
+            Damage::Rows { drawing, .. } => drawing.first,
+            Damage::None | Damage::Unreported => t0,
+        };
         hub.stats
             .damage_wait_us
             .fetch_add((t0 - origin).as_micros() as u64, Ordering::Relaxed);
-        let mut band = None;
-        let mut mb_dirty = (!full_next).then(|| cap.take_mb_map());
-        if full_next {
-            cap.take_mb_map();
-            full_next = false;
-        }
-        match &mb_dirty {
-            Some(m) => refiner.mark(m),
-            None => refiner.mark_all(),
-        }
-        if cap.damaged {
-            band = cap.take_damage()?;
-            if let Some(b) = band {
-                cap.grab(b)?;
-            }
+        let mb_dirty = cap.take_mb_map();
+        refiner.mark(&mb_dirty, t0);
+        let band = cap.take_damage()?;
+        if let Some(b) = band {
+            cap.grab(b)?;
         }
         let t1 = Instant::now();
         if marker.is_some() {
             log::info!(
                 "cap dt {:.1} ms band {:?} grab {} us",
-                last_capture.elapsed().as_secs_f64() * 1000.0,
+                captured.any.elapsed().as_secs_f64() * 1000.0,
                 band,
                 (t1 - t0).as_micros()
             );
         }
         let marker_ms = marker_reading(cap.bgrx(), probe);
-        let is_motion = band.is_some();
-        if !is_motion && !want_key && !paintover_due {
-            // Damage was empty after all.
-            continue;
-        }
-        // Sharpen only what was sent at motion quality; nothing pending, nothing to send.
-        let paint_map = if paintover_due && !is_motion && !want_key {
-            match refiner.pending_map() {
-                Some(m) => Some(m),
-                None => {
-                    paintover_left = 0;
-                    continue;
-                }
+        // What this capture is sent as, decided once; with nothing to send, the buffer
+        // goes back home.
+        let plan = match plan(key, band, due, &refiner) {
+            Planned::Send(plan) => plan,
+            Planned::Sharp => {
+                s.buf = Buffer::Home(buf);
+                sharpening.on_nothing_pending();
+                continue;
             }
-        } else {
-            None
+            Planned::Empty => {
+                s.buf = Buffer::Home(buf);
+                continue;
+            }
         };
-        let idx = next_idx;
-        let mut buf = pool[idx].take().unwrap();
-        let todo = match (pending[idx], band) {
+        let todo = match (s.pending.take(), band) {
             (p, Some(b)) => Some(union(p, b)),
             (p, None) => p,
         };
-        if let Some(b) = band {
-            pending[1 - idx] = Some(union(pending[1 - idx], b));
-        }
-        pending[idx] = None;
         if let Some(t) = todo {
-            cap.convert(&mut buf, t.y0 as usize, t.y1 as usize, cfg.convert_threads);
+            let pic = Arc::get_mut(&mut buf).expect("a picture comes back from every stripe");
+            cap.convert(pic, t.y0 as usize, t.y1 as usize, cfg.convert_threads);
         }
         let t2 = Instant::now();
+        let rows = todo.map_or(0, |t| t.y1 - t.y0);
         hub.stats
             .grab_us
             .fetch_add((t1 - t0).as_micros() as u64, Ordering::Relaxed);
@@ -746,68 +1581,79 @@ fn capture_loop(
             .fetch_add((t2 - t1).as_micros() as u64, Ordering::Relaxed);
         hub.stats.captured.fetch_add(1, Ordering::Relaxed);
 
-        let mut refine = None;
-        let paintover = if is_motion {
-            last_motion = Instant::now();
-            paintover_left = cfg.paintover_burst;
-            // Piggyback sharpening of blocks that have gone still on this frame.
-            refine = if want_key { None } else { refiner.due() };
-            refine.is_some()
-        } else if paintover_due {
-            paintover_left -= 1;
-            hub.stats.paintovers.fetch_add(1, Ordering::Relaxed);
-            true
-        } else {
-            false
-        };
-        if want_key {
-            for c in &clients {
-                c.needs_keyframe.store(false, Ordering::Relaxed);
+        // Each plan is one input to the sharpening schedule.
+        let frame = match plan {
+            Plan::Key(keyframe) => {
+                // Every block goes out at keyframe quality, which the rate cap squeezes:
+                // all of it is pending. In place of a pass the keyframe is coded at
+                // paint-over quality, and what comes back as asked is sharp.
+                refiner.mark_all(t0);
+                let blocks = match keyframe {
+                    Keyframe::Pass => {
+                        hub.stats.paintovers.fetch_add(1, Ordering::Relaxed);
+                        Some(refiner.every_block(t0))
+                    }
+                    Keyframe::Fresh => None,
+                };
+                sharpening.on_key(keyframe, t0);
+                let starts = seen
+                    .iter()
+                    .filter(|(c, v)| v.viewer == Viewer::Waiting && c.keyframe_planned())
+                    .map(|(c, _)| c.clone())
+                    .collect();
+                Frame::Key { blocks, starts }
             }
-            // A keyframe is squeezed into the rate cap; sharpen all of it once still.
-            refiner.mark_all();
-        }
-        let frame_paintover = paintover && refine.is_none();
-        if frame_paintover && paintover_left == 0 {
-            refiner.clear_all();
-        }
-        // A refinement frame encodes what moved plus what is due; everything else stays skipped.
-        let mb_map = if want_key {
-            None
-        } else if frame_paintover {
-            paint_map.map(|(m, b)| {
-                band = Some(match band {
-                    Some(x) => union(Some(x), b),
-                    None => b,
-                });
-                Arc::new(m)
-            })
-        } else if let Some((rmap, rband)) = refine.take() {
-            band = Some(match band {
-                Some(b) => union(Some(b), rband),
-                None => rband,
-            });
-            let mut m = mb_dirty.take().unwrap_or_else(|| vec![1; rmap.len()]);
-            for (d, r) in m.iter_mut().zip(rmap) {
-                *d |= r;
+            Plan::Sharpen { map, band } => {
+                hub.stats.paintovers.fetch_add(1, Ordering::Relaxed);
+                Frame::Sharpen {
+                    band,
+                    blocks: Sharpen {
+                        map: Arc::new(map),
+                        at: t0,
+                    },
+                }
             }
-            hub.stats.refines.fetch_add(1, Ordering::Relaxed);
-            Some(Arc::new(m))
-        } else {
-            mb_dirty.take().map(Arc::new)
+            Plan::Motion(moved) => {
+                sharpening.on_motion(t0);
+                // Piggyback sharpening of blocks that have gone still on this frame.
+                match refiner.due(t0) {
+                    // What moved plus what is due; everything else stays skipped.
+                    Some((rmap, rband)) => {
+                        let mut m = mb_dirty;
+                        for (d, r) in m.iter_mut().zip(&rmap) {
+                            *d |= r;
+                        }
+                        hub.stats.refines.fetch_add(1, Ordering::Relaxed);
+                        Frame::MotionAndSharpen {
+                            band: union(Some(moved), rband),
+                            dirty: Arc::new(m),
+                            blocks: Sharpen {
+                                map: Arc::new(rmap),
+                                at: t0,
+                            },
+                        }
+                    }
+                    None => Frame::Motion {
+                        band: moved,
+                        dirty: Arc::new(mb_dirty),
+                    },
+                }
+            }
         };
-        last_capture = t0;
-        next_idx = 1 - idx;
-        if job_tx
+        captured.on_capture(next, t0);
+        if s.job_tx
             .send(Job {
                 buf,
-                idx,
-                force_idr: want_key,
-                paintover,
-                paintover_final: frame_paintover && paintover_left == 0,
-                mb_dirty: mb_map,
-                band,
-                captured_at: origin,
+                frame,
+                allowance,
+                captured: CaptureMarks {
+                    damage: origin,
+                    capture: t0,
+                    grabbed: t1,
+                    converted: t2,
+                    queued: Instant::now(),
+                    rows,
+                },
                 marker_ms,
             })
             .is_err()
@@ -817,140 +1663,352 @@ fn capture_loop(
     }
 }
 
+/// The number of the frame a video message is part of; None for any other message.
+pub fn frame_of(m: &[u8]) -> Option<u32> {
+    match Header::read(m) {
+        Ok(Video::Stripe(header, _) | Video::Empty(header)) => Some(header.frame),
+        Err(NotVideo::Other | NotVideo::Short) => None,
+    }
+}
+
 /// Split the screen into horizontal stripes, each an independent H.264 stream.
 /// x264 pays ~9 ms of CPU per 2560x1600 frame even when nothing changed, and sliced
 /// threading triples that; independent single-threaded stripes are encoded in
 /// parallel (low latency) and only when they changed (low CPU).
-fn stripe_layout(height: u32, n: u32) -> Vec<(u32, u32)> {
+fn stripe_layout(height: u16, n: u32) -> Layout {
     let n = n.clamp(1, 16);
-    let each = (height.div_ceil(n) + 15) & !15;
-    let mut v = Vec::new();
-    let mut y = 0;
+    let each = (u32::from(height).div_ceil(n) + 15) & !15;
+    let mut stripes = Vec::new();
+    let (mut y, mut count) = (0, 0);
     while y < height {
-        let h = each.min(height - y);
-        v.push((y, h));
-        y += h;
+        let left = height - y;
+        // `each` rows, or what is left of the screen: all of it when `each` is past 16 bits.
+        let h = u16::try_from(each).map_or(left, |each| each.min(left));
+        stripes.push(Place {
+            stripe: count,
+            y,
+            h,
+        });
+        (y, count) = (y + h, count + 1);
     }
-    v
+    Layout { stripes, count }
+}
+
+/// A screen cut into stripes, in the types a video message's header names a stripe by:
+/// `stripe_layout` cuts at most 16 (`--stripes` is clamped to 1..=16), so a stripe's
+/// number and their count are 8-bit, and its screen has at most 65,535 rows, so a top row
+/// is 16-bit.
+struct Layout {
+    stripes: Vec<Place>,
+    count: u8,
+}
+
+/// One stripe of a layout: its number from the top, its top row and how many rows it has.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Place {
+    stripe: u8,
+    y: u16,
+    h: u16,
+}
+
+impl Layout {
+    /// The stripes `rows` names, (top row, rows) top to bottom, if each fits a header:
+    /// at most 16, each with its top row and its rows in 16 bits.
+    fn of(rows: &[(u32, u32)]) -> Option<Layout> {
+        let stripes = rows
+            .iter()
+            .enumerate()
+            .map(|(i, &(y, h))| {
+                Some(Place {
+                    stripe: u8::try_from(i).ok()?,
+                    y: u16::try_from(y).ok()?,
+                    h: u16::try_from(h).ok()?,
+                })
+            })
+            .collect::<Option<Vec<Place>>>()?;
+        let count = u8::try_from(stripes.len()).ok().filter(|&n| n <= 16)?;
+        Some(Layout { stripes, count })
+    }
+
+    /// (top row, rows) of each stripe, top to bottom.
+    fn rows(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.stripes
+            .iter()
+            .map(|p| (u32::from(p.y), u32::from(p.h)))
+    }
 }
 
 struct Stripe {
     y: usize,
     h: usize,
-    enc: Encoder,
+    /// What its encoders are opened with.
     cfg: EncoderConfig,
-    /// Sliced threads to fan out to under sustained heavy motion (1 = never).
-    max_threads: u32,
-    applied_kbps: u32,
-    applied_crf: f32,
+    /// None until the stripe's first frame opens it: on a new stream that is a viewer's
+    /// keyframe, so one open, for its budget. An open that fails ends the pipeline, so it
+    /// is None before that only.
+    running: Option<Running>,
 }
 
-const HDR: usize = 16;
+/// A stripe's encoder, and the rate x264 was last told for it.
+struct Running {
+    enc: Encoder,
+    rate: Applied,
+}
 
-struct SendPtr<T>(*const T);
-unsafe impl<T> Send for SendPtr<T> {}
-impl<T> Clone for SendPtr<T> {
-    fn clone(&self) -> Self {
-        *self
+impl Running {
+    /// The stream's encoder, as configured, told `rate`.
+    fn open(cfg: &EncoderConfig, rate: Applied) -> Result<Running, String> {
+        let mut enc = Encoder::new(cfg)?;
+        enc.set_rate(rate.crf, rate.kbps);
+        Ok(Running { enc, rate })
+    }
+
+    /// An encoder of a keyframe's own, at `crf` under `cap`, in a stream whose encoders
+    /// open at `ceiling` (`Encoder::for_keyframe`).
+    fn for_keyframe(
+        cfg: &EncoderConfig,
+        crf: f32,
+        ceiling: Kbps,
+        cap: u32,
+    ) -> Result<Running, String> {
+        let enc = Encoder::for_keyframe(&cfg.pictures, crf, ceiling, Kbps::new(cap as f64))?;
+        Ok(Running {
+            enc,
+            rate: Applied { crf, kbps: cap },
+        })
+    }
+
+    /// Before a frame at `crf` under `cap`: tells x264, unless what it was told holds.
+    fn set(&mut self, crf: f32, cap: u32) {
+        if let Some(rate) = self.rate.next(crf, cap) {
+            self.enc.set_rate(rate.crf, rate.kbps);
+            self.rate = rate;
+        }
     }
 }
-impl<T> Copy for SendPtr<T> {}
 
-struct StripeJob {
-    /// Valid until the worker replies: the encode loop waits for every stripe.
-    buf: SendPtr<I420>,
-    ts: i64,
-    force_idr: bool,
-    /// A paint-over or refinement pass (`crf` is the paint-over CRF).
-    paintover: bool,
+/// The CRF and cap a stripe's encoder was set to.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Applied {
     crf: f32,
+    kbps: u32,
+}
+
+/// How far a stripe's cap may move, as a share of the one set, before x264 is told:
+/// each change reconfigures the encoder. Upstream's guess, unmeasured. At none, every
+/// wobble of what a frame may take reconfigures x264; at twice this, a frame may be coded
+/// under a cap 8% off its share of it.
+const CAP_SLACK: f64 = 0.04;
+
+impl Applied {
+    /// The rate to set before a frame at `crf` under `cap`, unless this one still holds:
+    /// the same CRF, and a cap within CAP_SLACK of it.
+    fn next(self, crf: f32, cap: u32) -> Option<Applied> {
+        let holds = self.crf == crf
+            && (cap as f64 - self.kbps as f64).abs() <= self.kbps as f64 * CAP_SLACK;
+        (!holds).then_some(Applied { crf, kbps: cap })
+    }
+}
+
+#[derive(Clone)]
+struct StripeJob {
+    /// The frame's picture, lent to every stripe that codes it.
+    buf: Arc<I420>,
+    ts: i64,
+    coding: Coding,
     cap: u32,
-    mb_dirty: Option<Arc<Vec<u8>>>,
+    mb_dirty: Dirty,
     mb_cols: usize,
 }
 
-type StripeResult = (usize, Option<(bool, Vec<u8>)>);
-
-/// x264's sliced threading costs ~3x the CPU of one thread on desktop content (and on
-/// small updates is even slower), so a stripe encodes single-threaded and only fans out
-/// while sustained heavy motion would otherwise blow the frame budget.
-struct ThreadGovernor {
-    threads: u32,
-    ewma_ms: f64,
-    heavy: u32,
-    light_since: Option<Instant>,
-    budget_ms: f64,
-    /// One-thread encode time as a function of changed macroblocks, learned from
-    /// single-threaded frames, to tell when one thread would fit again.
-    fit: CostFit,
-    /// Predicted one-thread time while threaded.
-    predicted_ms: f64,
+/// What a stripe worker sends back for its part of a frame.
+struct StripeResult {
+    out: StripeOut,
+    /// The picture it was lent, handed back with the result, so that once every result
+    /// is in the capture loop has it alone again.
+    buf: Arc<I420>,
 }
 
-/// Exponentially weighted least squares fit of encode ms = a + b * changed MBs.
-#[derive(Default)]
-struct CostFit {
-    w: f64,
-    x: f64,
-    y: f64,
-    xx: f64,
-    xy: f64,
+/// What codes a frame's stripes. The encode loop codes stripe 0 itself, so a frame of one
+/// stripe is coded on the thread that received it, with no stage that only hands it on.
+/// The others have a worker thread each, with its stripe's encoder, reached by two
+/// channels of its own: the encode loop holds one end of each and nothing else does, so
+/// a worker that is gone has dropped the other ends, a job handed to it is refused and a
+/// wait for its result ends at once. Each channel holds one message, since a worker has
+/// one job at a time.
+struct Crew {
+    /// Codes stripe 0, or finds it gone: its encoder could not be opened.
+    own: Box<dyn FnMut(StripeJob) -> Result<StripeResult, Gone> + Send>,
+    /// Stripe 1's worker onwards.
+    hands: Vec<Hand>,
+    /// What came of the last frame: kept, so a frame allocates nothing for it.
+    out: FrameOut,
 }
 
-impl CostFit {
-    fn add(&mut self, x: f64, y: f64) {
-        let k = 0.995;
-        self.w = self.w * k + 1.0;
-        self.x = self.x * k + x;
-        self.y = self.y * k + y;
-        self.xx = self.xx * k + x * x;
-        self.xy = self.xy * k + x * y;
+/// The encode loop's ends of one stripe worker's channels.
+struct Hand {
+    jobs: mpsc::SyncSender<StripeJob>,
+    done: mpsc::Receiver<StripeResult>,
+}
+
+/// A stripe worker is gone, so its stripe can't be coded again: the pipeline ends, as it
+/// does when the encode loop is gone.
+#[derive(Debug)]
+struct Gone(usize);
+
+impl Crew {
+    /// `own` codes stripe 0; each of the others gets a thread, where `work` codes the jobs
+    /// that arrive on its receiver and answers each on its sender.
+    fn spawn<W>(
+        own: impl FnMut(StripeJob) -> Result<StripeResult, Gone> + Send + 'static,
+        workers: impl IntoIterator<Item = W>,
+    ) -> Crew
+    where
+        W: FnOnce(mpsc::Receiver<StripeJob>, mpsc::SyncSender<StripeResult>) + Send + 'static,
+    {
+        let hands = workers
+            .into_iter()
+            .enumerate()
+            .map(|(i, work)| {
+                let (jobs, rx) = mpsc::sync_channel(1);
+                let (answer, done) = mpsc::sync_channel(1);
+                std::thread::Builder::new()
+                    .name(format!("enc-{}", i + 1))
+                    .spawn(move || work(rx, answer))
+                    .unwrap();
+                Hand { jobs, done }
+            })
+            .collect();
+        Crew {
+            own: Box::new(own),
+            hands,
+            out: FrameOut(Vec::new()),
+        }
     }
-    fn predict(&self, x: f64) -> Option<f64> {
-        if self.w < 30.0 {
-            return None;
+
+    /// Lends the job's picture to the workers of the selected stripes, codes stripe 0
+    /// while they code theirs, and waits for their results. The picture comes back with
+    /// them, no longer shared.
+    fn run(
+        &mut self,
+        selected: &[bool],
+        job: StripeJob,
+    ) -> Result<(&mut FrameOut, Arc<I420>), Gone> {
+        let asked = || {
+            self.hands
+                .iter()
+                .zip(&selected[1..])
+                .enumerate()
+                .filter(|(_, (_, &on))| on)
+                .map(|(j, (hand, _))| (j + 1, hand))
+        };
+        for (i, hand) in asked() {
+            hand.jobs.send(job.clone()).map_err(|_| Gone(i))?;
         }
-        let var = self.xx * self.w - self.x * self.x;
-        if var <= f64::EPSILON * self.w * self.w {
-            return Some(self.y / self.w);
+        let results = &mut self.out.0;
+        results.clear();
+        results.extend((0..=self.hands.len()).map(|_| StripeOut::Skipped));
+        if selected[0] {
+            results[0] = (self.own)(job.clone())?.out;
         }
-        let b = (self.xy * self.w - self.x * self.y) / var;
-        let a = (self.y - b * self.x) / self.w;
-        Some(a + b * x)
+        for (i, hand) in asked() {
+            let StripeResult { out, buf } = hand.done.recv().map_err(|_| Gone(i))?;
+            results[i] = out;
+            drop(buf);
+        }
+        Ok((&mut self.out, job.buf))
     }
 }
 
-impl ThreadGovernor {
-    fn want(&mut self, enc_ms: f64, changed_mbs: f64, max: u32) -> Option<u32> {
-        self.ewma_ms = self.ewma_ms * 0.8 + enc_ms * 0.2;
-        if self.threads == 1 {
-            self.fit.add(changed_mbs, enc_ms);
-            // Before one thread runs out of frame budget: encode times vary from frame to
-            // frame, and at ~90% of the budget on average enough frames miss it to drop
-            // the frame rate.
-            self.heavy = if self.ewma_ms > self.budget_ms * 0.65 {
-                self.heavy + 1
-            } else {
-                0
-            };
-            if self.heavy >= 20 {
-                self.predicted_ms = self.ewma_ms;
-                return Some(max);
-            }
-            return None;
+/// What came of a frame in one stripe.
+enum StripeOut {
+    /// The frame didn't touch the stripe, so its worker wasn't asked.
+    Skipped,
+    /// The encode failed.
+    Failed,
+    /// x264 put out nothing for the picture. With no B-frames, lookahead or frame
+    /// threads it holds no picture back, so this doesn't come.
+    Empty,
+    /// The stripe's part of the frame: a header's room, then what x264 put out.
+    Sent {
+        key: bool,
+        bytes: BytesMut,
+        quality: Quality,
+        /// When the worker took the stripe, handed it to x264 and had it back.
+        coded: Coded,
+    },
+}
+
+impl StripeOut {
+    /// What x264 made of a stripe's picture, asked for at `crf` after a frame that left it
+    /// `before`; `bytes` is a header's room and what it put out.
+    fn coded(e: &Encoded, crf: f32, before: Settling, bytes: BytesMut, coded: Coded) -> StripeOut {
+        match bytes.len() {
+            Header::LEN => StripeOut::Empty,
+            _ => StripeOut::Sent {
+                key: e.keyframe(),
+                quality: e.quality(crf, before),
+                bytes,
+                coded,
+            },
         }
-        // Without enough one-thread history, assume one thread is no faster than these.
-        let one = self.fit.predict(changed_mbs).unwrap_or(enc_ms);
-        self.predicted_ms = self.predicted_ms * 0.8 + one * 0.2;
-        if self.predicted_ms < self.budget_ms * 0.5 {
-            // One thread would fit with room to spare (switching reopens the encoder,
-            // which costs a keyframe, so not on a brief lull).
-            let since = *self.light_since.get_or_insert_with(Instant::now);
-            (since.elapsed() >= Duration::from_secs(2)).then_some(1)
-        } else {
-            self.light_since = None;
-            None
-        }
+    }
+}
+
+/// What came of a frame in each stripe, in stripe order.
+struct FrameOut(Vec<StripeOut>);
+
+impl FrameOut {
+    /// Whether the frame's blocks came out sharp: every stripe it touched came back as
+    /// asked.
+    fn sharp(&self) -> bool {
+        self.0.iter().all(|o| match o {
+            StripeOut::Skipped => true,
+            StripeOut::Sent { quality, .. } => *quality == Quality::AsAsked,
+            StripeOut::Failed => false,
+            // As the picture x264 didn't fill in read: a CRF average of 0, so as asked.
+            StripeOut::Empty => true,
+        })
+    }
+
+    /// Whether a viewer can start on the frame: every stripe is a keyframe.
+    fn all_key(&self) -> bool {
+        self.0.iter().all(|o| match o {
+            StripeOut::Sent { key, .. } => *key,
+            StripeOut::Skipped | StripeOut::Failed | StripeOut::Empty => false,
+        })
+    }
+
+    /// When the stripe coded last was coded, if any stripe has a part to send: the frame
+    /// waits for it.
+    fn coded(&self) -> Option<Coded> {
+        self.0
+            .iter()
+            .filter_map(|o| match o {
+                StripeOut::Sent { coded, .. } => Some(*coded),
+                StripeOut::Skipped | StripeOut::Failed | StripeOut::Empty => None,
+            })
+            .reduce(Coded::later)
+    }
+
+    /// How many parts go to the viewers.
+    fn parts(&self) -> usize {
+        self.0
+            .iter()
+            .filter(|o| match o {
+                StripeOut::Sent { .. } => true,
+                StripeOut::Skipped | StripeOut::Failed | StripeOut::Empty => false,
+            })
+            .count()
+    }
+
+    /// The parts that go to the viewers, taken out: each stripe that has some, whether
+    /// it is a keyframe, and its bytes.
+    fn take_parts(&mut self) -> impl Iterator<Item = (usize, bool, BytesMut)> + '_ {
+        self.0.drain(..).enumerate().filter_map(|(i, o)| match o {
+            StripeOut::Sent { key, bytes, .. } => Some((i, key, bytes)),
+            StripeOut::Skipped | StripeOut::Failed | StripeOut::Empty => None,
+        })
     }
 }
 
@@ -1005,10 +2063,15 @@ impl MotionQuality {
     /// motion frame (not a paint-over).
     fn note(&mut self, e: &Encoded, crf: f32, size: Option<MotionSize>) {
         // A keyframe's QP isn't picked from the complexity estimate.
-        let (false, Some(qp)) = (e.keyframe, e.qp) else {
+        let Encoded::Picture {
+            keyframe: false,
+            qp,
+            crf_avg,
+        } = *e
+        else {
             return;
         };
-        self.observe(crf, qp, e);
+        self.observe(crf, qp, crf_avg);
         // Small updates cost more per macroblock (headers, a cursor's edges) and never
         // get x264's QP up; only big ones tell what kind of motion this is.
         if let Some(m) = size.filter(|m| m.changed * 16 >= m.mbs) {
@@ -1021,13 +2084,13 @@ impl MotionQuality {
     /// x264 starts from QP0 = `crf` + complexity. VBV may raise that before the frame
     /// (to `qp`) and row by row within it (to an average x264 doesn't report), never
     /// below QP0 or, with a VBV buffer over 1.1 frames, below the frame's starting QP,
-    /// and `e.crf_avg` is `crf` + average - QP0. So the complexity lies between
-    /// `qp - e.crf_avg` (no row raised) and `qp - crf` (nothing raised before the
+    /// and `crf_avg` is `crf` + average - QP0. So the complexity lies between
+    /// `qp - crf_avg` (no row raised) and `qp - crf` (nothing raised before the
     /// frame), give or take the rounding of `qp`: one value when VBV stayed out, a range
     /// when it didn't. Then the last estimate is kept while it fits, else moved to the
     /// nearest end, so a frame VBV squeezed doesn't throw away what earlier frames showed.
-    fn observe(&mut self, crf: f32, qp: f32, e: &Encoded) {
-        let lo = qp - 0.5 - e.crf_avg;
+    fn observe(&mut self, crf: f32, qp: f32, crf_avg: f32) {
+        let lo = qp - 0.5 - crf_avg;
         let hi = qp + 0.5 - crf;
         self.complexity = if hi - lo < 1.25 {
             (lo + hi) / 2.0
@@ -1048,47 +2111,128 @@ struct MotionSize {
     crf: f32,
 }
 
-fn stripe_worker(
-    i: usize,
-    mut s: Stripe,
-    rx: mpsc::Receiver<StripeJob>,
-    done: mpsc::Sender<StripeResult>,
+/// Codes one stripe's part of each frame: its encoder, and what it has learned of the
+/// frames it coded (how cheap their motion is, and where x264 started the last one).
+struct Coder {
+    s: Stripe,
+    crfs: Crfs,
     debug: bool,
-) {
-    let mut gov = ThreadGovernor {
-        threads: 1,
-        ewma_ms: 0.0,
-        heavy: 0,
-        light_since: None,
-        budget_ms: 1000.0 / s.cfg.fps as f64,
-        fit: CostFit::default(),
-        predicted_ms: 0.0,
-    };
-    let mut motion = MotionQuality::default();
-    while let Ok(job) = rx.recv() {
-        let buf = unsafe { &*job.buf.0 };
-        let is_motion = !job.force_idr && !job.paintover;
-        let crf = if is_motion {
-            motion.crf(job.crf)
-        } else {
-            job.crf
+    motion: MotionQuality,
+    settling: Settling,
+    /// What x264 put out for the last frame: kept, so a frame allocates nothing for it.
+    out: Vec<u8>,
+    /// x264's hint for each macroblock of the stripe (1: unchanged), kept likewise.
+    hints: Vec<u8>,
+    arenas: Arenas,
+    /// Takes the encoders a keyframe replaces, to close them on a thread of their own:
+    /// closing one joins x264's threads and frees its memory, which took 1.8-15.4 ms on
+    /// the stripe's thread, before the keyframe.
+    close: mpsc::SyncSender<Running>,
+}
+
+/// The bytes a stripe's messages are cut from, in two arenas taken in turn. A message
+/// is the next stretch of the arena in use; when that one is full the other is taken
+/// back, once every message cut from it has been sent and dropped. So a stream whose
+/// viewers keep up allocates nothing for its messages.
+struct Arenas {
+    two: [BytesMut; 2],
+    at: usize,
+}
+
+/// What each of a stripe's two arenas holds. Sized from the four numbers' scroll scene:
+/// a message there is about 11 KB, so an arena holds some 90 frames' messages, and is
+/// taken back after the other has held as many, long after a viewer that keeps up has
+/// been sent them; a keyframe of 300 KB fits three times. Half would still hold 45
+/// frames; one message bigger than an arena gets an arena of its own size. Unmeasured
+/// beyond that.
+const ARENA_BYTES: usize = 1 << 20;
+
+impl Arenas {
+    fn new() -> Arenas {
+        // Cutting from an arena the first time allocates bytes' count of who shares it:
+        // done here, once, and not on some later frame.
+        let shared = || {
+            let mut arena = BytesMut::with_capacity(ARENA_BYTES);
+            drop(arena.split());
+            arena
         };
-        if job.force_idr {
-            // A keyframe is what a new viewer sees first; don't starve it to the
-            // steady-state frame budget (up to ~8 frames' worth at 4x the cap).
-            let boost = job.cap.saturating_mul(4).max(16_000);
-            s.enc
-                .set_rate_buf(job.crf, boost, boost / s.cfg.fps.max(1) * 8);
-            s.applied_kbps = 0;
-        } else {
-            let moved = s.applied_kbps == 0
-                || (job.cap as f64 - s.applied_kbps as f64).abs() > s.applied_kbps as f64 * 0.04;
-            if crf != s.applied_crf || moved {
-                s.enc.set_rate(crf, job.cap);
-                s.applied_crf = crf;
-                s.applied_kbps = job.cap;
+        Arenas {
+            two: [shared(), shared()],
+            at: 0,
+        }
+    }
+
+    /// A message: a header's room, then `payload`.
+    fn message(&mut self, payload: &[u8]) -> BytesMut {
+        let len = Header::LEN + payload.len();
+        if !self.two[self.at].try_reclaim(len) {
+            self.at = 1 - self.at;
+            if !self.two[self.at].try_reclaim(len) {
+                self.two[self.at] = BytesMut::with_capacity(ARENA_BYTES.max(len));
             }
         }
+        let arena = &mut self.two[self.at];
+        arena.put_bytes(0, Header::LEN);
+        arena.put_slice(payload);
+        arena.split()
+    }
+}
+
+impl Coder {
+    fn new(s: Stripe, crfs: Crfs, debug: bool, close: mpsc::SyncSender<Running>) -> Coder {
+        Coder {
+            s,
+            crfs,
+            debug,
+            motion: MotionQuality::default(),
+            settling: Settling::Unknown,
+            out: Vec::new(),
+            hints: Vec::new(),
+            arenas: Arenas::new(),
+            close,
+        }
+    }
+
+    /// Codes the stripe's part of the job's frame, and hands the picture back with it; or
+    /// says why the stripe has no encoder to code it with, now or after.
+    fn code(&mut self, job: StripeJob) -> Result<StripeResult, String> {
+        let woke = Instant::now();
+        let Coder {
+            s,
+            crfs,
+            debug,
+            motion,
+            settling,
+            out,
+            hints,
+            arenas,
+            close,
+        } = self;
+        let buf = &*job.buf;
+        // The CRF the job asks for, and the one x264 is given: MotionQuality may lower
+        // a motion frame's.
+        let asked = crfs.of(job.coding);
+        let crf = match job.coding {
+            Coding::Key { .. } | Coding::Sharpen => asked,
+            Coding::Motion => motion.crf(asked),
+        };
+        // A keyframe under a cap gets an encoder of its own, opened for its budget `cap`
+        // while the running one is closed elsewhere; any other frame the running one,
+        // told its rate; the stripe's first frame opens it.
+        let running = match (job.coding.own_encoder(s.cfg.max_kbps), s.running.take()) {
+            (Some(ceiling), was) => {
+                if let Some(old) = was {
+                    let _ = close.send(old);
+                }
+                Running::for_keyframe(&s.cfg, asked, ceiling, job.cap)
+            }
+            (None, Some(mut running)) => {
+                running.set(crf, job.cap);
+                Ok(running)
+            }
+            (None, None) => Running::open(&s.cfg, Applied { crf, kbps: job.cap }),
+        };
+        let enc = &mut s.running.insert(running?).enc;
         let suv = buf.stride_uv();
         let planes = Planes {
             y: &buf.y[s.y * buf.width..],
@@ -1097,257 +2241,326 @@ fn stripe_worker(
             stride_y: buf.width,
             stride_uv: suv,
         };
-        let mut out = Vec::with_capacity(64 << 10);
-        out.resize(HDR, 0);
+        out.clear();
         // x264 wants X264_MBINFO_CONSTANT (1) on unchanged macroblocks of this stripe.
-        let mut info = job.mb_dirty.as_ref().map(|d| {
-            let rows = s.h.div_ceil(16);
-            let start = (s.y / 16) * job.mb_cols;
-            d[start..start + rows * job.mb_cols]
-                .iter()
-                .map(|&x| (x == 0) as u8)
-                .collect::<Vec<u8>>()
-        });
+        let info = match &job.mb_dirty {
+            Dirty::All => None,
+            Dirty::Blocks(d) => {
+                let rows = s.h.div_ceil(16);
+                let start = (s.y / 16) * job.mb_cols;
+                hints.clear();
+                hints.extend(
+                    d[start..start + rows * job.mb_cols]
+                        .iter()
+                        .map(|&x| (x == 0) as u8),
+                );
+                Some(&mut hints[..])
+            }
+        };
         // Changed macroblocks in this stripe (all of them without a damage map).
         let stripe_mbs = s.h.div_ceil(16) * job.mb_cols;
         let changed = info
             .as_ref()
             .map_or(stripe_mbs, |m| m.iter().filter(|&&c| c == 0).count());
         let te = Instant::now();
-        let r = s.enc.encode(
+        let r = enc.encode(
             &planes,
             job.ts,
-            job.force_idr,
+            matches!(job.coding, Coding::Key { .. }),
             None,
-            info.as_deref_mut(),
-            &mut out,
+            info,
+            out,
         );
-        if debug {
+        let encoded = Instant::now();
+        if *debug {
             let cpu_now = thread_cpu_us();
             log::info!(
                 "stripe y{} encode {} us wall, thread cpu total {} us, {} bytes",
                 s.y,
                 te.elapsed().as_micros(),
                 cpu_now,
-                out.len()
+                Header::LEN + out.len()
             );
         }
-        if s.max_threads > 1 {
-            if let Some(t) = gov.want(
-                te.elapsed().as_secs_f64() * 1000.0,
-                changed as f64,
-                s.max_threads,
-            ) {
-                match Encoder::new(&EncoderConfig {
-                    threads: t,
-                    ..s.cfg.clone()
-                }) {
-                    Ok(e) => {
-                        log::info!(
-                            "stripe {i}: encoder now {t} thread(s) (encode {:.1} ms)",
-                            gov.ewma_ms
-                        );
-                        // A fresh encoder opens with an IDR on its next frame, and
-                        // its rate control starts over.
-                        s.enc = e;
-                        motion = MotionQuality::default();
-                        s.applied_kbps = 0;
-                        gov.threads = t;
-                        gov.heavy = 0;
-                        gov.light_since = None;
-                    }
-                    Err(e) => log::error!("encoder reopen failed: {e}"),
-                }
-            }
-        }
-        let res = match r {
+        let result = match r {
             Ok(e) => {
-                let size = is_motion.then(|| MotionSize {
-                    bits: (out.len() - HDR) * 8,
+                let size = matches!(job.coding, Coding::Motion).then(|| MotionSize {
+                    bits: out.len() * 8,
                     changed,
                     mbs: stripe_mbs,
-                    crf: job.crf,
+                    crf: asked,
                 });
                 motion.note(&e, crf, size);
-                (out.len() > HDR).then_some((e.keyframe, out))
+                let before = std::mem::replace(settling, e.settling(crf));
+                StripeOut::coded(
+                    &e,
+                    crf,
+                    before,
+                    arenas.message(out),
+                    Coded {
+                        woke,
+                        x264: te,
+                        encoded,
+                    },
+                )
             }
             Err(e) => {
                 log::error!("{e}");
-                None
+                *settling = Settling::Unknown;
+                StripeOut::Failed
             }
         };
-        if done.send((i, res)).is_err() {
-            return;
+        Ok(StripeResult {
+            out: result,
+            buf: job.buf,
+        })
+    }
+}
+
+/// A stripe worker: codes each job that arrives, on its own thread, and answers with it.
+fn stripe_worker(
+    mut coder: Coder,
+    rx: mpsc::Receiver<StripeJob>,
+    done: mpsc::SyncSender<StripeResult>,
+) {
+    while let Ok(job) = rx.recv() {
+        match coder.code(job) {
+            Ok(result) => {
+                if done.send(result).is_err() {
+                    return;
+                }
+            }
+            // Without an encoder the stripe can't code this frame or any after it: the
+            // worker is gone, and the pipeline ends.
+            Err(e) => {
+                log::error!("{e}");
+                return;
+            }
         }
+    }
+}
+
+/// How a stream's frames are cut and paced: its stripes' layout, and the frames a second
+/// that what a frame may take is told to x264 in (a cap is a rate).
+struct Frames {
+    layout: Layout,
+    fps: Fps,
+}
+
+/// More frames than this in flight to a viewer, and it is closed (it stops watching, and is
+/// sent the close once): upstream's guess (its first commit), never measured; 10 s of
+/// frames at 60 a second. A viewer's window keeps what a viewer that holds the capture has
+/// on its way to what its path carries, a viewer alone always holds it, and one that stalls
+/// beside others is left behind and sent nothing. A keyframe gets past that: it passes the
+/// gate, and any client may ask for one (`kf`) as often as it likes, so while one asks at
+/// every capture, a viewer that stops reading its socket is sent a keyframe a capture
+/// until it has stalled and is left behind, `STALLED` of captures: 282 at 60 frames a
+/// second (70.6 captures a second), under this bound, and 1129 at 240, which this bound
+/// closes after 600, 2.1 s, with up to 108 MB of keyframes (60 to 180 KB on a terminal at
+/// 3024x1898) queued for it. At half (300), a stream from 64 frames a second reaches it
+/// before `STALLED`; at double (1200), none does, and up to 203 MB can queue.
+const HOPELESSLY_BEHIND: usize = 600;
+
+/// Starts the encode loop's thread with `run`, which owns the way home for the capture
+/// loop's pictures. However `run` ends, by returning or by a panic, it has closed that
+/// way by then, and the capture loop is woken to find it closed: it ends on "encoder
+/// gone", and never waits for a picture that cannot come. Dropped, it waits for `run` to
+/// end.
+fn encoder_thread(hub: Arc<Hub>, run: impl FnOnce() + Send + 'static) -> Stopped {
+    let woken = Woken(hub);
+    Stopped::spawn("encode", move || {
+        let _woken = woken;
+        run()
+    })
+}
+
+/// Wakes the hub when it is dropped.
+struct Woken(Arc<Hub>);
+
+impl Drop for Woken {
+    fn drop(&mut self) {
+        self.0.wake();
     }
 }
 
 fn encode_loop(
     stripes_in: Vec<Stripe>,
+    frames: Frames,
     rx: mpsc::Receiver<Job>,
-    ret: mpsc::Sender<(usize, Box<I420>)>,
+    ret: mpsc::SyncSender<Returned>,
     hub: Arc<Hub>,
-    crf: f32,
-    po_crf: f32,
+    crfs: Crfs,
     debug: Debugging,
 ) {
-    let epoch = Instant::now();
-    let mut frame_id: u32 = 0;
-    let n = stripes_in.len();
     let debug_stripes = debug.stripes;
-    // Geometry and paint-over bookkeeping stay here; encoders move to their workers.
-    let mut stripes: Vec<(usize, usize, bool)> =
-        stripes_in.iter().map(|s| (s.y, s.h, false)).collect();
-    let (done_tx, done_rx) = mpsc::channel::<StripeResult>();
-    let workers: Vec<(mpsc::Sender<StripeJob>, std::thread::JoinHandle<()>)> = stripes_in
+    // Geometry stays here; encoders move to their workers.
+    let stripes: Vec<(usize, usize)> = stripes_in.iter().map(|s| (s.y, s.h)).collect();
+    // The encoders the stripes' keyframes replace are closed here, off the stripes'
+    // threads. A keyframe hands over one a stripe, so the queue holds them all and no
+    // stripe waits; the thread ends with the last coder.
+    let (close, closing) = mpsc::sync_channel::<Running>(stripes.len());
+    std::thread::Builder::new()
+        .name("enc-close".into())
+        .spawn(move || closing.into_iter().for_each(drop))
+        .unwrap();
+    // Persistent per-stripe workers keep each encoder's state warm in one core's cache.
+    let mut coders = stripes_in
         .into_iter()
-        .enumerate()
-        .map(|(i, s)| {
-            let (tx, rx) = mpsc::channel();
-            let done = done_tx.clone();
-            let h = std::thread::Builder::new()
-                .name(format!("enc-{i}"))
-                .spawn(move || stripe_worker(i, s, rx, done, debug_stripes))
-                .unwrap();
-            (tx, h)
-        })
-        .collect();
+        .map(|s| Coder::new(s, crfs, debug_stripes, close.clone()));
+    let mut own = coders.next().expect("a screen has a stripe");
+    let mut crew = Crew::spawn(
+        move |job| {
+            own.code(job).map_err(|e| {
+                log::error!("{e}");
+                Gone(0)
+            })
+        },
+        coders.map(|c| move |rx, done| stripe_worker(c, rx, done)),
+    );
+    if let Err(Gone(i)) = encode_frames(&mut crew, &stripes, &frames, rx, ret, &hub) {
+        log::error!("stripe {i}'s encoder is gone");
+    }
+}
+
+/// Codes each frame the capture loop sends with the crew, and sends it to the viewers,
+/// until the capture loop is gone or a stripe worker is.
+fn encode_frames(
+    crew: &mut Crew,
+    stripes: &[(usize, usize)],
+    frames: &Frames,
+    rx: mpsc::Receiver<Job>,
+    ret: mpsc::SyncSender<Returned>,
+    hub: &Hub,
+) -> Result<(), Gone> {
+    let Frames { layout, fps } = frames;
+    let fps = *fps;
+    let epoch = Instant::now();
+    let n = stripes.len();
+    // Kept from frame to frame, so a frame allocates nothing for them.
+    let mut selected: Vec<bool> = Vec::with_capacity(n);
+    let mut msgs: Vec<Bytes> = Vec::with_capacity(n);
+    let mut viewers = Vec::new();
+    // A picture goes home only once its frame is in flight to its viewers: the capture
+    // loop, woken by it, asks the flow gate next, and the gate must count that frame.
+    let home = |r: Returned| {
+        let _ = ret.send(r);
+        hub.wake();
+    };
     while let Ok(job) = rx.recv() {
         let t0 = Instant::now();
-        let selected: Vec<bool> = stripes
-            .iter()
-            .map(|&(y, h, touched)| {
-                job.force_idr
-                    || (job.paintover && touched)
-                    || job
-                        .band
-                        .is_some_and(|b| (b.y0 as usize) < y + h && (b.y1 as usize) > y)
-            })
-            .collect();
+        // A sharpening frame's band covers the blocks it sharpens.
+        selected.clear();
+        selected.extend(stripes.iter().map(|&(y, h)| job.frame.touches(y, h)));
         if !selected.iter().any(|&x| x) {
-            let _ = ret.send((job.idx, job.buf));
+            home(Returned {
+                buf: job.buf,
+                sharpened: None,
+            });
             continue;
         }
-        let target = hub.target_kbps.load(Ordering::Relaxed);
-        let want_crf = if job.paintover { po_crf } else { crf };
-        // Each stripe may use up to twice its area share of the budget; the delay-based
-        // controller reins the total in if several stripes move at once.
-        let share = ((target as u64 * 2) / n as u64).max(target as u64 / n as u64 + 1) as u32;
-        let ts = job.captured_at.duration_since(epoch).as_millis() as i64;
-        // Persistent per-stripe workers keep each encoder's state warm in one core's cache.
-        let buf_ptr = SendPtr(&*job.buf as *const I420);
-        let mut pending = 0;
-        for (i, &on) in selected.iter().enumerate() {
-            if on {
-                let cap = if job.paintover {
-                    share.saturating_mul(2)
-                } else {
-                    share
-                };
-                let _ = workers[i].0.send(StripeJob {
-                    buf: buf_ptr,
-                    ts,
-                    force_idr: job.force_idr,
-                    paintover: job.paintover,
-                    crf: want_crf,
-                    cap,
-                    mb_dirty: job.mb_dirty.clone(),
-                    mb_cols: job.buf.width.div_ceil(16),
-                });
-                pending += 1;
-            }
+        let coding = job.frame.coding();
+        let mb_dirty = job.frame.mb_dirty();
+        // Each stripe may use up to twice its area share of the frame's allowance, and
+        // never more than all of it: what was sent is on its way, and leaves the frames
+        // that follow that much less room, so several stripes moving at once is paid for
+        // by them.
+        let frame = Bits::of_bytes(job.allowance).a_frame_at(fps.get()).get() as u32;
+        let share = (frame.saturating_mul(2) / n as u32).clamp(1, frame.max(1));
+        let ts = job.captured.damage.duration_since(epoch).as_millis() as i64;
+        let mb_cols = job.buf.width.div_ceil(16);
+        let dispatched = Instant::now();
+        // Sharpening spends from the same room as motion: what the room doesn't cover now
+        // is left pending for a later pass.
+        let (out, buf) = crew.run(
+            &selected,
+            StripeJob {
+                buf: job.buf,
+                ts,
+                coding,
+                cap: share,
+                mb_dirty,
+                mb_cols,
+            },
+        )?;
+        let collected = Instant::now();
+        let sharp = out.sharp();
+        let all_key = out.all_key();
+        let sharpens = job.frame.sharpens();
+        let (sharpened, starts) = job.frame.into_parts();
+        let back = Returned {
+            buf,
+            sharpened: sharpened.filter(|_| sharp),
+        };
+        // The viewers this keyframe was promised to start on it, or wait for another.
+        for c in &starts {
+            c.keyframe_sent(all_key);
         }
-        let mut results: Vec<Option<(bool, Vec<u8>)>> = (0..n).map(|_| None).collect();
-        for _ in 0..pending {
-            if let Ok((i, r)) = done_rx.recv() {
-                results[i] = r;
-            }
-        }
-        let _ = ret.send((job.idx, job.buf));
-        for (y, h, touched) in stripes.iter_mut() {
-            if job.paintover_final {
-                *touched = false;
-            }
-            if job
-                .band
-                .is_some_and(|b| (b.y0 as usize) < *y + *h && (b.y1 as usize) > *y)
-            {
-                *touched = true;
-            }
-        }
-        let parts: Vec<(usize, bool, Vec<u8>)> = results
-            .into_iter()
-            .enumerate()
-            .filter_map(|(i, r)| r.map(|(k, o)| (i, k, o)))
-            .collect();
-        if parts.is_empty() {
+        // A frame waits for the stripe coded last; one with nothing to send is not sent.
+        let Some(coded) = out.coded() else {
+            home(back);
             continue;
-        }
+        };
+        let nparts = u8::try_from(out.parts()).expect("a frame's parts are some of its stripes");
         let enc_us = t0.elapsed().as_micros() as u64;
-        let all_key = parts.len() == n && parts.iter().all(|p| p.1);
-        let total: usize = parts.iter().map(|p| p.2.len()).sum();
+        let frame_id = hub.timeline.number();
+        let pipe = Pipe::of(job.captured.damage.elapsed());
+        msgs.extend(out.take_parts().map(|(i, key, mut out)| {
+            let place = layout.stripes[i];
+            let header = Header {
+                key,
+                sharpens,
+                frame: frame_id.get(),
+                pipe,
+                stripe: place.stripe,
+                stripes: layout.count,
+                parts: nparts,
+                y: place.y,
+            };
+            out[..Header::LEN].copy_from_slice(&header.bytes());
+            out.freeze()
+        }));
+        let total: usize = msgs.iter().map(Bytes::len).sum();
         hub.stats.encode_us.fetch_add(enc_us, Ordering::Relaxed);
         hub.stats.encoded.fetch_add(1, Ordering::Relaxed);
         hub.stats.bytes.fetch_add(total as u64, Ordering::Relaxed);
         if all_key {
             hub.stats.keyframes.fetch_add(1, Ordering::Relaxed);
         }
-        frame_id = frame_id.wrapping_add(1);
-        // Server-side pipeline latency (capture -> sent) in 1/10 ms, for client stats.
-        let mut pipe = (job.captured_at.elapsed().as_micros() / 100).min(u32::MAX as u128) as u32;
-        if job.marker_ms.is_some() {
-            // Debug: wall-clock send time instead of pipeline latency.
-            pipe = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u32;
-        }
-        let nparts = parts.len() as u8;
-        let msgs: Vec<Bytes> = parts
-            .into_iter()
-            .map(|(i, key, mut out)| {
-                // type, flags, frame id, pipe, stripe, stripe count, parts in frame, reserved, y
-                out[0] = 0x01;
-                out[1] = (key as u8) | if job.paintover { 2 } else { 0 };
-                out[2..6].copy_from_slice(&frame_id.to_be_bytes());
-                out[6..10].copy_from_slice(&pipe.to_be_bytes());
-                out[10] = i as u8;
-                out[11] = n as u8;
-                out[12] = nparts;
-                out[13] = 0;
-                out[14..16].copy_from_slice(&(stripes[i].0 as u16).to_be_bytes());
-                Bytes::from(out)
-            })
-            .collect();
         let now = Instant::now();
-        for c in hub.video_clients() {
-            if !c.started.load(Ordering::Relaxed) {
-                if !all_key {
-                    continue;
+        hub.timeline.record(
+            frame_id,
+            &crate::timeline::Frame {
+                captured: job.captured,
+                taken: t0,
+                dispatched,
+                coded,
+                collected,
+                sent: now,
+                bytes: total,
+            },
+        );
+        hub.viewers_into(&mut viewers);
+        for (c, _) in &viewers {
+            match c.takes(frame_id, now, total, all_key, HOPELESSLY_BEHIND) {
+                Takes::Nothing => {}
+                Takes::Frame => {
+                    for m in &msgs {
+                        c.send(Out::Bin(m.clone()));
+                    }
                 }
-                c.started.store(true, Ordering::Relaxed);
-                c.inflight.lock().clear();
-            }
-            {
-                let mut q = c.inflight.lock();
-                if q.len() > 600 {
+                Takes::Close => {
                     log::warn!("client {} hopelessly behind; dropping", c.id);
-                    drop(q);
                     c.send(Out::Text(ServerMessage::Close));
-                    continue;
                 }
-                q.push_back(Inflight {
-                    id: frame_id,
-                    sent: now,
-                    bytes: total,
-                });
-            }
-            for m in &msgs {
-                c.send(Out::Bin(m.clone()));
             }
         }
+        home(back);
+        // What the viewers were sent is theirs now: dropped here, each stripe's arena is
+        // taken back once they are done with it.
+        msgs.clear();
+        viewers.clear();
         hub.stats.send_lat_us.fetch_add(
-            job.captured_at.elapsed().as_micros() as u64,
+            job.captured.damage.elapsed().as_micros() as u64,
             Ordering::Relaxed,
         );
         if let Some(ms) = job.marker_ms {
@@ -1358,6 +2571,7 @@ fn encode_loop(
             );
         }
     }
+    Ok(())
 }
 
 /// CPU time this thread has used, in microseconds.
@@ -1453,6 +2667,16 @@ fn marker_age(ms: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hub::ReachStats;
+    use crate::path::Kbps;
+    use crate::xorshift::Xorshift;
+
+    /// One look at `hub`'s viewers at `at`, as the capture loop takes it.
+    fn looked(hub: &Hub, at: Instant) -> Vec<(Arc<Client>, Seen)> {
+        let mut seen = Vec::new();
+        Seen::all(hub, at, &mut seen);
+        seen
+    }
 
     /// A marker is read where all of it fits the capture, as the time painted on it, and
     /// nowhere else: a place past an edge (by a pixel, by far, or so far the sum overflows)
@@ -1532,6 +2756,232 @@ mod tests {
         );
     }
 
+    /// Dropping a `Stopped` waits for its work: whatever the work did before it returned
+    /// is done once the drop returns, for work of every length up to 64 steps.
+    #[test]
+    fn a_stopped_thread_has_done_its_work_once_dropped() {
+        for steps in 0..64u32 {
+            let (tx, rx) = mpsc::channel();
+            drop(Stopped::spawn("work", move || {
+                for i in 0..steps {
+                    tx.send(i).unwrap();
+                }
+            }));
+            assert_eq!(rx.try_iter().count(), steps as usize, "{steps} steps");
+        }
+    }
+
+    /// A viewer that acks nothing is sent frames until more than `HOPELESSLY_BEHIND` of them
+    /// are in flight, and is then closed, once, by the real encode loop: it is sent
+    /// `HOPELESSLY_BEHIND + 1` frames, then one close, then nothing, whatever comes after.
+    #[test]
+    fn a_viewer_too_far_behind_is_closed() {
+        let hub = Hub::new(crate::hub::Paths::ANY);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let viewer = hub.add_client(tx, Instant::now());
+        viewer.watch();
+        viewer.keyframe_planned();
+        let (w, h) = (64, 64);
+        let ecfg = EncoderConfig {
+            pictures: Pictures {
+                width: w as u32,
+                height: h as u32,
+                fps: Fps::new(60).unwrap(),
+                preset: Preset::parse("ultrafast").unwrap(),
+                threads: 1,
+                debug: Debugging::read(|_| None).0,
+            },
+            crf: 23.0,
+            max_kbps: None,
+        };
+        let stripe = Stripe {
+            y: 0,
+            h,
+            cfg: ecfg.clone(),
+            running: None,
+        };
+        let (job_tx, job_rx) = mpsc::sync_channel::<Job>(1);
+        // The way home holds one picture: the capture loop's part, taking each home, is
+        // played by a thread of its own.
+        let (ret_tx, ret_rx) = mpsc::sync_channel::<Returned>(1);
+        let home = std::thread::spawn(move || ret_rx.iter().count());
+        let encode = std::thread::spawn({
+            let hub = hub.clone();
+            move || {
+                encode_loop(
+                    vec![stripe],
+                    Frames {
+                        layout: stripe_layout(h as u16, 1),
+                        fps: Fps::new(60).unwrap(),
+                    },
+                    job_rx,
+                    ret_tx,
+                    hub,
+                    Crfs {
+                        configured: 23.0,
+                        paintover: 18.0,
+                    },
+                    Debugging::read(|_| None).0,
+                )
+            }
+        });
+        for i in 0..HOPELESSLY_BEHIND + 3 {
+            let frame = match i {
+                0 => super::Frame::Key {
+                    blocks: None,
+                    starts: vec![viewer.clone()],
+                },
+                _ => super::Frame::Motion {
+                    band: Band {
+                        y0: 0,
+                        y1: h as u32,
+                    },
+                    dirty: Arc::new(vec![1; (w / 16) * (h / 16)]),
+                },
+            };
+            job_tx
+                .send(Job {
+                    buf: Arc::new(I420::new(w, h)),
+                    frame,
+                    allowance: window::START,
+                    captured: CaptureMarks::at(Instant::now()),
+                    marker_ms: None,
+                })
+                .unwrap();
+        }
+        drop(job_tx);
+        encode.join().unwrap();
+        assert_eq!(home.join().unwrap(), HOPELESSLY_BEHIND + 3);
+        let sent: Vec<Out> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let frames = sent.iter().take_while(|m| matches!(m, Out::Bin(_))).count();
+        assert_eq!(frames, HOPELESSLY_BEHIND + 1);
+        let after: Vec<String> = sent[frames..]
+            .iter()
+            .map(|m| match m {
+                Out::Text(t) => t.json(),
+                Out::Bin(_) => "a frame".into(),
+            })
+            .collect();
+        assert_eq!(after, ["{\"t\":\"close\"}"], "after the frames");
+    }
+
+    /// A stream is made when somebody starts watching, so its encoders are new: whatever
+    /// its first frame was planned as, and whatever blocks it was told are unchanged, each
+    /// stripe codes the first part it sends from nothing, and a viewer is sent nothing that
+    /// depends on a frame from before the stream. For every kind of frame, with every block
+    /// marked unchanged, over the whole screen and over its first rows, at 1 to 4 stripes,
+    /// then a motion frame with every block changed: each stripe's first part is coded
+    /// from nothing and its second is not. The stripes are the ones the hub's hello names.
+    #[test]
+    fn a_new_streams_first_frame_is_coded_from_nothing() {
+        let (w, h) = (64u32, 128u32);
+        let blocks = (w.div_ceil(16) * h.div_ceil(16)) as usize;
+        let unchanged = || Arc::new(vec![0u8; blocks]);
+        let sharpen = || Sharpen {
+            map: Arc::new(vec![1u8; blocks]),
+            at: Instant::now(),
+        };
+        let bands = [Band { y0: 0, y1: h }, Band { y0: 0, y1: 16 }];
+        for stripes in 1..=4 {
+            for band in bands {
+                let frames = [
+                    super::Frame::Key {
+                        blocks: None,
+                        starts: vec![],
+                    },
+                    super::Frame::Key {
+                        blocks: Some(sharpen()),
+                        starts: vec![],
+                    },
+                    super::Frame::Motion {
+                        band,
+                        dirty: unchanged(),
+                    },
+                    super::Frame::Sharpen {
+                        band,
+                        blocks: sharpen(),
+                    },
+                    super::Frame::MotionAndSharpen {
+                        band,
+                        dirty: unchanged(),
+                        blocks: sharpen(),
+                    },
+                ];
+                for frame in frames {
+                    let what = format!("{stripes} stripes, {:?}, {}", band, frame_kind(&frame));
+                    let hub = Hub::new(crate::hub::Paths::ANY);
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                    let viewer = hub.add_client(tx, Instant::now());
+                    // A viewer that has started, whatever the stream sends first.
+                    viewer.watch();
+                    assert!(viewer.keyframe_planned());
+                    viewer.keyframe_sent(true);
+                    let cfg = VideoConfig {
+                        display: None,
+                        #[cfg(target_os = "macos")]
+                        enable_resize: false,
+                        fps: Fps::new(60).unwrap(),
+                        preset: Preset::parse("ultrafast").unwrap(),
+                        threads: 1,
+                        convert_threads: 1,
+                        crf: 23.0,
+                        bounds: Bounds::new(Kbps::new(500.0), None),
+                        paintover_crf: 18.0,
+                        paintover_delay_ms: 0,
+                        coalesce: Duration::ZERO,
+                        // The stream codes the stripes the hub's hello names, not these.
+                        stripes: 1,
+                        debug: Debugging::read(|_| None).0,
+                    };
+                    *hub.stripes.lock() = stripe_layout(h as u16, stripes).rows().collect();
+                    let s = Stream::new(&cfg, &hub, w, h).unwrap();
+                    let next = super::Frame::Motion {
+                        band: bands[0],
+                        dirty: Arc::new(vec![1u8; blocks]),
+                    };
+                    for frame in [frame, next] {
+                        s.job_tx
+                            .send(Job {
+                                buf: Arc::new(I420::new(w as usize, h as usize)),
+                                frame,
+                                allowance: window::START,
+                                captured: CaptureMarks::at(Instant::now()),
+                                marker_ms: None,
+                            })
+                            .unwrap();
+                        // Its picture comes home before the next is sent, as the capture
+                        // loop's one picture does: the way home holds one.
+                        s.ret_rx.recv().unwrap();
+                    }
+                    drop(s);
+                    // Whether each part a stripe sent was coded from nothing, in order.
+                    let mut sent = vec![vec![]; hub.stripes.lock().len()];
+                    while let Ok(m) = rx.try_recv() {
+                        if let Out::Bin(b) = m {
+                            sent[b[10] as usize].push(b[1] & 1 == 1);
+                        }
+                    }
+                    for (i, parts) in sent.iter().enumerate() {
+                        assert_eq!(parts.first(), Some(&true), "stripe {i}: {what}");
+                        assert!(parts[1..].iter().all(|&key| !key), "stripe {i}: {what}");
+                    }
+                }
+            }
+        }
+    }
+
+    fn frame_kind(f: &super::Frame) -> &'static str {
+        match f {
+            super::Frame::Key { blocks: None, .. } => "key",
+            super::Frame::Key {
+                blocks: Some(_), ..
+            } => "key in place of a pass",
+            super::Frame::Motion { .. } => "motion",
+            super::Frame::Sharpen { .. } => "sharpen",
+            super::Frame::MotionAndSharpen { .. } => "motion and sharpen",
+        }
+    }
+
     const W: usize = 1280;
     const H: usize = 768;
 
@@ -1566,12 +3016,9 @@ mod tests {
                 }
             }
             Scene::Noise => {
-                let mut state = (frame as u64 + 1).wrapping_mul(0x9E3779B97F4A7C15);
+                let mut rng = Xorshift::new((frame as u64 + 1).wrapping_mul(0x9E3779B97F4A7C15));
                 for p in y.iter_mut() {
-                    state ^= state << 13;
-                    state ^= state >> 7;
-                    state ^= state << 17;
-                    *p = 64 + (state % 128) as u8;
+                    *p = 64 + rng.below(128) as u8;
                 }
             }
         }
@@ -1585,37 +3032,36 @@ mod tests {
     }
 
     /// Encodes frames the way a stripe worker does, under a bitrate cap of `max_kbps`
-    /// (0: none), with or without MotionQuality.
+    /// if there is one, with or without MotionQuality.
     struct Run {
         enc: Encoder,
         motion: MotionQuality,
         correct: bool,
         crf: f32,
-        max_kbps: u32,
         applied: f32,
         y: Vec<u8>,
         n: usize,
     }
 
     impl Run {
-        fn new(correct: bool, crf: f32, max_kbps: u32) -> Run {
+        fn new(correct: bool, crf: f32, max_kbps: Option<Kbps>) -> Run {
             Run {
                 enc: Encoder::new(&EncoderConfig {
-                    width: W as u32,
-                    height: H as u32,
-                    fps: 60,
-                    preset: "ultrafast".into(),
-                    threads: 1,
-                    debug: crate::env::Debugging::read(|_| None).0,
+                    pictures: Pictures {
+                        width: W as u32,
+                        height: H as u32,
+                        fps: Fps::new(60).unwrap(),
+                        preset: Preset::parse("ultrafast").unwrap(),
+                        threads: 1,
+                        debug: Debugging::read(|_| None).0,
+                    },
                     crf,
                     max_kbps,
-                    me_range: crate::encoder::ME_RANGE,
                 })
                 .unwrap(),
                 motion: MotionQuality::default(),
                 correct,
                 crf,
-                max_kbps,
                 applied: crf,
                 y: vec![0; W * H],
                 n: 0,
@@ -1635,7 +3081,7 @@ mod tests {
                 None => self.crf,
             };
             if c != self.applied {
-                self.enc.set_rate(c, self.max_kbps);
+                self.enc.set_crf(c);
                 self.applied = c;
             }
             let (u, v) = (vec![128u8; W * H / 4], vec![128u8; W * H / 4]);
@@ -1686,14 +3132,29 @@ mod tests {
     }
 
     fn qp(f: &Frame) -> f32 {
-        f.e.qp.unwrap()
+        match f.e {
+            Encoded::Picture { qp, .. } => qp,
+            Encoded::Nothing => panic!("x264 put nothing out"),
+        }
+    }
+
+    fn crf_avg(f: &Frame) -> f32 {
+        match f.e {
+            Encoded::Picture { crf_avg, .. } => crf_avg,
+            Encoded::Nothing => panic!("x264 put nothing out"),
+        }
     }
 
     #[test]
     fn dragged_window_stays_at_crf() {
         let crf = 24.0;
-        let plain = mean(Run::new(false, crf, 0).motion(Scene::Drag).iter().map(qp));
-        let corrected = mean(Run::new(true, crf, 0).motion(Scene::Drag).iter().map(qp));
+        let plain = mean(
+            Run::new(false, crf, None)
+                .motion(Scene::Drag)
+                .iter()
+                .map(qp),
+        );
+        let corrected = mean(Run::new(true, crf, None).motion(Scene::Drag).iter().map(qp));
         // The scene has to show the problem for the check below to mean anything.
         assert!(
             plain > crf + 3.0,
@@ -1712,12 +3173,12 @@ mod tests {
     fn capped_drag_keeps_its_estimate() {
         let crf = 24.0;
         // Without a cap the complexity is exactly what x264 added to the QP.
-        let plain = Run::new(false, crf, 0).motion(Scene::Drag);
+        let plain = Run::new(false, crf, None).motion(Scene::Drag);
         let complexity = mean(plain.iter().map(|f| qp(f) - f.crf));
-        let capped = Run::new(true, crf, 20_000).motion(Scene::Drag);
+        let capped = Run::new(true, crf, Some(Kbps::new(20_000.0))).motion(Scene::Drag);
         let start_qp_says = capped
             .iter()
-            .map(|f| qp(f) - f.e.crf_avg)
+            .map(|f| qp(f) - crf_avg(f))
             .fold(f32::MAX, f32::min);
         assert!(
             start_qp_says < complexity - 4.0,
@@ -1734,8 +3195,13 @@ mod tests {
     #[test]
     fn complex_content_is_left_alone() {
         let crf = 24.0;
-        let plain = mean(Run::new(false, crf, 0).motion(Scene::Noise).iter().map(qp));
-        let corrected = Run::new(true, crf, 0).motion(Scene::Noise);
+        let plain = mean(
+            Run::new(false, crf, None)
+                .motion(Scene::Noise)
+                .iter()
+                .map(qp),
+        );
+        let corrected = Run::new(true, crf, None).motion(Scene::Noise);
         assert!(
             plain > crf + 3.0,
             "x264 didn't raise the QP for noise ({plain:.1}, CRF {crf})"
@@ -1744,12 +3210,1800 @@ mod tests {
         assert_eq!(lowered, 0, "{lowered} noise frames got a lowered CRF");
     }
 
+    /// A block stays pending until a frame that sharpened it comes back sharp, and one
+    /// that changed again after that frame was captured stays pending even then.
+    #[test]
+    fn only_what_came_out_sharp_is_cleared() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let mut r = Refiner::new(4, 2, t0);
+        r.mark(&[1, 1, 1, 0], ms(10));
+        let (map, _) = r.pending_map().unwrap();
+        // A pass captured at 20 ms went out squeezed: nothing came back, so the next
+        // pass has it all.
+        assert_eq!(r.pending_map().unwrap().0, map);
+        r.mark(&[0, 1, 0, 0], ms(30));
+        // Then it comes back sharp: block 1 changed after its capture and stays.
+        r.sharpened(&map, ms(20));
+        assert_eq!(r.pending_map().unwrap().0, vec![0, 1, 0, 0]);
+        let (map, _) = r.pending_map().unwrap();
+        r.sharpened(&map, ms(40));
+        assert!(r.pending_map().is_none());
+    }
+
+    /// A keyframe sent in place of a due pass is coded at paint-over quality: when it
+    /// comes back as asked, every block is sharp and nothing is left for the passes
+    /// after it, except a block that changed after its capture. Any other keyframe
+    /// leaves every block pending.
+    #[test]
+    fn a_keyframe_in_place_of_a_pass_sharpens_every_block() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let mut r = Refiner::new(4, 2, t0);
+        r.mark(&[1, 0, 1, 0], ms(10));
+        r.mark_all(ms(200));
+        let key = super::Frame::Key {
+            blocks: None,
+            starts: vec![],
+        };
+        assert!(key.into_parts().0.is_none());
+        assert_eq!(r.pending_map().map(|p| p.0), Some(vec![1, 1, 1, 1]));
+        let key = super::Frame::Key {
+            blocks: Some(r.every_block(ms(200))),
+            starts: vec![],
+        };
+        assert!(key.sharpens());
+        r.mark(&[0, 0, 0, 1], ms(210));
+        let s = key.into_parts().0.expect("it sharpens what it codes");
+        r.sharpened(&s.map, s.at);
+        assert_eq!(r.pending_map().map(|p| p.0), Some(vec![0, 0, 0, 1]));
+    }
+
+    /// Typing beside an animation on a slow link: what the viewer is shown of blocks that
+    /// stopped changing is sharp within a bounded time, however long the motion beside them
+    /// goes on.
+    ///
+    /// One stripe: an animation's block changes on every frame, so the screen is never
+    /// still and the text is sharpened only by passes that frames with motion carry. The
+    /// text's blocks change in bursts of keystrokes, each burst followed by a pause. The
+    /// link: the cap squeezes a pass that has much left to send, but what a squeezed pass
+    /// sends stays, so a pass comes back as asked once every block it carries has had
+    /// `needs` passes since it last changed (live at 6 Mbit/s a still page takes 25-45).
+    /// The oracle is the model's own record of what the viewer is shown: a block at motion
+    /// quality from its last change until a pass that carried it, captured after that
+    /// change, comes back as asked.
+    ///
+    /// The bound, from the last keystroke: `REFINE_STILL` of stillness, then `needs`
+    /// passes `REFINE_EVERY` apart, each waiting up to a frame for a capture, then a frame
+    /// for the last one to come back. Throughout, a pass carries only blocks still for
+    /// `REFINE_STILL`, never the animation's, passes stay `REFINE_EVERY` apart, and none
+    /// goes once the text is shown sharp.
+    #[test]
+    fn still_blocks_are_sharpened_beside_motion() {
+        // Block 0 is the animation's, the others the text's.
+        const BLOCKS: usize = 8;
+        const FRAME: Duration = Duration::from_nanos(1_000_000_000 / 60);
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Shown {
+            AtMotionQuality,
+            Sharp,
+        }
+        struct Model {
+            r: Refiner,
+            now: Instant,
+            needs: u32,
+            changed: [Instant; BLOCKS],
+            /// Passes each block has had since it last changed.
+            passes: [u32; BLOCKS],
+            shown: [Shown; BLOCKS],
+            /// A pass that came back as asked, taken in before the next capture.
+            back: Option<(Vec<u8>, Instant)>,
+            last_pass: Option<Instant>,
+        }
+        impl Model {
+            /// One capture: the animation moved, and the block `typed`, if any.
+            fn capture(&mut self, typed: Option<usize>) {
+                self.now += FRAME;
+                if let Some((map, at)) = self.back.take() {
+                    for b in (0..BLOCKS).filter(|&b| map[b] != 0 && self.changed[b] <= at) {
+                        self.shown[b] = Shown::Sharp;
+                    }
+                    self.r.sharpened(&map, at);
+                }
+                let mut dirty = [0u8; BLOCKS];
+                dirty[0] = 1;
+                if let Some(b) = typed {
+                    dirty[b] = 1;
+                }
+                for b in (0..BLOCKS).filter(|&b| dirty[b] != 0) {
+                    (self.changed[b], self.passes[b], self.shown[b]) =
+                        (self.now, 0, Shown::AtMotionQuality);
+                }
+                self.r.mark(&dirty, self.now);
+                let Some((map, _)) = self.r.due(self.now) else {
+                    return;
+                };
+                assert_eq!(map[0], 0, "the animation's block went into a pass");
+                for b in (0..BLOCKS).filter(|&b| map[b] != 0) {
+                    let still = self.now - self.changed[b];
+                    assert!(
+                        still >= REFINE_STILL,
+                        "block {b} in a pass, still {still:?}"
+                    );
+                }
+                if let Some(last) = self.last_pass {
+                    assert!(
+                        self.now - last >= REFINE_EVERY,
+                        "passes {:?} apart",
+                        self.now - last
+                    );
+                }
+                self.last_pass = Some(self.now);
+                for (p, &m) in self.passes.iter_mut().zip(&map) {
+                    *p += m as u32;
+                }
+                if map
+                    .iter()
+                    .zip(&self.passes)
+                    .all(|(&m, &p)| m == 0 || p >= self.needs)
+                {
+                    self.back = Some((map, self.now));
+                }
+            }
+            fn text_at_motion_quality(&self) -> Vec<usize> {
+                (1..BLOCKS)
+                    .filter(|&b| self.shown[b] == Shown::AtMotionQuality)
+                    .collect()
+            }
+        }
+        let t0 = Instant::now();
+        let mut m = Model {
+            r: Refiner::new(BLOCKS, BLOCKS, t0),
+            now: t0,
+            needs: 1,
+            changed: [t0; BLOCKS],
+            passes: [0; BLOCKS],
+            shown: [Shown::Sharp; BLOCKS],
+            back: None,
+            last_pass: None,
+        };
+        let mut rng = Xorshift::new(0x2545F4914F6CDD1D);
+        let mut next = |n: u64| rng.below(n);
+        for _ in 0..300 {
+            m.needs = 1 + next(8) as u32;
+            let bound = REFINE_STILL + (REFINE_EVERY + FRAME) * m.needs + FRAME;
+            // Keystrokes 1 to 20 frames apart.
+            for _ in 0..1 + next(12) {
+                for _ in 0..next(20) {
+                    m.capture(None);
+                }
+                m.capture(Some(1 + next(BLOCKS as u64 - 1) as usize));
+            }
+            let typed = m.now;
+            while m.now < typed + bound {
+                m.capture(None);
+            }
+            assert_eq!(
+                m.text_at_motion_quality(),
+                Vec::<usize>::new(),
+                "needing {} passes, text shown at motion quality {:?} after the last keystroke",
+                m.needs,
+                m.now - typed
+            );
+            let sharp = m.last_pass;
+            for _ in 0..next(60) {
+                m.capture(None);
+            }
+            assert_eq!(m.last_pass, sharp, "a pass once the text was shown sharp");
+        }
+    }
+
+    /// The sharpening schedule against a model of it (when passes are due from, if they
+    /// are), over a long run of motion, passes, keyframes and empty pending maps at stated
+    /// times: a pass is due at the same moments in both, and the rules hold.
+    #[test]
+    fn sharpening_goes_on_until_nothing_is_pending() {
+        let delay = Duration::from_millis(150);
+        let t0 = Instant::now();
+        let mut s = Sharpening::new(delay);
+        let mut from: Option<Instant> = None;
+        let mut rng = Xorshift::new(0x2545F4914F6CDD1D);
+        let mut next = |n: u64| rng.below(n);
+        let mut now = t0;
+        for _ in 0..20_000 {
+            now += Duration::from_millis(next(120));
+            let model_due = from.is_some_and(|at| now >= at);
+            assert_eq!(
+                matches!(s.due(now), Due::Now),
+                model_due,
+                "due at {:?}",
+                now - t0
+            );
+            match next(10) {
+                0..=2 => {
+                    s.on_motion(now);
+                    from = Some(now + delay);
+                    // Motion always restarts the wait.
+                    assert_eq!(s.due(now), Due::In(delay));
+                }
+                3 => {
+                    // A keyframe: in place of a due pass it is that pass, else motion.
+                    let key = match s.due(now) {
+                        Due::Now => Keyframe::Pass,
+                        Due::In(_) | Due::Never => Keyframe::Fresh,
+                    };
+                    s.on_key(key, now);
+                    if !model_due {
+                        from = Some(now + delay);
+                    }
+                }
+                4..=7 if model_due => {
+                    // A pass went out: the next one is due at once.
+                    assert_eq!(s.due(now), Due::Now);
+                }
+                8 if model_due => {
+                    s.on_nothing_pending();
+                    from = None;
+                    // Nothing pending always ends in Idle.
+                    assert_eq!(s.due(now), Due::Never);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// A viewer joining a still screen gets a keyframe, every block at keyframe quality,
+    /// with nothing on screen moving: passes sharpen it from the paint-over delay after
+    /// the keyframe, as after motion. A keyframe in place of a due pass is that pass, and
+    /// passes go on.
+    #[test]
+    fn a_keyframe_on_a_still_screen_is_sharpened() {
+        let delay = Duration::from_millis(150);
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let mut s = Sharpening::new(delay);
+        assert_eq!(s.due(ms(0)), Due::Never, "a still screen, all of it sharp");
+        s.on_key(Keyframe::Fresh, ms(1000));
+        assert_eq!(s.due(ms(1149)), Due::In(Duration::from_millis(1)));
+        assert_eq!(
+            s.due(ms(1150)),
+            Due::Now,
+            "a pass at the keyframe plus the delay"
+        );
+        // A keyframe goes out in place of that pass: passes go on at once.
+        s.on_key(Keyframe::Pass, ms(1160));
+        assert_eq!(s.due(ms(1160)), Due::Now);
+    }
+
+    /// With nothing moved, a due pass is captured only while the encoder holds nothing, so
+    /// a keystroke that comes during it never waits behind a queued pass; with the encoder
+    /// busy, or nothing due, the loop waits for a wake; a pass due later, until then.
+    #[test]
+    fn a_pass_goes_only_to_an_idle_encoder() {
+        let ms = Duration::from_millis;
+        let now = Instant::now() + Duration::from_secs(10);
+        // A still screen, long since the last capture.
+        let still = |due, buffer| {
+            let look = Look {
+                key: Key::NotWanted,
+                damage: Damage::None,
+                due,
+                now,
+                captured: Captured::new(now - Duration::from_secs(1)),
+                min_interval: ms(14),
+                quiet: ms(2),
+                deadline: ms(16),
+                gate: Gated::Open(ROOM),
+                buffer,
+                in_flight: InFlight::Nothing,
+            };
+            step(look)
+        };
+        let (home, away) = (Buffer::Home(()), Buffer::Away);
+        assert_eq!(still(Due::Now, home), Step::Capture(Next::Pass, (), ROOM));
+        assert_eq!(still(Due::Now, away), Step::Wait(Wait::Change, away));
+        assert_eq!(still(Due::Never, home), Step::Wait(Wait::Change, home));
+        assert_eq!(
+            still(Due::In(ms(40)), away),
+            Step::Wait(Wait::Pass(ms(40)), away)
+        );
+    }
+
+    /// The frame interval as the capture loop applies it, over 20,000 random requests: a
+    /// change asked for at `t` is captured at `t`, or a frame after the last change if that
+    /// is later, and never later for a pass in between; a pass goes a frame after any
+    /// capture, so passes never come faster than the frame rate or right behind a change.
+    #[test]
+    fn a_pass_never_holds_a_change_back() {
+        let t0 = Instant::now();
+        let frame = Duration::from_micros(14_167);
+        let mut rng = Xorshift::new(0x9E3779B97F4A7C15);
+        let mut next = |n: u64| rng.below(n);
+        let mut captured = Captured::new(t0);
+        let (mut now, mut last_any, mut last_change) = (t0, t0, t0);
+        for _ in 0..20_000 {
+            now += Duration::from_micros(next(30_000));
+            let what = match next(3) {
+                0 => Next::Change,
+                _ => Next::Pass,
+            };
+            // The loop waits until a frame has passed since the capture that gates it.
+            let at = now.max(captured.gate(what) + frame);
+            match what {
+                Next::Change => {
+                    assert_eq!(at, now.max(last_change + frame), "a change held back");
+                    last_change = at;
+                }
+                Next::Pass => assert!(at >= last_any + frame, "a pass within a frame"),
+            }
+            captured.on_capture(what, at);
+            (now, last_any) = (at, at);
+        }
+    }
+
+    /// The tests' generator, drawing the stripes' cases.
+    struct Gen(Xorshift);
+    impl Gen {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0.below(n)
+        }
+        fn bytes(&mut self, len: usize) -> Vec<u8> {
+            (0..len).map(|_| self.below(256) as u8).collect()
+        }
+    }
+
+    /// A fake stripe worker's answer for the rows `y..y + h` of `buf`: a digest of every
+    /// byte of them, of the job, and of how many jobs it served before this one.
+    #[allow(clippy::too_many_arguments)]
+    fn fake_answer(
+        (y, h): (usize, usize),
+        buf: &I420,
+        ts: i64,
+        coding: Coding,
+        cap: u32,
+        mb_dirty: &Dirty,
+        mb_cols: usize,
+        served: u64,
+    ) -> StripeOut {
+        let mut d = 0xcbf29ce484222325u64;
+        let mut eat = |bytes: &[u8]| {
+            for &b in bytes {
+                d = (d ^ b as u64).wrapping_mul(0x100000001b3);
+            }
+        };
+        let suv = buf.stride_uv();
+        eat(&buf.y[y * buf.width..(y + h) * buf.width]);
+        eat(&buf.u[y / 2 * suv..(y + h).div_ceil(2) * suv]);
+        eat(&buf.v[y / 2 * suv..(y + h).div_ceil(2) * suv]);
+        eat(&ts.to_be_bytes());
+        eat(&[match coding {
+            Coding::Key { still: false } => 0,
+            Coding::Key { still: true } => 1,
+            Coding::Motion => 2,
+            Coding::Sharpen => 3,
+        }]);
+        eat(&cap.to_be_bytes());
+        match mb_dirty {
+            Dirty::All => eat(&[2]),
+            Dirty::Blocks(m) => {
+                let start = (y / 16) * mb_cols;
+                eat(&m[start..start + h.div_ceil(16) * mb_cols]);
+            }
+        }
+        eat(&served.to_be_bytes());
+        let at = Instant::now();
+        StripeOut::Sent {
+            key: d & 1 == 1,
+            bytes: BytesMut::from(&d.to_be_bytes()[..]),
+            quality: if d & 2 == 2 {
+                Quality::AsAsked
+            } else {
+                Quality::Coarser
+            },
+            coded: Coded {
+                woke: at,
+                x264: at,
+                encoded: at,
+            },
+        }
+    }
+
+    fn shown(outs: &[StripeOut]) -> Vec<String> {
+        outs.iter()
+            .map(|o| match o {
+                StripeOut::Skipped => "skipped".to_string(),
+                StripeOut::Failed => "failed".to_string(),
+                StripeOut::Empty => "empty".to_string(),
+                StripeOut::Sent {
+                    key,
+                    bytes,
+                    quality,
+                    ..
+                } => format!("{key} {bytes:?} {quality:?}"),
+            })
+            .collect()
+    }
+
+    /// The picture lent to the stripe workers comes back whole: over generated pictures,
+    /// stripe layouts, selections and jobs, every selected stripe's worker reads its rows
+    /// of the picture and answers for them, and the very picture lent comes back, each
+    /// plane where it was and as it was, and no longer shared, so the capture loop can
+    /// write it again.
+    #[test]
+    fn a_lent_picture_comes_back_as_it_went() {
+        let mut g = Gen(Xorshift::new(0x5851F42D4C957F2D));
+        for case in 0..300 {
+            let width = 16 + g.below(80) as usize;
+            let height = 16 + g.below(200) as usize;
+            let layout: Vec<(usize, usize)> = stripe_layout(height as u16, 1 + g.below(6) as u32)
+                .rows()
+                .map(|(y, h)| (y as usize, h as usize))
+                .collect();
+            let n = layout.len();
+            // A fake coder for the stripe at `rows`, counting the jobs it served.
+            let coder = |rows: (usize, usize)| {
+                let mut served = 0;
+                move |job: StripeJob| {
+                    let out = fake_answer(
+                        rows,
+                        &job.buf,
+                        job.ts,
+                        job.coding,
+                        job.cap,
+                        &job.mb_dirty,
+                        job.mb_cols,
+                        served,
+                    );
+                    served += 1;
+                    StripeResult { out, buf: job.buf }
+                }
+            };
+            let mut own = coder(layout[0]);
+            let mut crew = Crew::spawn(
+                move |job| Ok(own(job)),
+                layout[1..].iter().map(|&rows| {
+                    move |rx: mpsc::Receiver<StripeJob>, done: mpsc::SyncSender<StripeResult>| {
+                        let mut code = coder(rows);
+                        while let Ok(job) = rx.recv() {
+                            if done.send(code(job)).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }),
+            );
+            let mut served = vec![0; n];
+
+            // Two buffers, as the capture loop has, written afresh before each frame.
+            let mut pool = [
+                Some(Arc::new(I420::new(width, height))),
+                Some(Arc::new(I420::new(width, height))),
+            ];
+            for frame in 0..12 {
+                let idx = frame % 2;
+                let mut buf = pool[idx].take().unwrap();
+                let pic = Arc::get_mut(&mut buf).expect("the picture came back alone");
+                let (y, u, v) = (
+                    g.bytes(pic.y.len()),
+                    g.bytes(pic.u.len()),
+                    g.bytes(pic.v.len()),
+                );
+                pic.y.copy_from_slice(&y);
+                pic.u.copy_from_slice(&u);
+                pic.v.copy_from_slice(&v);
+                let at = (pic.y.as_ptr(), pic.u.as_ptr(), pic.v.as_ptr());
+                let selected: Vec<bool> = (0..n).map(|_| g.below(3) != 0).collect();
+                let ts = g.below(1 << 40) as i64;
+                let coding = match g.below(4) {
+                    0 => Coding::Key { still: false },
+                    1 => Coding::Key { still: true },
+                    2 => Coding::Motion,
+                    _ => Coding::Sharpen,
+                };
+                let share = 1 + g.below(50_000) as u32;
+                let mb_cols = width.div_ceil(16);
+                let mb_dirty = match g.below(2) {
+                    0 => Dirty::All,
+                    _ => Dirty::Blocks(Arc::new(g.bytes(mb_cols * height.div_ceil(16)))),
+                };
+                let want: Vec<StripeOut> = (0..n)
+                    .map(|i| {
+                        if !selected[i] {
+                            return StripeOut::Skipped;
+                        }
+                        served[i] += 1;
+                        fake_answer(
+                            layout[i],
+                            &buf,
+                            ts,
+                            coding,
+                            share,
+                            &mb_dirty,
+                            mb_cols,
+                            served[i] - 1,
+                        )
+                    })
+                    .collect();
+
+                let (outs, mut back) = crew
+                    .run(
+                        &selected,
+                        StripeJob {
+                            buf,
+                            ts,
+                            coding,
+                            cap: share,
+                            mb_dirty,
+                            mb_cols,
+                        },
+                    )
+                    .expect("no worker dies");
+                assert_eq!(shown(&outs.0), shown(&want), "case {case} frame {frame}");
+                assert_eq!(
+                    (back.y.as_ptr(), back.u.as_ptr(), back.v.as_ptr()),
+                    at,
+                    "case {case} frame {frame}: the planes came back moved"
+                );
+                assert!(
+                    back.y == y && back.u == u && back.v == v && back.width == width,
+                    "case {case} frame {frame}: the picture came back changed"
+                );
+                assert!(
+                    Arc::get_mut(&mut back).is_some(),
+                    "case {case} frame {frame}: the picture came back still shared"
+                );
+                pool[idx] = Some(back);
+            }
+        }
+    }
+
+    /// What came of a frame, from what came of it in each stripe: over generated frames
+    /// of 1-8 stripes, each untouched, failed, or coded by x264 (a keyframe or not, at a
+    /// CRF average either side of as asked, with bytes or none, a picture x264 put
+    /// nothing out for reading as one it didn't fill in), the frame is sharp when every
+    /// stripe it touched was coded as asked or put nothing out, a whole keyframe when
+    /// every stripe put out a keyframe, and its parts are the stripes that put out bytes,
+    /// in order.
+    #[test]
+    fn a_frame_comes_out_as_its_stripes_did() {
+        let mut g = Gen(Xorshift::new(0xD1B54A32D192ED03));
+        // Frames that came out sharp, not sharp, a whole keyframe, and with an empty stripe.
+        let mut reached = [0; 4];
+        for case in 0..20_000 {
+            let n = 1 + g.below(8) as usize;
+            let mut outs = vec![];
+            let (mut sharp, mut all_key, mut parts, mut empty) = (true, true, vec![], false);
+            for i in 0..n {
+                let crf = g.below(52) as f32;
+                match g.below(5) {
+                    0 => {
+                        outs.push(StripeOut::Skipped);
+                        all_key = false;
+                    }
+                    1 => {
+                        outs.push(StripeOut::Failed);
+                        (sharp, all_key) = (false, false);
+                    }
+                    _ => {
+                        let len = match g.below(4) {
+                            0 => 0,
+                            _ => 1 + g.below(64) as usize,
+                        };
+                        // A picture x264 put out: whether it is a keyframe, and its CRF
+                        // average.
+                        let picture = (len > 0).then(|| {
+                            let keyframe = g.below(3) != 0;
+                            (keyframe, crf + (g.below(40) as f32 - 10.0) / 10.0)
+                        });
+                        let e = match picture {
+                            None => Encoded::Nothing,
+                            Some((keyframe, crf_avg)) => Encoded::Picture {
+                                keyframe,
+                                qp: crf,
+                                crf_avg,
+                            },
+                        };
+                        let mut bytes = BytesMut::zeroed(Header::LEN);
+                        bytes.extend(g.bytes(len));
+                        // After a frame x264 started at its CRF, as this one: a predicted
+                        // frame the cap left at the CRF is as asked, a keyframe never.
+                        sharp &= match picture {
+                            None => true,
+                            Some((keyframe, crf_avg)) => !keyframe && crf_avg < crf + 0.5,
+                        };
+                        all_key &= picture.is_some_and(|(keyframe, _)| keyframe);
+                        empty |= len == 0;
+                        if let Some((keyframe, _)) = picture {
+                            parts.push((i, keyframe, bytes.clone()));
+                        }
+                        let at = Instant::now();
+                        let coded = Coded {
+                            woke: at,
+                            x264: at,
+                            encoded: at,
+                        };
+                        outs.push(StripeOut::coded(&e, crf, Settling::Over(0.0), bytes, coded));
+                    }
+                }
+            }
+            let mut out = FrameOut(outs);
+            let (sharp_got, all_key_got, count) = (out.sharp(), out.all_key(), out.parts());
+            let got = (sharp_got, all_key_got, out.take_parts().collect::<Vec<_>>());
+            assert_eq!(count, got.2.len(), "case {case}");
+            reached[usize::from(!sharp)] += 1;
+            reached[2] += usize::from(all_key);
+            reached[3] += usize::from(empty && sharp);
+            assert!(got == (sharp, all_key, parts), "case {case}");
+        }
+        assert!(
+            reached.iter().all(|&r| r >= 200),
+            "too few cases reached: {reached:?}"
+        );
+    }
+
+    /// A stripe sets x264's rate when it moves: over generated runs of encoders opened
+    /// (the stripe's first frame, a keyframe's own encoder), each told the rate of the
+    /// frame it opened for, and frames at a CRF (asked, or lowered for motion) under a cap
+    /// of at least 1 kbit/s (the share is never less), a frame sets its CRF and cap when
+    /// its CRF is not the one set, or when its cap is more than CAP_SLACK of the one set
+    /// away, and otherwise sets nothing.
+    #[test]
+    fn a_stripe_sets_its_rate_when_it_moves() {
+        let mut g = Gen(Xorshift::new(0x94D049BB133111EB));
+        // Frames that kept a rate, that set one, and that moved the cap onto the slack's edge.
+        let mut reached = [0; 3];
+        for case in 0..2_000 {
+            let mut cap = 1 + g.below(40_000) as u32;
+            let mut crf = 24.0;
+            // The rate set: the stripe's first frame opens its encoder, told its rate.
+            let mut set: (f32, u32) = (crf, cap);
+            let mut applied = Applied { crf, kbps: cap };
+            for frame in 0..200 {
+                match g.below(20) {
+                    // A keyframe's own encoder, told the keyframe's CRF and its budget.
+                    0 | 1 => {
+                        (crf, cap) = (12.0 + g.below(20) as f32, 1 + g.below(400_000) as u32);
+                        set = (crf, cap);
+                        applied = Applied { crf, kbps: cap };
+                    }
+                    _ => {
+                        // Caps wobble with the budget, and sometimes jump; CRFs step.
+                        cap = match g.below(6) {
+                            0 => 1 + g.below(40_000) as u32,
+                            // Onto the edge of the slack, or one past it.
+                            1 if set.1 % 25 == 0 => {
+                                let kbps = set.1;
+                                let edge = kbps / 25 + g.below(2) as u32;
+                                match g.below(2) {
+                                    0 => kbps + edge,
+                                    _ => kbps - edge.min(kbps - 1),
+                                }
+                            }
+                            _ => {
+                                let step = g.below(cap as u64 / 10 + 2) as u32;
+                                match g.below(2) {
+                                    0 => cap + step,
+                                    _ => cap - step.min(cap - 1),
+                                }
+                            }
+                        };
+                        if g.below(8) == 0 {
+                            crf = 12.0 + g.below(20) as f32;
+                        }
+                        let holds =
+                            set.0 == crf && cap.abs_diff(set.1) as f64 <= set.1 as f64 * CAP_SLACK;
+                        let on_edge = cap.abs_diff(set.1) as f64 == set.1 as f64 * CAP_SLACK;
+                        let want = (!holds).then_some((crf, cap));
+                        if let Some(rate) = want {
+                            set = rate;
+                        }
+                        let new = applied.next(crf, cap).map(|rate| {
+                            applied = rate;
+                            (rate.crf, rate.kbps)
+                        });
+                        assert_eq!(new, want, "case {case} frame {frame}");
+                        reached[usize::from(new.is_some())] += 1;
+                        reached[2] += usize::from(on_edge && holds);
+                    }
+                }
+            }
+        }
+        assert!(
+            reached.iter().all(|&r| r >= 100),
+            "too few cases reached: {reached:?}"
+        );
+    }
+
+    /// The crew codes each stripe as the stripe's coder alone would, wherever it runs it:
+    /// stripe 0 on the encode loop's own thread, the others on their workers. Over
+    /// generated screens of 1-4 stripes and runs of frames (each picture new, any
+    /// selection, every coding, caps that move, block maps or none), real x264 encoders
+    /// on one thread each put out, stripe by stripe, the bytes, keyframes and quality
+    /// their coders put out when handed the same jobs one by one on this thread, and a
+    /// stripe not selected is skipped. And once the crew is done with a frame nothing it
+    /// ran holds the frame's block map, so the capture loop may write it again.
+    #[test]
+    fn a_stripe_coded_where_its_frame_is_comes_out_as_on_a_worker() {
+        let crfs = Crfs {
+            configured: 24.0,
+            paintover: 16.0,
+        };
+        let coders = |width: usize, layout: &[(usize, usize)], cap: Option<Kbps>| {
+            layout
+                .iter()
+                .map(|&(y, h)| {
+                    let cfg = EncoderConfig {
+                        pictures: Pictures {
+                            width: width as u32,
+                            height: h as u32,
+                            fps: Fps::new(60).unwrap(),
+                            preset: Preset::parse("ultrafast").unwrap(),
+                            threads: 1,
+                            debug: Debugging::read(|_| None).0,
+                        },
+                        crf: 24.0,
+                        max_kbps: cap,
+                    };
+                    let s = Stripe {
+                        y,
+                        h,
+                        cfg: cfg.clone(),
+                        running: None,
+                    };
+                    Coder::new(s, crfs, false, mpsc::sync_channel(1).0)
+                })
+                .collect::<Vec<Coder>>()
+        };
+        let mut g = Gen(Xorshift::new(0xBF58476D1CE4E5B9));
+        let mut sent = 0;
+        for case in 0..40 {
+            let width = 16 * (2 + g.below(10) as usize);
+            let height = 16 * (2 + g.below(10) as usize);
+            let layout: Vec<(usize, usize)> = stripe_layout(height as u16, 1 + g.below(4) as u32)
+                .rows()
+                .map(|(y, h)| (y as usize, h as usize))
+                .collect();
+            let n = layout.len();
+            let cap = (g.below(2) == 0).then(|| Kbps::new(2000.0 + g.below(20_000) as f64));
+            let mut alone = coders(width, &layout, cap);
+            let mut ours = coders(width, &layout, cap).into_iter();
+            let mut own = ours.next().unwrap();
+            let mut new = Crew::spawn(
+                move |job| own.code(job).map_err(|_| Gone(0)),
+                ours.map(|c| move |rx, done| stripe_worker(c, rx, done)),
+            );
+            let mut buf = Arc::new(I420::new(width, height));
+            for frame in 0..10 {
+                let pic = Arc::get_mut(&mut buf).unwrap();
+                // Text-like rows over a gradient, moved a little each frame, or noise.
+                let noise = g.below(4) == 0;
+                let shift = g.below(8) as usize;
+                for (k, p) in pic.y.iter_mut().enumerate() {
+                    let (x, y) = (k % width, k / width);
+                    *p = match noise {
+                        true => g.below(256) as u8,
+                        false => match ((x + shift) / 3 + y / 7) % 5 {
+                            0 => 30,
+                            _ => (40 + y * 2) as u8,
+                        },
+                    };
+                }
+                let selected: Vec<bool> = match frame {
+                    0 => vec![true; n],
+                    _ => (0..n).map(|_| g.below(3) != 0).collect(),
+                };
+                let coding = match (frame, g.below(5)) {
+                    (0, _) | (_, 0) => Coding::Key { still: false },
+                    (_, 1) => Coding::Key { still: true },
+                    (_, 2) => Coding::Sharpen,
+                    _ => Coding::Motion,
+                };
+                let mb_cols = width.div_ceil(16);
+                let job = StripeJob {
+                    buf,
+                    ts: frame as i64 * 16,
+                    coding,
+                    cap: 200 + g.below(30_000) as u32,
+                    mb_dirty: match g.below(2) {
+                        0 => Dirty::All,
+                        _ => Dirty::Blocks(Arc::new(
+                            (0..mb_cols * height.div_ceil(16))
+                                .map(|_| (g.below(3) != 0) as u8)
+                                .collect(),
+                        )),
+                    },
+                    mb_cols,
+                };
+                let want: Vec<StripeOut> = alone
+                    .iter_mut()
+                    .zip(&selected)
+                    .map(|(coder, &on)| match on {
+                        true => coder.code(job.clone()).unwrap().out,
+                        false => StripeOut::Skipped,
+                    })
+                    .collect();
+                let map = match &job.mb_dirty {
+                    Dirty::Blocks(map) => Some(Arc::downgrade(map)),
+                    Dirty::All => None,
+                };
+                let (got, back) = new.run(&selected, job).unwrap();
+                let want = shown(&want);
+                assert_eq!(shown(&got.0), want, "case {case} frame {frame}");
+                assert!(
+                    map.is_none_or(|map| map.upgrade().is_none()),
+                    "case {case} frame {frame}: the block map is still held"
+                );
+                sent += want.iter().filter(|w| w.len() > 20).count();
+                buf = back;
+            }
+        }
+        assert!(sent >= 300, "only {sent} stripes coded");
+    }
+
+    /// A frame in steady state allocates nothing on the encode loop's thread or a stripe
+    /// worker's, whatever it is. The oracle is the allocator itself: it counts every
+    /// allocation the process makes while frames go through.
+    ///
+    /// The encode loop runs on a thread of its own, as the stream runs it, with real
+    /// encoders for 1 to 3 stripes of a 1024x768 screen and one viewer. This test's
+    /// thread plays the capture loop (it draws into the picture that came back and hands
+    /// it over) and the viewer's socket task (acks each frame as it arrives, and holds
+    /// what was sent until the next frame, as a socket that takes its time); what it
+    /// allocates is theirs and not counted. First every kind of frame goes through over
+    /// every band, of noise and then of text, which brings every buffer the encode loop
+    /// and its workers keep to its size (x264's output vector to the largest part it put
+    /// out); then a generated run of frames of text is counted. What x264 allocates
+    /// goes through C's malloc, which this allocator does not see.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_encode_loop_and_its_workers_allocate_nothing_a_frame() {
+        if !in_a_process_of_its_own(
+            "video::tests::the_encode_loop_and_its_workers_allocate_nothing_a_frame",
+        ) {
+            return;
+        }
+        let (w, h) = (1024usize, 768usize);
+        let (cols, rows) = (w.div_ceil(16), h.div_ceil(16));
+        let crfs = Crfs {
+            configured: 24.0,
+            paintover: 16.0,
+        };
+        let mut rng = Xorshift::new(0x2545F4914F6CDD1D);
+        let mut next = |n: usize| rng.below(n as u64) as usize;
+        for stripes in 1..=3 {
+            let layout = stripe_layout(h as u16, stripes);
+            let mut coders = layout.rows().map(|(y, sh)| {
+                let cfg = EncoderConfig {
+                    pictures: Pictures {
+                        width: w as u32,
+                        height: sh,
+                        fps: Fps::new(60).unwrap(),
+                        preset: Preset::parse("ultrafast").unwrap(),
+                        threads: (4 / u32::from(layout.count)).max(1),
+                        debug: Debugging::read(|_| None).0,
+                    },
+                    crf: 24.0,
+                    max_kbps: Some(Kbps::new(30_000.0)),
+                };
+                let s = Stripe {
+                    y: y as usize,
+                    h: sh as usize,
+                    cfg: cfg.clone(),
+                    running: None,
+                };
+                Coder::new(s, crfs, false, mpsc::sync_channel(1).0)
+            });
+            let mut own = coders.next().unwrap();
+            let crew = Crew::spawn(
+                move |job| own.code(job).map_err(|_| Gone(0)),
+                coders.map(|c| move |rx, done| stripe_worker(c, rx, done)),
+            );
+            let geometry: Vec<(usize, usize)> = layout
+                .rows()
+                .map(|(y, sh)| (y as usize, sh as usize))
+                .collect();
+            let hub = Hub::new(crate::hub::Paths::ANY);
+            let (tx, mut socket) = tokio::sync::mpsc::unbounded_channel();
+            let viewer = hub.add_client(tx, Instant::now());
+            viewer.watch();
+            // The capture loop planned its keyframe: the first frame played is one.
+            viewer.keyframe_planned();
+            let (job_tx, job_rx) = mpsc::sync_channel::<Job>(1);
+            // One picture goes round (capture-when-idle).
+            let (ret_tx, ret_rx) = mpsc::sync_channel::<Returned>(1);
+            let encoding = hub.clone();
+            let encode = std::thread::Builder::new()
+                .name("encode".into())
+                .spawn(move || {
+                    let mut crew = crew;
+                    let paced = Frames {
+                        layout,
+                        fps: Fps::new(60).unwrap(),
+                    };
+                    encode_frames(&mut crew, &geometry, &paced, job_rx, ret_tx, &encoding).unwrap()
+                })
+                .unwrap();
+            // Bands of block rows, each with a map of the blocks in it that changed,
+            // made before anything is counted.
+            let maps: Vec<(Band, Arc<Vec<u8>>)> = (0..8)
+                .map(|_| {
+                    let first = next(rows);
+                    let last = first + next(rows - first);
+                    let map = (0..cols * rows)
+                        .map(|b| ((first..=last).contains(&(b / cols)) && next(3) > 0) as u8)
+                        .collect();
+                    let band = Band {
+                        y0: (first * 16) as u32,
+                        y1: ((last + 1) * 16).min(h) as u32,
+                    };
+                    (band, Arc::new(map))
+                })
+                .collect();
+            let every = Arc::new(vec![1u8; cols * rows]);
+            let sharpen = |map: &Arc<Vec<u8>>| Sharpen {
+                map: map.clone(),
+                at: Instant::now(),
+            };
+            let mut home = Some(Arc::new(I420::new(w, h)));
+            // The viewer the first keyframe was planned for; it starts on it.
+            let mut starts = vec![viewer.clone()];
+            let mut writing: Vec<Bytes> = vec![];
+            let mut frame = |kind: usize, which: usize, n: usize, noise: bool| {
+                let (band, map) = &maps[which];
+                let frame = match kind {
+                    0 => super::Frame::Key {
+                        blocks: None,
+                        starts: std::mem::take(&mut starts),
+                    },
+                    1 => super::Frame::Key {
+                        blocks: Some(sharpen(&every)),
+                        starts: std::mem::take(&mut starts),
+                    },
+                    2 => super::Frame::Motion {
+                        band: *band,
+                        dirty: every.clone(),
+                    },
+                    3 => super::Frame::Motion {
+                        band: *band,
+                        dirty: map.clone(),
+                    },
+                    4 => super::Frame::Sharpen {
+                        band: *band,
+                        blocks: sharpen(map),
+                    },
+                    _ => super::Frame::MotionAndSharpen {
+                        band: *band,
+                        dirty: map.clone(),
+                        blocks: sharpen(map),
+                    },
+                };
+                // The picture comes home before the next frame is captured into it.
+                while home.is_none() {
+                    home = Some(ret_rx.recv().unwrap().buf);
+                }
+                let mut buf = home.take().unwrap();
+                // What moved: lines of 9 px glyphs scrolled 3 px a frame through the band;
+                // or noise over the whole picture, which wants more bytes than any text.
+                let pic = Arc::get_mut(&mut buf).unwrap();
+                if noise {
+                    let mut rng = Xorshift::new(0x9E37_79B9_7F4A_7C15u64 ^ n as u64);
+                    for p in pic.y.iter_mut() {
+                        *p = rng.next() as u8;
+                    }
+                }
+                let (y0, y1) = match noise {
+                    true => (0, 0),
+                    false => (band.y0 as usize, band.y1 as usize),
+                };
+                for (y, row) in pic.y.chunks_exact_mut(w).enumerate().take(y1).skip(y0) {
+                    let (line, within) = ((y + 3 * n) / 18, (y + 3 * n) % 18);
+                    for (x, glyph) in row.chunks_mut(9).enumerate() {
+                        let ink = within < 12 && (x * 2654435761 + line * 40503) >> 7 & 1 == 1;
+                        glyph.fill(if ink { 30 } else { 235 });
+                    }
+                }
+                job_tx
+                    .send(Job {
+                        buf,
+                        frame,
+                        allowance: window::START,
+                        captured: CaptureMarks::at(Instant::now()),
+                        marker_ms: None,
+                    })
+                    .unwrap();
+                // The viewer: every frame is acknowledged as it arrives, and what was
+                // sent to it is written out a frame later, as a socket that takes its time.
+                let mut arrived = vec![];
+                while let Ok(m) = socket.try_recv() {
+                    if let Out::Bin(m) = m {
+                        let id = u32::from_be_bytes([m[2], m[3], m[4], m[5]]);
+                        viewer.on_ack(Instant::now(), id, crate::hub::Hold::Unsaid);
+                        arrived.push(m);
+                    }
+                }
+                writing = arrived;
+            };
+            let mut n = 0;
+            for noise in [true, false] {
+                for kind in 0..6 {
+                    for which in 0..maps.len() {
+                        frame(kind, which, n, noise);
+                        n += 1;
+                    }
+                }
+            }
+            const COUNTED: usize = 120;
+            counting::arm();
+            for _ in 0..COUNTED {
+                // A keyframe now and then, as a viewer joining asks for one.
+                let kind = match next(30) {
+                    0 => next(2),
+                    _ => 2 + next(4),
+                };
+                frame(kind, next(maps.len()), n, false);
+                n += 1;
+            }
+            let (threads, others) = counting::disarm();
+            drop(job_tx);
+            encode.join().unwrap();
+            let ours: Vec<String> = threads
+                .iter()
+                .map(|t| {
+                    (
+                        String::from_utf8_lossy(&t.name)
+                            .trim_end_matches('\0')
+                            .to_owned(),
+                        t,
+                    )
+                })
+                .filter(|(name, _)| name == "encode" || name.starts_with("enc-"))
+                .map(|(name, t)| {
+                    let sizes: Vec<String> = t
+                        .sizes
+                        .iter()
+                        .flatten()
+                        .map(|(size, n)| format!("{size} B x {n}"))
+                        .collect();
+                    format!(
+                        "{name}: {:.2} a frame ({})",
+                        t.allocations as f64 / COUNTED as f64,
+                        sizes.join(", ")
+                    )
+                })
+                .collect();
+            assert!(
+                ours.is_empty() && others == 0,
+                "{stripes} stripes: {COUNTED} frames allocated, by thread:\n{}\nand {others} \
+                 times on threads past the table",
+                ours.join("\n")
+            );
+        }
+    }
+
+    /// How a fake stripe worker ends.
+    #[derive(Clone, Copy, Debug)]
+    enum End {
+        /// It answers every job it is given.
+        Never,
+        /// It answers `n` jobs, then returns before taking another.
+        Returns(u32),
+        /// It answers `n` jobs, takes the next one and returns without answering it.
+        Drops(u32),
+        /// It answers `n` jobs, takes the next one and panics.
+        Panics(u32),
+    }
+
+    impl End {
+        /// How many jobs it answers, if not all.
+        fn answers(self) -> Option<u32> {
+            match self {
+                End::Never => None,
+                End::Returns(n) | End::Drops(n) | End::Panics(n) => Some(n),
+            }
+        }
+    }
+
+    /// A fake stripe worker for stripe `i`: it answers each job with a header's room, its
+    /// stripe and how many jobs it answered before, until its `end`. Once it has dropped
+    /// both of its channels' ends, by returning or by unwinding, it says `i` on `ended`.
+    fn mortal(
+        i: usize,
+        end: End,
+        ended: mpsc::Sender<usize>,
+    ) -> impl FnOnce(mpsc::Receiver<StripeJob>, mpsc::SyncSender<StripeResult>) + Send + 'static
+    {
+        struct Ended(usize, mpsc::Sender<usize>);
+        impl Drop for Ended {
+            fn drop(&mut self) {
+                let _ = self.1.send(self.0);
+            }
+        }
+        move |rx, done| {
+            // Declared first, so dropped after both ends.
+            let _ended = Ended(i, ended);
+            let (rx, done) = (rx, done);
+            for served in 0u32.. {
+                if let End::Returns(n) = end {
+                    if n == served {
+                        return;
+                    }
+                }
+                let Ok(job) = rx.recv() else { return };
+                match end {
+                    End::Drops(n) if n == served => return,
+                    End::Panics(n) if n == served => panic!("stripe {i} dies on its job {n}"),
+                    End::Never | End::Returns(_) | End::Drops(_) | End::Panics(_) => {}
+                }
+                let mut bytes = BytesMut::zeroed(Header::LEN);
+                bytes.extend([i as u8, served as u8]);
+                let at = Instant::now();
+                let out = StripeOut::Sent {
+                    key: true,
+                    bytes,
+                    quality: Quality::AsAsked,
+                    coded: Coded {
+                        woke: at,
+                        x264: at,
+                        encoded: at,
+                    },
+                };
+                if done.send(StripeResult { out, buf: job.buf }).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+
+    fn a_job(n: usize) -> StripeJob {
+        StripeJob {
+            buf: Arc::new(I420::new(16, 16 * n)),
+            ts: 0,
+            coding: Coding::Motion,
+            cap: 1,
+            mb_dirty: Dirty::All,
+            mb_cols: 1,
+        }
+    }
+
+    /// A stripe worker that is gone leaves the encode loop nothing to wait on: once it
+    /// has dropped its ends, by returning before a job, after taking one, or by
+    /// panicking, its job channel refuses and its result channel reads disconnected,
+    /// for any crew and any of its workers gone, while the others' stay open.
+    #[test]
+    fn a_gone_worker_closes_both_its_channels() {
+        let mut g = Gen(Xorshift::new(0x2545F4914F6CDD1D));
+        for case in 0..300 {
+            let n = 1 + g.below(8) as usize;
+            let ends: Vec<End> = (0..n)
+                .map(|_| match g.below(4) {
+                    0 => End::Returns(0),
+                    1 => End::Drops(0),
+                    2 => End::Panics(0),
+                    _ => End::Never,
+                })
+                .collect();
+            let (ended_tx, ended) = mpsc::channel();
+            let crew = Crew::spawn(
+                |job: StripeJob| {
+                    Ok(StripeResult {
+                        out: StripeOut::Failed,
+                        buf: job.buf,
+                    })
+                },
+                (0..n).map(|i| mortal(i, ends[i], ended_tx.clone())),
+            );
+            for hand in &crew.hands {
+                let _ = hand.jobs.send(a_job(n));
+            }
+            let mut gone: Vec<usize> = (0..n).filter(|&i| ends[i].answers().is_some()).collect();
+            let mut seen: Vec<usize> = (0..gone.len()).map(|_| ended.recv().unwrap()).collect();
+            seen.sort();
+            gone.sort();
+            assert_eq!(seen, gone, "case {case}: {ends:?}");
+            for (i, hand) in crew.hands.iter().enumerate() {
+                let what = format!("case {case}: stripe {i}, {:?}", ends[i]);
+                match ends[i] {
+                    End::Never => {
+                        assert!(hand.done.recv().is_ok(), "{what}");
+                        assert!(
+                            matches!(hand.done.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                            "{what}: there, and its results are closed"
+                        );
+                        assert!(hand.jobs.send(a_job(n)).is_ok(), "{what}");
+                    }
+                    End::Returns(_) | End::Drops(_) | End::Panics(_) => {
+                        assert!(
+                            matches!(hand.done.try_recv(), Err(mpsc::TryRecvError::Disconnected)),
+                            "{what}: gone, and its results are open"
+                        );
+                        assert!(
+                            hand.jobs.send(a_job(n)).is_err(),
+                            "{what}: gone, and it takes jobs"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A stripe of `height` rows of `width`, whose encoders open at `ceiling` with `preset`.
+    fn stripe(width: usize, height: usize, ceiling: Option<Kbps>) -> Stripe {
+        Stripe {
+            y: 0,
+            h: height,
+            cfg: EncoderConfig {
+                pictures: Pictures {
+                    width: width as u32,
+                    height: height as u32,
+                    fps: Fps::new(60).unwrap(),
+                    preset: Preset::parse("ultrafast").unwrap(),
+                    threads: 1,
+                    debug: Debugging::read(|_| None).0,
+                },
+                crf: 23.0,
+                max_kbps: ceiling,
+            },
+            running: None,
+        }
+    }
+
+    /// What a stripe's coder did with `jobs` (a kind and a cap each) of one picture, coded
+    /// one after another: what it put out for each, and how many encoders it handed over
+    /// to be closed.
+    struct PutOut {
+        sent: Vec<Vec<u8>>,
+        closed: usize,
+    }
+
+    /// What a stripe's coder put out (x264's bytes, past the header's room) for `jobs` of
+    /// `buf`.
+    fn put_out(stripe: Stripe, buf: &Arc<I420>, jobs: &[(Coding, u32)]) -> PutOut {
+        let crfs = Crfs {
+            configured: 23.0,
+            paintover: 18.0,
+        };
+        // Room for every encoder the jobs could replace, so the coder never waits.
+        let (close, closing) = mpsc::sync_channel(jobs.len());
+        let mut coder = Coder::new(stripe, crfs, false, close);
+        let sent = jobs
+            .iter()
+            .enumerate()
+            .map(|(n, &(coding, cap))| {
+                let job = StripeJob {
+                    buf: buf.clone(),
+                    ts: n as i64 * 16,
+                    coding,
+                    cap,
+                    mb_dirty: Dirty::All,
+                    mb_cols: buf.width.div_ceil(16),
+                };
+                match coder.code(job).map(|r| r.out) {
+                    Ok(StripeOut::Sent { bytes, .. }) => bytes[Header::LEN..].to_vec(),
+                    Ok(StripeOut::Skipped | StripeOut::Failed | StripeOut::Empty) | Err(_) => {
+                        panic!("frame {n} came out with nothing")
+                    }
+                }
+            })
+            .collect();
+        drop(coder);
+        PutOut {
+            sent,
+            closed: closing.into_iter().count(),
+        }
+    }
+
+    /// The SPS of a keyframe: from its NAL header to the next start code.
+    fn sps(keyframe: &[u8]) -> &[u8] {
+        let at = keyframe
+            .windows(4)
+            .position(|w| w == [0, 0, 1, 0x67])
+            .expect("a keyframe carries its SPS")
+            + 3;
+        let len = keyframe[at..]
+            .windows(3)
+            .position(|w| w == [0, 0, 1])
+            .unwrap_or(keyframe.len() - at);
+        &keyframe[at..at + len]
+    }
+
+    /// `--max-kbps 0` is no ceiling: encoders open without a rate cap, so nothing applies
+    /// the target, and a viewer on a slow path gets every frame at its CRF. So with no
+    /// ceiling, what a stripe sends cannot depend on the cap its jobs carry, keyframes
+    /// included: over generated runs of keyframes, motion and passes of new noise, the
+    /// same bytes under caps of 100 kbit/s and of 20 Mbit/s. (RED's, for this commit's
+    /// coder.) One thread, no VBV: x264's output is byte-identical run to run.
+    #[test]
+    fn with_no_ceiling_a_stripe_sends_the_same_whatever_the_cap() {
+        let mut g = Gen(Xorshift::new(0xD1B5_4A32_D192_ED03));
+        for case in 0..6 {
+            let mut buf = Arc::new(I420::new(256, 64));
+            Arc::get_mut(&mut buf).unwrap().y = g.bytes(256 * 64);
+            let codings: Vec<Coding> = (0..2 + g.below(8))
+                .map(|_| match g.below(3) {
+                    0 => Coding::Key { still: false },
+                    1 => Coding::Motion,
+                    _ => Coding::Sharpen,
+                })
+                .collect();
+            let at = |cap: u32| codings.iter().map(|&c| (c, cap)).collect::<Vec<_>>();
+            let slow = put_out(stripe(256, 64, None), &buf, &at(100)).sent;
+            let fast = put_out(stripe(256, 64, None), &buf, &at(20_000)).sent;
+            assert!(
+                slow == fast,
+                "case {case}: with no ceiling, frames came out apart under 100 and 20000 kbit/s"
+            );
+        }
+    }
+
+    /// A keyframe gets its cap, one frame at it, whatever came before it. A stripe whose
+    /// stream is capped at a ceiling codes a picture at a low cap, then a keyframe of it
+    /// under a generated cap, from under the ceiling to past five frames of it in one. The
+    /// picture (noise) wants more than any of them. The keyframe takes most of one frame
+    /// at its cap and no more, where the running encoder had only the low cap's buffer
+    /// for it; and it carries the stream's own SPS, so the viewer keeps its decoder, even
+    /// under a cap past what the stream's level allows.
+    #[test]
+    fn a_keyframe_gets_its_cap() {
+        let mut buf = Arc::new(I420::new(W, H));
+        draw(&mut Arc::get_mut(&mut buf).unwrap().y, Scene::Noise, 0);
+        let key = Coding::Key { still: false };
+        // The level x264 picks for 1280x768 at 60 fps and this ceiling allows 20 Mbit/s.
+        let ceiling = Some(Kbps::new(20_000.0));
+        let low = 1200;
+        let frame = |cap: u32| cap as usize * 1000 / 60 / 8;
+        let mut g = Gen(Xorshift::new(0x9E37_79B9_7F4A_7C15));
+        for _ in 0..10 {
+            let cap = 2_000 + g.below(150_000) as u32;
+            let mut jobs = vec![(key, low)];
+            jobs.extend([(Coding::Sharpen, low); 6]);
+            jobs.push((key, cap));
+            let sent = put_out(stripe(W, H, ceiling), &buf, &jobs).sent;
+            let keyframe = sent.last().unwrap();
+            assert!(
+                keyframe.len() * 4 >= frame(cap) * 3 && keyframe.len() <= frame(cap),
+                "a keyframe of {} bytes under a cap of {cap} kbit/s, a frame of {}",
+                keyframe.len(),
+                frame(cap)
+            );
+            assert!(
+                sps(keyframe) == sps(&sent[0]),
+                "a keyframe under a cap of {cap} kbit/s names another SPS"
+            );
+        }
+    }
+
+    /// An encoder a keyframe replaces is handed over to be closed, not closed on the
+    /// stripe's thread before the keyframe. Over generated runs of keyframes, motion and
+    /// passes: under a cap, every keyframe after the stripe's first frame hands over the
+    /// encoder it replaces, and nothing else does; with no cap a keyframe keeps the
+    /// stream's encoder, and none is.
+    #[test]
+    fn a_replaced_encoder_is_closed_off_the_stripe() {
+        let mut g = Gen(Xorshift::new(0x51_7CC1_B727_220A));
+        for case in 0..12 {
+            let mut buf = Arc::new(I420::new(64, 64));
+            Arc::get_mut(&mut buf).unwrap().y = g.bytes(64 * 64);
+            let jobs: Vec<(Coding, u32)> = (0..4 + g.below(10))
+                .map(|_| match g.below(3) {
+                    0 => (Coding::Key { still: false }, 2000),
+                    1 => (Coding::Motion, 300),
+                    _ => (Coding::Sharpen, 300),
+                })
+                .collect();
+            let replaced = jobs[1..]
+                .iter()
+                .filter(|(coding, _)| matches!(coding, Coding::Key { .. }))
+                .count();
+            let capped = put_out(stripe(64, 64, Some(Kbps::new(8000.0))), &buf, &jobs).closed;
+            let uncapped = put_out(stripe(64, 64, None), &buf, &jobs).closed;
+            assert!(
+                capped == replaced && uncapped == 0,
+                "case {case}: {capped} encoders handed over under a cap and {uncapped} \
+                 without, for {replaced} keyframes after the first frame"
+            );
+        }
+    }
+
+    /// A stripe whose encoder cannot be opened has nothing to code with, now or after: it
+    /// is gone, and the pipeline ends, as when a worker dies. Over generated screens of
+    /// 1-4 stripes, one of them (stripe 0 on the encode loop's thread, or a worker's)
+    /// opening at a size x264 refuses, with a cap and without, and first frames of every
+    /// kind: the crew finds that stripe gone on the first frame.
+    #[test]
+    fn a_stripe_that_cannot_open_its_encoder_is_gone() {
+        let crfs = Crfs {
+            configured: 23.0,
+            paintover: 18.0,
+        };
+        let mut g = Gen(Xorshift::new(0xA076_1D64_78BD_642F));
+        let mut reached = [0; 2];
+        for case in 0..24 {
+            let n = 1 + g.below(4) as usize;
+            let dead = g.below(n as u64) as usize;
+            let ceiling = (g.below(2) == 0).then_some(Kbps::new(8000.0));
+            let coding = match g.below(3) {
+                0 => Coding::Key { still: false },
+                1 => Coding::Motion,
+                _ => Coding::Sharpen,
+            };
+            // x264 refuses a picture of odd height in 4:2:0.
+            let mut coders = (0..n).map(|i| {
+                Coder::new(
+                    stripe(64, if i == dead { 15 } else { 16 }, ceiling),
+                    crfs,
+                    false,
+                    mpsc::sync_channel(1).0,
+                )
+            });
+            let mut own = coders.next().unwrap();
+            let mut crew = Crew::spawn(
+                move |job| own.code(job).map_err(|_| Gone(0)),
+                coders.map(|c| move |rx, done| stripe_worker(c, rx, done)),
+            );
+            let job = StripeJob {
+                buf: Arc::new(I420::new(64, 16)),
+                ts: 0,
+                coding,
+                cap: 4000,
+                mb_dirty: Dirty::All,
+                mb_cols: 4,
+            };
+            let gone = crew.run(&vec![true; n], job).err().map(|Gone(i)| i);
+            assert_eq!(gone, Some(dead), "case {case}: {n} stripes");
+            reached[usize::from(dead > 0)] += 1;
+        }
+        assert!(reached.iter().all(|&r| r > 0), "{reached:?}");
+    }
+
+    /// Any stripe worker may die at any point, and the pipeline then ends with it gone
+    /// and never waits for it. Over generated stripe layouts, deaths (returning before
+    /// a job, taking one and returning, taking one and panicking, after any number of
+    /// jobs) and runs of frames over any band of rows, fed as the capture loop feeds
+    /// them: every frame before the first one that needs a dead worker comes back with
+    /// the picture it was given, and no other does; the encode loop ends with a worker
+    /// that frame needed gone; the capture loop, waiting for its pictures as it does (on
+    /// the hub's waker, with no limit), is woken to find the way home closed, which it
+    /// ends on ("encoder gone"); and its frame after the next is refused, as a closed
+    /// encoder refuses it. Stripe 0, coded on the encode loop's own thread, dies by
+    /// panicking there, which ends the same way. Every wait here is on a channel or the
+    /// waker, none on a clock.
+    #[test]
+    fn a_dead_worker_ends_the_pipeline() {
+        let mut g = Gen(Xorshift::new(0x9E3779B97F4A7C15));
+        // Cases that ended with each way of dying, that ended well, that refused, and
+        // that ended with stripe 0 panicking on the encode loop's thread.
+        let mut reached = [0; 6];
+        for case in 0..400 {
+            let width = 16 + g.below(40) as usize;
+            let height = 16 + g.below(160) as usize;
+            let layout = stripe_layout(height as u16, 1 + g.below(6) as u32);
+            let stripes: Vec<(usize, usize)> = layout
+                .rows()
+                .map(|(y, h)| (y as usize, h as usize))
+                .collect();
+            let n = stripes.len();
+            // Stripe 0 is coded on the encode loop's own thread: it has no worker to
+            // lose, and dies only by panicking there.
+            let ends: Vec<End> = (0..n)
+                .map(|i| {
+                    let after = g.below(5) as u32;
+                    match (i, g.below(6)) {
+                        (0, 2) => End::Panics(after),
+                        (0, _) => End::Never,
+                        (_, 0) => End::Returns(after),
+                        (_, 1) => End::Drops(after),
+                        (_, 2) => End::Panics(after),
+                        (_, _) => End::Never,
+                    }
+                })
+                .collect();
+            let (ended_tx, _ended) = mpsc::channel();
+            let (mut served0, end0) = (0u32, ends[0]);
+            let crew = Crew::spawn(
+                move |job: StripeJob| {
+                    if end0.answers() == Some(served0) {
+                        panic!("stripe 0 dies on its job {served0}");
+                    }
+                    let mut bytes = BytesMut::zeroed(Header::LEN);
+                    bytes.extend([0, served0 as u8]);
+                    served0 += 1;
+                    let at = Instant::now();
+                    let out = StripeOut::Sent {
+                        key: true,
+                        bytes,
+                        quality: Quality::AsAsked,
+                        coded: Coded {
+                            woke: at,
+                            x264: at,
+                            encoded: at,
+                        },
+                    };
+                    Ok(StripeResult { out, buf: job.buf })
+                },
+                (1..n).map(|i| mortal(i, ends[i], ended_tx.clone())),
+            );
+            // Each frame is a band of rows; one past the picture needs no stripe.
+            let frames: Vec<Band> = (0..1 + g.below(16))
+                .map(|_| {
+                    let y0 = g.below(height as u64 + 8) as u32;
+                    let y1 = y0 + 1 + g.below(height as u64) as u32;
+                    Band { y0, y1 }
+                })
+                .collect();
+            // The model: how many frames come back, and the stripes dead at the first
+            // one that doesn't.
+            let mut served = vec![0u32; n];
+            let mut back = 0;
+            let mut dying = vec![];
+            for band in &frames {
+                let needs: Vec<usize> = (0..n)
+                    .filter(|&i| {
+                        let (y, h) = stripes[i];
+                        (band.y0 as usize) < y + h && (band.y1 as usize) > y
+                    })
+                    .collect();
+                dying = needs
+                    .iter()
+                    .copied()
+                    .filter(|&i| ends[i].answers() == Some(served[i]))
+                    .collect();
+                if !dying.is_empty() {
+                    break;
+                }
+                for &i in &needs {
+                    served[i] += 1;
+                }
+                back += 1;
+            }
+            // The capture loop can hand over one frame past the one the encode loop
+            // ends on before it is refused, since the job channel holds one.
+            let refused = !dying.is_empty() && frames.len() > back + 2;
+
+            let (job_tx, rx) = mpsc::sync_channel::<Job>(1);
+            let (ret, ret_rx) = mpsc::sync_channel(2);
+            let hub = Hub::new(crate::hub::Paths::ANY);
+            let (ended_tx, ended) = mpsc::channel();
+            let encode = encoder_thread(hub.clone(), {
+                let hub = hub.clone();
+                let paced = Frames {
+                    layout,
+                    fps: Fps::new(60).unwrap(),
+                };
+                move || {
+                    let mut crew = crew;
+                    let r = encode_frames(&mut crew, &stripes, &paced, rx, ret, &hub);
+                    drop(crew);
+                    let _ = ended_tx.send(r);
+                }
+            });
+            let frames_n = frames.len();
+            let pictures: Vec<Arc<I420>> = (0..frames.len())
+                .map(|_| Arc::new(I420::new(width, height)))
+                .collect();
+            let at: Vec<*const I420> = pictures.iter().map(Arc::as_ptr).collect();
+            // The capture loop: it hands over each frame, and stops at one refused.
+            let capture = std::thread::spawn(move || {
+                for (band, buf) in frames.into_iter().zip(pictures) {
+                    let job = Job {
+                        buf,
+                        frame: super::Frame::Motion {
+                            band,
+                            dirty: Arc::new(vec![]),
+                        },
+                        allowance: window::START,
+                        captured: CaptureMarks::at(Instant::now()),
+                        marker_ms: None,
+                    };
+                    if job_tx.send(job).is_err() {
+                        return true;
+                    }
+                }
+                false
+            });
+            let what = format!("case {case}: {n} stripes, {ends:?}, {dying:?} dying");
+            // The capture loop's wait for its pictures. Once every frame is in, a capture
+            // loop that ended well has closed the stream and waits for nothing.
+            let mut home = 0;
+            while !(dying.is_empty() && home == frames_n) {
+                hub.drain_wake();
+                match ret_rx.try_recv() {
+                    Ok(r) => {
+                        assert!(home < back, "{what}: frame {home} came back");
+                        assert_eq!(Arc::as_ptr(&r.buf), at[home], "{what}: frame {home}");
+                        home += 1;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => wait_any([hub.waker.waitable()], None),
+                    Err(mpsc::TryRecvError::Disconnected) => break,
+                }
+            }
+            assert_eq!(home, back, "{what}");
+            drop(encode);
+            match ended.recv().unwrap_or(Err(Gone(0))) {
+                Ok(()) => {
+                    assert!(dying.is_empty(), "{what}: ended well");
+                    reached[3] += 1;
+                }
+                Err(Gone(0)) => {
+                    assert!(dying.contains(&0), "{what}: the encode loop panicked");
+                    reached[5] += 1;
+                }
+                Err(Gone(i)) => {
+                    assert!(dying.contains(&i), "{what}: ended with {i} gone");
+                    reached[match ends[i] {
+                        End::Returns(_) => 0,
+                        End::Drops(_) => 1,
+                        End::Panics(_) => 2,
+                        End::Never => unreachable!("{what}: {i} never dies"),
+                    }] += 1;
+                }
+            }
+            if refused {
+                assert!(capture.join().unwrap(), "{what}: no frame was refused");
+                reached[4] += 1;
+            } else {
+                capture.join().unwrap();
+            }
+        }
+        assert!(
+            reached.iter().all(|&r| r >= 20),
+            "too few cases reached: {reached:?}"
+        );
+    }
+
+    /// A frame is in flight to its viewers before its picture goes home. The capture loop,
+    /// woken by the picture, asks the flow gate next, and the gate counts what is in
+    /// flight: a frame not yet counted would let it capture one frame past the gate's room.
+    /// Over generated screens of 1-4 stripes and runs of frames over any band of rows
+    /// (some touching no stripe), each stripe's part put out or failed, and a viewer that
+    /// has started and acks nothing: the way home holds no picture (a rendezvous), so the
+    /// test takes each one the moment the encode loop hands it over, and then the viewer
+    /// has in flight every frame so far that put out a part, and no other.
+    #[test]
+    fn a_frame_is_in_flight_before_its_picture_goes_home() {
+        let mut g = Gen(Xorshift::new(0x2545F4914F6CDD1D));
+        // Frames counted in flight, frames every stripe of which failed, frames that
+        // touched no stripe.
+        let mut reached = [0; 3];
+        for case in 0..300 {
+            let height = 16 * (1 + g.below(12) as usize);
+            let layout = stripe_layout(height as u16, 1 + g.below(4) as u32);
+            let stripes: Vec<(usize, usize)> = layout
+                .rows()
+                .map(|(y, h)| (y as usize, h as usize))
+                .collect();
+            let n = stripes.len();
+            let frames: Vec<Band> = (0..1 + g.below(20))
+                .map(|_| {
+                    let y0 = g.below(height as u64 + 8) as u32;
+                    Band {
+                        y0,
+                        y1: y0 + 1 + g.below(height as u64) as u32,
+                    }
+                })
+                .collect();
+            // Whether each stripe's k-th part fails.
+            let fails: Vec<Vec<bool>> = (0..n)
+                .map(|_| (0..frames.len()).map(|_| g.below(3) == 0).collect())
+                .collect();
+            let coder = |i: usize| {
+                let (fails, mut k) = (fails[i].clone(), 0);
+                move |job: StripeJob| {
+                    let out = match fails[k] {
+                        true => StripeOut::Failed,
+                        false => {
+                            let mut bytes = BytesMut::zeroed(Header::LEN);
+                            bytes.extend([i as u8]);
+                            let at = Instant::now();
+                            StripeOut::Sent {
+                                key: false,
+                                bytes,
+                                quality: Quality::AsAsked,
+                                coded: Coded {
+                                    woke: at,
+                                    x264: at,
+                                    encoded: at,
+                                },
+                            }
+                        }
+                    };
+                    k += 1;
+                    StripeResult { out, buf: job.buf }
+                }
+            };
+            let mut own = coder(0);
+            let crew = Crew::spawn(
+                move |job| Ok(own(job)),
+                (1..n).map(|i| {
+                    let mut code = coder(i);
+                    move |rx: mpsc::Receiver<StripeJob>, done: mpsc::SyncSender<StripeResult>| {
+                        while let Ok(job) = rx.recv() {
+                            if done.send(code(job)).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }),
+            );
+            let hub = Hub::new(crate::hub::Paths::ANY);
+            let (tx, _socket) = tokio::sync::mpsc::unbounded_channel();
+            let viewer = hub.add_client(tx, Instant::now());
+            // A viewer that has started: watching, a keyframe planned and sent it whole.
+            viewer.watch();
+            viewer.keyframe_planned();
+            viewer.keyframe_sent(true);
+            let (job_tx, rx) = mpsc::sync_channel::<Job>(1);
+            let (ret, ret_rx) = mpsc::sync_channel(0);
+            let (ended_tx, ended) = mpsc::channel();
+            let encode = encoder_thread(hub.clone(), {
+                let (hub, stripes) = (hub.clone(), stripes.clone());
+                let paced = Frames {
+                    layout,
+                    fps: Fps::new(60).unwrap(),
+                };
+                move || {
+                    let mut crew = crew;
+                    let _ =
+                        ended_tx.send(encode_frames(&mut crew, &stripes, &paced, rx, ret, &hub));
+                }
+            });
+            // The model: each stripe's parts so far, and the frames that put one out.
+            let mut served = vec![0; n];
+            let mut in_flight = 0;
+            for (idx, band) in frames.into_iter().enumerate() {
+                let touched: Vec<usize> = (0..n)
+                    .filter(|&i| {
+                        let (y, h) = stripes[i];
+                        (band.y0 as usize) < y + h && (band.y1 as usize) > y
+                    })
+                    .collect();
+                let parts = touched.iter().filter(|&&i| !fails[i][served[i]]).count();
+                for &i in &touched {
+                    served[i] += 1;
+                }
+                match (touched.len(), parts) {
+                    (0, _) => reached[2] += 1,
+                    (_, 0) => reached[1] += 1,
+                    _ => {
+                        in_flight += 1;
+                        reached[0] += 1;
+                    }
+                }
+                job_tx
+                    .send(Job {
+                        buf: Arc::new(I420::new(16, height)),
+                        frame: super::Frame::Motion {
+                            band,
+                            dirty: Arc::new(vec![]),
+                        },
+                        allowance: window::START,
+                        captured: CaptureMarks::at(Instant::now()),
+                        marker_ms: None,
+                    })
+                    .unwrap();
+                let home = ret_rx.recv().unwrap();
+                assert_eq!(
+                    viewer.backlog(Instant::now()).map_or(0, |b| b.frames.get()),
+                    in_flight,
+                    "case {case}: frame {idx} over {band:?}, {n} stripes, its picture home"
+                );
+                drop(home);
+            }
+            drop(job_tx);
+            drop(encode);
+            ended.recv().unwrap().unwrap();
+        }
+        assert!(
+            reached.iter().all(|&r| r >= 100),
+            "too few cases reached: {reached:?}"
+        );
+    }
+
     /// Once the screen goes still the paint-overs show x264 forgetting the drag, so the
     /// next motion frame isn't handed the drag's correction.
     #[test]
     fn paintovers_wind_the_correction_down() {
         let crf = 24.0;
-        let mut run = Run::new(true, crf, 0);
+        let mut run = Run::new(true, crf, None);
         for _ in 0..40 {
             run.frame(Scene::Drag, None);
         }
@@ -1762,5 +5016,2523 @@ mod tests {
             after <= during / 2.0,
             "correction {after} after the paint-overs, {during} during the drag"
         );
+    }
+
+    /// The tests' generator, drawing headers' fields.
+    struct Rng(Xorshift);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0.next()
+        }
+        /// A number of any size: a random one, shifted right by a random amount.
+        fn any(&mut self) -> u64 {
+            let shift = self.next() % 64;
+            self.next() >> shift
+        }
+    }
+
+    fn random_header(rng: &mut Rng) -> Header {
+        Header {
+            key: rng.next() & 1 == 1,
+            sharpens: rng.next() & 1 == 1,
+            frame: rng.any() as u32,
+            pipe: Pipe(rng.any() as u32),
+            stripe: rng.any() as u8,
+            stripes: rng.any() as u8,
+            parts: rng.any() as u8,
+            y: rng.any() as u16,
+        }
+    }
+
+    #[test]
+    fn a_header_reads_back_as_it_was_written() {
+        let mut rng = Rng(Xorshift::new(0x9e37_79b9_7f4a_7c15));
+        for _ in 0..100_000 {
+            let header = random_header(&mut rng);
+            let picture: Vec<u8> = (0..1 + rng.next() % 64).map(|_| rng.next() as u8).collect();
+            let message = [&header.bytes()[..], &picture].concat();
+            assert_eq!(Header::read(&message), Ok(Video::Stripe(header, &picture)));
+        }
+    }
+
+    #[test]
+    fn a_header_alone_is_empty_less_is_short_and_another_type_is_not_video() {
+        let mut rng = Rng(Xorshift::new(0x2545_f491_4f6c_dd1d));
+        for _ in 0..100_000 {
+            let header = random_header(&mut rng);
+            let bytes = header.bytes();
+            assert_eq!(Header::read(&bytes), Ok(Video::Empty(header)));
+            let cut = 1 + (rng.next() % (Header::LEN as u64 - 1)) as usize;
+            assert_eq!(Header::read(&bytes[..cut]), Err(NotVideo::Short));
+            // Another message's type byte, or no byte, with anything after it.
+            let mut other: Vec<u8> = (0..rng.next() % 64).map(|_| rng.next() as u8).collect();
+            if other.first() == Some(&Header::VIDEO) {
+                other[0] = Header::VIDEO.wrapping_add(1 + (rng.next() % 255) as u8);
+            }
+            assert_eq!(Header::read(&other), Err(NotVideo::Other));
+        }
+    }
+
+    #[test]
+    fn a_pipe_is_whole_tenths_of_a_millisecond() {
+        let mut rng = Rng(Xorshift::new(0x6a09_e667_f3bc_c908));
+        let tenth = Duration::from_micros(100);
+        for _ in 0..100_000 {
+            let d = Duration::from_nanos(rng.any());
+            let Pipe(p) = Pipe::of(d);
+            // As many whole tenths as fit, or as many as a header holds.
+            assert!(tenth * p <= d, "{d:?} as {p}");
+            if p < u32::MAX {
+                assert!(d < tenth * (p + 1), "{d:?} as {p}");
+            }
+            let ms = Pipe(p).millis();
+            assert!(ms * 10 <= p as u64 && p as u64 <= ms * 10 + 9);
+        }
+    }
+
+    /// Every `--stripes` a layout can be asked for: none, each of 1 to 16, more, and the
+    /// most a flag holds.
+    const ASKED: [u32; 20] = [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        64,
+        u32::MAX,
+    ];
+
+    /// For every height a screen can have and every count asked: the stripes cover the
+    /// screen top to bottom, numbered from 0, as many as asked within 1 to 16 or fewer, all
+    /// as tall, a whole number of 16-row blocks, but the last.
+    #[test]
+    fn a_layout_cuts_the_screen_into_at_most_16_stripes() {
+        for height in 0..=u16::MAX {
+            for n in ASKED {
+                let layout = stripe_layout(height, n);
+                assert_eq!(usize::from(layout.count), layout.stripes.len());
+                assert!(u32::from(layout.count) <= n.clamp(1, 16));
+                assert_eq!(layout.count == 0, height == 0);
+                let mut top = 0;
+                for (i, p) in layout.stripes.iter().enumerate() {
+                    assert_eq!((usize::from(p.stripe), p.y), (i, top), "{height} rows, {n}");
+                    let last = i + 1 == layout.stripes.len();
+                    assert!(last || (p.h % 16 == 0 && p.h == layout.stripes[0].h));
+                    assert!(p.h > 0);
+                    top += p.h;
+                }
+                assert_eq!(top, height);
+            }
+        }
+    }
+
+    /// One case of web/src/video-header.json.
+    #[derive(serde::Deserialize)]
+    struct Case {
+        header: String,
+        picture: String,
+        key: bool,
+        sharpens: bool,
+        frame: u32,
+        pipe: u32,
+        stripe: u8,
+        stripes: u8,
+        parts: u8,
+        y: u16,
+    }
+
+    fn hex(s: &str) -> Vec<u8> {
+        let digits: String = s.split_whitespace().collect();
+        (0..digits.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&digits[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// The messages web/src/protocol.ts and bench/linkviewer.py check their readers against
+    /// are what the server writes and reads.
+    #[test]
+    fn the_header_is_what_the_fixture_says() {
+        let cases: Vec<Case> =
+            serde_json::from_str(include_str!("../web/src/video-header.json")).unwrap();
+        for c in cases {
+            let header = Header {
+                key: c.key,
+                sharpens: c.sharpens,
+                frame: c.frame,
+                pipe: Pipe(c.pipe),
+                stripe: c.stripe,
+                stripes: c.stripes,
+                parts: c.parts,
+                y: c.y,
+            };
+            assert_eq!(header.bytes().to_vec(), hex(&c.header), "{}", c.header);
+            let (bytes, picture) = (hex(&c.header), hex(&c.picture));
+            let message = [&bytes[..], &picture].concat();
+            assert_eq!(
+                Header::read(&message),
+                Ok(Video::Stripe(header, &picture)),
+                "{}",
+                c.header
+            );
+        }
+    }
+
+    /// A viewer that joins while the stream is rebuilt (a resize, a display switch)
+    /// starts on the rebuilt stream. The recorder needs it: it ends a recording at a
+    /// hello once it holds a frame, so a frame of the old stream ahead of the rebuilt
+    /// stream's hello is a recording of one frame, whatever length was asked for.
+    /// Steps, the loops' own: a page joins and the capture loop plans its keyframe and
+    /// clears its request; a resize ends the capture loop, and `encode.join` lets the
+    /// real encode loop send that last job while a recording has just joined; then
+    /// `build`'s `restart_clients` says hello.
+    #[test]
+    fn a_viewer_that_joins_while_the_stream_is_rebuilt_starts_on_the_rebuilt_stream() {
+        let hub = Hub::new(crate::hub::Paths::ANY);
+        let watch = || {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let c = hub.add_client(tx, Instant::now());
+            c.watch();
+            (c, rx)
+        };
+        let (w, h) = (64, 64);
+        let ecfg = EncoderConfig {
+            pictures: Pictures {
+                width: w as u32,
+                height: h as u32,
+                fps: Fps::new(60).unwrap(),
+                preset: Preset::parse("ultrafast").unwrap(),
+                threads: 1,
+                debug: Debugging::read(|_| None).0,
+            },
+            crf: 23.0,
+            max_kbps: None,
+        };
+        let stripe = Stripe {
+            y: 0,
+            h,
+            cfg: ecfg.clone(),
+            running: None,
+        };
+        let (job_tx, job_rx) = mpsc::sync_channel::<Job>(1);
+        let (ret_tx, _ret_rx) = mpsc::sync_channel::<Returned>(1);
+        let encode = std::thread::spawn({
+            let hub = hub.clone();
+            move || {
+                encode_loop(
+                    vec![stripe],
+                    Frames {
+                        layout: stripe_layout(h as u16, 1),
+                        fps: Fps::new(60).unwrap(),
+                    },
+                    job_rx,
+                    ret_tx,
+                    hub,
+                    Crfs {
+                        configured: 23.0,
+                        paintover: 18.0,
+                    },
+                    Debugging::read(|_| None).0,
+                )
+            }
+        });
+        // A page joins; the capture loop plans its keyframe and clears its request.
+        let (_page, _page_rx) = watch();
+        let starts = hub
+            .viewers()
+            .into_iter()
+            .map(|(c, _)| c)
+            .filter(|c| c.keyframe_planned())
+            .collect();
+        let key = Job {
+            buf: Arc::new(I420::new(w, h)),
+            frame: super::Frame::Key {
+                blocks: None,
+                starts,
+            },
+            allowance: window::START,
+            captured: CaptureMarks::at(Instant::now()),
+            marker_ms: None,
+        };
+        // A resize ends the capture loop, and a recording joins, before the encode loop
+        // has coded that keyframe: it reads the viewers once the frame is coded.
+        let (_recording, mut recording_rx) = watch();
+        job_tx.send(key).unwrap();
+        drop(job_tx);
+        encode.join().unwrap();
+        // build(): the rebuilt stream's hello.
+        hub.restart_clients();
+        assert!(
+            matches!(recording_rx.try_recv().unwrap(), Out::Text(_)),
+            "the recording held a frame of the old stream before the rebuilt stream's \
+             hello, and ends there"
+        );
+    }
+
+    /// The test binary's allocator on Linux: the system's, counting by thread what is
+    /// allocated while it is armed.
+    #[cfg(target_os = "linux")]
+    #[global_allocator]
+    static COUNTING: counting::Counting = counting::Counting;
+
+    #[cfg(target_os = "linux")]
+    mod counting {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Mutex, MutexGuard};
+
+        pub struct Counting;
+
+        /// What one thread allocated while the count was armed.
+        #[derive(Clone, Copy, Debug)]
+        pub struct Thread {
+            /// As the kernel has it: 15 bytes at most.
+            pub name: [u8; 16],
+            pub allocations: usize,
+            /// How many of each size it allocated, which tells where they come from: the
+            /// first 16 sizes it allocated, by size.
+            pub sizes: [Option<(usize, usize)>; 16],
+        }
+
+        /// Every thread that allocated while armed: a fixed table, since the allocator
+        /// cannot allocate to keep it.
+        struct Seen {
+            threads: [Option<Thread>; 32],
+            /// Allocations by threads after the table's 32.
+            others: usize,
+        }
+
+        static ARMED: AtomicBool = AtomicBool::new(false);
+        static SEEN: Mutex<Seen> = Mutex::new(Seen {
+            threads: [None; 32],
+            others: 0,
+        });
+
+        fn seen() -> MutexGuard<'static, Seen> {
+            SEEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        /// The calling thread's name, as the kernel has it.
+        pub fn thread_name() -> [u8; 16] {
+            let mut name = [0u8; 16];
+            unsafe { libc::prctl(libc::PR_GET_NAME, name.as_mut_ptr()) };
+            name
+        }
+
+        fn note(size: usize) {
+            if !ARMED.load(Ordering::Relaxed) {
+                return;
+            }
+            let name = thread_name();
+            let mut seen = seen();
+            let slot = seen
+                .threads
+                .iter()
+                .position(|t| t.is_none_or(|t| t.name == name));
+            let Some(i) = slot else {
+                seen.others += 1;
+                return;
+            };
+            let t = seen.threads[i].get_or_insert(Thread {
+                name,
+                allocations: 0,
+                sizes: [None; 16],
+            });
+            t.allocations += 1;
+            let same = t
+                .sizes
+                .iter()
+                .position(|s| s.is_none_or(|(s, _)| s == size));
+            if let Some(s) = same {
+                t.sizes[s].get_or_insert((size, 0)).1 += 1;
+            }
+        }
+
+        /// Counts every allocation from now on, by every thread of the process.
+        pub fn arm() {
+            *seen() = Seen {
+                threads: [None; 32],
+                others: 0,
+            };
+            ARMED.store(true, Ordering::SeqCst);
+        }
+
+        /// Stops counting: what each thread allocated since `arm`, and how many
+        /// allocations came from threads past the table.
+        pub fn disarm() -> (Vec<Thread>, usize) {
+            ARMED.store(false, Ordering::SeqCst);
+            let seen = seen();
+            (
+                seen.threads.iter().flatten().copied().collect(),
+                seen.others,
+            )
+        }
+
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                note(layout.size());
+                System.alloc(layout)
+            }
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                note(layout.size());
+                System.alloc_zeroed(layout)
+            }
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+                note(size);
+                System.realloc(ptr, layout, size)
+            }
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                System.dealloc(ptr, layout)
+            }
+        }
+    }
+
+    /// The counting allocator counts the whole process, where other tests allocate as
+    /// they please: so `name` runs in a process of its own, the test binary started again
+    /// with only that test selected. True in that process; in the first, starts it and
+    /// checks that it ran the test and the test passed.
+    #[cfg(target_os = "linux")]
+    fn in_a_process_of_its_own(name: &str) -> bool {
+        const ALONE: &str = "VOXL_TEST_IN_A_PROCESS_OF_ITS_OWN";
+        if std::env::var_os(ALONE).is_some() {
+            return true;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([name, "--exact", "--include-ignored", "--test-threads=1"])
+            .env(ALONE, "1")
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && said.contains("1 passed"),
+            "{said}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        false
+    }
+
+    /// The screen a test draws on, shared by the test and the capture it hands the loop.
+    #[cfg(target_os = "linux")]
+    struct Canvas {
+        w: u32,
+        h: u32,
+        drawn: parking_lot::Mutex<Drawn>,
+        /// Readable when something was drawn: the capture's fd.
+        news: crate::hub::Wake,
+        /// The test is done: the capture loop ends, as at a change of the screen's size.
+        done: std::sync::atomic::AtomicBool,
+    }
+
+    #[cfg(target_os = "linux")]
+    struct Drawn {
+        bgrx: Vec<u8>,
+        /// The rows drawn since the capture last took in what was drawn.
+        rows: Option<(u32, u32)>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Canvas {
+        /// Text in rows `y0..y1` as it stands `n` steps into a scroll of 3 px a step.
+        fn draw(&self, y0: u32, y1: u32, n: usize) {
+            let mut d = self.drawn.lock();
+            let w = self.w as usize;
+            for (y, row) in d
+                .bgrx
+                .chunks_exact_mut(w * 4)
+                .enumerate()
+                .take(y1 as usize)
+                .skip(y0 as usize)
+            {
+                let (line, within) = ((y + 3 * n) / 18, (y + 3 * n) % 18);
+                for (x, glyph) in row.chunks_mut(9 * 4).enumerate() {
+                    let ink = within < 12 && (x * 2654435761 + line * 40503) >> 7 & 1 == 1;
+                    glyph.fill(if ink { 30 } else { 235 });
+                }
+            }
+            d.rows = Some(match d.rows {
+                None => (y0, y1),
+                Some((a, b)) => (a.min(y0), b.max(y1)),
+            });
+            drop(d);
+            self.news.signal();
+        }
+    }
+
+    /// The loop's capture of a `Canvas`: it keeps damage as the X11 capturer does
+    /// (capture.rs: `pump`, `take_damage`, `take_mb_map`, the same lines, and the same
+    /// `Damage`), over pixels the test draws, read in place as from Xvfb's framebuffer.
+    #[cfg(target_os = "linux")]
+    struct Drawing {
+        canvas: Arc<Canvas>,
+        damage: Damage,
+        mb_dirty: Vec<u8>,
+        mb_cols: usize,
+        changes: Vec<(u32, u32, u32, u32)>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Capture for Drawing {
+        fn size(&self) -> (u32, u32) {
+            (self.canvas.w, self.canvas.h)
+        }
+        fn fd(&self) -> Waitable<'_> {
+            self.canvas.news.waitable()
+        }
+        fn pump(&mut self) -> Result<(), String> {
+            self.canvas.news.drain();
+            let Some((top, bot)) = self.canvas.drawn.lock().rows.take() else {
+                return Ok(());
+            };
+            for row in (top as usize / 16)..(bot as usize).div_ceil(16) {
+                self.mb_dirty[row * self.mb_cols..(row + 1) * self.mb_cols].fill(1);
+            }
+            self.changes.push((0, top, self.canvas.w, bot));
+            self.damage.add(top, bot, Instant::now());
+            Ok(())
+        }
+        fn needs_rebuild(&self) -> bool {
+            self.canvas.done.load(Ordering::Relaxed)
+        }
+        fn changes(&mut self) -> &mut Vec<(u32, u32, u32, u32)> {
+            &mut self.changes
+        }
+        fn damage(&mut self) -> &mut Damage {
+            &mut self.damage
+        }
+        fn take_damage(&mut self) -> Result<Option<Band>, String> {
+            Ok(self.damage.take(self.canvas.h))
+        }
+        fn take_mb_map(&mut self) -> Vec<u8> {
+            let n = self.mb_dirty.len();
+            std::mem::replace(&mut self.mb_dirty, vec![0; n])
+        }
+        fn full(&self) -> Band {
+            Band {
+                y0: 0,
+                y1: self.canvas.h,
+            }
+        }
+        fn grab(&mut self, _band: Band) -> Result<(), String> {
+            Ok(())
+        }
+        fn convert(&self, dst: &mut I420, y0: usize, y1: usize, threads: usize) {
+            let d = self.canvas.drawn.lock();
+            let stride = self.canvas.w as usize * 4;
+            crate::convert::convert_band(&d.bgrx, stride, dst, y0, y1, threads);
+        }
+        fn snapshot(&mut self) -> Result<Vec<u8>, String> {
+            Ok(self.canvas.drawn.lock().bgrx.clone())
+        }
+        fn bgrx(&self) -> Option<(&[u8], usize)> {
+            None
+        }
+    }
+
+    /// What the stream's threads allocated over a steady run, by thread.
+    #[cfg(target_os = "linux")]
+    struct Counted {
+        threads: Vec<counting::Thread>,
+        /// Allocations by threads past the counting table.
+        others: usize,
+        /// The frames the run sent.
+        frames: usize,
+        /// The test's own thread: the viewer, not counted.
+        viewer: [u8; 16],
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Counted {
+        /// The stream's threads named so.
+        fn named(&self, name: impl Fn(&str) -> bool) -> impl Iterator<Item = &counting::Thread> {
+            self.threads
+                .iter()
+                .filter(move |t| t.name != self.viewer && name(&thread(t)))
+        }
+
+        /// How many allocations the threads named so made of the sizes `sizes`.
+        fn of(&self, name: impl Fn(&str) -> bool, sizes: &[usize]) -> usize {
+            self.named(name)
+                .flat_map(|t| t.sizes.iter().flatten())
+                .filter(|(size, _)| sizes.contains(size))
+                .map(|(_, n)| n)
+                .sum()
+        }
+
+        /// Every thread's allocations, a frame, with their sizes.
+        fn said(&self) -> String {
+            let said: Vec<String> = self
+                .threads
+                .iter()
+                .map(|t| {
+                    let sizes: Vec<String> = t
+                        .sizes
+                        .iter()
+                        .flatten()
+                        .map(|(size, n)| format!("{size} B x {n}"))
+                        .collect();
+                    format!(
+                        "{}: {:.2} a frame ({})",
+                        thread(t),
+                        t.allocations as f64 / self.frames as f64,
+                        sizes.join(", ")
+                    )
+                })
+                .collect();
+            format!(
+                "{} frames; by thread (the viewer is this test's own):\n{}\nand {} times on \
+                 threads past the table",
+                self.frames,
+                said.join("\n"),
+                self.others
+            )
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn thread(t: &counting::Thread) -> String {
+        String::from_utf8_lossy(&t.name)
+            .trim_end_matches('\0')
+            .to_owned()
+    }
+
+    /// The capture loop's allocations a frame that are known and owned, by the sizes they
+    /// take on the run's 1024x768 screen with one viewer. Each owner's test is ignored until
+    /// its site is gone.
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy)]
+    enum Site {
+        /// A keyframe's `starts`, the viewers it is promised to: four `Arc`s' room. (The
+        /// loop's one look at the viewers keeps its vector from frame to frame.)
+        ViewerList,
+        /// `RateCtl::update`'s `Vec<PathNow>`: four of rate.rs's 32-byte `PathNow`.
+        RatePaths,
+        /// `wait_any`'s `Vec<PollFd>`, for one fd or two.
+        PollList,
+        /// `take_mb_map` and the refiner's maps (a byte a 16x16 block), and the `Arc`s
+        /// they are handed on in.
+        BlockMaps,
+        /// `split_rows`' scoped threads, started per capture: the sizes of what starting
+        /// one allocates that no other site takes (its other three, 8, 40 and 64 bytes, are
+        /// the poll list's, the maps' `Arc`'s and the viewer list's too). A run that converts
+        /// on one thread starts none.
+        Conversion,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Site {
+        const ALL: [Site; 5] = [
+            Site::ViewerList,
+            Site::RatePaths,
+            Site::PollList,
+            Site::BlockMaps,
+            Site::Conversion,
+        ];
+
+        fn sizes(self) -> Vec<usize> {
+            use std::mem::size_of;
+            match self {
+                Site::ViewerList => vec![4 * size_of::<Arc<crate::hub::Client>>()],
+                Site::RatePaths => vec![4 * 32],
+                Site::PollList => vec![
+                    size_of::<nix::poll::PollFd<'static>>(),
+                    2 * size_of::<nix::poll::PollFd<'static>>(),
+                ],
+                Site::BlockMaps => vec![
+                    (1024 / 16) * (768 / 16),
+                    2 * size_of::<usize>() + size_of::<Vec<u8>>(),
+                ],
+                Site::Conversion => vec![48, 24],
+            }
+        }
+    }
+
+    /// A thread parks on a parking_lot condition variable, surely: it says it is ready under
+    /// the lock and waits, and is told to go only once the lock is free, which waiting frees.
+    #[cfg(target_os = "linux")]
+    fn parked_once() {
+        let state = Arc::new((
+            parking_lot::Mutex::new((false, false)),
+            parking_lot::Condvar::new(),
+        ));
+        let waiter = {
+            let state = state.clone();
+            std::thread::spawn(move || {
+                let (lock, cv) = &*state;
+                let mut s = lock.lock();
+                s.0 = true;
+                while !s.1 {
+                    cv.wait(&mut s);
+                }
+            })
+        };
+        let (lock, cv) = &*state;
+        loop {
+            let mut s = lock.lock();
+            if s.0 {
+                s.1 = true;
+                cv.notify_one();
+                break;
+            }
+        }
+        waiter.join().unwrap();
+    }
+
+    /// A steady run of the capture loop, its stream and one viewer, counted: in a process
+    /// of its own (see `in_a_process_of_its_own`), so None in the first.
+    ///
+    /// The loop runs as `spawn` runs it, on its own thread, over a 1024x768 screen the test
+    /// draws on (a `Canvas`, captured by a `Drawing` that keeps damage as the X11 capturer
+    /// does, so no X server is needed), at the defaults, with one viewer: the stream it
+    /// makes for that viewer is the one a real viewer gets. The test draws text scrolling
+    /// through rows of any height, asks for keyframes, and lets the screen go still until a
+    /// sharpening pass goes; and plays the viewer, taking each frame's messages, writing
+    /// them as its socket task would, and acknowledging the frame. First each kind of step
+    /// goes through 24 times, which brings every buffer the stream keeps to its size; then
+    /// 60 generated steps are counted (a keyframe 1 in 30, sharpening 1 in 10). The test's
+    /// own thread is the viewer, and the server's handling of its acks keeps 30 s of them,
+    /// so it is not the stream's.
+    ///
+    /// What it cannot see: x264 and libyuv are C, and allocate with C's malloc, which the
+    /// counting allocator does not count; nor what the X11 capturer does over its socket.
+    #[cfg(target_os = "linux")]
+    fn steady_state(name: &str, convert_threads: usize) -> Option<Counted> {
+        if !in_a_process_of_its_own(name) {
+            return None;
+        }
+        let (w, h) = (1024u32, 768u32);
+        let cfg = VideoConfig {
+            display: None,
+            fps: Fps::new(60).unwrap(),
+            preset: Preset::parse("ultrafast").unwrap(),
+            threads: 4,
+            convert_threads,
+            crf: 24.0,
+            bounds: Bounds::new(Kbps::new(2000.0), Some(Kbps::new(30000.0))),
+            paintover_crf: 16.0,
+            paintover_delay_ms: 150,
+            coalesce: Duration::ZERO,
+            stripes: 1,
+            debug: Debugging::read(|_| None).0,
+        };
+        let hub = Hub::new(crate::hub::Paths::ANY);
+        *hub.stripes.lock() = stripe_layout(h as u16, cfg.stripes).rows().collect();
+        let (tx, socket) = tokio::sync::mpsc::unbounded_channel();
+        let client = hub.add_client(tx, Instant::now());
+        client.watch();
+        let canvas = Arc::new(Canvas {
+            w,
+            h,
+            drawn: parking_lot::Mutex::new(Drawn {
+                bgrx: vec![0; (w * h * 4) as usize],
+                rows: None,
+            }),
+            news: crate::hub::Wake::new().unwrap(),
+            done: std::sync::atomic::AtomicBool::new(false),
+        });
+        let (cols, rows) = ((w as usize).div_ceil(16), (h as usize).div_ceil(16));
+        let mut drawing = Drawing {
+            canvas: canvas.clone(),
+            damage: Damage::Unreported,
+            mb_dirty: vec![0; cols * rows],
+            mb_cols: cols,
+            changes: Vec::new(),
+        };
+        let capture = {
+            let (cfg, hub) = (cfg.clone(), hub.clone());
+            std::thread::Builder::new()
+                .name("capture".into())
+                .spawn(move || capture_loop(&mut drawing, cfg, hub, None))
+                .unwrap()
+        };
+        // The viewer: it takes frames until one of the kind waited for, writing each as its
+        // socket task does and acknowledging it.
+        struct Viewer {
+            socket: tokio::sync::mpsc::UnboundedReceiver<Out>,
+            client: Arc<crate::hub::Client>,
+            hub: Arc<Hub>,
+            frames: usize,
+        }
+        impl Viewer {
+            fn until(&mut self, what: fn(&Header) -> bool) {
+                loop {
+                    let Some(Out::Bin(m)) = self.socket.blocking_recv() else {
+                        continue;
+                    };
+                    let Ok(Video::Stripe(header, _)) = Header::read(&m) else {
+                        continue;
+                    };
+                    let now = Instant::now();
+                    self.hub.timeline.written(header.frame, now);
+                    self.client
+                        .on_ack(now, header.frame, crate::hub::Hold::Unsaid);
+                    self.frames += 1;
+                    if what(&header) {
+                        return;
+                    }
+                }
+            }
+        }
+        const ANY: fn(&Header) -> bool = |_| true;
+        const KEY: fn(&Header) -> bool = |header| header.key;
+        const PASS: fn(&Header) -> bool = |header| header.sharpens;
+        let mut viewer = Viewer {
+            socket,
+            client,
+            hub: hub.clone(),
+            frames: 0,
+        };
+        let mut rng = Xorshift::new(0x2545F4914F6CDD1D);
+        let mut next = move |n: u64| rng.below(n);
+        // A keyframe 1 in 30 steps, sharpening 1 in 10.
+        const STEPS: usize = 60;
+        let kinds: [u64; STEPS] = std::array::from_fn(|_| match next(30) {
+            0 => 0,
+            1..=3 => 1,
+            _ => 2,
+        });
+        // One step: what the test does, and the frame it waits for.
+        let mut step = |kind: u64, n: usize, viewer: &mut Viewer| match kind {
+            // The viewer asks for a keyframe.
+            0 => {
+                viewer.client.ask_keyframe();
+                hub.wake();
+                viewer.until(KEY);
+            }
+            // Text scrolls through rows of any height, and the screen is then still until
+            // a sharpening pass goes.
+            1 => {
+                let y0 = next(h as u64) as u32;
+                canvas.draw(y0, y0 + 1 + next((h - y0) as u64) as u32, n);
+                viewer.until(ANY);
+                viewer.until(PASS);
+            }
+            // Text scrolls: a line, a block of lines, the whole screen.
+            _ => {
+                let y0 = next(h as u64) as u32;
+                let y1 = match next(3) {
+                    0 => (y0 + 48).min(h),
+                    1 => y0 + 1 + next((h - y0) as u64) as u32,
+                    _ => h,
+                };
+                canvas.draw(y0, y1, n);
+                viewer.until(ANY);
+            }
+        };
+        viewer.until(KEY);
+        let mut n = 0;
+        for _ in 0..3 {
+            for kind in 0..3 {
+                for _ in 0..8 {
+                    n += 1;
+                    step(kind, n, &mut viewer);
+                }
+            }
+        }
+        // parking_lot makes its table of parked threads (1 KB) the first time any thread
+        // parks: a park now, so the count does not catch the process's first contended
+        // lock.
+        parked_once();
+        let test = counting::thread_name();
+        let before = viewer.frames;
+        counting::arm();
+        for kind in kinds {
+            n += 1;
+            step(kind, n, &mut viewer);
+        }
+        let (threads, others) = counting::disarm();
+        let counted = viewer.frames - before;
+        canvas.done.store(true, Ordering::Relaxed);
+        hub.wake();
+        capture.join().unwrap().unwrap();
+        Some(Counted {
+            threads,
+            others,
+            frames: counted,
+            viewer: test,
+        })
+    }
+
+    /// A steady-state frame allocates nothing in the capture loop but at the sites whose
+    /// owners' tests below are ignored until they are gone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_steady_state_frame_allocates_nothing_capturing_but_at_known_sites() {
+        let Some(c) = steady_state(
+            "video::tests::a_steady_state_frame_allocates_nothing_capturing_but_at_known_sites",
+            1,
+        ) else {
+            return;
+        };
+        let known: Vec<usize> = Site::ALL.iter().flat_map(|s| s.sizes()).collect();
+        let all: usize = c.named(|t| t == "capture").map(|t| t.allocations).sum();
+        assert_eq!(all, c.of(|t| t == "capture", &known), "{}", c.said());
+    }
+
+    /// The capture loop at one known site: none of its allocations in a steady run. Each
+    /// site but the conversion's is counted with the conversion on one thread, which starts
+    /// no thread whose allocations share their sizes.
+    #[cfg(target_os = "linux")]
+    fn the_capture_loop_allocates_nothing_at(site: Site, test: &str) {
+        let convert_threads = match site {
+            Site::Conversion => 4,
+            Site::ViewerList | Site::RatePaths | Site::PollList | Site::BlockMaps => 1,
+        };
+        let Some(c) = steady_state(test, convert_threads) else {
+            return;
+        };
+        assert_eq!(c.of(|t| t == "capture", &site.sizes()), 0, "{}", c.said());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "FIRST: the viewers a keyframe starts"]
+    fn a_steady_state_frame_takes_no_viewer_list() {
+        the_capture_loop_allocates_nothing_at(
+            Site::ViewerList,
+            "video::tests::a_steady_state_frame_takes_no_viewer_list",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "RATE: RateCtl::update's Vec<PathNow>, which goes with RateCtl (reply 41, D2)"]
+    fn a_steady_state_frame_makes_no_rate_paths() {
+        the_capture_loop_allocates_nothing_at(
+            Site::RatePaths,
+            "video::tests::a_steady_state_frame_makes_no_rate_paths",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_steady_state_frame_makes_no_poll_list() {
+        the_capture_loop_allocates_nothing_at(
+            Site::PollList,
+            "video::tests::a_steady_state_frame_makes_no_poll_list",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "DIRTY: take_mb_map, the refiner's maps and their Arcs"]
+    fn a_steady_state_frame_makes_no_block_maps() {
+        the_capture_loop_allocates_nothing_at(
+            Site::BlockMaps,
+            "video::tests::a_steady_state_frame_makes_no_block_maps",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "upstream's per-capture threads stay (reply 43): split_rows' scoped threads"]
+    fn a_steady_state_frame_starts_no_conversion_thread() {
+        the_capture_loop_allocates_nothing_at(
+            Site::Conversion,
+            "video::tests::a_steady_state_frame_starts_no_conversion_thread",
+        );
+    }
+
+    /// A steady-state frame allocates nothing in the encode loop or its stripe workers.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "stripe 0's kept x264 output, which grows when a frame outgrows every one \
+                before it: 130 KB once in 66 frames, in some runs"]
+    fn a_steady_state_frame_allocates_nothing_encoding() {
+        let Some(c) = steady_state(
+            "video::tests::a_steady_state_frame_allocates_nothing_encoding",
+            4,
+        ) else {
+            return;
+        };
+        let encoding = |t: &str| t == "encode" || t.starts_with("enc-");
+        assert_eq!(c.named(encoding).count(), 0, "{}", c.said());
+    }
+
+    /// Recording viewers' frames and acks, and viewers leaving, allocate nothing once they
+    /// have joined: a trace is made at its viewer's join with room for every frame it keeps,
+    /// and the hub's list of leavers with room for all it keeps. The oracle is the counting
+    /// allocator. Six viewers join; three rings' worth of frames go out, numbered by the
+    /// hub's timeline and recorded as the encode loop records them;
+    /// acks come as on_ack records them, each the oldest frame's not yet acked, but none for
+    /// a spell longer than the ring, after which acks come for frames the ring no longer
+    /// keeps; with every kind of hold. Every 2000 frames a viewer leaves, until one is left,
+    /// and is sent a frame as it goes; the first to leave is pushed out by the four after it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recording_a_viewers_frames_and_acks_allocates_nothing() {
+        use crate::hub::Hold;
+        use crate::timeline::{FRAMES_KEPT, LEFT_KEPT};
+        use crate::window::Flight;
+        if !in_a_process_of_its_own(
+            "video::tests::recording_a_viewers_frames_and_acks_allocates_nothing",
+        ) {
+            return;
+        }
+        let hub = Hub::new(crate::hub::Paths::ANY);
+        let viewers: Vec<_> = (0..LEFT_KEPT + 2)
+            .map(|_| hub.add_client(tokio::sync::mpsc::unbounded_channel().0, Instant::now()))
+            .collect();
+        let mut gone = 0;
+        let t0 = Instant::now();
+        // A fixed scramble of a frame's place in the run: what it is and how it is acked.
+        let mix = |k: u64| k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32;
+        let deaf = FRAMES_KEPT as u64..FRAMES_KEPT as u64 * 9 / 4;
+        counting::arm();
+        for k in 0..3 * FRAMES_KEPT as u64 {
+            let at = t0 + Duration::from_millis(k * 16);
+            let id = hub.timeline.number();
+            let bytes = (mix(k) % 100_000) as usize;
+            let frame = Flight {
+                id,
+                bytes,
+                left: at,
+            };
+            let key = mix(k) % 30 == 0;
+            for viewer in &viewers[gone..] {
+                viewer.trace.lock().sent(frame, key);
+            }
+            if k % 2000 == 1999 && gone + 1 < viewers.len() {
+                hub.remove_client(viewers[gone].id, at);
+                viewers[gone].trace.lock().sent(frame, key);
+                gone += 1;
+            }
+            if deaf.contains(&k) {
+                continue;
+            }
+            let hold = match mix(k) % 3 {
+                0 => Hold::Unsaid,
+                1 => Hold::Said(Duration::from_micros(mix(k) % 10_000)),
+                _ => Hold::Unreadable,
+            };
+            let acked = at + Duration::from_millis(mix(k) % 400);
+            for viewer in &viewers[gone..] {
+                viewer.trace.lock().acked(acked, hold);
+            }
+        }
+        let (threads, others) = counting::disarm();
+        assert_eq!(gone, viewers.len() - 1);
+        assert!(
+            threads.is_empty() && others == 0,
+            "recording allocated: {threads:?}, and {others} times on threads past the table"
+        );
+    }
+
+    /// The gate is what the viewers' windows say, by the rule, whatever their order: held
+    /// by the first with no room, until it will have stalled; else open, with the least
+    /// room of those that have not stalled; else, with every viewer stalled, held until an
+    /// ack. And each window's way is what its frames say: stalled once the oldest frame on
+    /// its way has been for `STALLED`; else its room, or none until that moment. Over
+    /// generated viewers (watching or not, with up to 30 frames of 200 B to 60 KB on their
+    /// way, the oldest about to stall, just stalled, or anything up to 5 s old, some of
+    /// them acknowledged): held to a moment, asked at it, the gate opens, or names a later
+    /// moment or none, since the viewer that held it has stalled; held with none, it is
+    /// held with none whenever it is asked again with no ack: time alone never opens it.
+    #[test]
+    fn the_gate_is_the_least_room_of_the_viewers_not_stalled() {
+        let mut rng = Xorshift::new(0x9E37_79B9_7F4A_7C15);
+        let mut next = |n: u64| rng.below(n);
+        let now = Instant::now() + Duration::from_secs(10);
+        // Held to a stall, held with every watching viewer stalled, and open.
+        let mut seen = [0u32; 3];
+        for case in 0..20_000 {
+            let hub = Hub::new(crate::hub::Paths::ANY);
+            for _ in 0..1 + next(4) {
+                let c = hub.add_client(
+                    tokio::sync::mpsc::unbounded_channel().0,
+                    now - Duration::from_secs(7),
+                );
+                if next(5) > 0 {
+                    c.watch();
+                }
+                // About to stall, just stalled, or anything up to 5 s old.
+                let age = Duration::from_micros(match next(3) {
+                    0 => 3_990_000 + next(10_000),
+                    1 => 4_000_000 + next(10_000),
+                    _ => next(5_000_000),
+                });
+                let mut at = now - age;
+                let mut sent = vec![];
+                for _ in 0..next(31) {
+                    let id = hub.timeline.number();
+                    c.fly(id, at, 200 + next(60_000) as usize);
+                    sent.push((at, id.get()));
+                    at = (at + Duration::from_micros(next(30_000))).min(now);
+                }
+                // The first few acknowledged, as they came back.
+                if !sent.is_empty() && next(2) == 0 {
+                    let (left, id) = sent[next(sent.len() as u64) as usize];
+                    let back = (left + Duration::from_micros(next(300_000))).min(now);
+                    c.on_ack(back, id, crate::hub::Hold::Unsaid);
+                }
+            }
+            let at = format!("case {case}");
+            let viewers = hub.viewers();
+            let ways: Vec<Way> = viewers
+                .iter()
+                .map(|(c, _)| c.window(|w| w.way(now, STALLED)))
+                .collect();
+            for ((c, _), &way) in viewers.iter().zip(&ways) {
+                let room = c.window(|w| w.room(now));
+                let want = match (c.backlog(now).map(|b| b.oldest), room) {
+                    (Some(age), _) if age >= STALLED => Way::Stalled,
+                    (_, Some(room)) => Way::Room(room),
+                    (Some(age), None) => Way::Full {
+                        stalls: now - age + STALLED,
+                    },
+                    (None, None) => panic!("no room with nothing on its way: {at}"),
+                };
+                assert_eq!(way, want, "{at}");
+            }
+            let full = ways.iter().find_map(|way| match way {
+                Way::Full { stalls } => Some(*stalls),
+                Way::Room(_) | Way::Stalled => None,
+            });
+            let least = ways
+                .iter()
+                .filter_map(|way| match way {
+                    Way::Room(room) => Some(*room),
+                    Way::Full { .. } | Way::Stalled => None,
+                })
+                .min();
+            let rule = match (full, least) {
+                (Some(stalls), _) => Gated::Held {
+                    until: Some(stalls),
+                },
+                (None, Some(room)) => Gated::Open(room),
+                (None, None) => Gated::Held { until: None },
+            };
+            let gate = Gated::ask(&looked(&hub, now));
+            assert_eq!(gate, rule, "{at}");
+            match gate {
+                Gated::Open(_) => seen[2] += 1,
+                Gated::Held { until: None } => {
+                    for t in [1, 1_000, 10_000_000].map(|us| now + Duration::from_micros(us)) {
+                        let again = Gated::ask(&looked(&hub, t));
+                        assert_eq!(again, Gated::Held { until: None }, "{at}");
+                    }
+                    seen[1] += u32::from(!viewers.is_empty());
+                }
+                Gated::Held { until: Some(until) } => {
+                    let then = Gated::ask(&looked(&hub, until));
+                    assert!(
+                        match then {
+                            Gated::Open(_) | Gated::Held { until: None } => true,
+                            Gated::Held { until: Some(later) } => later > until,
+                        },
+                        "{then:?}: {at}"
+                    );
+                    seen[0] += 1;
+                }
+            }
+        }
+        assert!(seen.iter().all(|&n| n > 100), "unreached: {seen:?}");
+    }
+
+    /// A capture goes only to viewers whose room, when the loop looked, held what the gate
+    /// let it take: the gate and the leaving behind decide from one look, whatever acks come
+    /// between it and the send. Two to four started viewers, each on a clogged path (up to
+    /// 30 frames of 200 B to 60 KB on their way, the oldest about to stall, just stalled, or
+    /// up to 5 s old) or a light one (a frame or two of up to 2 KB); one look; then an ack
+    /// for some of each viewer's frames, which may unstall one the look saw stalled; then,
+    /// if the gate opened, a capture of all it let through. A viewer takes it exactly when
+    /// the look saw it with that much room at least; one seen stalled is left behind
+    /// instead. Counted, and each must happen: viewers that took a capture, viewers left
+    /// behind, and viewers seen stalled that an ack then unstalled (a second read of the
+    /// way kept such a viewer started, and sent it the capture).
+    #[test]
+    fn a_capture_goes_only_where_its_look_made_room() {
+        let mut rng = Xorshift::new(0xD1B5_4A32_D192_ED03);
+        let mut next = |n: u64| rng.below(n);
+        let now = Instant::now() + Duration::from_secs(10);
+        let (mut took, mut left, mut unstalled) = (0u32, 0u32, 0u32);
+        for case in 0..2_000 {
+            let hub = Hub::new(crate::hub::Paths::ANY);
+            let mut sent = vec![];
+            for _ in 0..2 + next(3) {
+                let joined = now - Duration::from_secs(7);
+                let c = hub.add_client(tokio::sync::mpsc::unbounded_channel().0, joined);
+                c.watch();
+                c.keyframe_planned();
+                c.keyframe_sent(true);
+                // A clogged path (its oldest frame about to stall, just stalled, or up to
+                // 5 s old) or a light one (a frame or two of up to 2 KB, under 100 ms old).
+                let (age, frames, most) = match next(4) {
+                    0 => (3_990_000 + next(10_000), 1 + next(30), 60_000),
+                    1 => (4_000_000 + next(10_000), 1 + next(30), 60_000),
+                    2 => (next(5_000_000), 1 + next(30), 60_000),
+                    _ => (next(100_000), next(3), 2_000),
+                };
+                let mut at = now - Duration::from_micros(age);
+                let mut ids = vec![];
+                for _ in 0..frames {
+                    let id = hub.timeline.number();
+                    c.fly(id, at, 200 + next(most) as usize);
+                    ids.push(id.get());
+                    at = (at + Duration::from_micros(next(30_000))).min(now);
+                }
+                sent.push((c, ids));
+            }
+            let seen = looked(&hub, now);
+            for (c, ids) in &sent {
+                if let Some(k) = (next(ids.len() as u64 + 1) as usize).checked_sub(1) {
+                    c.on_ack(now, ids[k], crate::hub::Hold::Unsaid);
+                }
+            }
+            let Gated::Open(room) = Gated::ask(&seen) else {
+                continue;
+            };
+            leave_behind(&seen);
+            let id = hub.timeline.number();
+            for ((c, _), (looked_at, v)) in sent.iter().zip(&seen) {
+                assert!(Arc::ptr_eq(c, looked_at), "case {case}: the hub's order");
+                let now_way = c.window(|w| w.way(now, STALLED));
+                let made = matches!(v.way, Way::Room(seen) if seen >= room);
+                let takes = c.takes(id, now, room, false, HOPELESSLY_BEHIND) == Takes::Frame;
+                assert_eq!(takes, made, "case {case}: {room} B, a viewer seen {v:?}");
+                if !takes {
+                    assert_eq!(c.viewer(), Viewer::Behind, "case {case}: seen {v:?}");
+                }
+                took += u32::from(takes);
+                left += u32::from(!takes);
+                unstalled += u32::from(v.way == Way::Stalled && now_way != Way::Stalled);
+            }
+        }
+        assert!(
+            took > 100 && left > 100 && unstalled > 100,
+            "unreached: {took}, {left}, {unstalled}"
+        );
+    }
+
+    /// The recorder is no path: beside viewers it changes nothing the look decides, and
+    /// alone it lets a capture take the ceiling. Hubs whose ceiling is anything from a
+    /// packet to as much as there is; none to three viewers on a path, not watching,
+    /// waiting or started, each on a clogged path or a light one (as in the test above);
+    /// and the recorder, waiting for its keyframe or started. With the recorder the gate is
+    /// the viewers' own when one of those a frame goes to was seen with room or full, and
+    /// open at the ceiling when none was; a keyframe is wanted when the recorder or a
+    /// viewer waits, of the least those viewers carry, or of the ceiling with none; the
+    /// pass's holds are the viewers'. The recorder, once started, takes each frame and
+    /// keeps nothing in flight. Counted, and each must happen: gates the viewers decided,
+    /// gates the recorder opened, and keyframes only the recorder waited for.
+    #[test]
+    fn the_recorder_bounds_no_viewer_and_alone_takes_the_ceiling() {
+        let mut rng = Xorshift::new(0x94D0_49BB_1331_11EB);
+        let mut next = |n: u64| rng.below(n);
+        let now = Instant::now() + Duration::from_secs(10);
+        let joined = now - Duration::from_secs(7);
+        let (mut theirs, mut opened, mut asked) = (0u32, 0u32, 0u32);
+        for case in 0..2_000 {
+            let most = match next(3) {
+                0 => usize::MAX,
+                _ => window::PACKET * (1 + next(200) as usize),
+            };
+            let hub = Hub::new(crate::hub::Paths { least: 0, most });
+            for _ in 0..next(4) {
+                let c = hub.add_client(tokio::sync::mpsc::unbounded_channel().0, joined);
+                match next(3) {
+                    0 => {}
+                    1 => c.watch(),
+                    _ => {
+                        c.watch();
+                        c.keyframe_planned();
+                        c.keyframe_sent(true);
+                    }
+                }
+                let (age, frames, bytes) = match next(4) {
+                    0 => (3_990_000 + next(10_000), 1 + next(30), 60_000),
+                    1 => (4_000_000 + next(10_000), 1 + next(30), 60_000),
+                    2 => (next(5_000_000), 1 + next(30), 60_000),
+                    _ => (next(100_000), next(3), 2_000),
+                };
+                let mut at = now - Duration::from_micros(age);
+                for _ in 0..frames {
+                    c.fly(hub.timeline.number(), at, 200 + next(bytes) as usize);
+                    at = (at + Duration::from_micros(next(30_000))).min(now);
+                }
+            }
+            let recorder = hub.add_recorder(tokio::sync::mpsc::unbounded_channel().0);
+            recorder.watch();
+            if next(2) == 0 {
+                recorder.keyframe_planned();
+                recorder.keyframe_sent(true);
+            }
+            let ceiling = hub.ceiling();
+            let all = looked(&hub, now);
+            let viewers: Vec<_> = all
+                .iter()
+                .filter(|(c, _)| !Arc::ptr_eq(c, &recorder))
+                .cloned()
+                .collect();
+            let at = format!("case {case}");
+            let decide = sent(&viewers).any(|v| v.way != Way::Stalled);
+            match decide {
+                true => assert_eq!(Gated::ask(&all), Gated::ask(&viewers), "{at}"),
+                false => assert_eq!(Gated::ask(&all), Gated::Open(ceiling), "{at}"),
+            }
+            theirs += u32::from(decide);
+            opened += u32::from(!decide);
+            let waits = |seen: &[(Arc<Client>, Seen)]| {
+                seen.iter().any(|(_, v)| v.viewer == Viewer::Waiting)
+            };
+            let least = sent(&viewers).map(|v| v.carries).min();
+            let want = match (waits(&all), least) {
+                (false, _) => Key::NotWanted,
+                (true, Some(carries)) => Key::Wanted { carries },
+                (true, None) => Key::Wanted { carries: ceiling },
+            };
+            assert_eq!(Key::of(&all), want, "{at}");
+            asked += u32::from(waits(&all) && !waits(&viewers));
+            assert_eq!(
+                InFlight::ask(&all, now),
+                InFlight::ask(&viewers, now),
+                "{at}"
+            );
+            let started = recorder.viewer() == Viewer::Started;
+            let took = recorder.takes(hub.timeline.number(), now, 1 << 20, false, 0);
+            assert_eq!(took == Takes::Frame, started, "{at}");
+            let read = recorder.stats(now);
+            assert_eq!(
+                (read.backlog, read.reach),
+                (None, ReachStats::Recorder),
+                "{at}"
+            );
+        }
+        assert!(
+            theirs > 100 && opened > 100 && asked > 100,
+            "unreached: {theirs}, {opened}, {asked}"
+        );
+    }
+
+    /// A pass waits while a viewer's queue holds frames: a viewer holds it while its window
+    /// has not room for all its path carries, until the newest frame on its way has had
+    /// `STALLED`; the pass waits until the last viewer that holds it will have emptied or
+    /// stalled, and until then each that holds it still does with no ack. Over none to three
+    /// viewers, each with none to two frames of 1000 B or 60 KB on their way, sent in order at
+    /// ages either side of nothing and of `STALLED`, read as the capture loop reads them.
+    #[test]
+    fn a_pass_waits_for_the_viewers_queues_to_empty() {
+        let ns = Duration::from_nanos;
+        // Each case a minute after the one before: a window's time only goes forward.
+        let mut now = Instant::now();
+        let ages = [
+            ns(0),
+            ns(1),
+            Duration::from_millis(5),
+            Duration::from_millis(250),
+            STALLED - ns(1),
+            STALLED,
+            STALLED + ns(1),
+            Duration::from_secs(30),
+        ];
+        // What one viewer has on its way, oldest first: nothing, one frame, or two.
+        let queues: Vec<Vec<(Duration, usize)>> = std::iter::once(vec![])
+            .chain(
+                ages.iter()
+                    .flat_map(|&a| [1000, 60_000].map(|b| vec![(a, b)])),
+            )
+            .chain(ages.iter().flat_map(|&a| {
+                ages.iter()
+                    .filter(move |&&b| b <= a)
+                    .map(move |&b| vec![(a, 1000), (b, 60_000)])
+            }))
+            .collect();
+        let hub = Hub::new(crate::hub::Paths::ANY);
+        let viewers: Vec<Arc<Client>> = (0..3)
+            .map(|_| hub.add_client(tokio::sync::mpsc::unbounded_channel().0, now))
+            .collect();
+        let mut seen = [0; 2];
+        for n in 0..=viewers.len() as u32 {
+            for pick in 0..queues.len().pow(n) {
+                let picked: Vec<&[(Duration, usize)]> = (0..n)
+                    .map(|i| &queues[pick / queues.len().pow(i) % queues.len()][..])
+                    .collect();
+                now += Duration::from_secs(60);
+                for (c, frames) in viewers.iter().zip(&picked) {
+                    c.start_over(hub.hello());
+                    for &(age, bytes) in frames.iter() {
+                        c.fly(hub.timeline.number(), now - age, bytes);
+                    }
+                }
+                let asked = &viewers[..n as usize];
+                let holds: Vec<Option<Instant>> = asked
+                    .iter()
+                    .map(|c| c.window(|w| holds_pass(w, now)))
+                    .collect();
+                for ((c, frames), &hold) in asked.iter().zip(&picked).zip(&holds) {
+                    let at = format!("{frames:?}: {hold:?}");
+                    let empty = |t| c.window(|w| w.room(t) == Some(w.carries()));
+                    let stalls = frames.last().map(|&(age, _)| now - age + STALLED);
+                    let holding = stalls.is_some_and(|s| s > now) && !empty(now);
+                    assert_eq!(hold.is_some(), holding, "{at}");
+                    if let (Some(until), Some(stalls)) = (hold, stalls) {
+                        assert!(until > now && until <= stalls, "{at}");
+                        for t in [now, now + (until - now) / 2, until - ns(1)] {
+                            assert!(!empty(t), "empty {:?} in: {at}", t - now);
+                        }
+                    }
+                }
+                let got = InFlight::of(now, holds.iter().copied());
+                let want = match holds.iter().flatten().max() {
+                    None => InFlight::Nothing,
+                    Some(&until) => InFlight::Frames(until - now),
+                };
+                assert_eq!(got, want, "{picked:?}");
+                seen[usize::from(want != InFlight::Nothing)] += 1;
+            }
+        }
+        assert!(seen.iter().all(|&n| n > 1000), "unreached: {seen:?}");
+    }
+
+    /// On a path that carries less than the encoder makes, a keystroke's frame waits for
+    /// the path no more than three times `LATENESS`, the window's own bound (130 ms
+    /// measured: the window lets a queue grow to `LATENESS / 2` past the fastest trip so as
+    /// to see it), passes ahead of it included, and sharpening goes on: a pass goes only into
+    /// an empty queue, and at most a frame's least interval after it empties. The wait is
+    /// checked once the window has had the path 5 s, on paths that carry two packets in
+    /// `LATENESS`: before that the window starts at ten packets, and a path that carries less
+    /// than two is held to one. The loop's own `step`, with a pass
+    /// due at every look (a page whose passes all come back squeezed, as on a slow path),
+    /// drives a modelled stream: an encoder that codes one capture at a time into what the
+    /// capture may take, and a page seated on the oracle's path (`oracle::Seat`), which
+    /// serves in order, pinged every `PING_EVERY` from its connect behind what is queued on
+    /// it, acking each frame as it arrives; the server sees it through its `Client`, which
+    /// the gate and the pass read in one look; keystrokes come at generated instants. Over 300 generated paths from
+    /// 100 kbit/s to 40 Mbit/s and round trips to 600 ms, passes to 40 KB, keystrokes'
+    /// frames to 4 KB, encodes of 1 to 30 ms and quiet windows to 4 ms, 30 s each.
+    #[test]
+    fn a_keystrokes_frame_waits_for_the_path_three_times_the_lateness_at_most() {
+        let mut rng = Xorshift::new(0x2545_F491_4F6C_DD1D);
+        let mut next = |n: u64| rng.below(n);
+        let us = Duration::from_micros;
+        use crate::oracle::{Late, Page, Path, Seat};
+        // How long the window is given to learn a path, and `LATENESS` in whole ms.
+        const LEARNED: Duration = Duration::from_secs(5);
+        const LATENESS_MS: u64 = window::LATENESS.as_millis() as u64;
+        let (mut keys_behind_a_pass, mut passes) = (0, 0);
+        for _ in 0..300 {
+            let bps = 100_000 + next(40_000_000);
+            let rtt = us(1000 + next(600_000));
+            let pass_bytes = 200 + next(40_000) as usize;
+            let key_bytes = 200 + next(4000) as usize;
+            let encode = us(1000 + next(29_000));
+            let quiet = us(next(4000));
+            let interval = Duration::from_secs_f64(1.0 / 60.0);
+            let min_interval = interval.mul_f64(MIN_INTERVAL_SHARE);
+            let t0 = Instant::now() + Duration::from_secs(10);
+            let end = t0 + Duration::from_secs(30);
+            let mut keys = std::collections::VecDeque::new();
+            let mut k = t0;
+            while k < end {
+                k += us(50_000 + next(3_000_000));
+                keys.push_back(k);
+            }
+            let (mut now, mut captured) = (t0, Captured::new(t0 - Duration::from_secs(1)));
+            let mut damage = Damage::None;
+            let hub = Hub::new(crate::hub::Paths::ANY);
+            let carries = bps as f64 / 8.0 * window::LATENESS.as_secs_f64();
+            let path = Path::new(t0, carries, rtt, Late::None, next(1 << 32));
+            let mut seat = Seat::connect(&hub, t0, path, 0);
+            // It has started: the frames here are keystrokes' and passes.
+            seat.client.keyframe_planned();
+            seat.client.keyframe_sent(true);
+            // The capture the encoder holds: when it is coded, whether it is a pass, and
+            // what it may take.
+            let mut encoder: Option<(Instant, bool, usize)> = None;
+            // Each frame sent: when its last byte left the path's queue, and whether it is
+            // a pass.
+            let mut sent = Vec::<(Instant, bool)>::new();
+            // Since when the window's queue has been empty, the encoder idle and nothing
+            // damaged.
+            let mut clear: Option<Instant> = None;
+            while now < end {
+                seat.hears(now);
+                seat.pings(now);
+                if let Some((done, pass, allowance)) = encoder.filter(|e| e.0 <= now) {
+                    encoder = None;
+                    let bytes = allowance.min(if pass { pass_bytes } else { key_bytes });
+                    // How long it waits for the path behind what is queued on it.
+                    let waits = seat.path.free.saturating_duration_since(done);
+                    // Once the window has had the path a while, if it carries two packets in
+                    // `LATENESS`: before that the window starts at ten packets, and one less
+                    // than two is held to one.
+                    let learned = done - t0 >= LEARNED && bps * LATENESS_MS / 8_000 >= 2 * 1460;
+                    if !pass && learned {
+                        assert!(
+                            waits <= window::LATENESS * 3,
+                            "a keystroke's frame waited {waits:?} behind the queue"
+                        );
+                        let behind = sent.iter().filter(|&&(out, p)| p && out > done).count();
+                        keys_behind_a_pass += usize::from(behind > 0);
+                    }
+                    let id = hub.timeline.number();
+                    let took = seat.client.takes(id, done, bytes, false, HOPELESSLY_BEHIND);
+                    assert_eq!(took, Takes::Frame);
+                    seat.frame(done, id, bytes, Page::Holds(Duration::ZERO));
+                    sent.push((seat.path.free, pass));
+                }
+                while let Some(key) = keys.pop_front() {
+                    if key > now {
+                        keys.push_front(key);
+                        break;
+                    }
+                    damage.add(0, 16, key);
+                }
+                let seen = looked(&hub, now);
+                let holds = seen[0].1.holds;
+                clear = match (holds, encoder, damage) {
+                    (None, None, Damage::None) => clear.or(Some(now)),
+                    _ => None,
+                };
+                let look = Look {
+                    key: Key::NotWanted,
+                    damage,
+                    due: Due::Now,
+                    now,
+                    captured,
+                    min_interval,
+                    quiet,
+                    deadline: interval,
+                    gate: Gated::ask(&seen),
+                    buffer: match encoder {
+                        None => Buffer::Home(()),
+                        Some(_) => Buffer::Away,
+                    },
+                    in_flight: InFlight::ask(&seen, now),
+                };
+                let wait = match step(look) {
+                    Step::Capture(what, (), allowance) => {
+                        let pass = what == Next::Pass;
+                        if pass {
+                            let since = clear.expect("a pass went into a queue");
+                            assert!(
+                                now - since <= min_interval,
+                                "a pass {:?} after the queue emptied",
+                                now - since
+                            );
+                            passes += 1;
+                        }
+                        damage = Damage::None;
+                        encoder = Some((now + encode, pass, allowance));
+                        captured.on_capture(what, now);
+                        continue;
+                    }
+                    Step::Wait(wait, _) => wait,
+                };
+                // Each wait ends as `Wait::through` makes it: on damage, on the hub's waker
+                // (a buffer home, an ack, a pong, a ping going), on its time.
+                let woken = encoder.map(|e| e.0).into_iter().chain([seat.next()]);
+                let damaged = keys.front().copied();
+                now = match wait {
+                    Wait::Change => woken.chain(damaged).min(),
+                    Wait::Pass(due) | Wait::Gate(Some(due)) => {
+                        woken.chain(damaged).chain([now + due]).min()
+                    }
+                    Wait::Gate(None) => woken.chain(damaged).min(),
+                    Wait::Interval { rest, next } => match next.interval_ends() {
+                        On::Event => woken.chain(damaged).chain([now + rest]).min(),
+                        On::Wake => woken.chain([now + rest]).min(),
+                    },
+                    Wait::Settle(rest) => woken.chain(damaged).chain([now + rest]).min(),
+                    Wait::Buffer => woken.min(),
+                }
+                .unwrap_or(end);
+            }
+        }
+        assert!(
+            passes > 10_000 && keys_behind_a_pass > 100,
+            "unreached: {passes} passes, {keys_behind_a_pass} keystrokes behind one"
+        );
+    }
+
+    /// The room an open gate finds in a look, and what the slowest viewer's path carries
+    /// while a keyframe is wanted: any two numbers whose frames differ, so a capture says
+    /// which it took.
+    const ROOM: usize = 9_000;
+    const CARRIES: usize = 30_000;
+
+    /// One look, as the capture loop reads it: the capturer's damage, whether a viewer
+    /// wants a keyframe, the pass due, the last capture, the pacing, the
+    /// gate, whether the buffer is home, what the viewers have in flight, the area the
+    /// damage comes to when taken, and the blocks pending.
+    #[derive(Clone, Copy)]
+    struct StepCase<'a> {
+        damage: Damage,
+        want_key: bool,
+        now: Instant,
+        due: Due,
+        captured: Captured,
+        min_interval: Duration,
+        quiet: Duration,
+        deadline: Duration,
+        gate: Gated,
+        home: bool,
+        in_flight: InFlight,
+        band: Option<Band>,
+        refiner: &'a Refiner,
+    }
+
+    impl StepCase<'_> {
+        fn key(&self) -> Key {
+            match self.want_key {
+                true => Key::Wanted { carries: CARRIES },
+                false => Key::NotWanted,
+            }
+        }
+        fn buffer(&self) -> Buffer<()> {
+            match self.home {
+                true => Buffer::Home(()),
+                false => Buffer::Away,
+            }
+        }
+        fn look(&self) -> Look<()> {
+            Look {
+                key: self.key(),
+                damage: self.damage,
+                due: self.due,
+                now: self.now,
+                captured: self.captured,
+                min_interval: self.min_interval,
+                quiet: self.quiet,
+                deadline: self.deadline,
+                gate: self.gate,
+                buffer: self.buffer(),
+                in_flight: self.in_flight,
+            }
+        }
+    }
+
+    /// How many looks `each_case` makes: four frame rates, three quiet windows, 18
+    /// damages, 28 pairs of times since the last change and the last capture, nine dues,
+    /// seven answers of the gate, and 32 ways for the rest.
+    const CASES: usize = 4 * 3 * 18 * 28 * 9 * 7 * 32;
+
+    /// Every look over a discretised domain: each state the capturer's damage takes, its
+    /// latest area at four times either side of three quiet windows, and its first at that
+    /// time or at three either side of the frame's deadline; four frame rates,
+    /// at seven times since the last change and since the last capture (no longer ago than
+    /// the change), either side of the least interval and its rounding to whole
+    /// milliseconds; seven waits for a pass, a pass due and none; a
+    /// keyframe wanted or not; the gate open, holding until a viewer stalls now, either
+    /// side of a millisecond or seconds away, or holding with no viewer to stall; the
+    /// buffer home or out; nothing in flight, or frames whose newest will have had
+    /// `STALLED` in a nanosecond under it; damage that came to an area or to none; and
+    /// blocks pending or none.
+    fn each_case(mut check: impl FnMut(StepCase)) -> usize {
+        let ns = Duration::from_nanos;
+        let us = Duration::from_micros;
+        let ms = Duration::from_millis;
+        let now = Instant::now() + Duration::from_secs(10);
+        let sharp = Refiner::new(12, 4, now);
+        let mut pending = Refiner::new(12, 4, now);
+        pending.mark(&[0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 1], now - ms(500));
+        let ins = [
+            ns(0),
+            ns(1),
+            ns(999_999),
+            ms(1),
+            ms(1) + ns(1),
+            ms(40),
+            ms(1500),
+        ];
+        let dues = ins.map(Due::In).into_iter().chain([Due::Never, Due::Now]);
+        let gates = [
+            ns(0),
+            ns(1),
+            us(999),
+            ms(1),
+            ms(1) + ns(1),
+            Duration::from_secs(4),
+        ]
+        .map(|d| Gated::Held {
+            until: Some(now + d),
+        });
+        let gates = [
+            Gated::Open(ROOM),
+            gates[0],
+            gates[1],
+            gates[3],
+            gates[4],
+            gates[5],
+            Gated::Held { until: None },
+        ];
+        let mut cases = 0;
+        for fps in [1, 30, 60, 144] {
+            let interval = Duration::from_secs_f64(1.0 / fps as f64);
+            let min_interval = interval.mul_f64(MIN_INTERVAL_SHARE);
+            let sinces = [
+                ns(0),
+                min_interval - us(1000),
+                min_interval - us(999),
+                min_interval - ns(1),
+                min_interval,
+                min_interval + ns(1),
+                Duration::from_secs(5),
+            ];
+            let deadline = interval;
+            for quiet in [ns(0), ms(2), ms(8)] {
+                let quiets = [ns(0), quiet.saturating_sub(ns(1)), quiet, quiet + ms(1)];
+                // The first area came with the latest, or before it, either side of the
+                // deadline.
+                let spans = quiets.into_iter().flat_map(|last| {
+                    [
+                        last,
+                        deadline.saturating_sub(ns(1)),
+                        deadline,
+                        deadline + ms(1),
+                    ]
+                    .map(move |first| (first.max(last), last))
+                });
+                let damages = [Damage::None, Damage::Unreported]
+                    .into_iter()
+                    .chain(spans.map(|(first, last)| Damage::Rows {
+                        drawing: super::Drawing {
+                            first: now - first,
+                            last: now - last,
+                        },
+                        y0: 16,
+                        y1: 48,
+                    }));
+                // The last capture of any kind is the last change or later.
+                let captures = sinces.iter().enumerate().flat_map(|(i, &change)| {
+                    sinces[..=i].iter().map(move |&any| Captured {
+                        any: now - any,
+                        change: now - change,
+                    })
+                });
+                for (damage, captured, due) in damages.flat_map(|d| {
+                    let dues = dues.clone();
+                    captures
+                        .clone()
+                        .flat_map(move |c| dues.clone().map(move |due| (d, c, due)))
+                }) {
+                    for (case, gate) in (0..32).flat_map(|case| gates.map(move |g| (case, g))) {
+                        let bit = |i: u32| case >> i & 1 == 1;
+                        check(StepCase {
+                            damage,
+                            want_key: bit(0),
+                            now,
+                            due,
+                            captured,
+                            min_interval,
+                            quiet,
+                            deadline,
+                            gate,
+                            home: bit(1),
+                            in_flight: match bit(4) {
+                                false => InFlight::Nothing,
+                                true => InFlight::Frames(STALLED - ns(1)),
+                            },
+                            band: bit(2).then_some(Band { y0: 16, y1: 48 }),
+                            refiner: if bit(3) { &pending } else { &sharp },
+                        });
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        cases
+    }
+
+    /// A look waits for the first of these that holds it, and only for that, else it
+    /// captures if the encoder is idle, or waits for the buffer to come home: a still
+    /// screen (nothing damaged, no keyframe wanted, and no pass due, or one due while the
+    /// encoder holds the buffer or a viewer has frames to acknowledge), for the pass due,
+    /// or for the viewers' acks until the newest frame has had `STALLED`, or else for a
+    /// change; the rest of the least interval
+    /// since the last capture; the drawing, while it has been quiet less than the quiet
+    /// window and the frame's deadline is still to come, until the first of the two; the
+    /// flow gate. The gate is asked only when nothing before it holds the capture and no
+    /// keyframe is wanted. Checked over every look of `each_case`.
+    #[test]
+    fn a_capture_waits_only_for_what_holds_it() {
+        let cases = each_case(|c| {
+            let got = step(c.look());
+            // A due pass goes only to an idle encoder, and onto empty paths.
+            let pass_goes = c.due == Due::Now && c.home && c.in_flight == InFlight::Nothing;
+            let still = !(c.damage != Damage::None || c.want_key || pass_goes);
+            // A change waits a frame after the last change, a pass after any capture.
+            let (next, after) = match c.damage != Damage::None || c.want_key {
+                true => (Next::Change, c.captured.change),
+                false => (Next::Pass, c.captured.any),
+            };
+            let since = c.now - after;
+            let early = (since < c.min_interval).then(|| c.min_interval - since);
+            // What is left of the quiet window since the latest area, and of the deadline
+            // since the first: the drawing holds the capture while both are.
+            let left = |window: Duration, since: Instant| {
+                window
+                    .checked_sub(c.now - since)
+                    .filter(|left| !left.is_zero())
+            };
+            let settling = match c.damage {
+                Damage::Rows { drawing, .. } => {
+                    match (left(c.quiet, drawing.last), left(c.deadline, drawing.first)) {
+                        (Some(quiet), Some(deadline)) => Some(quiet.min(deadline)),
+                        (None, _) | (_, None) => None,
+                    }
+                }
+                Damage::None | Damage::Unreported => None,
+            };
+            let gate_asked = !still && early.is_none() && settling.is_none() && !c.want_key;
+            // A wait leaves the buffer where it was; a capture takes it.
+            let wait = |w| Step::Wait(w, c.buffer());
+            let want = match (still, early, settling) {
+                (true, _, _) => wait(match (c.due, c.home, c.in_flight) {
+                    (Due::In(due), _, _) => Wait::Pass(due),
+                    (Due::Now, true, InFlight::Frames(last)) => Wait::Pass(last),
+                    (Due::Now, true, InFlight::Nothing) => unreachable!("a pass that goes"),
+                    (Due::Now, false, _) | (Due::Never, _, _) => Wait::Change,
+                }),
+                (false, Some(rest), _) => wait(Wait::Interval { rest, next }),
+                (false, None, Some(rest)) => wait(Wait::Settle(rest)),
+                (false, None, None) => match (gate_asked, c.gate, c.home) {
+                    (true, Gated::Held { until }, _) => {
+                        wait(Wait::Gate(until.map(|until| until - c.now)))
+                    }
+                    (_, _, false) => wait(Wait::Buffer),
+                    // Any other frame takes the room the gate found.
+                    (true, Gated::Open(room), true) => Step::Capture(next, (), room),
+                    // A keyframe takes what the slowest path carries in `KEY_TIME`.
+                    (false, _, true) => {
+                        Step::Capture(next, (), window::scale(CARRIES, KEY_TIME, window::LATENESS))
+                    }
+                },
+            };
+            assert_eq!(
+                got, want,
+                "still {still}, early {early:?}, settling {settling:?}, gate asked \
+                 {gate_asked} and {:?}, buffer home {}",
+                c.gate, c.home
+            );
+        });
+        assert_eq!(cases, CASES);
+    }
+
+    /// Each wait wakes on what it waits for, and ends on its time: a change on damage or
+    /// a wake, with no limit; a pass on damage or a wake, or once due; the interval before
+    /// a change only on a wake, before a pass on damage too, or once over; the gate on
+    /// damage or a wake, or once the viewer it holds for will have stalled, with no limit
+    /// when every viewer has; a buffer only on a wake, with no limit; the drawing on damage
+    /// or a wake, or once quiet or due. Over every wait `step` makes in `each_case`.
+    #[test]
+    fn a_wait_wakes_on_what_it_waits_for() {
+        let mut waits = 0;
+        each_case(|c| {
+            let Step::Wait(wait, _) = step(c.look()) else {
+                return;
+            };
+            waits += 1;
+            let mut polled = None;
+            wait.through(|on, t| polled = Some((on, t)));
+            let want = match wait {
+                Wait::Change => (On::Event, None),
+                Wait::Pass(due) => (On::Event, Some(due)),
+                Wait::Interval {
+                    rest,
+                    next: Next::Change,
+                } => (On::Wake, Some(rest)),
+                Wait::Interval {
+                    rest,
+                    next: Next::Pass,
+                } => (On::Event, Some(rest)),
+                Wait::Settle(rest) => (On::Event, Some(rest)),
+                Wait::Gate(stalls) => (On::Event, stalls),
+                Wait::Buffer => (On::Wake, None),
+            };
+            assert_eq!(polled, Some(want), "{wait:?}");
+        });
+        assert!(waits > 0);
+    }
+
+    /// The capture loop over a timeline of puts, against the rule written apart: from the
+    /// first damage it captures at the first instant at which the drawing has been quiet
+    /// for the quiet window, or a frame interval has passed since that first damage, and
+    /// at that instant, the waits being exact. So a burst whose puts come
+    /// closer together than the window is captured whole, once it ends, unless it outlasts
+    /// the frame. Over generated timelines (one to three bursts of one to eight puts, 0 to
+    /// 3 ms apart, the bursts 0 to 30 ms apart) at three quiet windows and four frame
+    /// rates. A put wakes the loop only through a wait that wakes on damage.
+    #[test]
+    fn a_capture_waits_for_the_drawing_to_go_quiet_or_its_deadline() {
+        let us = Duration::from_micros;
+        let t0 = Instant::now() + Duration::from_secs(10);
+        let mut rng = Xorshift::new(0x9E37_79B9_7F4A_7C15);
+        let mut timelines = 0;
+        for fps in [30u64, 60, 120, 144] {
+            let deadline = us(1_000_000 / fps);
+            for quiet in [us(0), us(1000), us(3000)] {
+                for _ in 0..2000 {
+                    // Puts, as microseconds after t0, in order.
+                    let mut puts = Vec::new();
+                    let mut t = 0;
+                    for _ in 0..rng.range(1, 4) {
+                        for _ in 0..rng.range(1, 9) {
+                            puts.push(t);
+                            t += rng.range(0, 3001);
+                        }
+                        t += rng.range(0, 30_001);
+                    }
+                    // The rule: the first instant from the first put at which the latest
+                    // put so far is a quiet window old, or the deadline has come.
+                    let window = quiet.as_micros() as u64;
+                    let rule = puts
+                        .iter()
+                        .map(|&p| p + window)
+                        .filter(|&end| !puts.iter().any(|&p| p > end - window && p <= end))
+                        .chain([puts[0] + deadline.as_micros() as u64])
+                        .min()
+                        .expect("the deadline");
+                    // The loop: it looks at the first put, and again whenever a wait ends.
+                    let (mut now, mut seen) = (puts[0], 1);
+                    while seen < puts.len() && puts[seen] <= now {
+                        seen += 1;
+                    }
+                    let mut looks = 0;
+                    let captured = loop {
+                        looks += 1;
+                        assert!(looks < 1000, "the loop never captures: puts {puts:?}");
+                        let look = Look {
+                            key: Key::NotWanted,
+                            damage: Damage::Rows {
+                                drawing: super::Drawing {
+                                    first: t0 + us(puts[0]),
+                                    last: t0 + us(puts[seen - 1]),
+                                },
+                                y0: 0,
+                                y1: 16,
+                            },
+                            due: Due::Never,
+                            now: t0 + us(now),
+                            captured: Captured::new(t0 - Duration::from_secs(1)),
+                            min_interval: deadline.mul_f64(MIN_INTERVAL_SHARE),
+                            quiet,
+                            deadline,
+                            gate: Gated::Open(ROOM),
+                            buffer: Buffer::Home(()),
+                            in_flight: InFlight::Nothing,
+                        };
+                        match step(look) {
+                            Step::Capture(_, (), _) => break now,
+                            Step::Wait(wait, _) => {
+                                let mut polled = None;
+                                wait.through(|on, t| polled = Some((on, t)));
+                                let Some((on, Some(t))) = polled else {
+                                    panic!("{polled:?}: the drawing waits for a time");
+                                };
+                                let over = now + t.as_micros() as u64;
+                                now = match (on, puts.get(seen)) {
+                                    (On::Event, Some(&put)) if put <= over => put,
+                                    (On::Event | On::Wake, _) => over,
+                                };
+                                while seen < puts.len() && puts[seen] <= now {
+                                    seen += 1;
+                                }
+                            }
+                        }
+                    };
+                    assert_eq!(
+                        captured, rule,
+                        "captured at {captured} us, the rule says {rule}: {fps} fps, quiet \
+                         {quiet:?}, puts {puts:?}"
+                    );
+                    timelines += 1;
+                }
+            }
+        }
+        assert_eq!(timelines, 4 * 3 * 2000);
+    }
+
+    /// However many areas come, and however far apart, the drawing runs from the first
+    /// to the latest, whether the capturer held nothing or had been marked. Over
+    /// generated runs of one to 64 areas, 0 to 20 ms apart, added as a capturer adds them.
+    #[test]
+    fn a_drawing_runs_from_its_first_area_to_its_latest() {
+        let mut rng = Xorshift::new(0x2545_F491_4F6C_DD1D);
+        let t0 = Instant::now() + Duration::from_secs(10);
+        for _ in 0..10_000 {
+            let mut next = || rng.next();
+            let n = 1 + next() % 64;
+            let mut at = t0;
+            let mut areas = Vec::new();
+            for _ in 0..n {
+                at += Duration::from_micros(next() % 20_001);
+                areas.push(at);
+            }
+            let mut damage = match next() % 2 {
+                0 => Damage::None,
+                _ => Damage::Unreported,
+            };
+            for &at in &areas {
+                damage.add(0, 16, at);
+            }
+            let Damage::Rows { drawing, .. } = damage else {
+                panic!("{damage:?}: areas came");
+            };
+            assert_eq!(
+                (drawing.first, drawing.last),
+                (areas[0], areas[areas.len() - 1])
+            );
+        }
+    }
+
+    /// A capture is a keyframe while one is wanted, in place of a due pass when nothing
+    /// moved; else what moved, if anything did; else a due pass sharpens every pending
+    /// block, or finds the screen sharp; else nothing is sent. Over every look of
+    /// `each_case`.
+    #[test]
+    fn a_capture_is_sent_as_what_it_holds() {
+        let cases = each_case(|c| {
+            let pending = c.refiner.pending_map();
+            let shown = format!("key {}, band {:?}, due {:?}", c.want_key, c.band, c.due);
+            match (plan(c.key(), c.band, c.due, c.refiner), c.due) {
+                (Planned::Send(Plan::Key(Keyframe::Pass)), Due::Now) => {
+                    assert!(c.want_key && c.band.is_none(), "{shown}")
+                }
+                (Planned::Send(Plan::Key(Keyframe::Fresh)), due) => {
+                    assert!(
+                        c.want_key && (c.band.is_some() || due != Due::Now),
+                        "{shown}"
+                    )
+                }
+                (Planned::Send(Plan::Motion(moved)), _) => {
+                    assert!(!c.want_key, "{shown}");
+                    assert_eq!(Some((moved.y0, moved.y1)), c.band.map(|b| (b.y0, b.y1)));
+                }
+                (Planned::Send(Plan::Sharpen { map, band }), Due::Now) => {
+                    assert!(!c.want_key && c.band.is_none(), "{shown}");
+                    let (want, want_band) = pending.expect("a pass sharpens what is pending");
+                    assert_eq!(map, want);
+                    assert_eq!((band.y0, band.y1), (want_band.y0, want_band.y1));
+                }
+                (Planned::Sharp, Due::Now) => {
+                    assert!(
+                        !c.want_key && c.band.is_none() && pending.is_none(),
+                        "{shown}"
+                    )
+                }
+                (Planned::Empty, Due::In(_) | Due::Never) => {
+                    assert!(!c.want_key && c.band.is_none(), "{shown}")
+                }
+                (_, due) => panic!("{shown}: planned with {due:?}"),
+            }
+        });
+        assert_eq!(cases, CASES);
+    }
+
+    /// The capturer's damage, against what was drawn: over every sequence of five events
+    /// from a new capturer (rows drawn at three places, the screen marked to capture, a
+    /// take), damage is due exactly when something was drawn or marked since the last
+    /// take; it has rows exactly when rows were drawn, from the first of them to the
+    /// latest, spanning them all; and a take returns those rows widened to even rows
+    /// within the picture, and leaves nothing.
+    #[test]
+    fn damage_is_what_was_drawn_since_the_take() {
+        let t0 = Instant::now();
+        let height = 101;
+        let rows = [(0, 1), (17, 48), (90, 101)];
+        for seq in 0..5u32.pow(5) {
+            let mut damage = Damage::Unreported;
+            // Since the last take: when rows were first and last drawn and which, and
+            // whether anything at all is due (a new capturer is).
+            let mut drawn: Option<(Instant, Instant, u32, u32)> = None;
+            let mut due: bool;
+            for i in 0..5 {
+                let now = t0 + Duration::from_millis(i as u64);
+                match seq / 5u32.pow(i) % 5 {
+                    r @ 0..=2 => {
+                        let (top, bot) = rows[r as usize];
+                        damage.add(top, bot, now);
+                        drawn = Some(match drawn {
+                            Some((first, _, a, b)) => (first, now, a.min(top), b.max(bot)),
+                            None => (now, now, top, bot),
+                        });
+                        due = true;
+                    }
+                    3 => {
+                        damage.mark();
+                        due = true;
+                    }
+                    _ => {
+                        let band = damage.take(height).map(|b| (b.y0, b.y1));
+                        let want = drawn.map(|(_, _, a, b)| (a & !1, ((b + 1) & !1).min(height)));
+                        assert_eq!(band, want, "sequence {seq}, event {i}");
+                        assert_eq!(damage, Damage::None);
+                        (drawn, due) = (None, false);
+                    }
+                }
+                let want = match (drawn, due) {
+                    (Some((first, last, y0, y1)), _) => Damage::Rows {
+                        drawing: super::Drawing { first, last },
+                        y0,
+                        y1,
+                    },
+                    (None, true) => Damage::Unreported,
+                    (None, false) => Damage::None,
+                };
+                assert_eq!(damage, want, "sequence {seq}, event {i}");
+            }
+        }
+    }
+
+    /// Damage that comes while the loop waits out the frame interval for a pass ends the
+    /// wait: it makes the capture a change, which the pass does not hold back. Waiting out
+    /// the interval for a change, more damage changes nothing, and only a wake ends it
+    /// early. Over every interval wait `step` makes in `each_case`.
+    #[test]
+    fn damage_ends_the_wait_before_a_pass() {
+        let mut waits = [0; 2];
+        each_case(|c| {
+            let Step::Wait(wait @ Wait::Interval { .. }, _) = step(c.look()) else {
+                return;
+            };
+            // What the capture held back would be, as the look says.
+            let (next, on) = match c.damage != Damage::None || c.want_key {
+                true => (Next::Change, On::Wake),
+                false => (Next::Pass, On::Event),
+            };
+            waits[usize::from(next == Next::Pass)] += 1;
+            let mut polled = None;
+            wait.through(|on, _| polled = Some(on));
+            assert_eq!(polled, Some(on), "waiting out the interval for {next:?}");
+        });
+        assert!(waits.iter().all(|&n| n > 0), "unreached: {waits:?}");
+    }
+
+    /// When a viewer's acks for a frame come, from the frame's going.
+    #[derive(Clone, Copy, Debug)]
+    enum Acks {
+        /// Its round trip (the one its pings show) and up to `w_us` more: it may fill,
+        /// never stall.
+        OnTime { rtt_ms: u32, w_us: u64 },
+        /// Each anywhere from `lo_us` to `hi_us`.
+        Late { lo_us: u64, hi_us: u64 },
+    }
+
+    /// A viewer in the model of the capture loop's flow.
+    struct Watcher {
+        c: Arc<crate::hub::Client>,
+        acks: Acks,
+        /// Its acks on their way: when each arrives, in order, and for which frame.
+        coming: std::collections::VecDeque<(Instant, u32)>,
+        keyframes: u32,
+        frames: u32,
+    }
+
+    /// A viewer whose acks come late (5 s, or anything up to 8 s) holds no other viewer once
+    /// it has stalled: beside others, a capture leaves it behind, and it is sent no byte
+    /// until everything on its way has come back (its oldest frame included), then exactly
+    /// one keyframe, which starts it again; nothing on its way is forgotten. Alone, it holds
+    /// the capture, is never left behind, and is never sent a frame but a keyframe while
+    /// its window has no room. A model of the capture loop's flow
+    /// over 30 s, one frame time at a time with the screen always changing: the acks due
+    /// arrive, in order as TCP brings them; then a keyframe if one is wanted, else the gate
+    /// is asked; a capture leaves behind the viewers that have stalled, and a frame goes to
+    /// every viewer that has started as the encode loop sends one.
+    /// Over the late viewer alone or beside 1 to 3 on time (round trips of 1 to 300 ms,
+    /// plus up to 150 ms, so they hold the capture now and then), placed anywhere among
+    /// them, its acks each 5 s late or anywhere in a range of 0 to 8 s, at 10 to 120 fps.
+    /// Every viewer joins at the start, and its first ping has come back as its acks do at
+    /// the least.
+    #[test]
+    fn a_late_viewer_is_left_behind_and_holds_nobody_else() {
+        let mut rng = Xorshift::new(0x2545_F491_4F6C_DD1D);
+        let mut next = |n: u64| rng.below(n);
+        let start = Instant::now() + Duration::from_secs(10);
+        // Steps where the late viewer had stalled: beside viewers the gate opened for,
+        // beside viewers one of which held it, and alone; late viewers that came back; and
+        // times one left behind was started again.
+        let mut seen = [0u32; 5];
+        for case in 0..400 {
+            let fps = 10 + next(111);
+            let interval = Duration::from_secs_f64(1.0 / fps as f64);
+            let on_time = next(4) as usize;
+            let late_at = next(on_time as u64 + 1) as usize;
+            let late = match next(4) {
+                0 => Acks::Late {
+                    lo_us: 5_000_000,
+                    hi_us: 5_000_001,
+                },
+                _ => {
+                    let lo_us = next(5_000_000);
+                    Acks::Late {
+                        lo_us,
+                        hi_us: lo_us + 1 + next(3_000_000),
+                    }
+                }
+            };
+            let hub = Hub::new(crate::hub::Paths::ANY);
+            // The same viewers but the late one.
+            let mut others = Vec::new();
+            let mut viewers = Vec::new();
+            for i in 0..=on_time {
+                let acks = match i == late_at {
+                    true => late,
+                    false => Acks::OnTime {
+                        rtt_ms: 1 + next(300) as u32,
+                        w_us: next(150_001),
+                    },
+                };
+                let c = hub.add_client(tokio::sync::mpsc::unbounded_channel().0, start);
+                c.watch();
+                // Its first ping came back as its acks do at the least.
+                let trip = match acks {
+                    Acks::OnTime { rtt_ms, .. } => Duration::from_millis(rtt_ms as u64),
+                    Acks::Late { lo_us, .. } => Duration::from_micros(lo_us),
+                };
+                c.pinged(start, trip, window::Ahead::Nothing);
+                if i != late_at {
+                    others.push(c.clone());
+                }
+                viewers.push(Watcher {
+                    c,
+                    acks,
+                    coming: Default::default(),
+                    keyframes: 0,
+                    frames: 0,
+                });
+            }
+            let at = format!("case {case}: {fps} fps, {on_time} on time, late {late:?}");
+            let mut stalled_before = false;
+            // What the late viewer was a step before, and the keyframes it is owed: one each
+            // time it was left behind, and the first.
+            let mut was = crate::hub::Viewer::Waiting;
+            let mut owed = 1u32;
+            let mut t = start;
+            while t < start + Duration::from_secs(30) {
+                for v in &mut viewers {
+                    while let Some(&(when, id)) = v.coming.front().filter(|a| a.0 <= t) {
+                        v.c.on_ack(when, id, crate::hub::Hold::Unsaid);
+                        v.coming.pop_front();
+                    }
+                }
+                use crate::hub::Viewer::{Behind, Started, Waiting};
+                // What its acks made of it: one left behind wants its keyframe only once all
+                // of what was on its way is back.
+                let mid = viewers[late_at].c.viewer();
+                match (was, mid) {
+                    (Behind, Waiting) => assert!(viewers[late_at].c.backlog(t).is_none(), "{at}"),
+                    (was, mid) => assert_eq!(was, mid, "{at}"),
+                }
+                let stalled = viewers[late_at]
+                    .c
+                    .backlog(t)
+                    .is_some_and(|b| b.oldest >= STALLED);
+                seen[3] += u32::from(stalled_before && !stalled);
+                stalled_before = stalled;
+                let key = viewers
+                    .iter()
+                    .any(|v| v.c.viewer() == crate::hub::Viewer::Waiting);
+                let way = viewers[late_at].c.window(|w| w.way(t, STALLED));
+                let look = looked(&hub, t);
+                let go = key || {
+                    let gate = Gated::ask(&look);
+                    // Stalled, or left behind, it holds no other viewer.
+                    if stalled || mid == Behind {
+                        let others: Vec<_> = others
+                            .iter()
+                            .map(|c| (c.clone(), c.look(|v, r| Seen::of(v, r, t, hub.ceiling()))))
+                            .collect();
+                        assert_eq!(gate, Gated::ask(&others), "{at}");
+                        seen[match (on_time, gate) {
+                            (0, _) => 2,
+                            (_, Gated::Open(_)) => 0,
+                            (_, Gated::Held { .. }) => 1,
+                        }] += 1;
+                    }
+                    matches!(gate, Gated::Open(_))
+                };
+                if go {
+                    leave_behind(&look);
+                    // A keyframe is planned for the viewers waiting, and sent whole: it
+                    // starts them.
+                    if key {
+                        for v in &viewers {
+                            v.c.keyframe_planned();
+                        }
+                        for v in &viewers {
+                            v.c.keyframe_sent(true);
+                        }
+                    }
+                    let id = hub.timeline.number();
+                    for v in &mut viewers {
+                        if v.c.viewer() != crate::hub::Viewer::Started {
+                            continue;
+                        }
+                        let took = v.c.takes(id, t, 1000, key, usize::MAX);
+                        assert_eq!(took, Takes::Frame, "{at}");
+                        v.keyframes += u32::from(key);
+                        v.frames += 1;
+                        let after = match v.acks {
+                            Acks::OnTime { rtt_ms, w_us } => {
+                                Duration::from_millis(rtt_ms as u64)
+                                    + Duration::from_micros(next(w_us + 1))
+                            }
+                            Acks::Late { lo_us, hi_us } => {
+                                Duration::from_micros(lo_us + next(hi_us - lo_us))
+                            }
+                        };
+                        // In order: an ack waits for the one before it.
+                        let when = v.coming.back().map_or(t + after, |a| a.0.max(t + after));
+                        v.coming.push_back((when, id.get()));
+                    }
+                }
+                let v = &viewers[late_at];
+                let now_is = v.c.viewer();
+                let in_flight = v.c.backlog(t).map_or(0, |b| b.frames.get());
+                // Nothing on its way is forgotten.
+                assert_eq!(in_flight, v.coming.len(), "{at}");
+                // What the capture made of it.
+                match (mid, now_is) {
+                    // Left behind only by a capture, and only once it had stalled.
+                    (Started, Behind) => {
+                        assert!(go && stalled && on_time > 0, "{at}");
+                        owed += 1;
+                    }
+                    (Waiting, Started) => seen[4] += u32::from(owed > 1),
+                    (mid, now_is) => assert_eq!(mid, now_is, "{at}"),
+                }
+                was = now_is;
+                // Every keyframe it is sent starts it: one after each time it was left behind.
+                let started = u32::from(now_is == Started);
+                assert_eq!(v.keyframes + 1 - started, owed, "{at}");
+                match on_time {
+                    0 => assert!(!go || key || matches!(way, Way::Room(_)), "{way:?}: {at}"),
+                    _ => {
+                        let on = viewers.iter().enumerate().filter(|(i, _)| *i != late_at);
+                        let frames: Vec<u32> = on.map(|(_, o)| o.frames).collect();
+                        assert!(frames.windows(2).all(|f| f[0] == f[1]), "{at}");
+                    }
+                }
+                t += interval;
+            }
+        }
+        assert!(seen.iter().all(|&n| n > 100), "unreached: {seen:?}");
+    }
+
+    /// Two viewers on very different paths, a LAN and a slow link, and the slow one's
+    /// path goes out for longer than `STALLED`: it holds the other until it has stalled,
+    /// and then no longer. But what it is sent while it has stalled is the stream the
+    /// other's path takes, and its own path must still carry all of it: so once its path
+    /// is back, no message the server sends it (its close included) reaches it more than
+    /// a minute after it was sent, or after its path came back if it was sent before. A
+    /// model of the capture loop's flow, one frame time at a time at 60 fps with a scroll
+    /// that wants a frame of 60 KB (a terminal page at 3024x1898) or 400 KB (the whole
+    /// page): the hub's own clients and gate, each page seated on the oracle's path
+    /// (`oracle::Seat`), its acks, each 1 ms after its frame arrived, and pongs coming back
+    /// over it. A LAN of 50 to 200 Mbit/s and 1 to 5 ms beside a slow link of 0.3 to
+    /// 3 Mbit/s and 60 to 300 ms, out for 4.5 to 8 s.
+    #[test]
+    fn a_viewer_that_stalls_beside_a_fast_one_is_never_minutes_behind() {
+        use crate::oracle::{Late, Page, Path, Seat};
+        let mut rng = Xorshift::new(0xBF58_476D_1CE4_E5B9);
+        let mut next = |n: u64| rng.below(n);
+        let ms = Duration::from_millis;
+        let frame = Duration::from_micros(16_667);
+        let carries = |bits: u64| bits as f64 / 8.0 * window::LATENESS.as_secs_f64();
+        for case in 0..20 {
+            let want = [60_000, 400_000][next(2) as usize];
+            let start = Instant::now() + Duration::from_secs(10);
+            let back = start + Duration::from_secs(10);
+            let outage = ms(4500 + next(3500));
+            let hub = Hub::new(crate::hub::Paths::ANY);
+            let lan = carries(50_000_000 + next(150_000_000));
+            let slow = carries(300_000 + next(2_700_000));
+            let mut path = Path::new(start, slow, ms(60 + next(240)), Late::None, next(1 << 32));
+            path.stalls.push((back - outage, back));
+            let mut seats = [
+                Seat::connect(
+                    &hub,
+                    start,
+                    Path::new(start, lan, ms(1 + next(5)), Late::None, next(1 << 32)),
+                    0,
+                ),
+                Seat::connect(&hub, start, path, 0),
+            ];
+            let (lan_rate, slow_rate, slow_trip) =
+                (seats[0].path.rate, seats[1].path.rate, seats[1].path.trip);
+            // How far behind the slow viewer is: the most any message to it reached it
+            // after it was sent, or after its path came back.
+            let mut behind = Duration::ZERO;
+            let mut t = start;
+            while t < start + Duration::from_secs(60) {
+                for seat in &mut seats {
+                    seat.hears(t);
+                    seat.pings(t);
+                }
+                let seen = looked(&hub, t);
+                let key = seen.iter().any(|(_, v)| v.viewer == Viewer::Waiting);
+                let room = match key {
+                    true => {
+                        for seat in &seats {
+                            seat.client.keyframe_planned();
+                        }
+                        for seat in &seats {
+                            seat.client.keyframe_sent(true);
+                        }
+                        let carries = seats.iter().map(|s| s.client.window(|w| w.carries())).min();
+                        carries.map(|c| window::scale(c, KEY_TIME, window::LATENESS))
+                    }
+                    false => match Gated::ask(&seen) {
+                        Gated::Open(room) => Some(room),
+                        Gated::Held { .. } => None,
+                    },
+                };
+                if let Some(room) = room {
+                    // A capture leaves behind a viewer that has stalled, as the loop does.
+                    leave_behind(&seen);
+                    let bytes = want.min(room);
+                    let id = hub.timeline.number();
+                    for (i, seat) in seats.iter_mut().enumerate() {
+                        let arrives = match seat.client.takes(id, t, bytes, key, HOPELESSLY_BEHIND)
+                        {
+                            Takes::Nothing => continue,
+                            Takes::Frame => seat.frame(t, id, bytes, Page::Holds(ms(1))),
+                            Takes::Close => seat.message(t, 20),
+                        };
+                        if i == 1 {
+                            behind = behind.max(arrives.saturating_duration_since(t.max(back)));
+                        }
+                    }
+                }
+                t += frame;
+            }
+            assert!(
+                behind <= Duration::from_secs(60),
+                "case {case}: {want} B a frame, LAN {:.0} Mbit/s beside {:.1} Mbit/s, {slow_trip:?}, \
+                 out {outage:?}: the slow viewer is {behind:?} behind",
+                lan_rate * 8e-6,
+                slow_rate * 8e-6,
+            );
+        }
+    }
+
+    /// A viewer whose decoder breaks asks for a keyframe and gets one: within two seconds of
+    /// each `kf` reaching the server, it is sent a keyframe, and it never stalls. The page
+    /// acks every frame it is sent once, in order, whatever became of its pictures
+    /// (web/src/frames.ts): on a break it sends `kf` and acks the frame, and frames that
+    /// arrive after it are acked as they arrive, undecoded, until the keyframe. A model of
+    /// the capture loop's flow one frame time at a time at 60 fps: the hub's own clients and
+    /// gate, each page seated on the oracle's path (`oracle::Seat`), a decode of 1 to 10 ms
+    /// before each ack; a screen that changes at every frame or every 100 ms to 2 s
+    /// (keystrokes, a clock); the first viewer's decoder breaks on about one frame in 300,
+    /// at random. Alone, or beside a viewer on another path; paths of 1 to 100 Mbit/s and
+    /// 2 to 300 ms, 30 s each. Counted, and it must happen: breaks answered.
+    #[test]
+    fn a_viewer_whose_decoder_breaks_gets_a_keyframe() {
+        use crate::oracle::{Late, Page, Path, Seat};
+        let mut rng = Xorshift::new(0x2F2E_9A0C_5B17_D3E1);
+        let mut next = |n: u64| rng.below(n);
+        let ms = Duration::from_millis;
+        let frame = Duration::from_micros(16_667);
+        let mut answered = 0;
+        for case in 0..100 {
+            let start = Instant::now() + Duration::from_secs(10);
+            let hub = Hub::new(crate::hub::Paths::ANY);
+            let n = 1 + next(2) as usize;
+            let mut seats: Vec<Seat> = (0..n)
+                .map(|_| {
+                    let bits = 1_000_000 + next(99_000_000);
+                    let carries = bits as f64 / 8.0 * window::LATENESS.as_secs_f64();
+                    let path =
+                        Path::new(start, carries, ms(2 + next(298)), Late::None, next(1 << 32));
+                    Seat::connect(&hub, start, path, 0)
+                })
+                .collect();
+            let decode = ms(1 + next(10));
+            let every = match next(2) {
+                0 => frame,
+                _ => ms(100 + next(1900)),
+            };
+            let want = 1000 + next(60_000) as usize;
+            // Whether the first viewer's page waits for a keyframe since its decoder broke;
+            // when its last `kf` reached the server, unanswered.
+            let mut waits_key = false;
+            let mut asked = None::<Instant>;
+            let (mut t, mut drawn) = (start, start);
+            while t < start + Duration::from_secs(30) {
+                for (i, seat) in seats.iter_mut().enumerate() {
+                    let heard = seat.hears(t);
+                    if i == 0 {
+                        asked = heard.or(asked);
+                    }
+                    seat.pings(t);
+                }
+                if let Some(at) = asked {
+                    assert!(
+                        t - at <= Duration::from_secs(2),
+                        "case {case}: no keyframe {:?} after the kf at {:?}",
+                        t - at,
+                        at - start
+                    );
+                }
+                let changed = t >= drawn;
+                if changed {
+                    drawn += every;
+                }
+                let seen = looked(&hub, t);
+                let key = seen.iter().any(|(_, v)| v.viewer == Viewer::Waiting);
+                let room = match (key, changed) {
+                    (true, _) => {
+                        for seat in &seats {
+                            seat.client.keyframe_planned();
+                        }
+                        for seat in &seats {
+                            seat.client.keyframe_sent(true);
+                        }
+                        let carries = seats.iter().map(|s| s.client.window(|w| w.carries())).min();
+                        carries.map(|c| window::scale(c, KEY_TIME, window::LATENESS))
+                    }
+                    (false, true) => match Gated::ask(&seen) {
+                        Gated::Open(room) => Some(room),
+                        Gated::Held { .. } => None,
+                    },
+                    (false, false) => None,
+                };
+                if let Some(room) = room {
+                    leave_behind(&seen);
+                    let bytes = want.min(room);
+                    let id = hub.timeline.number();
+                    for (i, seat) in seats.iter_mut().enumerate() {
+                        if seat.client.takes(id, t, bytes, key, HOPELESSLY_BEHIND) != Takes::Frame {
+                            continue;
+                        }
+                        // A keyframe answers the kf that reached the server before it.
+                        if (i, key) == (0, true) {
+                            answered += usize::from(asked.take().is_some());
+                        }
+                        let page = match (i, waits_key, key) {
+                            // Waiting for a keyframe: a frame that is not one is acked as it
+                            // arrives, undecoded; the keyframe is decoded.
+                            (0, true, false) => Page::Holds(Duration::ZERO),
+                            (0, true, true) => {
+                                waits_key = false;
+                                Page::Holds(decode)
+                            }
+                            (0, false, _) if next(300) == 0 => {
+                                waits_key = true;
+                                Page::Breaks(decode)
+                            }
+                            (_, _, _) => Page::Holds(decode),
+                        };
+                        seat.frame(t, id, bytes, page);
+                    }
+                }
+                t += frame;
+            }
+        }
+        assert!(answered > 100, "{answered} breaks answered");
     }
 }

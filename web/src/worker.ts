@@ -1,6 +1,7 @@
 // Owns the WebSocket, decodes H.264 with WebCodecs and paints straight onto an
 // OffscreenCanvas the moment each frame is decoded (no rAF queueing), or hands the
 // frames to the page when it presents them through <video>.
+import { Frames } from './frames';
 import { Bin, cmd, parseVideoHeader, VIDEO_HEADER_BYTES } from './protocol';
 import type {
 	FromWorker,
@@ -26,34 +27,13 @@ let audioTs = 0;
 let wantVideo = true;
 let wantAudio = false;
 
-// The screen arrives as independent H.264 stripes, one decoder each. A frame is a
-// set of stripe updates sharing an id; frames are presented whole and in order.
-interface StripeState {
-	dec: VideoDecoder | null;
-	codec: string | null;
-	waitingKey: boolean;
-	ts: number;
-	/** Decoder timestamp -> frame id. */
-	ids: Map<number, number>;
-}
-interface PendingFrame {
-	need: number;
-	got: StripeFrame[];
-	t0: number;
-}
 let layout: Stripe[] = [];
-const stripes: StripeState[] = [];
-const frames = new Map<number, PendingFrame>();
-/** Frame ids awaiting presentation, oldest first. */
-const order: number[] = [];
-let kfRequested = 0;
 const st = {
 	frames: 0,
 	bytes: 0,
 	decodeMs: 0,
 	pipeMs: 0,
 	lastReport: performance.now(),
-	dropped: 0,
 };
 
 // Firefox throws if getContext('2d') is called twice on one canvas; reuse it.
@@ -91,7 +71,7 @@ function connect() {
 	});
 	sock.addEventListener('close', () => {
 		post({ t: 'status', s: 'closed' });
-		resetDecoder();
+		frames.closed();
 		setTimeout(connect, 1000);
 	});
 	sock.addEventListener('message', (e: MessageEvent<string | ArrayBuffer>) => {
@@ -99,7 +79,7 @@ function connect() {
 		const b = new Uint8Array(e.data);
 		switch (b[0]) {
 			case Bin.Video:
-				onVideo(b);
+				onVideo(sock, b);
 				break;
 			case Bin.Audio:
 				onAudio(b);
@@ -138,172 +118,99 @@ function onText(s: string) {
 		}
 		ctx = get2dContext(canvas);
 		layout = m.stripes && m.stripes.length ? m.stripes : [[0, m.h]];
-		resetDecoder();
+		frames.hello(layout.length);
 	}
 	post(m);
 }
 
-function resetDecoder() {
-	for (const sd of stripes)
-		if (sd.dec && sd.dec.state !== 'closed') {
-			try {
-				sd.dec.close();
-			} catch {}
-		}
-	stripes.length = 0;
-	for (const f of frames.values()) for (const g of f.got) g.frame.close();
-	frames.clear();
-	order.length = 0;
-}
-
-function requestKeyframe() {
-	const now = performance.now();
-	if (now - kfRequested > 500) {
-		kfRequested = now;
-		send(cmd.keyframe);
-	}
-}
-
 const hex2 = (x: number) => x.toString(16).padStart(2, '0');
 
-/** avc1.PPCCLL from the first SPS in an Annex-B keyframe. */
-function codecFromSps(d: Uint8Array): string | null {
-	for (let i = 0; i + 4 < d.length; i++) {
-		if (
-			d[i] === 0 &&
-			d[i + 1] === 0 &&
-			d[i + 2] === 1 &&
-			(d[i + 3] & 0x1f) === 7
-		) {
-			return 'avc1.' + hex2(d[i + 4]) + hex2(d[i + 5]) + hex2(d[i + 6]);
-		}
-	}
-	return null;
-}
-
-function stripeState(i: number): StripeState {
-	return (
-		stripes[i] ||
-		(stripes[i] = {
-			dec: null,
-			codec: null,
-			waitingKey: true,
-			ts: 0,
-			ids: new Map(),
-		})
-	);
-}
-
-function makeDecoder(i: number, codec: string): VideoDecoder {
-	const sd = stripeState(i);
-	const dec = new VideoDecoder({
-		output: (frame) => {
-			const id = sd.ids.get(frame.timestamp);
-			sd.ids.delete(frame.timestamp);
-			const f = id === undefined ? undefined : frames.get(id);
-			if (!f) {
-				frame.close();
-				return;
+// The screen arrives as independent H.264 stripes, one decoder each. A frame is a set of
+// stripe updates sharing an id; frames are presented whole and in order.
+const frames = new Frames<VideoDecoder, StripeFrame, Uint8Array>({
+	/** avc1.PPCCLL from the first SPS in an Annex-B keyframe. */
+	codec(key) {
+		for (let i = 0; i + 4 < key.length; i++) {
+			if (
+				key[i] === 0 &&
+				key[i + 1] === 0 &&
+				key[i + 2] === 1 &&
+				(key[i + 3] & 0x1f) === 7
+			) {
+				return 'avc1.' + hex2(key[i + 4]) + hex2(key[i + 5]) + hex2(key[i + 6]);
 			}
-			f.got.push({ i, y: layout[i] ? layout[i][0] : 0, frame });
-			flush();
-		},
-		error: (e) => {
-			post({ t: 'log', s: `stripe ${i} decoder error: ${e.message}` });
-			resetDecoder();
-			requestKeyframe();
-		},
-	});
-	dec.configure({
-		codec,
-		optimizeForLatency: true,
-		hardwareAcceleration: 'no-preference',
-	});
-	return dec;
-}
-
-/** Present every complete frame at the head of the queue. */
-function flush() {
-	while (order.length) {
-		const id = order[0];
-		const f = frames.get(id);
-		if (f && f.got.length < f.need) return;
-		order.shift();
-		frames.delete(id);
-		if (!f) continue;
-		if (f.got.length) {
+		}
+		throw new TypeError('a keyframe without an SPS');
+	},
+	open(i, codec) {
+		// A decoder is opened after the hello that cut the screen it decodes a stripe of.
+		const y = layout[i][0];
+		const dec = new VideoDecoder({
+			output: (frame) => frames.output(i, frame.timestamp, { i, y, frame }),
+			error: (e) => frames.error(dec, e.name, e.message),
+		});
+		dec.configure({
+			codec,
+			optimizeForLatency: true,
+			hardwareAcceleration: 'no-preference',
+		});
+		return dec;
+	},
+	decode(dec, key, frame, data) {
+		dec.decode(
+			new EncodedVideoChunk({
+				type: key ? 'key' : 'delta',
+				timestamp: frame,
+				data,
+			})
+		);
+	},
+	close(dec) {
+		dec.close();
+	},
+	ask() {
+		send(cmd.keyframe);
+	},
+	log(i, why) {
+		post({ t: 'log', s: `stripe ${i}: ${why}` });
+	},
+	letGo(picture) {
+		picture.frame.close();
+	},
+	show(f) {
+		const parts = f.pictures;
+		if (parts.length) {
 			if (presentToMain)
 				post(
-					{ t: 'frames', parts: f.got },
-					f.got.map((g) => g.frame)
+					{ t: 'frames', parts },
+					parts.map((g) => g.frame)
 				);
 			else
-				for (const g of f.got) {
+				for (const g of parts) {
 					if (ctx && !noDraw) ctx.drawImage(g.frame, 0, g.y);
 					g.frame.close();
 				}
 		}
-		send(cmd.ack(id));
+		const now = performance.now();
+		send(cmd.ack(f.id, now - f.last));
 		st.frames++;
-		st.decodeMs += performance.now() - f.t0;
-	}
-}
+		st.decodeMs += now - f.first;
+	},
+});
 
-function onVideo(b: Uint8Array) {
+function onVideo(sock: WebSocket, b: Uint8Array) {
 	const h = parseVideoHeader(b);
-	const data = b.subarray(VIDEO_HEADER_BYTES);
 	st.bytes += b.length;
-	let f = frames.get(h.frame);
-	if (!f) {
-		f = { need: h.parts, got: [], t0: performance.now() };
-		frames.set(h.frame, f);
-		order.push(h.frame);
-		st.pipeMs += h.pipe / 10;
-	}
-	const sd = stripeState(h.stripe);
-	if (sd.waitingKey && !h.key) {
-		f.need--;
-		st.dropped++;
-		requestKeyframe();
-		flush();
+	const part = frames.admit(h);
+	if (!part) {
+		// Its frame could never be acknowledged, and the server would hold the picture for
+		// it for good: the connection starts over, from a hello.
+		post({ t: 'log', s: `a part of stripe ${h.stripe}, outside the cut` });
+		sock.close();
 		return;
 	}
-	if (h.key) {
-		const codec = codecFromSps(data) || 'avc1.640034';
-		if (!sd.dec || sd.dec.state === 'closed' || codec !== sd.codec) {
-			if (sd.dec && sd.dec.state !== 'closed') {
-				try {
-					sd.dec.close();
-				} catch {}
-			}
-			sd.codec = codec;
-			sd.ids.clear();
-			try {
-				sd.dec = makeDecoder(h.stripe, codec);
-			} catch (e) {
-				post({ t: 'log', s: 'configure failed ' + e });
-				f.need--;
-				flush();
-				return;
-			}
-		}
-		sd.waitingKey = false;
-	}
-	const ts = ++sd.ts;
-	sd.ids.set(ts, h.frame);
-	try {
-		sd.dec!.decode(
-			new EncodedVideoChunk({
-				type: h.key ? 'key' : 'delta',
-				timestamp: ts,
-				data,
-			})
-		);
-	} catch (e) {
-		post({ t: 'log', s: 'decode threw ' + e });
-		resetDecoder();
-		requestKeyframe();
-	}
+	if (frames.part(performance.now(), part, b.subarray(VIDEO_HEADER_BYTES)))
+		st.pipeMs += h.pipe / 10;
 }
 
 function onAudio(b: Uint8Array) {
@@ -356,10 +263,10 @@ setInterval(() => {
 		kbps: (st.bytes * 8) / 1000 / dt,
 		decodeMs: n ? st.decodeMs / n : 0,
 		pipeMs: n ? st.pipeMs / n : 0,
-		codec: stripes[0]?.codec ?? null,
+		codec: frames.codec,
 		stripes: layout.length,
-		dropped: st.dropped,
-		queue: order.length,
+		dropped: frames.dropped,
+		queue: frames.waiting,
 	};
 	post(stats);
 	st.frames = 0;
@@ -388,7 +295,6 @@ self.addEventListener('message', (e: MessageEvent<ToWorker>) => {
 		case 'video':
 			if (wantVideo !== m.on) {
 				wantVideo = m.on;
-				if (m.on) resetDecoder();
 				send(cmd.video(m.on));
 			}
 			break;
