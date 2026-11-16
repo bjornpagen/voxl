@@ -138,14 +138,6 @@ pub struct Display {
     pub name: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Inflight {
-    pub id: FrameId,
-    pub bytes: usize,
-    /// When it left.
-    pub left: Instant,
-}
-
 /// How long a client says it kept a frame between its arrival and the ack (decode,
 /// draw, frames ahead of it), as the ack's optional last field.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -332,12 +324,11 @@ pub enum Reach {
     Recorder,
 }
 
-/// What a client is to the stream, the frames sent to it and not yet acked, how they reach
-/// it, and how long it says it holds a frame: under one lock, so that every change to them
-/// is one step, and every read of them one state.
+/// What a client is to the stream, how frames reach it (on a path, its window holds the
+/// frames sent and not yet acked), and how long it says it holds a frame: under one lock,
+/// so that every change to them is one step, and every read of them one state.
 struct Viewing {
     viewer: Viewer,
-    inflight: VecDeque<Inflight>,
     reach: Reach,
     /// How long the client keeps a frame between its arrival and the ack (decode, draw,
     /// frames ahead of it), as it reports it: smoothed ms, once it has said a hold that
@@ -346,22 +337,16 @@ struct Viewing {
 }
 
 impl Viewing {
-    /// What it has in flight is not coming back: acks for it no longer apply, and its
-    /// window forgets it.
-    fn forget(&mut self, now: Instant) {
-        self.inflight.clear();
-        match &mut self.reach {
-            Reach::Path(window) => window.forget(now),
-            Reach::Recorder => {}
-        }
-    }
-
-    /// What it has in flight at `now`, if anything.
+    /// What it has in flight at `now`, if anything: on a path, what its window holds; the
+    /// recorder takes each frame as it is sent.
     fn backlog(&self, now: Instant) -> Option<Backlog> {
-        Some(Backlog {
-            frames: NonZeroUsize::new(self.inflight.len())?,
-            oldest: now.saturating_duration_since(self.inflight.front()?.left),
-        })
+        match &self.reach {
+            Reach::Path(window) => Some(Backlog {
+                frames: NonZeroUsize::new(window.frames())?,
+                oldest: now.saturating_duration_since(window.oldest()?.left),
+            }),
+            Reach::Recorder => None,
+        }
     }
 }
 
@@ -430,12 +415,10 @@ impl Client {
         self.viewing.lock().viewer
     }
 
-    /// It starts watching at `now` (`v,1`, or a recording begins): it waits for a keyframe,
-    /// and acks for frames sent before no longer apply.
-    pub fn watch(&self, now: Instant) {
-        let mut v = self.viewing.lock();
-        v.viewer = Viewer::Waiting;
-        v.forget(now);
+    /// It starts watching (`v,1`, or a recording begins): it waits for a keyframe. What is
+    /// on its way stays on its way until it is acked.
+    pub fn watch(&self) {
+        self.viewing.lock().viewer = Viewer::Waiting;
     }
 
     /// It stops watching (`v,0`).
@@ -450,15 +433,15 @@ impl Client {
         v.viewer = asked(v.viewer);
     }
 
-    /// The stream starts over for it at `now` (it is rebuilt, or a display switch failed),
-    /// and its page is told so by `hello`, which resets the page's decoders: if it watches,
-    /// it waits for a keyframe of what follows; acks for frames sent before no longer apply.
-    /// The hello is queued under the lock a keyframe is planned, sent and taken under, so a
-    /// keyframe planned for it after this reaches the page behind the hello, and one planned
-    /// before is not sent it.
-    pub fn start_over(&self, now: Instant, hello: ServerMessage) {
+    /// The stream starts over for it (it is rebuilt, or a display switch failed), and its
+    /// page is told so by `hello`, which resets the page's decoders: if it watches, it waits
+    /// for a keyframe of what follows. What is on its way stays on its way: the page
+    /// acknowledges every frame it is sent, decoded or not (web/src/frames.ts). The hello
+    /// is queued under the lock a keyframe is planned, sent and taken under, so a keyframe
+    /// planned for it after this reaches the page behind the hello, and one planned before
+    /// is not sent it.
+    pub fn start_over(&self, hello: ServerMessage) {
         let mut v = self.viewing.lock();
-        v.forget(now);
         v.viewer = restarted(v.viewer);
         self.send(Out::Text(hello));
     }
@@ -494,27 +477,24 @@ impl Client {
         }
     }
 
-    /// At `now` the encode loop sent a keyframe this client was promised, `whole` when every
-    /// stripe of it is a keyframe. A whole one starts it, and acks for frames sent before it
-    /// no longer apply; one that is not leaves it waiting for another. A client that has
-    /// since stopped watching, asked again or started over is what that made it.
-    pub fn keyframe_sent(&self, whole: bool, now: Instant) {
+    /// The encode loop sent a keyframe this client was promised, `whole` when every stripe
+    /// of it is a keyframe. A whole one starts it; one that is not leaves it waiting for
+    /// another. A client that has since stopped watching, asked again or started over is
+    /// what that made it.
+    pub fn keyframe_sent(&self, whole: bool) {
         let mut v = self.viewing.lock();
         match (v.viewer, whole) {
-            (Viewer::Promised, true) => {
-                v.viewer = Viewer::Started;
-                v.forget(now);
-            }
+            (Viewer::Promised, true) => v.viewer = Viewer::Started,
             (Viewer::Promised, false) => v.viewer = Viewer::Waiting,
             (Viewer::NotWatching | Viewer::Waiting | Viewer::Behind | Viewer::Started, _) => {}
         }
     }
 
     /// The encode loop has frame `id`, of `bytes`, to send at `now`; `key`: every stripe of
-    /// it is a keyframe. A client that has started takes it. On a path it is in flight
-    /// until acked and in its trace, unless the client already has more than `behind`
-    /// frames in flight: then it stops watching, and is to be sent a close. The recorder
-    /// takes it, and that is all.
+    /// it is a keyframe. A client that has started takes it. On a path it is on its way in
+    /// the window until its own ack, and in the trace, unless the client already has more
+    /// than `behind` frames on their way: then it stops watching, and is to be sent a close.
+    /// The recorder takes it, and that is all.
     pub fn takes(
         &self,
         id: FrameId,
@@ -524,26 +504,14 @@ impl Client {
         behind: usize,
     ) -> Takes {
         let mut v = self.viewing.lock();
-        let Viewing {
-            viewer,
-            inflight,
-            reach,
-            ..
-        } = &mut *v;
+        let Viewing { viewer, reach, .. } = &mut *v;
         match (*viewer, reach) {
-            (Viewer::Started, Reach::Path(_)) if inflight.len() > behind => {
+            (Viewer::Started, Reach::Path(window)) if window.frames() > behind => {
                 *viewer = Viewer::NotWatching;
                 Takes::Close
             }
             (Viewer::Started, Reach::Path(window)) => {
-                window.leave(now, bytes);
-                let frame = Inflight {
-                    id,
-                    bytes,
-                    left: now,
-                };
-                inflight.push_back(frame);
-                self.trace.lock().sent(frame, key);
+                self.trace.lock().sent(window.leave(now, id, bytes), key);
                 Takes::Frame
             }
             (Viewer::Started, Reach::Recorder) => Takes::Frame,
@@ -553,49 +521,46 @@ impl Client {
         }
     }
 
-    /// At `now`, the ack for frame `id` (and every one before it) arrived. It names a frame
-    /// only if that frame is in flight to this client: an id that is not (one acked or
-    /// covered already, one sent to another client, one never given) takes nothing out of
-    /// flight. Each frame it covers comes back to the window, oldest first, when the one it
-    /// names did: when the client had it, as what the client says it held of the trip is its
-    /// own time, not the path's. One whose hold cannot be true (unreadable, or longer than
-    /// the trip it is part of) arrived at `now`: later, so what the window reads of the path
-    /// can only be lower. One left behind wants its keyframe once the last of what is on its
-    /// way is back.
-    pub fn on_ack(&self, now: Instant, id: u32, hold: Hold) {
-        self.trace.lock().acked(now, id, hold);
+    /// At `now`, an ack for frame `id` arrived. The page acknowledges every frame it is
+    /// sent, once and in order (web/src/frames.ts), so an ack names the oldest frame on its
+    /// way, which comes back to the window and the trace: when the client had it, as what
+    /// the client says it held of the trip is its own time, not the path's. A hold that
+    /// cannot be true (unreadable, or longer than the frame's own trip) leaves it arrived at
+    /// `now`: later, so what the window reads of the path can only be lower. An ack that
+    /// names any other frame, or comes with nothing on its way, is from a client that is not
+    /// the page: `Broken`, and nothing is taken out. One left behind wants its keyframe once
+    /// the last of what is on its way is back.
+    pub fn on_ack(&self, now: Instant, id: u32, hold: Hold) -> Acked {
         let mut v = self.viewing.lock();
         let Viewing {
             viewer,
-            inflight,
             reach,
             client_ms,
         } = &mut *v;
-        // The recorder is sent nothing it acks: nothing of it is in flight.
+        // The recorder is sent nothing it acks: nothing of it is on its way.
         let window = match reach {
             Reach::Path(window) => window,
-            Reach::Recorder => return,
+            Reach::Recorder => return Acked::Broken,
         };
-        let Some(named) = inflight.iter().position(|f| f.id.get() == id) else {
-            return;
+        let Some(oldest) = window.oldest().filter(|f| f.id.get() == id) else {
+            return Acked::Broken;
         };
-        // When the frame it names was at the client, and so every frame it covers.
         let (at, said) = match hold {
-            Hold::Said(held) if held <= now.saturating_duration_since(inflight[named].left) => {
+            Hold::Said(held) if held <= now.saturating_duration_since(oldest.left) => {
                 (now - held, Some(held))
             }
             Hold::Unsaid | Hold::Said(_) | Hold::Unreadable => (now, None),
         };
-        for _ in inflight.drain(..=named) {
-            window.came_back(at);
-        }
-        if let (Viewer::Behind, true) = (*viewer, inflight.is_empty()) {
+        window.came_back(at);
+        self.trace.lock().acked(now, hold);
+        if let (Viewer::Behind, 0) = (*viewer, window.frames()) {
             *viewer = Viewer::Waiting;
         }
         if let Some(held) = said {
             let ms = held.as_secs_f64() * 1000.0;
             *client_ms = Some(client_ms.map_or(ms, |m| m * 0.9 + ms * 0.1));
         }
+        Acked::Oldest
     }
 
     /// A ping came back at `now`, `trip` after it went with `ahead` on its way ahead of it:
@@ -668,20 +633,27 @@ impl Client {
         self.viewing.lock().backlog(now)
     }
 
-    /// Frame `id` of `bytes` leaves for it at `at`, whatever it is to the stream: in
-    /// flight, and on its way in its window.
+    /// Frame `id` of `bytes` leaves for it at `at`, whatever it is to the stream: on its
+    /// way in its window and in its trace, as `takes` sends a frame. A frame stays on its
+    /// way until its own ack, so a viewer in any state may have some; tests build those
+    /// states here.
     pub fn fly(&self, id: FrameId, at: Instant, bytes: usize) {
         let mut v = self.viewing.lock();
         let Reach::Path(window) = &mut v.reach else {
             panic!("a recorder has no path");
         };
-        window.leave(at, bytes);
-        v.inflight.push_back(Inflight {
-            id,
-            bytes,
-            left: at,
-        });
+        self.trace.lock().sent(window.leave(at, id, bytes), false);
     }
+}
+
+/// What an ack was to a client's frames on their way.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Acked {
+    /// It named the oldest, which came back.
+    Oldest,
+    /// It named another frame, or none was on its way: the client is not the page, and its
+    /// connection is to be closed.
+    Broken,
 }
 
 /// The frames sent to a client that it has not acknowledged, while there are any.
@@ -923,7 +895,6 @@ impl Hub {
             tx,
             viewing: Mutex::new(Viewing {
                 viewer: Viewer::NotWatching,
-                inflight: VecDeque::new(),
                 reach,
                 client_ms: None,
             }),
@@ -1024,12 +995,12 @@ impl Hub {
         })
     }
 
-    /// After the stream restarts at `now` (new size): every client needs the new geometry
-    /// and a keyframe, and acks for the old stream's frames no longer apply.
-    pub fn restart_clients(&self, now: Instant) {
+    /// After the stream restarts (new size): every client needs the new geometry and a
+    /// keyframe. The old stream's frames still on their way are acked as they arrive.
+    pub fn restart_clients(&self) {
         let hello = self.hello();
         for c in self.clients.lock().iter() {
-            c.start_over(now, hello.clone());
+            c.start_over(hello.clone());
         }
     }
 
@@ -1153,25 +1124,23 @@ mod tests {
             Behind => (Behind, n),
             Waiting | Started => (Waiting, n),
         };
+        // What is on its way stays on its way until its own ack, whatever else happens.
         match step {
-            Step::Watch(i) | Step::Record(i) => c[i] = (Waiting, 0),
+            Step::Watch(i) | Step::Record(i) => c[i].0 = Waiting,
             Step::Stall(i) => c[i].0 = Behind,
             Step::StopWatching(i) => c[i].0 = NotWatching,
             Step::AskKeyframe(i) => c[i] = asked(c[i]),
-            // Starting over: one that watches waits for a keyframe of what follows; its
-            // frames on their way no longer count.
+            // Starting over: one that watches waits for a keyframe of what follows.
             Step::StartOver(i) => {
                 if c[i].0 != NotWatching {
                     c[i].0 = Waiting;
                 }
-                c[i].1 = 0;
             }
             Step::Restart => {
                 for c in c.iter_mut() {
                     if c.0 != NotWatching {
                         c.0 = Waiting;
                     }
-                    c.1 = 0;
                 }
                 m.held.clear();
             }
@@ -1189,9 +1158,9 @@ mod tests {
                 let starts = m.held.remove(0).unwrap_or([false; 2]);
                 for (i, c) in c.iter_mut().enumerate() {
                     if starts[i] && c.0 == Promised {
-                        *c = match whole {
-                            true => (Started, 0),
-                            false => (Waiting, c.1),
+                        c.0 = match whole {
+                            true => Started,
+                            false => Waiting,
                         };
                     }
                     match c.0 {
@@ -1204,10 +1173,14 @@ mod tests {
                     }
                 }
             }
+            // The ack of the oldest frame on its way, if one is: one left behind wants its
+            // keyframe once the last is back.
             Step::Ack(i) => {
-                c[i].1 = 0;
-                if c[i].0 == Behind {
-                    c[i].0 = Waiting;
+                if c[i].1 > 0 {
+                    c[i].1 -= 1;
+                    if c[i].0 == Behind && c[i].1 == 0 {
+                        c[i].0 = Waiting;
+                    }
                 }
             }
         }
@@ -1277,16 +1250,16 @@ mod tests {
         let mut after = m.clone();
         let (mut planned, mut sent) = (false, vec![]);
         match step {
-            Step::Watch(i) | Step::Record(i) => c[i].watch(t0),
+            Step::Watch(i) | Step::Record(i) => c[i].watch(),
             Step::StopWatching(i) => c[i].stop_watching(),
             Step::AskKeyframe(i) => c[i].ask_keyframe(),
-            Step::StartOver(i) => c[i].start_over(t0, hub.hello()),
+            Step::StartOver(i) => c[i].start_over(hub.hello()),
             Step::Stall(i) => {
                 // The capture loop saw it started with frames on their way for `STALLED`.
                 c[i].left_behind();
             }
             Step::Restart => {
-                hub.restart_clients(t0);
+                hub.restart_clients();
                 after.held.clear();
             }
             Step::Capture => {
@@ -1307,7 +1280,7 @@ mod tests {
                 if let Some(starts) = after.held.remove(0) {
                     for (i, c) in c.iter().enumerate() {
                         if starts[i] {
-                            c.keyframe_sent(whole, t0);
+                            c.keyframe_sent(whole);
                         }
                     }
                 }
@@ -1319,23 +1292,14 @@ mod tests {
                 }
             }
             Step::Ack(i) => {
-                let last = c[i].viewing.lock().inflight.back().map(|f| f.id.get());
-                if let Some(id) = last {
-                    c[i].on_ack(t0 + Duration::from_millis(50), id, Hold::Unsaid);
+                let oldest = c[i].window(|w| w.oldest().map(|f| f.id.get()));
+                if let Some(id) = oldest {
+                    let acked = c[i].on_ack(t0 + Duration::from_millis(50), id, Hold::Unsaid);
+                    assert_eq!(acked, Acked::Oldest, "{step:?}");
                 }
             }
         }
-        after.c = [0, 1].map(|i| {
-            // The window has on its way what is in flight, whatever the step did.
-            let bytes: usize = c[i].viewing.lock().inflight.iter().map(|f| f.bytes).sum();
-            assert_eq!(
-                c[i].window(|w| w.flying()),
-                bytes,
-                "client {i}'s window, {step:?}"
-            );
-            let v = c[i].viewing.lock();
-            (v.viewer, v.inflight.len())
-        });
+        after.c = [0, 1].map(|i| (c[i].viewer(), c[i].window(|w| w.frames())));
         after.fresh = rule(m, step).2.fresh;
         let read = [0, 1].map(|i| {
             let c = &c[i];
@@ -1458,12 +1422,14 @@ mod tests {
                 path.push(send);
                 m = new_step(&hub, &m, send).2;
             }
-            for step in [
-                Step::Ack(0),
-                Step::Ack(1),
-                Step::Capture,
-                Step::Send { whole: true },
-            ] {
+            // Each frame on its way is acked, the oldest first.
+            for i in 0..2 {
+                while m.c[i].1 > 0 {
+                    path.push(Step::Ack(i));
+                    m = new_step(&hub, &m, Step::Ack(i)).2;
+                }
+            }
+            for step in [Step::Capture, Step::Send { whole: true }] {
                 if applies(&m, step) {
                     path.push(step);
                     m = new_step(&hub, &m, step).2;
@@ -1501,9 +1467,8 @@ mod tests {
         c.window(|w| (w.carries(), w.flying(), w.fastest(), w.room(at)))
     }
 
-    /// A frame of a generated run: when it leaves, its number and bytes, when it arrives
-    /// at the viewer and when the viewer acks it, and whether it is acked itself or
-    /// covered by the ack of a later one.
+    /// A frame of a generated run: when it leaves, its number and bytes, and when it
+    /// arrives at the viewer and the viewer acks it.
     #[derive(Clone, Copy)]
     struct Sent {
         at: Instant,
@@ -1511,7 +1476,6 @@ mod tests {
         bytes: usize,
         arrives: Instant,
         acks: Instant,
-        acked: bool,
     }
 
     impl Sent {
@@ -1524,13 +1488,12 @@ mod tests {
     /// A run of 200 frames a viewer of `hub` is sent, numbered by the hub's one count and
     /// generated from `seed`: each leaves 1 to 40 ms after the one before, of 200 B to
     /// 60 KB, arrives 0 to 120 ms later, and is acked 0 to 50 ms after that, each no sooner
-    /// than the one before (TCP keeps them in order); with `covering`, about one in four is
-    /// covered by a later frame's ack. The last is acked.
-    fn run(hub: &Hub, seed: u64, covering: bool) -> Vec<Sent> {
+    /// than the one before (TCP keeps them in order).
+    fn run(hub: &Hub, seed: u64) -> Vec<Sent> {
         let mut rng = Rng(crate::xorshift::Xorshift::new(seed));
         let t0 = Instant::now();
         let (mut at, mut arrives, mut acks) = (t0, t0, t0);
-        let mut frames: Vec<Sent> = (0..200)
+        (0..200)
             .map(|_| {
                 at += Duration::from_millis(1 + rng.below(40));
                 arrives = arrives.max(at + Duration::from_millis(rng.below(121)));
@@ -1541,17 +1504,14 @@ mod tests {
                     bytes: 200 + rng.below(60_000) as usize,
                     arrives,
                     acks,
-                    acked: !covering || rng.below(4) > 0,
                 }
             })
-            .collect();
-        frames.last_mut().unwrap().acked = true;
-        frames
+            .collect()
     }
 
-    /// `frames` on a new client of `hub` that has started: each is sent when it leaves,
-    /// and each acked is acked as its ack arrives, in order between the frames sent, as of
-    /// what `when` says with what `hold` says.
+    /// `frames` on a new client of `hub` that has started: each is sent when it leaves, and
+    /// acked as its ack arrives, in order between the frames sent, as of what `when` says
+    /// with what `hold` says.
     fn acked(
         hub: &Hub,
         frames: &[Sent],
@@ -1563,17 +1523,17 @@ mod tests {
         let c = hub.add_client(mpsc::unbounded_channel().0, frames[0].at);
         c.viewing.lock().viewer = Viewer::Started;
         c.pinged(frames[0].at, PING_TRIP, window::Ahead::Nothing);
-        let mut acks = frames.iter().filter(|f| f.acked).peekable();
+        let mut acks = frames.iter().peekable();
         for f in frames {
             // The acks that arrive before it leaves, of frames already sent.
             while let Some(a) = acks.next_if(|a| a.id.get() < f.id.get() && a.acks <= f.at) {
-                c.on_ack(when(a), a.id.get(), hold(a));
+                assert_eq!(c.on_ack(when(a), a.id.get(), hold(a)), Acked::Oldest);
             }
             let took = c.takes(f.id, f.at, f.bytes, false, usize::MAX);
             assert_eq!(took, Takes::Frame);
         }
         for a in acks {
-            c.on_ack(when(a), a.id.get(), hold(a));
+            assert_eq!(c.on_ack(when(a), a.id.get(), hold(a)), Acked::Oldest);
         }
         c
     }
@@ -1588,7 +1548,7 @@ mod tests {
         let mut otherwise = 0;
         for seed in 1..=50u64 {
             let hub = Hub::new(Paths::ANY);
-            let frames = run(&hub, seed.wrapping_mul(0x9E37_79B9_7F4A_7C15), false);
+            let frames = run(&hub, seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
             let end = frames.last().unwrap().acks + Duration::from_secs(1);
             let says = acked(&hub, &frames, |f| f.acks, |f| Hold::Said(f.held()));
             let twin = acked(&hub, &frames, |f| f.arrives, |_| Hold::Unsaid);
@@ -1599,41 +1559,29 @@ mod tests {
         assert!(otherwise > 40, "{otherwise} of 50");
     }
 
-    /// An ack names one frame, and what left before it and has not come back came back with
-    /// it. A client's window is the one the rule written here makes of the same run: each
-    /// frame leaves as it is sent, and the frame an ack names, and each still on its way
-    /// before it, come back when the ack does less what the client says it held the one it
-    /// names. Over 50 generated runs, about one frame in four with no ack of its own.
+    /// Each ack brings back the oldest frame on its way, as of when the client had it. A
+    /// client's window is the one the rule written here makes of the same run: each frame
+    /// leaves as it is sent, and comes back, the oldest first, when its ack does less what
+    /// the client says it held it. Over 50 generated runs.
     #[test]
-    fn a_frame_an_ack_covers_comes_back_with_it() {
+    fn an_ack_brings_back_the_oldest_frame_as_of_when_the_client_had_it() {
         for seed in 1..=50u64 {
             let hub = Hub::new(Paths::ANY);
-            let frames = run(&hub, seed.wrapping_mul(0x2545_F491_4F6C_DD1D), true);
+            let frames = run(&hub, seed.wrapping_mul(0x2545_F491_4F6C_DD1D));
             let end = frames.last().unwrap().acks + Duration::from_secs(1);
             let c = acked(&hub, &frames, |f| f.acks, |f| Hold::Said(f.held()));
             let mut w = Window::new(frames[0].at, 0, usize::MAX);
             w.pinged(frames[0].at, PING_TRIP, window::Ahead::Nothing);
-            let mut flying = VecDeque::<FrameId>::new();
-            let ack = |w: &mut Window, flying: &mut VecDeque<FrameId>, a: &Sent| {
-                while let Some(id) = flying.pop_front() {
-                    w.came_back(a.arrives);
-                    if id == a.id {
-                        break;
-                    }
-                }
-            };
-            let mut acks = frames.iter().filter(|f| f.acked).peekable();
+            let mut acks = frames.iter().peekable();
             for f in &frames {
                 while let Some(a) = acks.next_if(|a| a.id.get() < f.id.get() && a.acks <= f.at) {
-                    ack(&mut w, &mut flying, a);
+                    w.came_back(a.arrives);
                 }
-                w.leave(f.at, f.bytes);
-                flying.push_back(f.id);
+                w.leave(f.at, f.id, f.bytes);
             }
             for a in acks {
-                ack(&mut w, &mut flying, a);
+                w.came_back(a.arrives);
             }
-            assert!(frames.iter().any(|f| !f.acked));
             let rule = (w.carries(), w.flying(), w.fastest(), w.room(end));
             assert_eq!(said(&c, end), rule, "seed {seed}");
         }
@@ -1661,7 +1609,7 @@ mod tests {
         for seed in 1..=50u64 {
             for lie in lies {
                 let hub = Hub::new(Paths::ANY);
-                let frames = run(&hub, seed.wrapping_mul(0xD1B5_4A32_D192_ED03), true);
+                let frames = run(&hub, seed.wrapping_mul(0xD1B5_4A32_D192_ED03));
                 let end = frames.last().unwrap().acks + Duration::from_secs(1);
                 let truth = |f: &Sent| Hold::Said(f.held());
                 let c = acked(
@@ -1991,112 +1939,112 @@ mod tests {
         }
     }
 
-    /// An ack takes out of flight exactly the frames up to the one it names, if that one is
-    /// in flight, and nothing else: over any interleaving of viewers that watch, stop and
-    /// ask for keyframes, streams rebuilt, frames sent, and acks of any frame numbered
-    /// before (one in flight, one acked already, one from before a watch or a rebuild, one
-    /// sent to the other viewer) or of a number never given (past the newest, or before
-    /// the first), the frames in flight after it are those before it less that run, and
-    /// the frames its trace covers are its uncovered frames up to the one named, if it
-    /// keeps that one uncovered, and none otherwise. Frames are numbered as the encode
-    /// loop numbers them, by the hub's count; the test knows each frame by the order it
-    /// numbered it in (its bytes), not by its number. Counted, and each must happen: acks
-    /// that took frames out, acks of a frame numbered but not in flight, and acks of a
-    /// number never given, each beside frames in flight.
+    /// An ack takes out the oldest frame on its way when it names that frame, and is broken
+    /// when it names any other, taking nothing out: over any interleaving of viewers that
+    /// watch, stop and ask for keyframes, streams rebuilt, frames sent, and acks of the
+    /// oldest frame on its way, of any other frame numbered (one on its way behind the
+    /// oldest, one acked already, one sent only to the other viewer) or of a number never
+    /// given (past the newest, or before the first). The frames on their way, in the window
+    /// and as the trace has them not yet acked, are exactly those the client took, in order,
+    /// less those acked: whatever the stream did meanwhile, nothing else takes them out.
+    /// Frames are numbered as the encode loop numbers them, by the hub's count; the test
+    /// knows each frame by the order it numbered it in (its bytes), not by its number.
+    /// Counted, and each must happen: acks of the oldest, and broken acks of a frame
+    /// numbered, of a number never given, and with nothing on its way.
     #[test]
-    fn an_ack_takes_out_exactly_the_frames_up_to_the_one_it_names() {
+    fn an_ack_takes_out_the_oldest_frame_and_any_other_is_broken() {
         let mut rng = Rng(crate::xorshift::Xorshift::new(0x9E37_79B9_7F4A_7C15));
-        // Acks that took frames out of flight; that named a frame numbered but not in
-        // flight; that named a number never given; the last two beside frames in flight.
-        let (mut popped, mut stale, mut unnamed) = (0, 0, 0);
+        // Acks of the oldest; broken acks of a frame numbered, of a number never given, and
+        // with nothing on its way.
+        let (mut oldest, mut numbered_other, mut never, mut empty) = (0, 0, 0, 0);
         for _ in 0..40 {
             let t0 = Instant::now();
             let hub = Hub::new(Paths::ANY);
             let c = [0, 1].map(|_| hub.add_client(mpsc::unbounded_channel().0, t0));
             // Every frame numbered, in the order numbered: its number.
             let mut numbered: Vec<u32> = vec![];
+            // Each client's frames on their way, by the order they were numbered in.
+            let mut model: [VecDeque<usize>; 2] = Default::default();
             let mut now = t0;
             for _ in 0..500 {
                 now += Duration::from_millis(rng.below(20));
                 let i = rng.below(2) as usize;
                 match rng.below(12) {
-                    0 => c[i].watch(now),
+                    0 => c[i].watch(),
                     1 => c[i].stop_watching(),
                     2 => c[i].ask_keyframe(),
-                    3 => hub.restart_clients(now),
+                    3 => hub.restart_clients(),
                     4 => {
                         // A keyframe planned and sent: it starts who it was promised to.
                         let promised = c.each_ref().map(|c| c.keyframe_planned());
                         for (c, _) in c.iter().zip(promised).filter(|(_, p)| *p) {
-                            c.keyframe_sent(true, now);
+                            c.keyframe_sent(true);
                         }
                     }
                     5..=7 => {
                         let id = hub.timeline.number();
                         let k = numbered.len();
                         numbered.push(id.get());
-                        for c in &c {
-                            c.takes(id, now, k, false, usize::MAX);
+                        for (c, model) in c.iter().zip(&mut model) {
+                            if c.takes(id, now, k, false, usize::MAX) == Takes::Frame {
+                                model.push_back(k);
+                            }
                         }
                     }
                     _ if numbered.is_empty() => {}
                     _ => {
-                        let flying = |c: &Client| -> Vec<usize> {
-                            c.viewing.lock().inflight.iter().map(|f| f.bytes).collect()
-                        };
-                        // A frame in flight to it, a recent one or any frame numbered so
-                        // far; or a number never given, past the newest or before the
-                        // first.
+                        // The oldest on its way, any frame numbered so far, or a number
+                        // never given, past the newest or before the first.
                         let last = numbered.len() - 1;
-                        let in_flight = flying(&c[i]);
-                        let (named, id) = match rng.below(6) {
-                            0 => (None, numbered[last].wrapping_add(1 + rng.below(9) as u32)),
-                            1 => (None, numbered[0].wrapping_sub(1 + rng.below(9) as u32)),
-                            2 if !in_flight.is_empty() => {
-                                let k = in_flight[rng.below(in_flight.len() as u64) as usize];
-                                (Some(k), numbered[k])
-                            }
-                            2 | 3 => {
-                                let k = last - (rng.below(4) as usize).min(last);
-                                (Some(k), numbered[k])
-                            }
+                        let (named, id) = match (rng.below(6), model[i].front()) {
+                            (0, _) => (None, numbered[last].wrapping_add(1 + rng.below(9) as u32)),
+                            (1, _) => (None, numbered[0].wrapping_sub(1 + rng.below(9) as u32)),
+                            (2..=3, Some(&k)) => (Some(k), numbered[k]),
                             _ => {
                                 let k = rng.below(numbered.len() as u64) as usize;
                                 (Some(k), numbered[k])
                             }
                         };
-                        let open = |c: &Client| -> Vec<usize> {
-                            let t = c.trace.lock();
-                            t.frames()
-                                .filter(|f| f.ack.is_none())
-                                .map(|f| f.frame.bytes)
-                                .collect()
-                        };
-                        let (before, open_before) = (flying(&c[i]), open(&c[i]));
-                        c[i].on_ack(now, id, Hold::Unsaid);
-                        let (after, open_after) = (flying(&c[i]), open(&c[i]));
-                        // The run up to the frame named, in what was in flight and in what
-                        // the trace had not yet seen acked.
-                        let through = |list: &[usize]| {
-                            named
-                                .and_then(|k| list.iter().position(|&f| f == k))
-                                .map_or(0, |p| p + 1)
-                        };
-                        let gone = through(&before);
-                        assert_eq!(after, before[gone..], "the ack of {named:?} ({id})");
-                        let covered = through(&open_before);
-                        assert_eq!(open_after, open_before[covered..], "{named:?} ({id})");
-                        let beside = !before.is_empty();
-                        popped += usize::from(gone > 0);
-                        stale += usize::from(named.is_some() && gone == 0 && beside);
-                        unnamed += usize::from(named.is_none() && beside);
+                        let took = c[i].on_ack(now, id, Hold::Unsaid);
+                        let front = model[i].front().copied();
+                        match (named.is_some() && named == front, front) {
+                            (true, _) => {
+                                assert_eq!(took, Acked::Oldest, "the ack of {named:?} ({id})");
+                                model[i].pop_front();
+                                oldest += 1;
+                            }
+                            (false, Some(_)) => {
+                                assert_eq!(took, Acked::Broken, "the ack of {named:?} ({id})");
+                                numbered_other += usize::from(named.is_some());
+                                never += usize::from(named.is_none());
+                            }
+                            (false, None) => {
+                                assert_eq!(took, Acked::Broken, "the ack of {named:?} ({id})");
+                                empty += 1;
+                            }
+                        }
                     }
+                }
+                for (c, model) in c.iter().zip(&model) {
+                    let window = c.window(|w| (w.frames(), w.oldest().map(|f| f.bytes)));
+                    assert_eq!(window, (model.len(), model.front().copied()), "the window");
+                    let open: Vec<usize> = c
+                        .trace
+                        .lock()
+                        .frames()
+                        .filter(|f| f.ack.is_none())
+                        .map(|f| f.frame.bytes)
+                        .collect();
+                    assert!(
+                        open.iter().eq(model.iter()),
+                        "the trace: {open:?}, {model:?}"
+                    );
                 }
             }
         }
         assert!(
-            popped > 100 && stale > 100 && unnamed > 100,
-            "popped {popped}, stale {stale}, unnamed {unnamed}"
+            oldest > 100 && numbered_other > 100 && never > 100 && empty > 100,
+            "oldest {oldest}, numbered {numbered_other}, never given {never}, empty {empty}"
         );
     }
 

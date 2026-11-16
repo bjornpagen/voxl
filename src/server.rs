@@ -1,7 +1,7 @@
 //! HTTP + WebSocket front end. Serves the embedded web client and the media/input socket.
 
 use crate::event::{InputEvent, KeyAct};
-use crate::hub::{Client, Hub, Out, ServerMessage};
+use crate::hub::{Acked, Client, Hub, Out, ServerMessage};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::header;
@@ -415,7 +415,11 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
     };
     while let Some(Ok(msg)) = stream.next().await {
         match msg {
-            Message::Text(t) => handle_text(&s, &client, t.as_str()),
+            Message::Text(t) => {
+                if handle_text(&s, &client, t.as_str()) == Flow::Close {
+                    break;
+                }
+            }
             // Every binary message from a viewer acts on the desktop (clipboard images,
             // microphone audio), so a read-only viewer's are all dropped.
             Message::Binary(_) if s.read_only => {}
@@ -671,12 +675,19 @@ impl Command {
     }
 }
 
-fn handle_text(s: &AppState, c: &Arc<Client>, t: &str) {
+/// What the socket does after a viewer's message: reads on, or closes the connection.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Flow {
+    Go,
+    Close,
+}
+
+fn handle_text(s: &AppState, c: &Arc<Client>, t: &str) -> Flow {
     let Some(command) = Command::parse(t) else {
-        return;
+        return Flow::Go;
     };
     if s.read_only && !command.watches() {
-        return;
+        return Flow::Go;
     }
     let input = |ev| send_input(&s.hub, c, ev);
     match command {
@@ -690,14 +701,22 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str) {
                 // The page is told the stream again, which resets its decoders: for this
                 // viewer the stream starts over. A keyframe that reached the page ahead of
                 // the hello would be lost there, with the viewer counted as started.
-                c.start_over(Instant::now(), s.hub.hello());
+                c.start_over(s.hub.hello());
                 s.hub.wake();
             }
         },
-        Command::Ack { frame, hold } => {
-            c.on_ack(Instant::now(), frame, hold);
-            s.hub.wake();
-        }
+        // The page acknowledges every frame it is sent, once and in order: an ack of any
+        // other frame is from a client that is not the page, and its connection closes.
+        Command::Ack { frame, hold } => match c.on_ack(Instant::now(), frame, hold) {
+            Acked::Oldest => s.hub.wake(),
+            Acked::Broken => {
+                log::warn!(
+                    "client {} acked frame {frame}, not its oldest; closing",
+                    c.id
+                );
+                return Flow::Close;
+            }
+        },
         Command::Move { x, y } => input(InputEvent::Move { x, y }),
         Command::Button { button, down } => input(InputEvent::Button { button, down }),
         Command::ScrollPx { dx, dy } => input(InputEvent::ScrollPx { dx, dy }),
@@ -708,7 +727,7 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str) {
         )),
         Command::Video(on) => {
             if on {
-                c.watch(Instant::now());
+                c.watch();
             } else {
                 c.stop_watching();
             }
@@ -731,13 +750,13 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str) {
         // platform has its own rule) and changes nothing if it has that size already.
         Command::Resize { w, h } => {
             if !s.resize {
-                return;
+                return Flow::Go;
             }
             #[cfg(target_os = "macos")]
             let input = s.hub.input.lock();
             #[cfg(target_os = "macos")]
             if input.is_none() || c.id < s.hub.input_floor.load(Ordering::Relaxed) {
-                return;
+                return Flow::Go;
             }
             if s.hub.resize_max.lock().is_some() && c.asks_for((w, h)) {
                 *s.hub.resize_req.lock() = Some((w, h));
@@ -751,11 +770,12 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str) {
         Command::Pong { token } => {
             let now = Instant::now();
             let Some((rtt, ahead)) = c.pings.lock().answer(now, token) else {
-                return;
+                return Flow::Go;
             };
             c.pinged(now, rtt, ahead);
         }
     }
+    Flow::Go
 }
 
 #[cfg(test)]
@@ -1138,6 +1158,58 @@ mod tests {
         assert!(
             client.window(|w| w.fastest()).is_some(),
             "the reply to a ping was no round trip"
+        );
+    }
+
+    /// The page acknowledges every frame it is sent once, in order: an ack of the oldest
+    /// frame on its way reads on, and an ack of any other frame (one behind it, one acked
+    /// already, a number never given), or with nothing on its way, closes the connection and
+    /// takes nothing out. Over 4,000 steps on a started client: frames sent, and acks of
+    /// the oldest, of any frame numbered, and of numbers past the newest. Counted, and both
+    /// must happen: acks read on, and connections closed.
+    #[test]
+    fn an_ack_of_any_frame_but_the_oldest_closes_the_connection() {
+        let hub = Hub::new(crate::hub::Paths::ANY);
+        let s = app(&hub, false, None);
+        let client = hub.add_client(mpsc::unbounded_channel().0, Instant::now());
+        client.watch();
+        client.keyframe_planned();
+        client.keyframe_sent(true);
+        let mut rng = crate::xorshift::Xorshift::new(0xA076_1D64_78BD_642F);
+        // The frames on their way, oldest first, and every number given.
+        let (mut flying, mut given) = (std::collections::VecDeque::new(), vec![]);
+        let (mut read_on, mut closed) = (0, 0);
+        for _ in 0..4_000 {
+            if rng.below(2) == 0 || given.is_empty() {
+                let id = hub.timeline.number();
+                client.takes(id, Instant::now(), 1000, false, usize::MAX);
+                flying.push_back(id.get());
+                given.push(id.get());
+                continue;
+            }
+            let last = given[given.len() - 1];
+            let id = match (rng.below(3), flying.front()) {
+                (0, Some(&oldest)) => oldest,
+                (1, _) => given[rng.below(given.len() as u64) as usize],
+                _ => last.wrapping_add(1 + rng.below(9) as u32),
+            };
+            let flow = handle_text(&s, &client, &format!("a,{id},1.5"));
+            let oldest = flying.front() == Some(&id);
+            let want = match oldest {
+                true => Flow::Go,
+                false => Flow::Close,
+            };
+            assert_eq!(flow, want, "the ack of {id}, {flying:?} on their way");
+            if oldest {
+                flying.pop_front();
+            }
+            assert_eq!(client.window(|w| w.frames()), flying.len(), "after {id}");
+            read_on += usize::from(oldest);
+            closed += usize::from(!oldest);
+        }
+        assert!(
+            read_on > 100 && closed > 100,
+            "{read_on} read on, {closed} closed"
         );
     }
 

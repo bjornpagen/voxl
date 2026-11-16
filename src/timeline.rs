@@ -9,7 +9,8 @@
 //! Each viewer also has a `Trace`: the frames it was sent and the acks that came back,
 //! which is what its path did to them. The traces of the last viewers to leave are kept.
 
-use crate::hub::{Hold, Inflight};
+use crate::hub::Hold;
+use crate::window::Flight;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
@@ -313,33 +314,24 @@ impl Timeline {
     }
 }
 
-/// A frame as the encode loop sent it to one viewer, and the ack that covered it.
+/// A frame as the encode loop sent it to one viewer, and its ack.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sent {
-    /// What the hub keeps of it while it is in flight: its number, its bytes, and when the
-    /// encode loop handed it to the viewer's socket task.
-    pub frame: Inflight,
+    /// What the window keeps of it while it is on its way: its number, its bytes, and when
+    /// the encode loop handed it to the viewer's socket task.
+    pub frame: Flight,
     /// Every stripe of it is a keyframe, as `/stats` counts keyframes.
     pub key: bool,
     pub ack: Option<Ack>,
 }
 
-/// The first ack that covered a frame.
+/// A frame's ack.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Ack {
     /// When it arrived.
     pub at: Instant,
-    pub of: AckOf,
-}
-
-/// Which frame the ack that covered a frame named.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum AckOf {
-    /// This one, with the hold the viewer reported for it.
-    This(Hold),
-    /// One sent after it. Over TCP this one had arrived by then; the viewer reported no
-    /// hold for it.
-    Later,
+    /// What the viewer said it held the frame.
+    pub hold: Hold,
 }
 
 /// The last `FRAMES_KEPT` frames sent to one viewer, and their acks. Made with room for
@@ -351,8 +343,8 @@ pub struct Trace {
     ring: Vec<Sent>,
     /// How many frames the viewer has been sent.
     sent: u64,
-    /// How many of them, from the first, an ack has covered.
-    covered: u64,
+    /// How many of them, from the first, have been acked.
+    acked: u64,
 }
 
 impl Trace {
@@ -360,7 +352,7 @@ impl Trace {
         Trace {
             ring: Vec::with_capacity(FRAMES_KEPT),
             sent: 0,
-            covered: 0,
+            acked: 0,
         }
     }
 
@@ -370,7 +362,7 @@ impl Trace {
 
     /// The encode loop handed `frame` to the viewer's socket task; `key`: every stripe of it
     /// is a keyframe.
-    pub fn sent(&mut self, frame: Inflight, key: bool) {
+    pub fn sent(&mut self, frame: Flight, key: bool) {
         let sent = Sent {
             frame,
             key,
@@ -383,24 +375,16 @@ impl Trace {
         self.sent += 1;
     }
 
-    /// At `at`, an ack named frame `id`, with `hold`. It covers the frame numbered `id`,
-    /// if one is kept that no ack has covered, and every frame sent before it. One that
-    /// names no such frame (covered already, never sent, or no longer kept) covers nothing.
-    pub fn acked(&mut self, at: Instant, id: u32, hold: Hold) {
-        let first = self.covered.max(self.sent - self.ring.len() as u64);
-        let Some(named) =
-            (first..self.sent).find(|&k| self.ring[Self::slot(k)].frame.id.get() == id)
-        else {
-            return;
-        };
-        for k in first..=named {
-            let of = match k == named {
-                true => AckOf::This(hold),
-                false => AckOf::Later,
-            };
-            self.ring[Self::slot(k)].ack = Some(Ack { at, of });
+    /// At `at`, the ack of the oldest frame sent and not yet acked arrived, with `hold`. The
+    /// hub tells it so as the frame comes back to the window, which holds what the trace
+    /// was sent and not yet told acked, in the same order: so the ack is that frame's. It is
+    /// marked if the ring still keeps it.
+    pub fn acked(&mut self, at: Instant, hold: Hold) {
+        let k = self.acked;
+        self.acked += 1;
+        if (self.sent - self.ring.len() as u64..self.sent).contains(&k) {
+            self.ring[Self::slot(k)].ack = Some(Ack { at, hold });
         }
-        self.covered = named + 1;
     }
 
     /// The frames kept, oldest first.
@@ -466,8 +450,6 @@ pub enum HoldRow {
     Unsaid,
     /// It named the frame with a hold that is not a time.
     Unreadable,
-    /// It named a frame sent later.
-    Later,
 }
 
 impl Timeline {
@@ -480,11 +462,10 @@ impl Timeline {
             key: s.key,
             ack: s.ack.map(|a| AckRow {
                 at_us: self.us(a.at),
-                hold: match a.of {
-                    AckOf::This(Hold::Said(held)) => HoldRow::SaidUs(held.as_micros()),
-                    AckOf::This(Hold::Unsaid) => HoldRow::Unsaid,
-                    AckOf::This(Hold::Unreadable) => HoldRow::Unreadable,
-                    AckOf::Later => HoldRow::Later,
+                hold: match a.hold {
+                    Hold::Said(held) => HoldRow::SaidUs(held.as_micros()),
+                    Hold::Unsaid => HoldRow::Unsaid,
+                    Hold::Unreadable => HoldRow::Unreadable,
                 },
             }),
         };
@@ -699,38 +680,13 @@ mod tests {
     }
 
     /// A viewer as the test sees it: the client the hub made for it, every frame it was
-    /// ever sent with the first ack that covered it, and the step from which its acks get
-    /// through again.
+    /// ever sent with its ack, how many of them have been acked, and the step from which its
+    /// acks get through again.
     struct Watcher {
         client: std::sync::Arc<crate::hub::Client>,
         sent: Vec<Sent>,
+        acked: usize,
         heard_from: u32,
-    }
-
-    /// What an ack does, said over a viewer's whole history: among the last `FRAMES_KEPT`
-    /// frames sent, the one that no ack has covered and whose number it names is acked by
-    /// it, and every one sent before it still kept and not yet acked is acked by a later
-    /// one. Whether it covered anything.
-    fn model_ack(sent: &mut [Sent], at: Instant, id: u32, hold: Hold) -> bool {
-        let from = sent.len().saturating_sub(FRAMES_KEPT);
-        let kept = &mut sent[from..];
-        let open = |s: &&mut Sent| s.ack.is_none();
-        let Some(named) =
-            (0..kept.len()).find(|&i| kept[i].ack.is_none() && kept[i].frame.id.get() == id)
-        else {
-            return false;
-        };
-        for s in kept[..named].iter_mut().filter(open) {
-            s.ack = Some(Ack {
-                at,
-                of: AckOf::Later,
-            });
-        }
-        kept[named].ack = Some(Ack {
-            at,
-            of: AckOf::This(hold),
-        });
-        true
     }
 
     /// The rows `/stats/trace` gives for frames as the model has them, written apart from
@@ -740,13 +696,12 @@ mod tests {
         kept.iter()
             .map(|s| {
                 let ack = s.ack.map(|a| {
-                    let hold = match a.of {
-                        AckOf::This(Hold::Said(held)) => {
+                    let hold = match a.hold {
+                        Hold::Said(held) => {
                             serde_json::json!({"said_us": held.as_micros() as u64})
                         }
-                        AckOf::This(Hold::Unsaid) => "unsaid".into(),
-                        AckOf::This(Hold::Unreadable) => "unreadable".into(),
-                        AckOf::Later => "later".into(),
+                        Hold::Unsaid => "unsaid".into(),
+                        Hold::Unreadable => "unreadable".into(),
                     };
                     serde_json::json!({"at_us": us(a.at), "hold": hold})
                 });
@@ -762,18 +717,16 @@ mod tests {
     }
 
     /// Each viewer's trace holds exactly the last `FRAMES_KEPT` frames it was sent, oldest
-    /// first, each with the ack that covered it as the model says; the hub lists exactly
-    /// the viewers present, and the last `LEFT_KEPT` to leave with when each left, their
-    /// traces as they stood; and their rows in `/stats/trace` say the same. Generated over
-    /// several laps of the ring: viewers join and leave (one now and then after laps of
-    /// its ring), a frame goes to a viewer as it leaves, a viewer gone already leaves
-    /// again, a viewer is sent most frames but not every one, and goes deaf for spells long
-    /// enough that frames no ack covered leave its ring. Frames are numbered by the hub's
-    /// timeline. Acks name the oldest frame open, one of the newest (skipping the frames
-    /// between, whose own acks never come), one already covered (out of order, or twice), a
-    /// number never sent, a frame no longer kept or any frame sent; with a hold said,
-    /// unsaid or unreadable. The run must reach every one of those, and a leaver pushed out
-    /// by later ones.
+    /// first, each with its ack as the model says: the k-th ack is the k-th frame's, as the
+    /// hub tells the trace of each frame the window takes back; the hub lists exactly the
+    /// viewers present, and the last `LEFT_KEPT` to leave with when each left, their traces
+    /// as they stood; and their rows in `/stats/trace` say the same. Generated over several
+    /// laps of the ring: viewers join and leave (one now and then after laps of its ring), a
+    /// frame goes to a viewer as it leaves, a viewer gone already leaves again, a viewer is
+    /// sent most frames but not every one, and goes deaf for spells long enough that frames
+    /// leave its ring before their acks come. Frames are numbered by the hub's timeline;
+    /// acks come with a hold said, unsaid or unreadable. The run must reach every one of
+    /// those, and a leaver pushed out by later ones.
     #[test]
     fn each_viewer_keeps_its_last_frames_and_their_acks() {
         const STEPS: u32 = 64_000;
@@ -783,23 +736,21 @@ mod tests {
         let mut watchers: Vec<Watcher> = vec![];
         // The last to leave, with when each left and at which step, oldest first.
         let mut leavers: VecDeque<(Watcher, Instant, u32)> = VecDeque::new();
-        // The number of the newest frame numbered.
-        let mut newest = 0u32;
         // How often each situation the run must reach came up.
-        let (mut left, mut covered_nothing) = (0usize, 0);
+        let (mut left, mut marked, mut gone_before) = (0usize, 0, 0);
         let (mut late, mut again, mut longest_left, mut fell_open) = (0, 0, 0, 0);
         // Frames that left a viewer's ring with no ack.
         let open_fallen = |w: &Watcher| {
             let gone = &w.sent[..w.sent.len().saturating_sub(FRAMES_KEPT)];
             gone.iter().filter(|s| s.ack.is_none()).count()
         };
-        let mut kinds = [0usize; 6];
         for step in 0..STEPS {
             at += Duration::from_micros(rng.below(30_000));
             match rng.below(10_000) {
                 0..=29 if watchers.len() < 4 => watchers.push(Watcher {
                     client: hub.add_client(tokio::sync::mpsc::unbounded_channel().0, at),
                     sent: vec![],
+                    acked: 0,
                     heard_from: step,
                 }),
                 // The first stays a long while (a leave in 20,000 steps); the others come
@@ -830,18 +781,23 @@ mod tests {
                 63..=72 if !watchers.is_empty() => {
                     let w = rng.below(watchers.len() as u64) as usize;
                     let w = &mut watchers[w];
-                    w.heard_from = w.heard_from.max(step + rng.below(12_000) as u32);
+                    // A short spell, or one long enough that more than a ring of frames
+                    // goes out before its acks come again.
+                    let spell = match rng.below(8) {
+                        0 => 9_000 + rng.below(3_000),
+                        _ => rng.below(1_000),
+                    };
+                    w.heard_from = w.heard_from.max(step + spell as u32);
                 }
                 73..=5972 => {
                     let number = hub.timeline.number();
-                    newest = number.get();
                     let (bytes, key) = (rng.below(1 << 20) as usize, rng.below(30) == 0);
                     for w in &mut watchers {
                         // One waiting for a keyframe is not sent the frames before it.
                         if rng.below(12) == 0 {
                             continue;
                         }
-                        let frame = Inflight {
+                        let frame = Flight {
                             id: number,
                             bytes,
                             left: at,
@@ -855,7 +811,7 @@ mod tests {
                     }
                     // The encode loop read the viewers just before the last one left.
                     if let Some((w, _, _)) = leavers.back_mut().filter(|l| l.2 + 2 >= step) {
-                        let frame = Inflight {
+                        let frame = Flight {
                             id: number,
                             bytes,
                             left: at,
@@ -872,36 +828,24 @@ mod tests {
                 5973.. if !watchers.is_empty() => {
                     let w = rng.below(watchers.len() as u64) as usize;
                     let w = &mut watchers[w];
-                    if step < w.heard_from || w.sent.is_empty() {
+                    if step < w.heard_from || w.acked == w.sent.len() {
                         continue;
                     }
-                    let n = w.sent.len();
-                    let from = n.saturating_sub(FRAMES_KEPT);
-                    let open = (from..n).find(|&i| w.sent[i].ack.is_none());
-                    let pick = |rng: &mut Xorshift, lo: usize, hi: usize| {
-                        (hi > lo).then(|| lo + rng.below((hi - lo) as u64) as usize)
-                    };
-                    let kind = rng.below(6) as usize;
-                    let named = match kind {
-                        0 => open,
-                        1 => pick(&mut rng, n.saturating_sub(8), n),
-                        2 => open.and_then(|o| pick(&mut rng, o.saturating_sub(8), o)),
-                        3 => None,
-                        4 => pick(&mut rng, from.saturating_sub(64), from),
-                        _ => pick(&mut rng, 0, n),
-                    };
-                    let id = match (kind, named) {
-                        (3, _) | (_, None) => newest.wrapping_add(1 + rng.below(1000) as u32),
-                        (_, Some(i)) => w.sent[i].frame.id.get(),
-                    };
-                    let hold = match rng.below(3) {
-                        0 => Hold::Unsaid,
-                        1 => Hold::Said(Duration::from_micros(rng.below(1 << 40))),
-                        _ => Hold::Unreadable,
-                    };
-                    w.client.on_ack(at, id, hold);
-                    covered_nothing += usize::from(!model_ack(&mut w.sent, at, id, hold));
-                    kinds[kind] += named.is_some() as usize;
+                    // The acks that arrive together, as TCP brings them: up to 64, each the
+                    // oldest frame's not yet acked.
+                    for _ in 0..(1 + rng.below(64) as usize).min(w.sent.len() - w.acked) {
+                        let hold = match rng.below(3) {
+                            0 => Hold::Unsaid,
+                            1 => Hold::Said(Duration::from_micros(rng.below(1 << 40))),
+                            _ => Hold::Unreadable,
+                        };
+                        w.client.trace.lock().acked(at, hold);
+                        let kept = w.acked + FRAMES_KEPT >= w.sent.len();
+                        w.sent[w.acked].ack = Some(Ack { at, hold });
+                        w.acked += 1;
+                        marked += usize::from(kept);
+                        gone_before += usize::from(!kept);
+                    }
                 }
                 _ => {}
             }
@@ -945,10 +889,6 @@ mod tests {
         }
         let everyone = || watchers.iter().chain(leavers.iter().map(|l| &l.0));
         let fell_open = fell_open + everyone().map(open_fallen).sum::<usize>();
-        let later = everyone()
-            .flat_map(|w| &w.sent)
-            .filter(|s| s.ack.is_some_and(|a| a.of == AckOf::Later))
-            .count();
         let reached = [
             ("a viewer left", left),
             (
@@ -961,13 +901,12 @@ mod tests {
                 "a viewer left after a lap of its ring",
                 longest_left.saturating_sub(FRAMES_KEPT),
             ),
-            ("an ack covered nothing", covered_nothing),
             ("a frame left the ring with no ack", fell_open),
-            ("a frame was acked by a later one", later),
-            ("an ack named the oldest open frame", kinds[0]),
-            ("an ack named one of the newest", kinds[1]),
-            ("an ack named a frame covered already", kinds[2]),
-            ("an ack named a frame no longer kept", kinds[4]),
+            ("an ack marked a frame the ring keeps", marked),
+            (
+                "an ack came for a frame that had left the ring",
+                gone_before,
+            ),
         ];
         for (what, n) in reached {
             assert!(n > 0, "never reached: {what}");

@@ -566,7 +566,7 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Capturer, String> {
         );
     }
     // New geometry (and a keyframe) for clients already connected; no-op at startup.
-    hub.restart_clients(Instant::now());
+    hub.restart_clients();
     Ok(cap)
 }
 
@@ -2493,7 +2493,7 @@ fn encode_frames(
         };
         // The viewers this keyframe was promised to start on it, or wait for another.
         for c in &starts {
-            c.keyframe_sent(all_key, collected);
+            c.keyframe_sent(all_key);
         }
         // A frame waits for the stripe coded last; one with nothing to send is not sent.
         let Some(coded) = out.coded() else {
@@ -2779,7 +2779,7 @@ mod tests {
         let hub = Hub::new(crate::hub::Paths::ANY);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let viewer = hub.add_client(tx, Instant::now());
-        viewer.watch(Instant::now());
+        viewer.watch();
         viewer.keyframe_planned();
         let (w, h) = (64, 64);
         let ecfg = EncoderConfig {
@@ -2913,9 +2913,9 @@ mod tests {
                     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
                     let viewer = hub.add_client(tx, Instant::now());
                     // A viewer that has started, whatever the stream sends first.
-                    viewer.watch(Instant::now());
+                    viewer.watch();
                     assert!(viewer.keyframe_planned());
-                    viewer.keyframe_sent(true, Instant::now());
+                    viewer.keyframe_sent(true);
                     let cfg = VideoConfig {
                         display: None,
                         #[cfg(target_os = "macos")]
@@ -4105,7 +4105,7 @@ mod tests {
             let hub = Hub::new(crate::hub::Paths::ANY);
             let (tx, mut socket) = tokio::sync::mpsc::unbounded_channel();
             let viewer = hub.add_client(tx, Instant::now());
-            viewer.watch(Instant::now());
+            viewer.watch();
             // The capture loop planned its keyframe: the first frame played is one.
             viewer.keyframe_planned();
             let (job_tx, job_rx) = mpsc::sync_channel::<Job>(1);
@@ -4928,9 +4928,9 @@ mod tests {
             let (tx, _socket) = tokio::sync::mpsc::unbounded_channel();
             let viewer = hub.add_client(tx, Instant::now());
             // A viewer that has started: watching, a keyframe planned and sent it whole.
-            viewer.watch(Instant::now());
+            viewer.watch();
             viewer.keyframe_planned();
-            viewer.keyframe_sent(true, Instant::now());
+            viewer.keyframe_sent(true);
             let (job_tx, rx) = mpsc::sync_channel::<Job>(1);
             let (ret, ret_rx) = mpsc::sync_channel(0);
             let (ended_tx, ended) = mpsc::channel();
@@ -5205,7 +5205,7 @@ mod tests {
         let watch = || {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let c = hub.add_client(tx, Instant::now());
-            c.watch(Instant::now());
+            c.watch();
             (c, rx)
         };
         let (w, h) = (64, 64);
@@ -5274,7 +5274,7 @@ mod tests {
         drop(job_tx);
         encode.join().unwrap();
         // build(): the rebuilt stream's hello.
-        hub.restart_clients(Instant::now());
+        hub.restart_clients();
         assert!(
             matches!(recording_rx.try_recv().unwrap(), Out::Text(_)),
             "the recording held a frame of the old stream before the rebuilt stream's \
@@ -5731,7 +5731,7 @@ mod tests {
         *hub.stripes.lock() = stripe_layout(h as u16, cfg.stripes).rows().collect();
         let (tx, socket) = tokio::sync::mpsc::unbounded_channel();
         let client = hub.add_client(tx, Instant::now());
-        client.watch(Instant::now());
+        client.watch();
         let canvas = Arc::new(Canvas {
             w,
             h,
@@ -5966,16 +5966,16 @@ mod tests {
     /// and the hub's list of leavers with room for all it keeps. The oracle is the counting
     /// allocator. Six viewers join; three rings' worth of frames go out, numbered by the
     /// hub's timeline and recorded as the encode loop records them;
-    /// acks come as on_ack records them: for the frame just sent or up to three before it
-    /// (several at once, out of order, twice), now and then for a number never sent, and
-    /// none for a spell longer than the ring, after which an ack scans a whole ring of open
-    /// frames; with every kind of hold. Every 2000 frames a viewer leaves, until one is left,
+    /// acks come as on_ack records them, each the oldest frame's not yet acked, but none for
+    /// a spell longer than the ring, after which acks come for frames the ring no longer
+    /// keeps; with every kind of hold. Every 2000 frames a viewer leaves, until one is left,
     /// and is sent a frame as it goes; the first to leave is pushed out by the four after it.
     #[cfg(target_os = "linux")]
     #[test]
     fn recording_a_viewers_frames_and_acks_allocates_nothing() {
-        use crate::hub::{Hold, Inflight};
+        use crate::hub::Hold;
         use crate::timeline::{FRAMES_KEPT, LEFT_KEPT};
+        use crate::window::Flight;
         if !in_a_process_of_its_own(
             "video::tests::recording_a_viewers_frames_and_acks_allocates_nothing",
         ) {
@@ -5995,7 +5995,7 @@ mod tests {
             let at = t0 + Duration::from_millis(k * 16);
             let id = hub.timeline.number();
             let bytes = (mix(k) % 100_000) as usize;
-            let frame = Inflight {
+            let frame = Flight {
                 id,
                 bytes,
                 left: at,
@@ -6017,14 +6017,9 @@ mod tests {
                 1 => Hold::Said(Duration::from_micros(mix(k) % 10_000)),
                 _ => Hold::Unreadable,
             };
-            // What a viewer's ack says: a number on the wire.
-            let named = match mix(k) % 50 {
-                0 => id.get().wrapping_add(5000),
-                n => id.get().wrapping_sub((n % 4) as u32),
-            };
             let acked = at + Duration::from_millis(mix(k) % 400);
             for viewer in &viewers[gone..] {
-                viewer.trace.lock().acked(acked, named, hold);
+                viewer.trace.lock().acked(acked, hold);
             }
         }
         let (threads, others) = counting::disarm();
@@ -6060,7 +6055,7 @@ mod tests {
                     now - Duration::from_secs(7),
                 );
                 if next(5) > 0 {
-                    c.watch(now - Duration::from_secs(6));
+                    c.watch();
                 }
                 // About to stall, just stalled, or anything up to 5 s old.
                 let age = Duration::from_micros(match next(3) {
@@ -6169,9 +6164,9 @@ mod tests {
             for _ in 0..2 + next(3) {
                 let joined = now - Duration::from_secs(7);
                 let c = hub.add_client(tokio::sync::mpsc::unbounded_channel().0, joined);
-                c.watch(joined);
+                c.watch();
                 c.keyframe_planned();
-                c.keyframe_sent(true, joined);
+                c.keyframe_sent(true);
                 // A clogged path (its oldest frame about to stall, just stalled, or up to
                 // 5 s old) or a light one (a frame or two of up to 2 KB, under 100 ms old).
                 let (age, frames, most) = match next(4) {
@@ -6249,11 +6244,11 @@ mod tests {
                 let c = hub.add_client(tokio::sync::mpsc::unbounded_channel().0, joined);
                 match next(3) {
                     0 => {}
-                    1 => c.watch(joined),
+                    1 => c.watch(),
                     _ => {
-                        c.watch(joined);
+                        c.watch();
                         c.keyframe_planned();
-                        c.keyframe_sent(true, joined);
+                        c.keyframe_sent(true);
                     }
                 }
                 let (age, frames, bytes) = match next(4) {
@@ -6269,10 +6264,10 @@ mod tests {
                 }
             }
             let recorder = hub.add_recorder(tokio::sync::mpsc::unbounded_channel().0);
-            recorder.watch(joined);
+            recorder.watch();
             if next(2) == 0 {
                 recorder.keyframe_planned();
-                recorder.keyframe_sent(true, joined);
+                recorder.keyframe_sent(true);
             }
             let ceiling = hub.ceiling();
             let all = looked(&hub, now);
@@ -6366,7 +6361,7 @@ mod tests {
                     .collect();
                 now += Duration::from_secs(60);
                 for (c, frames) in viewers.iter().zip(&picked) {
-                    c.start_over(now - Duration::from_secs(40), hub.hello());
+                    c.start_over(hub.hello());
                     for &(age, bytes) in frames.iter() {
                         c.fly(hub.timeline.number(), now - age, bytes);
                     }
@@ -6454,6 +6449,7 @@ mod tests {
             let (mut now, mut captured) = (t0, Captured::new(t0 - Duration::from_secs(1)));
             let mut damage = Damage::None;
             let mut window = Window::new(t0, 0, usize::MAX);
+            let numbers = crate::timeline::Timeline::new(t0);
             // The capture the encoder holds: when it is coded, whether it is a pass, and
             // what it may take.
             let mut encoder: Option<(Instant, bool, usize)> = None;
@@ -6499,7 +6495,7 @@ mod tests {
                         let behind = sent.iter().filter(|f| f.pass && f.out > done).count();
                         keys_behind_a_pass += usize::from(behind > 0);
                     }
-                    window.leave(done, bytes);
+                    window.leave(done, numbers.number(), bytes);
                     sent.push(Sent {
                         out: path_free,
                         acked: path_free + rtt,
@@ -7213,7 +7209,7 @@ mod tests {
                     },
                 };
                 let c = hub.add_client(tokio::sync::mpsc::unbounded_channel().0, start);
-                c.watch(start);
+                c.watch();
                 // Its first ping came back as its acks do at the least.
                 let trip = match acks {
                     Acks::OnTime { rtt_ms, .. } => Duration::from_millis(rtt_ms as u64),
@@ -7290,7 +7286,7 @@ mod tests {
                             v.c.keyframe_planned();
                         }
                         for v in &viewers {
-                            v.c.keyframe_sent(true, t);
+                            v.c.keyframe_sent(true);
                         }
                     }
                     let id = hub.timeline.number();
@@ -7421,7 +7417,7 @@ mod tests {
                 .map(|_| hub.add_client(tokio::sync::mpsc::unbounded_channel().0, start))
                 .collect();
             for c in &cs {
-                c.watch(start);
+                c.watch();
             }
             // Acks and pongs on their way back, in order: (arrives, frame or the ping's
             // token).
@@ -7463,7 +7459,7 @@ mod tests {
                             c.keyframe_planned();
                         }
                         for c in &cs {
-                            c.keyframe_sent(true, t);
+                            c.keyframe_sent(true);
                         }
                         let carries = cs.iter().map(|c| c.window(|w| w.carries())).min();
                         carries.map(|c| window::scale(c, KEY_TIME, window::LATENESS))
@@ -7545,7 +7541,7 @@ mod tests {
                 .map(|_| hub.add_client(tokio::sync::mpsc::unbounded_channel().0, start))
                 .collect();
             for c in &cs {
-                c.watch(start);
+                c.watch();
             }
             // What reaches the server from each viewer, in order: (when, an ack for a frame,
             // a pong for the ping that went then, or `kf`).
@@ -7586,7 +7582,10 @@ mod tests {
                 for (i, c) in cs.iter().enumerate() {
                     while let Some((at, m)) = up[i].front().filter(|u| u.0 <= t) {
                         match *m {
-                            Up::Ack(f) => c.on_ack(*at, f, crate::hub::Hold::Unsaid),
+                            Up::Ack(f) => {
+                                let acked = c.on_ack(*at, f, crate::hub::Hold::Unsaid);
+                                assert_eq!(acked, crate::hub::Acked::Oldest, "{f}");
+                            }
                             Up::Pong(token) => {
                                 if let Some((trip, ahead)) = c.pings.lock().answer(*at, token) {
                                     c.pinged(*at, trip, ahead);
@@ -7621,7 +7620,7 @@ mod tests {
                             c.keyframe_planned();
                         }
                         for c in &cs {
-                            c.keyframe_sent(true, t);
+                            c.keyframe_sent(true);
                         }
                         let carries = cs.iter().map(|c| c.window(|w| w.carries())).min();
                         carries.map(|c| window::scale(c, KEY_TIME, window::LATENESS))

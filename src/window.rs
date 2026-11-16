@@ -33,6 +33,7 @@
 //!   queued ahead of it. During a stall nothing comes back, the frames on their way grow
 //!   late, and nothing more goes out.
 
+use crate::timeline::FrameId;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -137,9 +138,9 @@ pub struct Window {
     /// Until when the path is busy with what has left, carrying `carries` in each
     /// `LATENESS`.
     busy: Instant,
-    /// (left at, bytes, what had come back by then) of each frame that has left and not
-    /// come back, oldest first.
-    flying: VecDeque<(Instant, usize, Before)>,
+    /// Each frame that has left and not come back, oldest first, with what had come back
+    /// when it left: the one record of the frames on their way to the viewer.
+    flying: VecDeque<(Flight, Before)>,
     /// The bytes that have come back, ever: what each frame's reading counts from.
     delivered: usize,
     /// When the frame that came back last did, and when it had left; since nothing was on
@@ -148,6 +149,14 @@ pub struct Window {
     acked: Instant,
     sent: Instant,
     round: Round,
+}
+
+/// A frame on its way to the viewer: its number, its bytes, and when it left.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Flight {
+    pub id: FrameId,
+    pub bytes: usize,
+    pub left: Instant,
 }
 
 /// What had come back when a frame left: what its reading counts from.
@@ -237,7 +246,17 @@ impl Window {
 
     /// The bytes that have left and not come back.
     pub fn flying(&self) -> usize {
-        self.flying.iter().map(|&(_, b, _)| b).sum()
+        self.flying.iter().map(|(f, _)| f.bytes).sum()
+    }
+
+    /// How many frames have left and not come back.
+    pub fn frames(&self) -> usize {
+        self.flying.len()
+    }
+
+    /// The oldest frame on its way, while one is: the one the next ack must name.
+    pub fn oldest(&self) -> Option<Flight> {
+        self.flying.front().map(|&(f, _)| f)
     }
 
     /// What a ping leaving now finds ahead of it on the path.
@@ -284,8 +303,8 @@ impl Window {
         self.flying
             .iter()
             .skip(1)
-            .filter(|&&(left, _, _)| now.saturating_duration_since(left) > fastest + LATENESS)
-            .map(|&(_, b, _)| b)
+            .filter(|(f, _)| now.saturating_duration_since(f.left) > fastest + LATENESS)
+            .map(|(f, _)| f.bytes)
             .sum()
     }
 
@@ -308,10 +327,10 @@ impl Window {
     /// What a frame leaving at `now` finds on its way to the viewer, once one whose oldest
     /// frame on its way has been on its way for `stall` is taken to have stalled.
     pub fn way(&self, now: Instant, stall: Duration) -> Way {
-        let Some(&(oldest, _, _)) = self.flying.front() else {
+        let Some((oldest, _)) = self.flying.front() else {
             return Way::Room(self.carries);
         };
-        let stalls = oldest + stall;
+        let stalls = oldest.left + stall;
         match self.room(now) {
             _ if now >= stalls => Way::Stalled,
             Some(room) => Way::Room(room),
@@ -321,13 +340,13 @@ impl Window {
 
     /// When the newest frame on its way left, while one is on its way.
     pub fn newest(&self) -> Option<Instant> {
-        self.flying.back().map(|&(at, _, _)| at)
+        self.flying.back().map(|(f, _)| f.left)
     }
 
-    /// A frame of `bytes` leaves at `now`: the path is busy until what is queued ahead of
-    /// it and itself are through, and it keeps what had come back, to count its reading
-    /// from.
-    pub fn leave(&mut self, now: Instant, bytes: usize) {
+    /// Frame `id`, of `bytes`, leaves at `now`: the path is busy until what is queued ahead
+    /// of it and itself are through, and it keeps what had come back, to count its reading
+    /// from. It is on its way until its own ack.
+    pub fn leave(&mut self, now: Instant, id: FrameId, bytes: usize) -> Flight {
         let queued = self.queued(now);
         let filled = queued + bytes + PACKET > self.carries;
         self.round.sent = match (self.round.sent, filled) {
@@ -346,14 +365,13 @@ impl Window {
             },
         };
         self.busy = now + self.time(queued + bytes);
-        self.flying.push_back((now, bytes, before));
-    }
-
-    /// Whatever was on its way is not coming back: the viewer starts over.
-    pub fn forget(&mut self, now: Instant) {
-        self.flying.clear();
-        self.busy = now;
-        self.round = Round::new(now);
+        let flight = Flight {
+            id,
+            bytes,
+            left: now,
+        };
+        self.flying.push_back((flight, before));
+        flight
     }
 
     /// A ping came back at `now`, `trip` after it left, with `ahead` on its way as it left.
@@ -382,11 +400,11 @@ impl Window {
         };
     }
 
-    /// The oldest frame on its way came back: it was at the viewer at `at` (the ack's
-    /// arrival, less what the viewer says it held it). Once a ping has said how fast the path
-    /// is, it reads the path (see the module's doc).
+    /// The oldest frame on its way came back, if one is on its way: it was at the viewer
+    /// at `at` (the ack's arrival, less what the viewer says it held it). Once a ping has
+    /// said how fast the path is, it reads the path (see the module's doc).
     pub fn came_back(&mut self, at: Instant) {
-        let Some((left, bytes, before)) = self.flying.pop_front() else {
+        let Some((Flight { bytes, left, .. }, before)) = self.flying.pop_front() else {
             return;
         };
         self.delivered += bytes;
@@ -624,6 +642,8 @@ mod tests {
     struct Viewer {
         now: Instant,
         window: Window,
+        /// The count its frames are numbered by.
+        numbers: crate::timeline::Timeline,
         path: Path,
         /// Frames on their way: when the ack of each comes back, and what the viewer says it
         /// held it.
@@ -647,19 +667,19 @@ mod tests {
     impl Viewer {
         /// A viewer connects at `t0` over `path`: the first ping goes first, its pong coming
         /// back `extra` later than the path brings it, then the hello and cursor (`ahead`
-        /// bytes). It says it watches as its socket opens (the hub forgets what is on its
-        /// way), and the capture loop sends it its keyframe at once (and forgets again).
+        /// bytes). It says it watches as its socket opens, and the capture loop sends it its
+        /// keyframe at once.
         fn connect(t0: Instant, mut path: Path, ahead: usize, extra: Duration) -> Viewer {
-            let mut window = Window::new(t0, 0, usize::MAX);
+            let window = Window::new(t0, 0, usize::MAX);
             let through = path.through(t0, PING);
             let pong = path.answer(through, Duration::ZERO) + extra;
             path.through(t0, ahead);
             let watch = t0 + path.trip + path.late();
-            window.forget(watch);
             let rng = Xorshift::new(path.rng.next());
             Viewer {
                 now: watch,
                 window,
+                numbers: crate::timeline::Timeline::new(t0),
                 frames: VecDeque::new(),
                 pongs: VecDeque::from([(pong, t0, Ahead::Nothing)]),
                 ping: t0 + crate::hub::PING_EVERY,
@@ -732,7 +752,7 @@ mod tests {
             };
             let waits = self.path.free.saturating_duration_since(self.now);
             self.worst = self.worst.max(waits);
-            self.window.leave(self.now, bytes);
+            self.window.leave(self.now, self.numbers.number(), bytes);
             let through = self.path.through(self.now, bytes);
             let held = Duration::from_micros(self.rng.below(5_000));
             let ack = self.path.answer(through, held);
@@ -923,6 +943,7 @@ mod tests {
             // Up to what 1 Gbit/s carries in `LATENESS`: the queue's bytes are kept across a
             // move to the byte under 60 MB.
             let mut w = Window::new(t0, 0, MOST);
+            let numbers = crate::timeline::Timeline::new(t0);
             // Frames on their way: when each left, its bytes, and when its ack comes back.
             let mut flying = VecDeque::<(Instant, usize, Instant)>::new();
             let (mut now, mut acks, mut ping) = (t0, t0, t0 + ms(rng.below(2_000)));
@@ -982,7 +1003,7 @@ mod tests {
                     (true, None) => continue,
                     (false, _) => 100 + rng.below(30_000) as usize,
                 };
-                w.leave(now, bytes);
+                w.leave(now, numbers.number(), bytes);
                 acks = acks.max(now + ms(trip + rng.below(jitter)));
                 flying.push_back((now, bytes, acks));
             }

@@ -147,7 +147,7 @@ fn begin(
     }
     let (tx, rx) = mpsc::unbounded_channel();
     let client = r.hub.add_recorder(tx);
-    client.watch(Instant::now());
+    client.watch();
     r.hub.wake();
     let hub = r.hub.clone();
     Ok(tokio::spawn(async move {
