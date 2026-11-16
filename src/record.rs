@@ -10,7 +10,7 @@
 //! CPU and never slows real viewers down. Like the stream, it holds frames only when
 //! the screen changes, and it doesn't include the cursor (viewers draw it locally).
 
-use crate::hub::{Client, Hub, Out};
+use crate::hub::{Client, Hub, Out, ServerMessage};
 use crate::mp4;
 use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
@@ -192,10 +192,8 @@ async fn collect(
                     });
                 }
                 // A capture restart or closed subscription ends this recording.
-                Some(Out::Text(m)) if !frames.is_empty() && {
-                    let t = m.json();
-                    t.contains("\"hello\"") || t.contains("\"close\"")
-                } => break,
+                Some(Out::Text(ServerMessage::Hello(_) | ServerMessage::Close))
+                    if !frames.is_empty() => break,
                 _ => {}
             },
         }
@@ -288,6 +286,82 @@ pub async fn stop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn next(rng: &mut u64) -> u64 {
+        *rng ^= *rng << 13;
+        *rng ^= *rng >> 7;
+        *rng ^= *rng << 17;
+        *rng
+    }
+
+    /// Video frame `id`: a keyframe, its SPS and PPS as mp4.rs's own test writes them.
+    fn video(id: u32) -> Out {
+        let mut m = vec![0x01, 1];
+        m.extend_from_slice(&id.to_be_bytes());
+        m.extend_from_slice(&[0; 10]);
+        m.extend_from_slice(&[
+            0, 0, 0, 1, 0x67, 100, 0, 40, 0xac, 0, 0, 0, 1, 0x68, 0xee, 0, 0, 0, 1, 0x65, 0xaa,
+        ]);
+        Out::Bin(bytes::Bytes::from(m))
+    }
+
+    /// The frames an MP4 holds: its sample count.
+    fn samples(mp4: &[u8]) -> u32 {
+        let stsz = mp4.windows(4).position(|w| w == b"stsz").unwrap();
+        u32::from_be_bytes(mp4[stsz + 12..stsz + 16].try_into().unwrap())
+    }
+
+    /// A recording holds the frames that came before the first hello (a capture restart)
+    /// or close (its subscription ended) after its first frame, whatever else a viewer is
+    /// told, and whatever the desktop's clipboard says.
+    #[tokio::test]
+    async fn a_recording_ends_at_a_restart_or_a_close_and_nothing_else() {
+        const CLIPS: [&str; 7] = [
+            "hello",
+            "close",
+            "\"hello\"",
+            "say \"close",
+            "hello there",
+            "",
+            "x",
+        ];
+        let hub = Hub::new();
+        let (tx, _) = mpsc::unbounded_channel();
+        let client = hub.add_client(tx);
+        let mut rng = 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..2_000 {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let (mut held, mut ended) = (0, false);
+            for id in 0..next(&mut rng) % 12 {
+                let m = match next(&mut rng) % 7 {
+                    0..=2 => video(id as u32),
+                    3 => Out::Text(hub.hello()),
+                    4 => Out::Text(ServerMessage::Close),
+                    5 => Out::Text(ServerMessage::Clip {
+                        d: CLIPS[(next(&mut rng) % CLIPS.len() as u64) as usize].into(),
+                    }),
+                    _ => Out::Text(ServerMessage::Mic {
+                        on: next(&mut rng) & 1 == 1,
+                    }),
+                };
+                match &m {
+                    Out::Bin(_) if !ended => held += 1,
+                    Out::Text(ServerMessage::Hello(_) | ServerMessage::Close) if held > 0 => {
+                        ended = true
+                    }
+                    _ => {}
+                }
+                tx.send(m).unwrap();
+            }
+            drop(tx);
+            let (_keep, stop) = oneshot::channel();
+            let mp4 = collect(&hub, &client, rx, stop, Duration::from_secs(3600)).await;
+            match held {
+                0 => assert!(mp4.is_err()),
+                n => assert_eq!(samples(&mp4.unwrap()), n),
+            }
+        }
+    }
 
     #[test]
     fn record_len_is_positive_and_capped() {
