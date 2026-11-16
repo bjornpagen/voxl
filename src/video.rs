@@ -7242,18 +7242,16 @@ mod tests {
         }
     }
 
-    /// A viewer whose decoder fails asks for a keyframe and gets one. The browser's client,
-    /// on a decoder error, drops every frame it holds and has not acknowledged (it resets
-    /// its decoders and forgets them) and sends `kf`; frames that arrive after are
-    /// acknowledged as they arrive, undecoded, until the keyframe. Acks are cumulative, so a
-    /// later frame's ack covers the dropped ones; but if nothing is sent after them, nothing
-    /// ever covers them. So within two seconds of its `kf` reaching the server, the viewer
-    /// is sent a keyframe. A model of the capture loop's flow one frame time at a time at
-    /// 60 fps: the hub's own clients and gate, each viewer's frames, acks and pongs over a
-    /// path that serves in order, a decode of 1 to 10 ms before each ack; a screen that
-    /// changes at every frame or every 100 ms to 2 s (keystrokes, a clock); the viewer's
-    /// decoder fails on one frame between 5 and 15 s in. Alone, or beside a viewer on
-    /// another path; paths of 1 to 100 Mbit/s and 2 to 300 ms.
+    /// A viewer whose decoder fails asks for a keyframe and gets one: within two seconds of
+    /// its `kf` reaching the server, it is sent a keyframe. The browser's client, on a
+    /// decoder error, sends `kf` and acknowledges the frames that decoder held, which never
+    /// come out of it (web/src/frames.ts); frames that arrive after are acknowledged as they
+    /// arrive, undecoded, until the keyframe. A model of the capture loop's flow one frame
+    /// time at a time at 60 fps: the hub's own clients and gate, each viewer's frames, acks
+    /// and pongs over a path that serves in order, a decode of 1 to 10 ms before each ack; a
+    /// screen that changes at every frame or every 100 ms to 2 s (keystrokes, a clock); the
+    /// viewer's decoder fails on one frame between 5 and 15 s in. Alone, or beside a viewer
+    /// on another path; paths of 1 to 100 Mbit/s and 2 to 300 ms.
     #[test]
     fn a_viewer_whose_decoder_fails_gets_a_keyframe() {
         let mut rng = Xorshift::new(0x2F2E_9A0C_5B17_D3E1);
@@ -7307,13 +7305,15 @@ mod tests {
             let (mut t, mut ping, mut drawn) = (start, start, start);
             while t < start + Duration::from_secs(30) {
                 // The first viewer decodes what it holds; its decoder fails on the first
-                // frame decoded after `fails`, and it drops all it holds.
+                // frame decoded after `fails`, and the frames it held go without it.
                 while let Some(&(f, at)) = holding.front().filter(|h| h.1 <= t) {
                     if failed.is_none() && at >= fails {
                         failed = Some(at);
-                        holding.clear();
                         waits_key = true;
                         push(&mut up[0], at + links[0].rtt / 2, Up::Keyframe);
+                        for (f, _) in holding.drain(..) {
+                            push(&mut up[0], at + links[0].rtt / 2, Up::Ack(f));
+                        }
                         break;
                     }
                     holding.pop_front();

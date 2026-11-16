@@ -7,7 +7,7 @@
 		"fmt:check": "oxfmt --check .",
 		"lint": "oxlint",
 		"typecheck": "tsc -p web && tsc -p web/tsconfig.worker.json && tsc -p web/tsconfig.worklet.json",
-		"test": "node web/src/video-header.test.ts",
+		"test": "node web/src/video-header.test.ts && node web/src/frames.test.ts",
 		"check": "npm run fmt:check && npm run lint && npm run typecheck && npm test"
 	},
 	"devDependencies": {

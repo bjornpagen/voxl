@@ -268,9 +268,8 @@ pub enum Viewer {
     /// Its path stalled beside others' and it was left behind (`falls_behind`): it waits
     /// for a keyframe, but frames are still on their way to it. It is sent nothing, and
     /// wants its keyframe once all of them have come back, so that no keyframe goes into a
-    /// path that is still clogged. A viewer that asks for a keyframe is not left behind: it
-    /// may have dropped the frames on their way (a decoder that failed forgets what it has
-    /// not acknowledged), and then nothing would ever bring them back.
+    /// path that is still clogged. A viewer that asks for a keyframe is not left behind:
+    /// like any viewer that asks, it wants one at once, whatever is on its way (`asked`).
     Behind,
     /// A keyframe has been planned for it: it starts on that keyframe if it comes out
     /// whole, and waits again if it does not. One still `Waiting` is not started by it, as

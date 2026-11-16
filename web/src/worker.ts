@@ -1,6 +1,7 @@
 // Owns the WebSocket, decodes H.264 with WebCodecs and paints straight onto an
 // OffscreenCanvas the moment each frame is decoded (no rAF queueing), or hands the
 // frames to the page when it presents them through <video>.
+import { Frames } from './frames';
 import { Bin, cmd, parseVideoHeader, VIDEO_HEADER_BYTES } from './protocol';
 import type {
 	FromWorker,
@@ -26,43 +27,13 @@ let audioTs = 0;
 let wantVideo = true;
 let wantAudio = false;
 
-// The screen arrives as independent H.264 stripes, one decoder each. A frame is a
-// set of stripe updates sharing an id; frames are presented whole and in order.
-/**
- * Why a stripe decodes or not. It decodes with its decoder; or the server owes it a
- * keyframe, which every viewer that starts watching (after a hello or an open) is sent and
- * which re-keys every stripe; or its decoder broke and it has asked for one, once. Only a
- * broken stripe asks: a keyframe owed is already on its way.
- */
-type Decoding =
-	| { s: 'decoding'; dec: VideoDecoder; codec: string }
-	| { s: 'owed' }
-	| { s: 'broken' };
-interface StripeState {
-	d: Decoding;
-	ts: number;
-	/** Decoder timestamp -> frame id. */
-	ids: Map<number, number>;
-}
-interface PendingFrame {
-	need: number;
-	got: StripeFrame[];
-	t0: number;
-	/** When its last part arrived. */
-	arrived: number;
-}
 let layout: Stripe[] = [];
-const stripes: StripeState[] = [];
-const frames = new Map<number, PendingFrame>();
-/** Frame ids awaiting presentation, oldest first. */
-const order: number[] = [];
 const st = {
 	frames: 0,
 	bytes: 0,
 	decodeMs: 0,
 	pipeMs: 0,
 	lastReport: performance.now(),
-	dropped: 0,
 };
 
 // Firefox throws if getContext('2d') is called twice on one canvas; reuse it.
@@ -100,7 +71,7 @@ function connect() {
 	});
 	sock.addEventListener('close', () => {
 		post({ t: 'status', s: 'closed' });
-		resetDecoder();
+		frames.closed();
 		setTimeout(connect, 1000);
 	});
 	sock.addEventListener('message', (e: MessageEvent<string | ArrayBuffer>) => {
@@ -147,184 +118,91 @@ function onText(s: string) {
 		}
 		ctx = get2dContext(canvas);
 		layout = m.stripes && m.stripes.length ? m.stripes : [[0, m.h]];
-		resetDecoder();
+		frames.hello(layout.length);
 	}
 	post(m);
 }
 
-function resetDecoder() {
-	for (const sd of stripes)
-		if (sd.d.s === 'decoding' && sd.d.dec.state !== 'closed') {
-			try {
-				sd.d.dec.close();
-			} catch {}
-		}
-	stripes.length = 0;
-	for (const f of frames.values()) for (const g of f.got) g.frame.close();
-	frames.clear();
-	order.length = 0;
-}
-
-/**
- * Stripe `i`'s decoder broke: what it was decoding never comes out, so the frames waiting
- * for it go without it, and it asks for a keyframe, once.
- */
-function broke(i: number, why: string) {
-	const sd = stripeState(i);
-	post({ t: 'log', s: `stripe ${i} ${why}` });
-	if (sd.d.s === 'decoding' && sd.d.dec.state !== 'closed') {
-		try {
-			sd.d.dec.close();
-		} catch {}
-	}
-	for (const id of sd.ids.values()) {
-		const f = frames.get(id);
-		if (f) f.need--;
-	}
-	sd.ids.clear();
-	if (sd.d.s !== 'broken') send(cmd.keyframe);
-	sd.d = { s: 'broken' };
-	flush();
-}
-
 const hex2 = (x: number) => x.toString(16).padStart(2, '0');
 
-/** avc1.PPCCLL from the first SPS in an Annex-B keyframe. */
-function codecFromSps(d: Uint8Array): string | null {
-	for (let i = 0; i + 4 < d.length; i++) {
-		if (
-			d[i] === 0 &&
-			d[i + 1] === 0 &&
-			d[i + 2] === 1 &&
-			(d[i + 3] & 0x1f) === 7
-		) {
-			return 'avc1.' + hex2(d[i + 4]) + hex2(d[i + 5]) + hex2(d[i + 6]);
-		}
-	}
-	return null;
-}
-
-function stripeState(i: number): StripeState {
-	return (
-		stripes[i] ||
-		(stripes[i] = {
-			d: { s: 'owed' },
-			ts: 0,
-			ids: new Map(),
-		})
-	);
-}
-
-function makeDecoder(i: number, codec: string): VideoDecoder {
-	const sd = stripeState(i);
-	const dec = new VideoDecoder({
-		output: (frame) => {
-			const id = sd.ids.get(frame.timestamp);
-			sd.ids.delete(frame.timestamp);
-			const f = id === undefined ? undefined : frames.get(id);
-			if (!f) {
-				frame.close();
-				return;
+// The screen arrives as independent H.264 stripes, one decoder each. A frame is a set of
+// stripe updates sharing an id; frames are presented whole and in order.
+const frames = new Frames<VideoDecoder, StripeFrame, Uint8Array>({
+	/** avc1.PPCCLL from the first SPS in an Annex-B keyframe. */
+	codec(key) {
+		for (let i = 0; i + 4 < key.length; i++) {
+			if (
+				key[i] === 0 &&
+				key[i + 1] === 0 &&
+				key[i + 2] === 1 &&
+				(key[i + 3] & 0x1f) === 7
+			) {
+				return 'avc1.' + hex2(key[i + 4]) + hex2(key[i + 5]) + hex2(key[i + 6]);
 			}
-			f.got.push({ i, y: layout[i] ? layout[i][0] : 0, frame });
-			flush();
-		},
-		error: (e) => {
-			// A decoder this stripe has since replaced or let go of breaks nothing.
-			const d = stripeState(i).d;
-			if (d.s === 'decoding' && d.dec === dec)
-				broke(i, `decoder error: ${e.message}`);
-		},
-	});
-	dec.configure({
-		codec,
-		optimizeForLatency: true,
-		hardwareAcceleration: 'no-preference',
-	});
-	return dec;
-}
-
-/** Present every complete frame at the head of the queue. */
-function flush() {
-	while (order.length) {
-		const id = order[0];
-		const f = frames.get(id);
-		if (f && f.got.length < f.need) return;
-		order.shift();
-		frames.delete(id);
-		if (!f) continue;
-		if (f.got.length) {
+		}
+		throw new TypeError('a keyframe without an SPS');
+	},
+	open(i, codec) {
+		// A decoder is opened after the hello that cut the screen it decodes a stripe of.
+		const y = layout[i][0];
+		const dec = new VideoDecoder({
+			output: (frame) => frames.output(i, frame.timestamp, { i, y, frame }),
+			error: (e) => frames.error(dec, e.name, e.message),
+		});
+		dec.configure({
+			codec,
+			optimizeForLatency: true,
+			hardwareAcceleration: 'no-preference',
+		});
+		return dec;
+	},
+	decode(dec, key, frame, data) {
+		dec.decode(
+			new EncodedVideoChunk({
+				type: key ? 'key' : 'delta',
+				timestamp: frame,
+				data,
+			})
+		);
+	},
+	close(dec) {
+		dec.close();
+	},
+	ask() {
+		send(cmd.keyframe);
+	},
+	log(i, why) {
+		post({ t: 'log', s: `stripe ${i}: ${why}` });
+	},
+	letGo(picture) {
+		picture.frame.close();
+	},
+	show(f) {
+		const parts = f.pictures;
+		if (parts.length) {
 			if (presentToMain)
 				post(
-					{ t: 'frames', parts: f.got },
-					f.got.map((g) => g.frame)
+					{ t: 'frames', parts },
+					parts.map((g) => g.frame)
 				);
 			else
-				for (const g of f.got) {
+				for (const g of parts) {
 					if (ctx && !noDraw) ctx.drawImage(g.frame, 0, g.y);
 					g.frame.close();
 				}
 		}
-		send(cmd.ack(id, performance.now() - f.arrived));
+		const now = performance.now();
+		send(cmd.ack(f.id, now - f.last));
 		st.frames++;
-		st.decodeMs += performance.now() - f.t0;
-	}
-}
+		st.decodeMs += now - f.first;
+	},
+});
 
 function onVideo(b: Uint8Array) {
 	const h = parseVideoHeader(b);
-	const data = b.subarray(VIDEO_HEADER_BYTES);
 	st.bytes += b.length;
-	let f = frames.get(h.frame);
-	if (!f) {
-		f = { need: h.parts, got: [], t0: performance.now(), arrived: 0 };
-		frames.set(h.frame, f);
-		order.push(h.frame);
+	if (frames.part(performance.now(), h, b.subarray(VIDEO_HEADER_BYTES)))
 		st.pipeMs += h.pipe / 10;
-	}
-	f.arrived = performance.now();
-	const sd = stripeState(h.stripe);
-	if (h.key) {
-		const codec = codecFromSps(data) || 'avc1.640034';
-		const d = sd.d;
-		if (d.s !== 'decoding' || d.dec.state === 'closed' || codec !== d.codec) {
-			if (d.s === 'decoding' && d.dec.state !== 'closed') {
-				try {
-					d.dec.close();
-				} catch {}
-			}
-			sd.ids.clear();
-			// The keyframe answers whatever this stripe waited for.
-			sd.d = { s: 'owed' };
-			try {
-				sd.d = { s: 'decoding', dec: makeDecoder(h.stripe, codec), codec };
-			} catch (e) {
-				f.need--;
-				broke(h.stripe, 'configure failed ' + e);
-				return;
-			}
-		}
-	}
-	const d = sd.d;
-	if (d.s !== 'decoding') {
-		f.need--;
-		st.dropped++;
-		flush();
-		return;
-	}
-	const ts = ++sd.ts;
-	sd.ids.set(ts, h.frame);
-	try {
-		d.dec.decode(
-			new EncodedVideoChunk({
-				type: h.key ? 'key' : 'delta',
-				timestamp: ts,
-				data,
-			})
-		);
-	} catch (e) {
-		broke(h.stripe, 'decode threw ' + e);
-	}
 }
 
 function onAudio(b: Uint8Array) {
@@ -371,17 +249,16 @@ setInterval(() => {
 	const now = performance.now();
 	const dt = (now - st.lastReport) / 1000;
 	const n = st.frames;
-	const first = stripes[0]?.d;
 	const stats: Stats = {
 		t: 'stats',
 		fps: n / dt,
 		kbps: (st.bytes * 8) / 1000 / dt,
 		decodeMs: n ? st.decodeMs / n : 0,
 		pipeMs: n ? st.pipeMs / n : 0,
-		codec: first?.s === 'decoding' ? first.codec : null,
+		codec: frames.codec,
 		stripes: layout.length,
-		dropped: st.dropped,
-		queue: order.length,
+		dropped: frames.dropped,
+		queue: frames.waiting,
 	};
 	post(stats);
 	st.frames = 0;
