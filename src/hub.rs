@@ -172,11 +172,10 @@ const LONGEST_ROUND_TRIP: Duration = crate::video::STALLED;
 const PINGS_KEPT: usize = (LONGEST_ROUND_TRIP.as_millis() / PING_EVERY.as_millis()) as usize;
 
 /// What names a ping, and what its reply echoes: 64 bits from the operating system's
-/// random source, 16 hex digits on the wire. A ping used to be named by the time it went
-/// out, which a viewer can tell before the ping reaches it (one goes every `PING_EVERY`,
-/// late by the pinger's scheduling), and a burst of replies naming each microsecond
-/// around it found it for a few kilobytes. A token it has not seen it can only guess, one
-/// in 2^64 a reply.
+/// random source, 16 hex digits on the wire. Not the time it went out: a viewer can tell
+/// that before the ping reaches it (one goes every `PING_EVERY`, late by the pinger's
+/// scheduling), and a burst of replies naming each microsecond around it would find it for
+/// a few kilobytes. A token it has not seen it can only guess, one in 2^64 a reply.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Token(u64);
 
@@ -238,7 +237,7 @@ impl Pings {
     /// At `now`, a reply echoing `token`: the round trip of the ping it names, and what
     /// was ahead of it, if that ping is in the record, which it then leaves. A reply echoing
     /// anything else (a ping already answered, one older than the record keeps, a token
-    /// never sent, or a time, as replies used to) is no round trip.
+    /// never sent) is no round trip.
     pub fn answer(&mut self, now: Instant, token: Token) -> Option<(Duration, window::Ahead)> {
         let i = self.0.iter().position(|p| p.token == token)?;
         let ping = self.0.remove(i)?;
@@ -1626,8 +1625,8 @@ mod tests {
     /// A reply is a round trip only if it echoes the token of a ping that was sent and not
     /// yet answered: the latest, or an older one still out. One already answered, one never
     /// sent, and one older than the record keeps are none. A token goes out and comes back
-    /// as 16 hex digits, and a reply in any other shape, a time as replies used to be among
-    /// them, is no token.
+    /// as 16 hex digits, and a reply in any other shape (a decimal time among them) is no
+    /// token.
     #[test]
     fn a_reply_is_a_round_trip_only_to_a_ping_still_out() {
         let ms = Duration::from_millis;
@@ -1678,12 +1677,11 @@ mod tests {
         }
     }
 
-    /// A reply cannot answer a ping before it arrives (wip/red-ping-guess 8808024): what a
-    /// viewer could know of the next ping before having it is when it is due, one
-    /// `PING_EVERY` after the last, and the tokens of the pings it has had. A burst of
-    /// replies naming each microsecond of the millisecond the ping went out in, written as
-    /// replies wrote times and as tokens, and each token within 500 of one it has had, is
-    /// no round trip.
+    /// A reply cannot answer a ping before it arrives: what a viewer could know of the next
+    /// ping before having it is when it is due, one `PING_EVERY` after the last, and the
+    /// tokens of the pings it has had. A burst of replies naming each microsecond of the
+    /// millisecond the ping went out in, written as decimal times and as tokens, and each
+    /// token within 500 of one it has had, is no round trip.
     #[test]
     fn a_reply_cannot_answer_a_ping_before_it_arrives() {
         let us = Duration::from_micros;
@@ -1706,7 +1704,7 @@ mod tests {
         // burst arrives naming everything it could have guessed.
         pings.send(due(3) + late[3], Token::random(), window::Ahead::Nothing);
         let now = due(3) + Duration::from_millis(1);
-        // Each microsecond it could have gone out at, as replies wrote it and as a token.
+        // Each microsecond it could have gone out at, as a decimal time and as a token.
         let times = (0..1000u64).flat_map(|j| {
             let us = (PING_EVERY * 3 + us(j)).as_micros();
             [us.to_string(), format!("{us:016x}")]

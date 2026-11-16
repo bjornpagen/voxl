@@ -1097,8 +1097,8 @@ mod tests {
         };
         let (tx, _rx) = mpsc::unbounded_channel();
         let client = hub.add_client(tx, Instant::now());
-        // No ping was sent to this viewer. It names a moment just past, as replies did when
-        // pings were named by the microsecond they went out, then a token.
+        // No ping was sent to this viewer. It names a moment just past, as a decimal time,
+        // then a token.
         for reply in ["po,9999000", "po,0123456789abcdef"] {
             handle_text(&s, &client, reply);
         }
