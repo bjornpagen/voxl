@@ -16,9 +16,7 @@ every frame. It does not decode. Instead it models what a viewer behind a bottle
   last part arrived on the emulated link.
 - With `--late page` every ack and pong then leaves later still, by a lateness drawn
   (seeded by `--seed`) from the page's own (`link.PAGE_LATE`: median 13.2 ms, p90 18.9,
-  p99 41.8, rarely none), in the order the page gave them. With `--cumulative`, acks that
-  leave together because one waited for the other leave as one, naming the newest frame:
-  the frames before it are covered and never acked by their own id.
+  p99 41.8, rarely none), in the order the page gave them.
 - The ack then takes the other half of the round trip, on the same monotonic clock.
 
 All of it runs on one asyncio loop, so a busy machine only ever makes messages arrive
@@ -51,12 +49,12 @@ The run fails (exit status 1) when:
 Writes OUT.msgs.tsv (each video message: when received, when it arrived on the link,
 frame, key, paint-over, bytes, server pipeline ms, ms it waited behind the queue),
 OUT.acks.tsv (frame, when it arrived, when its ack reached the server, the hold, the
-lateness in ms, and the frame whose ack covered it), OUT.marks.tsv (the scenario's phases),
+lateness in ms), OUT.marks.tsv (the scenario's phases),
 OUT.scroll.tsv (scroll input), OUT.keys.tsv (key messages, when each was due and when it
 was sent) and OUT.stats.json (the /stats it read at the end).
 
 usage: linkviewer.py HOST:PORT SCENARIO OUT [--kbps N] [--rtt MS] [--jitter MS]
-       [--stall EVERY_S,LENGTH_MS] [--late page] [--cumulative] [--hold]
+       [--stall EVERY_S,LENGTH_MS] [--late page] [--hold]
        [--seed N] [--fifo PATH] [--page FILE] [--passive SECS] [--stats URL]
        [--keysym K] [--key-hold S] [--key-repeat MS,MS] [--key-delay MS] [--key-stall MS]
        linkviewer.py --check-header   (the standard library alone; python3 -I runs it)
@@ -214,7 +212,6 @@ async def main():
     ap.add_argument("--jitter", type=float, default=0, help="one-sided jitter after the bottleneck, at most this many ms")
     ap.add_argument("--stall", help="EVERY_S,LENGTH_MS: the link carries nothing for LENGTH_MS every EVERY_S seconds")
     ap.add_argument("--late", choices=["none", "page"], default="none", help="acks and pongs leave late as the page's do")
-    ap.add_argument("--cumulative", action="store_true", help="acks that leave together leave as one, naming the newest")
     ap.add_argument("--hold", action="store_true", help="hold frames as a software decoder would")
     ap.add_argument("--fifo", help="FIFO a terminal on the benchmark display reads commands from")
     ap.add_argument("--page", default="/etc/services", help="file the scenarios print")
@@ -246,20 +243,17 @@ async def main():
     got_key = asyncio.Event()
     msgs = open(f"{a.out}.msgs.tsv", "w")
     msgs.write("t_recv\tt_arrive\tframe\tkey\tpaintover\tbytes\tpipe_ms\twait_ms\n")
+    acks = open(f"{a.out}.acks.tsv", "w")
     marks = open(f"{a.out}.marks.tsv", "w")
     scrolls = open(f"{a.out}.scroll.tsv", "w")
     keys = open(f"{a.out}.keys.tsv", "w")
     keys.write("t_intended\tt_sent\tmsg\n")
-    acked = {}  # frame: [arrived, ack at the server, hold ms, late ms, covered by]
-    last_ack = None  # (frame, when it left the page, its entry in sendq)
     waits = []  # (from the connect, ms behind the queue) of each video message
 
     def schedule(at, msg):
         nonlocal seq
         seq += 1
-        entry = [at, seq, msg]
-        heapq.heappush(sendq, entry)
-        return entry
+        heapq.heappush(sendq, (at, seq, msg))
 
     def term(cmd):
         if a.fifo:
@@ -311,13 +305,10 @@ async def main():
         marks.write(f"connect\t{connected:.4f}\n")
 
         async def sender():
-            # Sends each scheduled message once its time has come (at most 2 ms late); an
-            # ack another one covered (its message gone) is not sent.
+            # Sends each scheduled message once its time has come (at most 2 ms late).
             while True:
                 if sendq and sendq[0][0] <= clock():
                     at, _, msg = heapq.heappop(sendq)
-                    if msg is None:
-                        continue
                     await ws.send(msg)
                     if msg.startswith("k,"):
                         keys.write(f"{at:.4f}\t{clock():.4f}\t{msg}\n")
@@ -326,7 +317,6 @@ async def main():
                 await asyncio.sleep(min(max(wait, 0), 0.002))
 
         async def receiver():
-            nonlocal last_ack
             async for m in ws:
                 if isinstance(m, str):
                     j = json.loads(m)
@@ -352,14 +342,9 @@ async def main():
                 # The frame's last part is in: hold it for decode and draw, then ack.
                 del frames[fid]
                 hold = 0.002 + f["bytes"] / 1e7 + rng.uniform(0, 0.008) if a.hold else 0.003
-                leaves, ack_at, held_back = up.send(at + hold)
-                entry = schedule(ack_at, f"a,{fid},{hold * 1000:.1f}")
-                acked[fid] = [at, ack_at, hold * 1000, (leaves - at - hold) * 1000, ""]
-                if a.cumulative and held_back and last_ack and last_ack[1] == leaves and last_ack[2][2]:
-                    # It left with the ack before it: one ack, naming the newest, covers both.
-                    last_ack[2][2] = None
-                    acked[last_ack[0]][4] = fid
-                last_ack = (fid, leaves, entry)
+                leaves, ack_at = up.send(at + hold)
+                acks.write(f"{fid}\t{at:.4f}\t{ack_at:.4f}\t{hold * 1000:.1f}\t{(leaves - at - hold) * 1000:.1f}\n")
+                schedule(ack_at, f"a,{fid},{hold * 1000:.1f}")
 
         async def watch():
             """The scenario, then the /stats read that ends it, while the viewer is still
@@ -392,10 +377,7 @@ async def main():
             t.cancel()
         first = watching if watching in done else done.pop()
         stopped = clock()
-    with open(f"{a.out}.acks.tsv", "w") as f:
-        for fid, (arrived, ack_at, hold, late, covered_by) in acked.items():
-            f.write(f"{fid}\t{arrived:.4f}\t{ack_at:.4f}\t{hold:.1f}\t{late:.1f}\t{covered_by}\n")
-    for f in (msgs, marks, scrolls, keys):
+    for f in (msgs, acks, marks, scrolls, keys):
         f.close()
     if first is not watching or first.exception():
         why = first.exception() or "the server closed the connection"

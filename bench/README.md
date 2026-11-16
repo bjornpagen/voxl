@@ -36,9 +36,8 @@ is its log. CBR from 30 Mbps, with congestion control down to 2 Mbps.
   crossed the link, after a decode hold (3 ms, or a software decoder's with `--hold`,
   carried in the ack as the page's is), and can scroll and type into a terminal on
   the benchmark display (`--fifo`). With `--late page` its acks and pongs leave late as
-  a real page's do (`link.PAGE_LATE`, seeded by `--seed`), `--cumulative` lets acks that
-  leave together name only the newest frame, `--stall EVERY_S,LENGTH_MS` stops the link
-  periodically and `--jitter MS` jitters its arrivals. The `cold` scenario is a first
+  a real page's do (`link.PAGE_LATE`, seeded by `--seed`), `--stall EVERY_S,LENGTH_MS`
+  stops the link periodically and `--jitter MS` jitters its arrivals. The `cold` scenario is a first
   load: the terminal is filled with dense text before the viewer connects, and it is
   measured from the connect. At the end it reads from `/stats` the viewer's lowest
   `carries` since it connected and the window's `LATENESS`, `START` and `FALL`, and the

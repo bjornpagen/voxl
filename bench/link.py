@@ -129,13 +129,12 @@ class Up:
         self.leaving = 0.0  # when the last answer left the page
 
     def send(self, now):
-        """`(leaves, arrival, held_back)` of an answer the page gives at `now`: when it
-        leaves the page, when it reaches the server, and whether it left with the answer
-        before it (its own lateness ended first, and it waited for that one)."""
+        """`(leaves, arrival)` of an answer the page gives at `now`: when it leaves the
+        page (at its own lateness, or with the answer before it if that one is later
+        still), and when it reaches the server."""
         late = self.late(self.rng) if self.late else 0.0
-        held_back = now + late < self.leaving
         self.leaving = max(now + late, self.leaving)
-        return self.leaving, self.stalls.resume(self.leaving) + self.owd, held_back
+        return self.leaving, self.stalls.resume(self.leaving) + self.owd
 
 
 def _check(seed=0x5EED):
@@ -202,19 +201,19 @@ def _check(seed=0x5EED):
         if abs(share - p) > 4 * (p * (1 - p) / n) ** 0.5 + 1 / n:
             sys.exit(f"{share:.4f} of draws fall below {ms} ms, the table says {p}")
     # Answers: each leaves at its own lateness or with the one before it, whichever is
-    # later; `held_back` says which. The oracle draws the same lateness from a twin stream.
+    # later. The oracle draws the same lateness from a twin stream.
     twin = random.Random(seed)
     up = Up(0.055, Stalls(1.0, 0.25), page_late, random.Random(seed))
     now, before, held = 0.0, 0.0, 0
     for _ in range(20_000):
         now += rng.expovariate(1 / 0.01)
         own = now + page_late(twin)
-        leaves, arrival, held_back = up.send(now)
-        if leaves != max(own, before) or held_back != (own < before):
-            sys.exit(f"an answer due at {own:.6f} after one at {before:.6f} leaves at {leaves:.6f}, held back {held_back}")
+        leaves, arrival = up.send(now)
+        if leaves != max(own, before):
+            sys.exit(f"an answer due at {own:.6f} after one at {before:.6f} leaves at {leaves:.6f}")
         if arrival < leaves + up.owd:
             sys.exit(f"an answer leaving at {leaves:.6f} arrives at {arrival:.6f}")
-        before, held = leaves, held + held_back
+        before, held = leaves, held + (own < before)
     if not 0 < held < 20_000:
         sys.exit(f"{held} of 20,000 answers held back: the check never saw both sides")
     print(f"link: 300 queues as a tick-by-tick oracle serves them; PAGE_LATE's {len(PAGE_LATE) - 2} inner"
