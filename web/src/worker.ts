@@ -117,7 +117,7 @@ function onText(s: string) {
 			canvas.height = m.h;
 		}
 		ctx = get2dContext(canvas);
-		layout = m.stripes && m.stripes.length ? m.stripes : [[0, m.h]];
+		layout = m.stripes;
 		frames.hello(layout.length);
 	}
 	post(m);

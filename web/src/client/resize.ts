@@ -1,9 +1,9 @@
 // Dynamic resolution: ask the server for a desktop that matches this window, so it
 // is shown 1:1 instead of being scaled down. Asked once a connection, at its first
 // hello, and, debounced, when the window changes size (sidebar drags, fullscreen,
-// rotating a tablet); never again at a later hello. A hello follows every resize, so
-// a page that asked at each one kept two pages of different sizes moving the desktop
-// back and forth, and kept asking for a size the server could not give.
+// rotating a tablet); never again at a later hello. A hello follows every resize:
+// asking at each would move the desktop between two pages' sizes for as long as both
+// are open, and ask again after every refusal for a size the server cannot give.
 import { cmd } from '../protocol';
 import type { App } from './app';
 

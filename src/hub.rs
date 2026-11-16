@@ -139,26 +139,20 @@ pub struct Display {
 }
 
 /// How long a client says it kept a frame between its arrival and the ack (decode,
-/// draw, frames ahead of it), as the ack's optional last field.
+/// draw, frames ahead of it), as the ack's last field.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Hold {
-    /// An older client, or the recorder: its delay samples include its own time.
-    Unsaid,
-    Said(Duration),
-    /// The field isn't a time (not a number, negative, more than a Duration holds):
-    /// the frame is acknowledged and says nothing about the path.
-    Unreadable,
-}
+pub struct Hold(pub Duration);
 
 impl Hold {
-    /// From the ack's hold field, in milliseconds. An ack without one is `Unsaid`.
-    pub fn parse(field: &str) -> Hold {
+    /// From the ack's hold field, in milliseconds: a time, or no hold (not a number,
+    /// negative, more than a Duration holds), and then the ack is no command.
+    pub fn parse(field: &str) -> Option<Hold> {
         field
             .trim()
             .parse::<f64>()
             .ok()
             .and_then(|ms| Duration::try_from_secs_f64(ms / 1000.0).ok())
-            .map_or(Hold::Unreadable, Hold::Said)
+            .map(Hold)
     }
 }
 
@@ -178,11 +172,10 @@ const LONGEST_ROUND_TRIP: Duration = crate::video::STALLED;
 const PINGS_KEPT: usize = (LONGEST_ROUND_TRIP.as_millis() / PING_EVERY.as_millis()) as usize;
 
 /// What names a ping, and what its reply echoes: 64 bits from the operating system's
-/// random source, 16 hex digits on the wire. A ping used to be named by the time it went
-/// out, which a viewer can tell before the ping reaches it (one goes every `PING_EVERY`,
-/// late by the pinger's scheduling), and a burst of replies naming each microsecond
-/// around it found it for a few kilobytes. A token it has not seen it can only guess, one
-/// in 2^64 a reply.
+/// random source, 16 hex digits on the wire. Not the time it went out: a viewer can tell
+/// that before the ping reaches it (one goes every `PING_EVERY`, late by the pinger's
+/// scheduling), and a burst of replies naming each microsecond around it would find it for
+/// a few kilobytes. A token it has not seen it can only guess, one in 2^64 a reply.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Token(u64);
 
@@ -244,7 +237,7 @@ impl Pings {
     /// At `now`, a reply echoing `token`: the round trip of the ping it names, and what
     /// was ahead of it, if that ping is in the record, which it then leaves. A reply echoing
     /// anything else (a ping already answered, one older than the record keeps, a token
-    /// never sent, or a time, as replies used to) is no round trip.
+    /// never sent) is no round trip.
     pub fn answer(&mut self, now: Instant, token: Token) -> Option<(Duration, window::Ahead)> {
         let i = self.0.iter().position(|p| p.token == token)?;
         let ping = self.0.remove(i)?;
@@ -377,21 +370,11 @@ pub struct Client {
     /// Its last frames as they were sent and acked (`/stats/trace`), kept a while once it
     /// has left.
     pub trace: Arc<Mutex<crate::timeline::Trace>>,
-    /// The desktop size it last asked for (`sz`, as asked), if it has asked.
-    asked: Mutex<Option<(u32, u32)>>,
 }
 
 impl Client {
     pub fn send(&self, m: Out) {
         let _ = self.tx.send(m);
-    }
-
-    /// It asks for the desktop to be `size`: whether that is a new ask. Asking again for the
-    /// size it last asked for asks nothing, so a page that repeats its size on every hello
-    /// (as the web client did before it asked only on connect and when its window changes)
-    /// cannot move the screen back and forth by repeating it.
-    pub fn asks_for(&self, size: (u32, u32)) -> bool {
-        self.asked.lock().replace(size) != Some(size)
     }
 
     /// What its window says, as one read sees it.
@@ -525,8 +508,8 @@ impl Client {
     /// sent, once and in order (web/src/frames.ts), so an ack names the oldest frame on its
     /// way, which comes back to the window and the trace: when the client had it, as what
     /// the client says it held of the trip is its own time, not the path's. A hold that
-    /// cannot be true (unreadable, or longer than the frame's own trip) leaves it arrived at
-    /// `now`: later, so what the window reads of the path can only be lower. An ack that
+    /// cannot be true (longer than the frame's own trip) leaves it arrived at `now`: later,
+    /// so what the window reads of the path can only be lower. An ack that
     /// names any other frame, or comes with nothing on its way, is from a client that is not
     /// the page: `Broken`, and nothing is taken out. One left behind wants its keyframe once
     /// the last of what is on its way is back.
@@ -545,11 +528,10 @@ impl Client {
         let Some(oldest) = window.oldest().filter(|f| f.id.get() == id) else {
             return Acked::Broken;
         };
-        let (at, said) = match hold {
-            Hold::Said(held) if held <= now.saturating_duration_since(oldest.left) => {
-                (now - held, Some(held))
-            }
-            Hold::Unsaid | Hold::Said(_) | Hold::Unreadable => (now, None),
+        let Hold(held) = hold;
+        let (at, said) = match held <= now.saturating_duration_since(oldest.left) {
+            true => (now - held, Some(held)),
+            false => (now, None),
         };
         window.came_back(at);
         self.trace.lock().acked(now, hold);
@@ -819,8 +801,8 @@ pub struct Hub {
     pub waker: Wake,
     pub input: Mutex<Option<std::sync::mpsc::Sender<crate::event::InputEvent>>>,
     pub last_clipboard: Mutex<Option<String>>,
-    /// The newest new ask for a desktop size (dynamic resolution), until the capture loop
-    /// takes it and gives it to the screen.
+    /// The newest ask for a desktop size (dynamic resolution), until the capture loop takes
+    /// it and gives it to the screen.
     pub resize_req: Mutex<Option<(u32, u32)>>,
     /// Largest desktop size (Some when dynamic resolution is on).
     pub resize_max: Mutex<Option<(u32, u32)>>,
@@ -901,7 +883,6 @@ impl Hub {
             audio: AtomicBool::new(false),
             pings: Mutex::new(Pings::default()),
             trace: Arc::new(Mutex::new(crate::timeline::Trace::with_room())),
-            asked: Mutex::new(None),
         });
         self.clients.lock().push(c.clone());
         c
@@ -1294,7 +1275,8 @@ mod tests {
             Step::Ack(i) => {
                 let oldest = c[i].window(|w| w.oldest().map(|f| f.id.get()));
                 if let Some(id) = oldest {
-                    let acked = c[i].on_ack(t0 + Duration::from_millis(50), id, Hold::Unsaid);
+                    let acked =
+                        c[i].on_ack(t0 + Duration::from_millis(50), id, Hold(Duration::ZERO));
                     assert_eq!(acked, Acked::Oldest, "{step:?}");
                 }
             }
@@ -1550,9 +1532,9 @@ mod tests {
             let hub = Hub::new(Paths::ANY);
             let frames = run(&hub, seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
             let end = frames.last().unwrap().acks + Duration::from_secs(1);
-            let says = acked(&hub, &frames, |f| f.acks, |f| Hold::Said(f.held()));
-            let twin = acked(&hub, &frames, |f| f.arrives, |_| Hold::Unsaid);
-            let silent = acked(&hub, &frames, |f| f.acks, |_| Hold::Unsaid);
+            let says = acked(&hub, &frames, |f| f.acks, |f| Hold(f.held()));
+            let twin = acked(&hub, &frames, |f| f.arrives, |_| Hold(Duration::ZERO));
+            let silent = acked(&hub, &frames, |f| f.acks, |_| Hold(Duration::ZERO));
             assert_eq!(said(&says, end), said(&twin, end), "seed {seed}");
             otherwise += u32::from(said(&silent, end) != said(&twin, end));
         }
@@ -1569,7 +1551,7 @@ mod tests {
             let hub = Hub::new(Paths::ANY);
             let frames = run(&hub, seed.wrapping_mul(0x2545_F491_4F6C_DD1D));
             let end = frames.last().unwrap().acks + Duration::from_secs(1);
-            let c = acked(&hub, &frames, |f| f.acks, |f| Hold::Said(f.held()));
+            let c = acked(&hub, &frames, |f| f.acks, |f| Hold(f.held()));
             let mut w = Window::new(frames[0].at, 0, usize::MAX);
             w.pinged(frames[0].at, PING_TRIP, window::Ahead::Nothing);
             let mut acks = frames.iter().peekable();
@@ -1587,61 +1569,64 @@ mod tests {
         }
     }
 
-    /// The hold is whatever a client sends. A field that isn't a time parses to
-    /// `Unreadable`, whatever it is; and an ack whose hold is unreadable, or longer than
-    /// the trip it is part of, is read as one that says none: the window reads it as a
-    /// twin's that says nothing, and the client's hold is the twin's. Over 50 generated
-    /// runs, each lie in place of every other frame's hold.
+    /// The hold is whatever a client sends. A field that isn't a time is no hold, whatever
+    /// it is (and its ack no command); and an ack whose hold is longer than the trip it is
+    /// part of says nothing of the client's time: the window reads it as a twin's that
+    /// acked it then holding it for no time, and the client's hold is that of a twin sent
+    /// only the frames whose holds are true. Over 50 generated runs, the lie in place of
+    /// every other frame's hold.
     #[test]
     fn a_hold_that_cannot_be_true_says_nothing() {
         let unreadable = [
             "", "x", "NaN", "inf", "-inf", "-1", "-0.001", "1e30", "1e400",
         ];
         for field in unreadable {
-            assert_eq!(Hold::parse(field), Hold::Unreadable, "{field:?}");
+            assert_eq!(Hold::parse(field), None, "{field:?}");
         }
-        assert_eq!(Hold::parse(" 3.5"), Hold::Said(Duration::from_micros(3500)));
+        assert_eq!(Hold::parse(" 3.5"), Some(Hold(Duration::from_micros(3500))));
 
-        let lies: [fn(&Sent) -> Hold; 2] = [
-            |_| Hold::Unreadable,
-            |f| Hold::Said(f.acks - f.at + Duration::from_nanos(1)),
-        ];
+        let lie = |f: &Sent| Hold(f.acks - f.at + Duration::from_nanos(1));
         for seed in 1..=50u64 {
-            for lie in lies {
-                let hub = Hub::new(Paths::ANY);
-                let frames = run(&hub, seed.wrapping_mul(0xD1B5_4A32_D192_ED03));
-                let end = frames.last().unwrap().acks + Duration::from_secs(1);
-                let truth = |f: &Sent| Hold::Said(f.held());
-                let c = acked(
-                    &hub,
-                    &frames,
-                    |f| f.acks,
-                    |f| match f.id.get() % 2 {
-                        0 => lie(f),
-                        _ => truth(f),
-                    },
-                );
-                let twin = acked(
-                    &hub,
-                    &frames,
-                    |f| f.acks,
-                    |f| match f.id.get() % 2 {
-                        0 => Hold::Unsaid,
-                        _ => truth(f),
-                    },
-                );
-                assert_eq!(said(&c, end), said(&twin, end), "seed {seed}");
-                let client_ms = |c: &Client| c.stats(end).client_ms;
-                assert_eq!(client_ms(&c), client_ms(&twin), "seed {seed}");
-            }
+            let hub = Hub::new(Paths::ANY);
+            let frames = run(&hub, seed.wrapping_mul(0xD1B5_4A32_D192_ED03));
+            let end = frames.last().unwrap().acks + Duration::from_secs(1);
+            let truth = |f: &Sent| Hold(f.held());
+            let c = acked(
+                &hub,
+                &frames,
+                |f| f.acks,
+                |f| match f.id.get() % 2 {
+                    0 => lie(f),
+                    _ => truth(f),
+                },
+            );
+            let twin = acked(
+                &hub,
+                &frames,
+                |f| f.acks,
+                |f| match f.id.get() % 2 {
+                    0 => Hold(Duration::ZERO),
+                    _ => truth(f),
+                },
+            );
+            // Sent the truthful frames alone, and acking each with its true hold.
+            let truthful: Vec<Sent> = frames
+                .iter()
+                .filter(|f| f.id.get() % 2 == 1)
+                .copied()
+                .collect();
+            let told = acked(&hub, &truthful, |f| f.acks, truth);
+            assert_eq!(said(&c, end), said(&twin, end), "seed {seed}");
+            let client_ms = |c: &Client| c.stats(end).client_ms;
+            assert_eq!(client_ms(&c), client_ms(&told), "seed {seed}");
         }
     }
 
     /// A reply is a round trip only if it echoes the token of a ping that was sent and not
     /// yet answered: the latest, or an older one still out. One already answered, one never
     /// sent, and one older than the record keeps are none. A token goes out and comes back
-    /// as 16 hex digits, and a reply in any other shape, a time as replies used to be among
-    /// them, is no token.
+    /// as 16 hex digits, and a reply in any other shape (a decimal time among them) is no
+    /// token.
     #[test]
     fn a_reply_is_a_round_trip_only_to_a_ping_still_out() {
         let ms = Duration::from_millis;
@@ -1692,12 +1677,11 @@ mod tests {
         }
     }
 
-    /// A reply cannot answer a ping before it arrives: what a
-    /// viewer could know of the next ping before having it is when it is due, one
-    /// `PING_EVERY` after the last, and the tokens of the pings it has had. A burst of
-    /// replies naming each microsecond of the millisecond the ping went out in, written as
-    /// replies wrote times and as tokens, and each token within 500 of one it has had, is
-    /// no round trip.
+    /// A reply cannot answer a ping before it arrives: what a viewer could know of the next
+    /// ping before having it is when it is due, one `PING_EVERY` after the last, and the
+    /// tokens of the pings it has had. A burst of replies naming each microsecond of the
+    /// millisecond the ping went out in, written as decimal times and as tokens, and each
+    /// token within 500 of one it has had, is no round trip.
     #[test]
     fn a_reply_cannot_answer_a_ping_before_it_arrives() {
         let us = Duration::from_micros;
@@ -1720,7 +1704,7 @@ mod tests {
         // burst arrives naming everything it could have guessed.
         pings.send(due(3) + late[3], Token::random(), window::Ahead::Nothing);
         let now = due(3) + Duration::from_millis(1);
-        // Each microsecond it could have gone out at, as replies wrote it and as a token.
+        // Each microsecond it could have gone out at, as a decimal time and as a token.
         let times = (0..1000u64).flat_map(|j| {
             let us = (PING_EVERY * 3 + us(j)).as_micros();
             [us.to_string(), format!("{us:016x}")]
@@ -2005,7 +1989,7 @@ mod tests {
                                 (Some(k), numbered[k])
                             }
                         };
-                        let took = c[i].on_ack(now, id, Hold::Unsaid);
+                        let took = c[i].on_ack(now, id, Hold(Duration::ZERO));
                         let front = model[i].front().copied();
                         match (named.is_some() && named == front, front) {
                             (true, _) => {
@@ -2082,7 +2066,7 @@ mod tests {
             for _ in 0..3000 {
                 t += Duration::from_millis(1 + rng.below(20));
                 while let Some(&(at, id)) = acks.front().filter(|a| a.0 <= t) {
-                    c.on_ack(at, id, Hold::Unsaid);
+                    c.on_ack(at, id, Hold(Duration::ZERO));
                     acks.pop_front();
                 }
                 match rng.below(50) {

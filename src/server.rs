@@ -551,7 +551,7 @@ fn send_input(hub: &Hub, client: &Client, event: InputEvent) {
 
 /// A text command from a viewer (web/src/protocol.ts), parsed once where it arrives.
 enum Command {
-    /// `a,<frame>[,<hold ms>]`
+    /// `a,<frame>,<hold ms>`
     Ack { frame: u32, hold: crate::hub::Hold },
     /// `m,<x>,<y>`: a desktop pixel, from the top left. X's coordinates are 16-bit (XTest
     /// takes them as they are); macOS's CGFloat and Windows's LONG hold every one.
@@ -607,13 +607,9 @@ impl Command {
             _ => None,
         };
         Some(match (name, fields.as_slice()) {
-            ("a", [frame]) => Command::Ack {
-                frame: num(frame)?,
-                hold: crate::hub::Hold::Unsaid,
-            },
             ("a", [frame, hold]) => Command::Ack {
                 frame: num(frame)?,
-                hold: crate::hub::Hold::parse(hold),
+                hold: crate::hub::Hold::parse(hold)?,
             },
             ("m", [x, y]) => Command::Move {
                 x: num(x)?,
@@ -743,8 +739,8 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str) -> Flow {
                 });
             }
         }
-        // The desktop size this client's window wants (dynamic resolution). The newest new
-        // ask wins: it is the request until a newer one, and no ask clears another, so the
+        // The desktop size this client's window wants (dynamic resolution). The newest ask
+        // wins: it is the request until a newer one, and no ask clears another, so the
         // screen ends at the size asked last whatever the capture loop was doing. The
         // capture loop gives it to the screen, which fits it to a size it can take (each
         // platform has its own rule) and changes nothing if it has that size already.
@@ -758,7 +754,7 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str) -> Flow {
             if input.is_none() || c.id < s.hub.input_floor.load(Ordering::Relaxed) {
                 return Flow::Go;
             }
-            if s.hub.resize_max.lock().is_some() && c.asks_for((w, h)) {
+            if s.hub.resize_max.lock().is_some() {
                 *s.hub.resize_req.lock() = Some((w, h));
                 s.hub.wake();
             }
@@ -786,7 +782,6 @@ mod tests {
 
     /// Every command the web client sends (web/src/protocol.ts), with arguments.
     const ALL: &[&str] = &[
-        "a,1",
         "a,2,3.5",
         "m,10,20",
         "b,1,1",
@@ -884,11 +879,10 @@ mod tests {
         }
     }
 
-    /// A page: as the web client is now (`resize.ts` asks on connect and when its window
-    /// changes), or a tab still running the client from before (it also asks on every
-    /// hello); its connection, if it has one, what it asked on it, and its window.
+    /// A page, as the web client is (`resize.ts`: it asks once a connection, and when its
+    /// window changes to a size it has not asked for on it); its connection, if it has one,
+    /// what it asked on it, and its window.
     struct Page {
-        asks_on_hello: bool,
         client: Option<Arc<crate::hub::Client>>,
         asked: Option<(u32, u32)>,
         window: (u32, u32),
@@ -901,10 +895,8 @@ mod tests {
         screen: Screen,
         pages: Vec<Page>,
         rebuilds: usize,
-        /// The newest ask that changed what its connection asks for: the oracle's rule.
+        /// The newest ask: the oracle's rule.
         newest: Option<(u32, u32)>,
-        /// Asks that repeated what their connection last asked for.
-        repeats: usize,
     }
 
     impl Desk {
@@ -912,17 +904,14 @@ mod tests {
         fn ask(&mut self, i: usize) {
             let p = &mut self.pages[i];
             let c = p.client.clone().expect("only a connected page asks");
-            match p.asked == Some(p.window) {
-                true => self.repeats += 1,
-                false => self.newest = Some(p.window),
-            }
+            self.newest = Some(p.window);
             p.asked = Some(p.window);
             let sz = format!("sz,{},{}", p.window.0, p.window.1);
             handle_text(&self.s, &c, &sz);
         }
 
-        /// The capture loop's turn: it takes the request, gives it to the screen, and if
-        /// the stream is rebuilt, every page is said hello.
+        /// The capture loop's turn: it takes the request and gives it to the screen. A
+        /// rebuild says hello to every page, and a hello brings no ask.
         fn capture(&mut self) {
             let hub = self.s.hub.clone();
             let Some(want) = hub.resize_req.lock().take() else {
@@ -936,32 +925,27 @@ mod tests {
                 self.rebuilds += 1;
                 hub.width.store(self.screen.size.0, Ordering::Relaxed);
                 hub.height.store(self.screen.size.1, Ordering::Relaxed);
-                for i in 0..self.pages.len() {
-                    if self.pages[i].asks_on_hello && self.pages[i].client.is_some() {
-                        self.ask(i);
-                    }
-                }
             }
         }
     }
 
     /// Dynamic resolution takes the screen to the size asked last and rests there. Over 500
-    /// generated runs of 1 to 4 pages (each new or old, as `Page` says) connecting, leaving
-    /// and changing their windows among 5 sizes, 40 events each, with the screen refusing
-    /// each size in one run of four and the capture loop taking the request at generated
-    /// moments between the events (each rebuild saying hello to every page):
+    /// generated runs of 1 to 4 pages (as `Page` says) connecting, leaving and changing
+    /// their windows among 5 sizes, 40 events each, with the screen refusing each size in
+    /// one run of four and the capture loop taking the request at generated moments between
+    /// the events:
     /// - the stream is rebuilt exactly as often as the screen's size really changed: a
     ///   refused ask, or one for the size it has, rebuilds nothing;
     /// - after the last connect or window change the capture loop rebuilds at most once,
-    ///   and then never again: a hello brings no new ask, an old page's included;
-    /// - the screen then has the size of the newest ask that changed what its connection
-    ///   asks for, unless it refuses that size: no page's ask clears another's.
+    ///   and then never again;
+    /// - the screen then has the size of the newest ask, unless it refuses that size: no
+    ///   page's ask clears another's.
     ///
-    /// Each clause is counted over the runs (refused asks, asks already met, repeated asks,
-    /// rests reached with one rebuild and with none, newest asks met and refused, and real
-    /// changes of the screen's size), so none holds unreached. The screen is the test's own,
-    /// fit and all: the server gives it the size as asked, so the property is the same on
-    /// every platform, whatever its screen's rule for fitting a size.
+    /// Each clause is counted over the runs (refused asks, asks already met, rests reached
+    /// with one rebuild and with none, newest asks met and refused, and real changes of the
+    /// screen's size), so none holds unreached. The screen is the test's own, fit and all:
+    /// the server gives it the size as asked, so the property is the same on every
+    /// platform, whatever its screen's rule for fitting a size.
     #[test]
     fn resizing_rebuilds_once_per_size_granted_and_rests_after_the_last_ask() {
         let sizes = [
@@ -973,9 +957,9 @@ mod tests {
         ];
         let max = (3024, 1898);
         let mut rng = crate::xorshift::Xorshift::new(0x9E37_79B9_7F4A_7C15);
-        // refused, met, repeated, rested after one rebuild, after none, newest met, newest
-        // refused, real changes of the screen's size
-        let mut reach = [0usize; 8];
+        // refused, met, rested after one rebuild, after none, newest met, newest refused,
+        // real changes of the screen's size
+        let mut reach = [0usize; 7];
         for run in 0..500 {
             let hub = Hub::new(crate::hub::Paths::ANY);
             hub.width.store(max.0, Ordering::Relaxed);
@@ -1000,7 +984,6 @@ mod tests {
                 },
                 pages: (0..rng.range(1, 5))
                     .map(|_| Page {
-                        asks_on_hello: rng.below(2) == 0,
                         client: None,
                         asked: None,
                         window: sizes[rng.below(5) as usize],
@@ -1008,12 +991,11 @@ mod tests {
                     .collect(),
                 rebuilds: 0,
                 newest: None,
-                repeats: 0,
             };
             for _ in 0..40 {
                 let i = rng.below(d.pages.len() as u64) as usize;
                 match (rng.below(4), d.pages[i].client.clone()) {
-                    // It connects: it is said hello, and asks once, new or old.
+                    // It connects: it is said hello, and asks once.
                     (0, None) => {
                         let (tx, _rx) = mpsc::unbounded_channel();
                         d.pages[i].client = Some(hub.add_client(tx, Instant::now()));
@@ -1025,10 +1007,12 @@ mod tests {
                         hub.remove_client(c.id, Instant::now());
                         d.pages[i].client = None;
                     }
-                    // Its window changes, and it asks if it is connected.
+                    // Its window changes, and it asks if it is connected and has not asked for
+                    // that size on this connection.
                     (1, client) => {
-                        d.pages[i].window = sizes[rng.below(5) as usize];
-                        if client.is_some() {
+                        let p = &mut d.pages[i];
+                        p.window = sizes[rng.below(5) as usize];
+                        if client.is_some() && p.asked != Some(p.window) {
                             d.ask(i);
                         }
                     }
@@ -1051,18 +1035,17 @@ mod tests {
                 "run {run}: rebuilds against the screen's real changes"
             );
             match d.newest {
-                Some(n) if d.screen.refuses.contains(&n) => reach[6] += 1,
+                Some(n) if d.screen.refuses.contains(&n) => reach[5] += 1,
                 Some(n) => {
                     assert_eq!(d.screen.size, n, "run {run}: the newest ask was lost");
-                    reach[5] += 1;
+                    reach[4] += 1;
                 }
                 None => {}
             }
             reach[0] += d.screen.refused;
             reach[1] += d.screen.met;
-            reach[2] += d.repeats;
-            reach[7] += d.screen.changes;
-            reach[3 + usize::from(after == 0)] += 1;
+            reach[2 + usize::from(after == 0)] += 1;
+            reach[6] += d.screen.changes;
         }
         assert!(reach.iter().all(|&n| n > 0), "unreached: {reach:?}");
     }
@@ -1114,8 +1097,8 @@ mod tests {
         };
         let (tx, _rx) = mpsc::unbounded_channel();
         let client = hub.add_client(tx, Instant::now());
-        // No ping was sent to this viewer. It names a moment just past, as replies did when
-        // pings were named by the microsecond they went out, then a token.
+        // No ping was sent to this viewer. It names a moment just past, as a decimal time,
+        // then a token.
         for reply in ["po,9999000", "po,0123456789abcdef"] {
             handle_text(&s, &client, reply);
         }
@@ -1258,19 +1241,18 @@ mod tests {
             );
         }
         for c in [
-            "v,2", "v", "a", "a,x", "k,65", "k,65,3", "b,1,7", "sp,1", "po,-1", "zz,1",
+            "v,2", "v", "a", "a,x", "a,1", "a,1,x", "a,1,-1", "a,1,NaN", "k,65", "k,65,3", "b,1,7",
+            "sp,1", "po,-1", "zz,1",
         ] {
             assert!(Command::parse(c).is_none(), "{c} parsed");
         }
     }
 
-    /// How many fields each command has, written apart from `parse`: an ack's hold is the
-    /// one field that may be left out. A clipboard is not here: its one field is the rest
-    /// of the line, commas and all.
+    /// How many fields each command has, written apart from `parse`. A clipboard is not
+    /// here: its one field is the rest of the line, commas and all.
     fn fields_of(name: &str) -> &'static [usize] {
         match name {
-            "a" => &[1, 2],
-            "m" | "b" | "sp" | "k" | "sz" => &[2],
+            "a" | "m" | "b" | "sp" | "k" | "sz" => &[2],
             "v" | "au" | "mi" | "po" | "ds" => &[1],
             "r" | "kf" => &[0],
             _ => &[],
@@ -1314,8 +1296,8 @@ mod tests {
 
     /// One rule for every command: its name and exactly its fields. Each command the web
     /// client sends, with none to four well-formed fields (its own, then copies of its
-    /// last), parses exactly when that is a count `fields_of` gives it; an ack without its
-    /// hold is `Unsaid`, and with it, the hold as the field says. A clipboard takes one
+    /// last), parses exactly when that is a count `fields_of` gives it; an ack's hold is as
+    /// its field says. A clipboard takes one
     /// field or more, and its text is all of them, commas and all.
     #[test]
     fn a_command_is_exactly_its_fields() {
@@ -1349,8 +1331,7 @@ mod tests {
                 assert_eq!(parsed.is_some(), has, "{line}");
                 match parsed {
                     Some(Command::Ack { hold, .. }) => {
-                        let said = fields.get(1).map_or(Hold::Unsaid, |f| Hold::parse(f));
-                        assert_eq!(hold, said, "{line}");
+                        assert_eq!(Some(hold), Hold::parse(fields[1]), "{line}");
                     }
                     Some(Command::Clipboard(text)) => assert_eq!(text, fields.join(","), "{line}"),
                     _ => {}
