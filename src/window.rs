@@ -5,24 +5,32 @@
 //! the viewer has not acknowledged, and when each frame left and came back. That is enough
 //! to hold the stream to the path with no estimate of a rate and nothing steered:
 //!
-//! - **One reading.** While frames come back one behind the other the path is busy with
-//!   their bytes and nothing else: each took, to cross, the time between the frame ahead
-//!   coming back and itself (or, if nothing was ahead, since it would have come back had
-//!   it weighed nothing). So over a round, the bytes that came back and the time they kept
-//!   the path busy say what it carries: `bytes * LATENESS / busy` in `LATENESS`. Anything
-//!   else that held a frame up (a stall, a busy client) only made `busy` longer, so a
-//!   reading is never more than the path carries; and it is trusted no further than twice
-//!   the load the path was really under, since frames say nothing of loads they did not
-//!   meet.
-//! - **One value**, `carries`: the bytes the path carries in `LATENESS`. It moves once a
-//!   round (the time one frame takes to go and come back), and only in a round that tested
-//!   it, with a load of at least half of it: to that round's reading, and never to less
-//!   than half of itself. So typing cannot move it, a stall halves it once, and a path
-//!   that never carried a load is never credited with one.
-//! - **What a frame may spend** is what the path carries in `LATENESS`, less what is still
-//!   queued ahead of it by that same measure; and never more than leaves the unacknowledged
-//!   bytes within what the path holds on its way there and back plus that queue. During a
-//!   stall nothing comes back, so nothing more goes out.
+//! - **One value**, `carries`: the bytes the path carries in `LATENESS`, from a packet up.
+//!   A path that carries less than a packet in it is outside the window's range.
+//! - **One queue**, a time: the path is taken to be busy with what has left until `busy`,
+//!   carrying `carries` in each `LATENESS`. It says what a frame may spend, nothing more.
+//! - **One reading a frame**, of bytes that really crossed the path, as a TCP sender reads
+//!   its delivery rate: the bytes that came back from the last ack before the frame left
+//!   until its own, over the longer of the time between those acks and the time between
+//!   their frames' leaving, never under `LATENESS / 2`. Every byte counted left and came back
+//!   within those times, so acks that bunch are read over the time their frames took to
+//!   leave, a burst over the time its acks took to come, and no reading is more than the
+//!   path delivered. A frame that left an empty path reads its own bytes over its whole
+//!   trip. Which of the two times is longer says what set the pace: the path, or the stream.
+//!   With it, how long the frame waited behind what was queued: its trip past the fastest
+//!   ping's and its own crossing. Only pings say the fastest trip, and no reading uses it: a
+//!   ping's own lateness would be an error in every reading.
+//! - **One move a round** (the time one frame takes to go and come back), never to less than
+//!   half the window or more than twice it. Where the path set the pace and every frame
+//!   waited more than `LATENESS / 2`, to what it delivered, less as much again as the queue
+//!   is over that, over twice the round. Where the window held the stream back (every
+//!   frame took all its room) and the path kept up, up by as much as the queue is short of
+//!   it, over twice the round: if the path carries no more, one round adds a quarter of
+//!   `LATENESS` of queue. A round in which the stream sent less than the window let
+//!   through says only that the path carries at least what it delivered.
+//! - **What a frame may spend** is what the path carries in `LATENESS`, less what is
+//!   queued ahead of it. During a stall nothing comes back, the frames on their way grow
+//!   late, and nothing more goes out.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -40,79 +48,73 @@ pub const PACKET: usize = 1460;
 /// with (RFC 6928), and for the same reason: nothing is known about the path yet.
 pub const START: usize = 10 * PACKET;
 
-/// The frames a window keeps room for, of those that left in the last `LATENESS`: the capture
-/// loop captures at most twice in its least interval (a change and a pass), 3.5 ms at 240
-/// frames a second, so at most 35 frames leave in `LATENESS`. Room for 64 is made when a
-/// viewer joins, so that no frame grows it: one frame leaving allocates nothing. A bench that
-/// sends frames faster than any capture loop still fits: the allocation test, a frame every
-/// 2 ms, measured 31 of them in `LATENESS`. At half (32) that is all the margin there is;
-/// at double, 1.5 KB a viewer more for nothing.
-const LATELY: usize = 64;
+/// In one round the window falls to no less than this part of itself, and rises to no more
+/// than this many times itself. A round a stall fell in reads far too low; a link that
+/// really slowed is followed down by this a round. A frame that crossed alone may read twice
+/// its bytes, a keyframe eight times the window's: against a first ping that came back
+/// late, it would lift the window by all of that.
+pub const FALL: usize = 2;
 
-/// How long the fastest round trip is remembered. A path whose own delay rises reads as
-/// late for this long, and then is the new fastest.
+/// How long a ping that left an empty path is remembered for the path's fastest trip. A
+/// path whose own delay rises reads as late for this long after the last such ping before
+/// the rise; under motion that never pauses no ping leaves an empty path, and it stays so
+/// until the first pause.
 const FASTEST_FOR: Duration = Duration::from_secs(30);
 
-/// A reading is trusted to this many times the load its frames met.
-const TRUST: usize = 2;
+/// The pings `FASTEST_FOR` holds: one every `PING_EVERY`. Room for them is made when a
+/// viewer joins, so no ping grows it.
+const PINGS_FOR: usize =
+    (FASTEST_FOR.as_millis() / crate::hub::PING_EVERY.as_millis()) as usize + 1;
 
-/// In one round the window falls to no less than this part of itself. A round a stall fell
-/// in reads far too low, and motion wins a fall back by `TRUST` a round; a link that really
-/// slowed is followed down by this a round.
-const FALL: usize = 2;
-
-/// The smallest round trip over `FASTEST_FOR`, and the bytes of the frame it was measured
-/// on (a ping's: none), whose own time on the path is part of it.
-struct Fastest {
-    /// (when, trip, bytes), trips rising from the front: the front is the smallest.
-    trips: VecDeque<(Instant, Duration, usize)>,
+/// How the window was sent through in a round: whether it held the stream back.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Sent {
+    /// No frame has left in it.
+    Nothing,
+    /// Every frame that left took all its room, to within a packet: the stream wanted more
+    /// than the window let through.
+    Filled,
+    /// One left with room to spare: the stream sent what it had.
+    Short,
 }
 
-impl Fastest {
-    /// A `trip` of `bytes`, taken at `now`; the fastest there is now, which is no slower.
-    fn take(&mut self, now: Instant, trip: Duration, bytes: usize) -> (Duration, usize) {
-        while self
-            .trips
-            .front()
-            .is_some_and(|&(at, _, _)| now.saturating_duration_since(at) > FASTEST_FOR)
-        {
-            self.trips.pop_front();
-        }
-        while self.trips.back().is_some_and(|&(_, t, _)| t >= trip) {
-            self.trips.pop_back();
-        }
-        self.trips.push_back((now, trip, bytes));
-        self.get().unwrap_or((trip, bytes))
-    }
-
-    /// None until something has come back.
-    fn get(&self) -> Option<(Duration, usize)> {
-        self.trips.front().map(|&(_, t, b)| (t, b))
-    }
-}
-
-/// The frames that came back since `began`. It ends at the first of them that left after
-/// it began (by then every frame on its way when it began has come back), or once it has
-/// gone on as long as a round trip and `LATENESS`.
+/// The frames that come back from `began`: it ends at the first of them, acknowledged by
+/// its own id, that left after it began (by then every frame on its way when it began has
+/// come back), or that came back as long as a round trip and `LATENESS` after it began.
 struct Round {
     began: Instant,
-    /// The bytes that came back in it and the time they kept the path busy.
-    bytes: usize,
-    busy: Duration,
-    /// The most that a frame that crossed alone in it said the path carries in `LATENESS`.
-    alone: Option<usize>,
-    /// The most the path was under as one of its frames left.
-    met: usize,
+    /// What its frames said, once one has.
+    read: Option<Reading>,
+    sent: Sent,
+}
+
+/// What the frames of a round said.
+#[derive(Clone, Copy, Debug)]
+struct Reading {
+    /// The most any said the path carries in `LATENESS`, what set its pace, and the bytes
+    /// it counted.
+    says: usize,
+    pace: Pace,
+    counted: usize,
+    /// The least time any waited behind what was queued.
+    queue: Duration,
+}
+
+/// What set the pace of a frame's reading.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Pace {
+    /// Its acks came back further apart than its frames left: the path did.
+    Path,
+    /// They did not, or it crossed alone: the stream did.
+    Stream,
 }
 
 impl Round {
-    fn new(began: Instant) -> Self {
+    fn new(began: Instant) -> Round {
         Round {
             began,
-            bytes: 0,
-            busy: Duration::ZERO,
-            alone: None,
-            met: 0,
+            read: None,
+            sent: Sent::Nothing,
         }
     }
 }
@@ -120,29 +122,45 @@ impl Round {
 pub struct Window {
     /// The bytes the path carries in `LATENESS`. Never under `least` or over `most`.
     carries: usize,
+    /// The least `carries` has been.
+    lowest: usize,
     least: usize,
     most: usize,
-    fastest: Fastest,
-    /// The path's own round trip: the fastest of the pings that left with nothing on its
-    /// way ahead of them. Kept until another such ping comes back, however long that is:
-    /// while frames follow one another every trip holds some of their queue, and one of
-    /// those must never pass for the path's own.
-    own: Fastest,
-    /// When there was last nothing on its way, and when the first frame after that left,
-    /// if one has: between the two the path was empty.
-    emptied: Instant,
-    resumed: Option<Instant>,
+    /// The path's fastest round trip, once a ping has come back: the least trip of the pings
+    /// in `pings`, once two are there; until then the least of any. No ping is faster than
+    /// the path's own trip, so any ping faster than it lowers it, whatever it left behind.
+    fastest: Option<Duration>,
+    /// (came back at, trip) of the pings of the last `FASTEST_FOR` that left an empty path
+    /// or came back faster than `fastest`, oldest first.
+    pings: VecDeque<(Instant, Duration)>,
+    /// Until when the path is busy with what has left, carrying `carries` in each
+    /// `LATENESS`.
+    busy: Instant,
+    /// (left at, bytes, what had come back by then) of each frame that has left and not
+    /// come back, oldest first.
+    flying: VecDeque<(Instant, usize, Before)>,
+    /// The bytes that have come back, ever: what each frame's reading counts from.
+    delivered: usize,
+    /// When the frame that came back last did, and when it had left; since nothing was on
+    /// its way, when the first frame after that left, for both: the acks' time then holds
+    /// that frame's trip, as a TCP sender's does after an idle path.
+    acked: Instant,
+    sent: Instant,
     round: Round,
-    /// When the last frame that came back did, and when it had left.
-    last: Option<(Instant, Instant)>,
-    /// (left at, bytes) of each frame that has left and not come back, oldest first.
-    flying: VecDeque<(Instant, usize)>,
-    /// The bytes still on their way through the path at `as_of`, had it carried them as
-    /// it is taken to since.
-    queued: usize,
-    as_of: Instant,
-    /// (left at, bytes) of the frames that left within the last `LATENESS`, oldest first.
-    lately: VecDeque<(Instant, usize)>,
+}
+
+/// What had come back when a frame left: what its reading counts from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Before {
+    /// Nothing was on its way: it had the path to itself.
+    Nothing,
+    /// Frames were: `delivered` bytes had come back, the last at `acked`, which had left at
+    /// `sent`.
+    Frames {
+        delivered: usize,
+        acked: Instant,
+        sent: Instant,
+    },
 }
 
 /// What a frame leaving finds on its way to the viewer, a viewer being taken to have
@@ -158,12 +176,13 @@ pub enum Way {
     Stalled,
 }
 
-/// What a frame was part of as it left: when it left, and the bytes the path was asked to
-/// carry in the `LATENESS` up to then (itself included).
+/// What was on its way to the viewer as a ping left.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Left {
-    pub at: Instant,
-    pub asked: usize,
+pub enum Ahead {
+    /// Nothing: it had the path to itself.
+    Nothing,
+    /// Frames, which it may have queued behind.
+    Frames,
 }
 
 /// `bytes * a / b`, for durations.
@@ -180,22 +199,17 @@ impl Window {
         let least = least.clamp(PACKET, most);
         Window {
             carries: START.clamp(least, most),
+            lowest: START.clamp(least, most),
             least,
             most,
-            fastest: Fastest {
-                trips: VecDeque::new(),
-            },
-            own: Fastest {
-                trips: VecDeque::new(),
-            },
-            emptied: now,
-            resumed: None,
-            round: Round::new(now),
-            last: None,
+            fastest: None,
+            pings: VecDeque::with_capacity(PINGS_FOR),
+            busy: now,
             flying: VecDeque::new(),
-            queued: 0,
-            as_of: now,
-            lately: VecDeque::with_capacity(LATELY),
+            delivered: 0,
+            acked: now,
+            sent: now,
+            round: Round::new(now),
         }
     }
 
@@ -204,63 +218,82 @@ impl Window {
         self.carries
     }
 
-    /// The fastest round trip of the last `FASTEST_FOR`, once something has come back.
+    /// The least the path has been taken to carry in `LATENESS`.
+    pub fn lowest(&self) -> usize {
+        self.lowest
+    }
+
+    /// The path's fastest round trip, once a ping has come back.
     pub fn fastest(&self) -> Option<Duration> {
-        self.there_and_back()
+        self.fastest
     }
 
     /// The bytes that have left and not come back.
     pub fn flying(&self) -> usize {
-        self.flying.iter().map(|&(_, b)| b).sum()
+        self.flying.iter().map(|&(_, b, _)| b).sum()
+    }
+
+    /// What a ping leaving now finds ahead of it on the path.
+    pub fn ahead(&self) -> Ahead {
+        match self.flying.is_empty() {
+            true => Ahead::Nothing,
+            false => Ahead::Frames,
+        }
+    }
+
+    /// The time the path takes to carry `bytes` at `carries`, to the nanosecond below.
+    fn time(&self, bytes: usize) -> Duration {
+        let ns = bytes as u128 * LATENESS.as_nanos() / self.carries as u128;
+        Duration::from_nanos(ns.min(u64::MAX as u128) as u64)
+    }
+
+    /// The bytes the path is still busy with at `now`, at `carries`: every byte not yet
+    /// through, so none until `busy` and some right up to it. With `time`, the queue a frame
+    /// leaves is all it was given exactly, and a move keeps it: for any `carries` under
+    /// 60 MB (a byte a nanosecond of `LATENESS`), `time` loses less than one byte.
+    fn model(&self, now: Instant) -> usize {
+        let ns = self.busy.saturating_duration_since(now).as_nanos();
+        let bytes = (self.carries as u128 * ns).div_ceil(LATENESS.as_nanos());
+        bytes.min(usize::MAX as u128) as usize
     }
 
     /// The bytes queued in the path at `now`, as far as can be told; never more than are.
-    /// Two things tell. What has left since the queue was last known empty, less what the
-    /// path carries in the time since: right for a burst, but it takes the path to have
-    /// carried all along, and a path that stalled or slowed has more queued than that. And
-    /// the frames that left so long ago that they would be back even behind the fullest
-    /// queue the path is allowed, and are not: those are queued, but for the oldest, which
-    /// may be all but through.
+    /// Two things tell. The model queue, which takes the path to have carried all along,
+    /// and a path that stalled or slowed has more queued than that. And the frames that left
+    /// so long ago that they would be back even behind the fullest queue the path is
+    /// allowed, and are not: those are queued, but for the oldest, which may be all but
+    /// through.
     fn queued(&self, now: Instant) -> usize {
-        let through = scale(
-            self.carries,
-            now.saturating_duration_since(self.as_of),
-            LATENESS,
-        );
-        let sent = self.queued.saturating_sub(through);
-        sent.max(self.overdue(now))
+        self.model(now).max(self.overdue(now))
     }
 
     /// The bytes of the frames on their way at `now` that would be back even behind the
-    /// fullest queue the path is allowed, but for the oldest.
+    /// fullest queue the path is allowed, but for the oldest. Until a ping has said how
+    /// fast the path is, none.
     fn overdue(&self, now: Instant) -> usize {
-        let there_and_back = self.there_and_back().unwrap_or(Duration::ZERO);
+        let Some(fastest) = self.fastest else {
+            return 0;
+        };
         self.flying
             .iter()
             .skip(1)
-            .filter(|&&(left, _)| now.saturating_duration_since(left) > there_and_back + LATENESS)
-            .map(|&(_, b)| b)
+            .filter(|&&(left, _, _)| now.saturating_duration_since(left) > fastest + LATENESS)
+            .map(|&(_, b, _)| b)
             .sum()
     }
 
     /// When the queue the path is taken to hold at `now` is empty, so that a frame leaving
-    /// then finds all of `carries`: the moment what has left since it was last empty is
-    /// through at what the path carries (at or before `now` if it is), or None while frames
-    /// on their way are overdue, which only their acks clear.
+    /// then finds all of `carries`: `busy`, or None while frames on their way are overdue,
+    /// which only their acks clear.
     pub fn empties(&self, now: Instant) -> Option<Instant> {
-        let ns = (LATENESS.as_nanos() * self.queued as u128).div_ceil(self.carries as u128);
-        let drained = Duration::from_nanos(ns.min(u64::MAX as u128) as u64);
-        (self.overdue(now) == 0).then_some(self.as_of + drained)
+        (self.overdue(now) == 0).then_some(self.busy)
     }
 
     /// What a frame leaving at `now` may spend: what the path carries in `LATENESS`, less
-    /// what is queued ahead of it; or None while that leaves no room for a packet. With
-    /// nothing on its way a frame may always go. In a stall nothing comes back, the queue
-    /// stands, and nothing more goes out.
+    /// what is queued ahead of it; or None while that leaves no room for a packet. In a
+    /// stall nothing comes back, the frames on their way grow overdue, and nothing more
+    /// goes out.
     pub fn room(&self, now: Instant) -> Option<usize> {
-        if self.flying.is_empty() {
-            return Some(self.carries);
-        }
         let room = self.carries.saturating_sub(self.queued(now));
         (room >= PACKET).then_some(room)
     }
@@ -268,7 +301,7 @@ impl Window {
     /// What a frame leaving at `now` finds on its way to the viewer, once one whose oldest
     /// frame on its way has been on its way for `stall` is taken to have stalled.
     pub fn way(&self, now: Instant, stall: Duration) -> Way {
-        let Some(&(oldest, _)) = self.flying.front() else {
+        let Some(&(oldest, _, _)) = self.flying.front() else {
             return Way::Room(self.carries);
         };
         let stalls = oldest + stall;
@@ -281,825 +314,823 @@ impl Window {
 
     /// When the newest frame on its way left, while one is on its way.
     pub fn newest(&self) -> Option<Instant> {
-        self.flying.back().map(|&(at, _)| at)
+        self.flying.back().map(|&(at, _, _)| at)
     }
 
-    /// A frame of `bytes` leaves at `now`.
-    pub fn leave(&mut self, now: Instant, bytes: usize) -> Left {
-        let through = scale(
-            self.carries,
-            now.saturating_duration_since(self.as_of),
-            LATENESS,
-        );
-        self.queued = self.queued.saturating_sub(through) + bytes;
-        self.as_of = now;
-        if self.flying.is_empty() {
-            self.resumed = Some(now);
-        }
-        self.flying.push_back((now, bytes));
-        while self
-            .lately
-            .front()
-            .is_some_and(|&(at, _)| now.saturating_duration_since(at) > LATENESS)
-        {
-            self.lately.pop_front();
-        }
-        self.lately.push_back((now, bytes));
-        Left {
-            at: now,
-            asked: self.lately.iter().map(|&(_, b)| b).sum(),
-        }
+    /// A frame of `bytes` leaves at `now`: the path is busy until what is queued ahead of
+    /// it and itself are through, and it keeps what had come back, to count its reading
+    /// from.
+    pub fn leave(&mut self, now: Instant, bytes: usize) {
+        let queued = self.queued(now);
+        let filled = queued + bytes + PACKET > self.carries;
+        self.round.sent = match (self.round.sent, filled) {
+            (Sent::Nothing | Sent::Filled, true) => Sent::Filled,
+            (Sent::Nothing | Sent::Filled, false) | (Sent::Short, _) => Sent::Short,
+        };
+        let before = match self.flying.is_empty() {
+            true => {
+                (self.acked, self.sent) = (now, now);
+                Before::Nothing
+            }
+            false => Before::Frames {
+                delivered: self.delivered,
+                acked: self.acked,
+                sent: self.sent,
+            },
+        };
+        self.busy = now + self.time(queued + bytes);
+        self.flying.push_back((now, bytes, before));
     }
 
     /// Whatever was on its way is not coming back: the viewer starts over.
     pub fn forget(&mut self, now: Instant) {
         self.flying.clear();
-        self.queued = 0;
-        self.as_of = now;
-        self.emptied = now;
-        self.resumed = None;
-        self.last = None;
+        self.busy = now;
         self.round = Round::new(now);
     }
 
-    /// A ping came back at `now`, `trip` after it left. A ping carries nothing, so one
-    /// that left with nothing on its way ahead of it took the path's own round trip, and
-    /// frames that cross alone are timed against it. One that left behind a frame may
-    /// have queued behind it, and counts only toward the fastest trip of any kind.
-    pub fn pinged(&mut self, now: Instant, trip: Duration) {
-        self.fastest.take(now, trip, 0);
-        // Nothing was on its way when it left: it left after the path was last empty and
-        // before any frame left after that. What is on its way when it comes back says
-        // nothing of that: every frame that left ahead of it has come back by then.
-        let Some(left) = now.checked_sub(trip) else {
+    /// A ping came back at `now`, `trip` after it left, with `ahead` on its way as it left.
+    /// A ping carries nothing: no ping is faster than the path's own trip, so one faster
+    /// than `fastest` lowers it, whatever was ahead of it; and of those that had the path
+    /// to themselves, the least of the last `FASTEST_FOR` is nearest it. That least may
+    /// raise it only once two pings say so: one ping's own lateness would be an error in
+    /// every reading.
+    pub fn pinged(&mut self, now: Instant, trip: Duration, ahead: Ahead) {
+        let lower = self.fastest.is_some_and(|fastest| trip < fastest);
+        if ahead == Ahead::Nothing || lower {
+            self.pings.push_back((now, trip));
+        }
+        while self
+            .pings
+            .front()
+            .is_some_and(|&(at, _)| now.saturating_duration_since(at) > FASTEST_FOR)
+        {
+            self.pings.pop_front();
+        }
+        let least = self.pings.iter().map(|&(_, trip)| trip).min();
+        self.fastest = match (self.pings.len() >= 2, least) {
+            (true, Some(least)) => Some(least),
+            (true, None) | (false, None) => self.fastest,
+            (false, Some(least)) => Some(self.fastest.map_or(least, |f| f.min(least))),
+        };
+    }
+
+    /// The oldest frame on its way came back: it was at the viewer at `at` (the ack's
+    /// arrival, less what the viewer says it held it). Once a ping has said how fast the path
+    /// is, it reads the path (see the module's doc).
+    pub fn came_back(&mut self, at: Instant) {
+        let Some((left, bytes, before)) = self.flying.pop_front() else {
             return;
         };
-        let behind = self.resumed.is_some_and(|resumed| resumed <= left);
-        if self.emptied <= left && !behind {
-            self.own.take(now, trip, 0);
-        }
-    }
-
-    /// The path's own round trip as far as it is known: a ping's that had the path to
-    /// itself, or, until one has come back, the fastest trip of any kind.
-    fn there_and_back(&self) -> Option<Duration> {
-        self.own.get().or(self.fastest.get()).map(|(trip, _)| trip)
-    }
-
-    /// A frame of `bytes` that `left` came back at `back` (the time the viewer held it
-    /// taken off).
-    pub fn came_back(&mut self, left: Left, back: Instant, bytes: usize) {
-        self.flying.pop_front();
+        self.delivered += bytes;
+        (self.acked, self.sent) = (at, left);
         if self.flying.is_empty() {
             // Everything is through, whatever the queue was taken to be.
-            self.queued = 0;
-            self.as_of = back;
-            self.emptied = back;
-            self.resumed = None;
+            self.busy = self.busy.min(at);
         }
-        let trip = back.saturating_duration_since(left.at);
-        self.fastest.take(back, trip, bytes);
-        let fastest = self.there_and_back().unwrap_or(trip);
-        // When it would have come back alone, weighing what the fastest trip's frame did.
-        let alone = left.at + fastest;
-        match self.last {
-            // The frame ahead was not through yet: this one took the time since it was.
-            // Frames on each other's heels are read together, a round's bytes over the time
-            // between its acknowledgements, where one that came late and the next that then
-            // seemed early cancel.
-            Some((ahead, _)) if ahead > alone => {
-                self.round.bytes += bytes;
-                self.round.busy += back.saturating_duration_since(ahead);
+        let Some(fastest) = self.fastest else {
+            return;
+        };
+        let late = at.saturating_duration_since(left + fastest);
+        let queue = late.saturating_sub(self.time(bytes));
+        let (counted, took, pace) = match before {
+            // It had the path to itself: its own bytes, over its whole trip.
+            Before::Nothing => (bytes, at.saturating_duration_since(left), Pace::Stream),
+            Before::Frames {
+                delivered,
+                acked,
+                sent,
+            } => {
+                let sending = left.saturating_duration_since(sent);
+                let acking = at.saturating_duration_since(acked);
+                let pace = match acking > sending {
+                    true => Pace::Path,
+                    false => Pace::Stream,
+                };
+                (self.delivered - delivered, sending.max(acking), pace)
             }
-            // Nothing was ahead: it crossed alone, in the time since `alone`, a moment that
-            // is no acknowledgement of a frame. Whatever else held it up made it later,
-            // never earlier, so of the frames that crossed alone in a round the one that
-            // says most is nearest the truth; one that came back no later than a ping would
-            // crossed faster than can be told, and says as much as it may. Only against the
-            // path's own round trip, though: until a ping has had the path to itself there
-            // is none, and a frame timed against another frame's trip says nothing if it is
-            // that frame's size and too much if that frame had queued.
-            Some(_) | None => {
-                if let Some((own, _)) = self.own.get() {
-                    let says = match back.saturating_duration_since(left.at + own) {
-                        Duration::ZERO => usize::MAX,
-                        crossed => scale(bytes, LATENESS, crossed),
-                    };
-                    self.round.alone = self.round.alone.max(Some(says));
-                }
+        };
+        let says = scale(counted, LATENESS, took.max(LATENESS / 2));
+        self.round.read = Some(match self.round.read {
+            Some(r) if r.says >= says => Reading {
+                queue: r.queue.min(queue),
+                ..r
+            },
+            Some(r) => Reading {
+                says,
+                pace,
+                counted,
+                queue: r.queue.min(queue),
+            },
+            None => Reading {
+                says,
+                pace,
+                counted,
+                queue,
+            },
+        });
+        let round = at.saturating_duration_since(self.round.began);
+        if left >= self.round.began || round >= fastest + LATENESS {
+            if let Some(read) = self.round.read {
+                let to = self.verdict(read, round);
+                let to = to.clamp(self.carries / FALL, self.carries.saturating_mul(FALL));
+                self.moves(at, to.clamp(self.least, self.most));
             }
+            self.round = Round::new(at);
         }
-        self.last = Some((back, left.at));
-        // What the path was really under when the frame left.
-        self.round.met = self.round.met.max(left.asked);
-        // The round ends with the first frame back that left after it began; or, when the
-        // path is so over-full that this takes longer, after as long as a round should
-        // take: what has come back by then says what the path carries now.
-        let long_enough = back.saturating_duration_since(self.round.began) >= fastest + LATENESS;
-        if left.at >= self.round.began || long_enough {
-            let Round {
-                bytes,
-                busy,
-                alone,
-                met,
-                ..
-            } = self.round;
-            // What the frames on each other's heels say. They can show that the path
-            // carries less than it is taken to, and never more: acknowledgements that were
-            // held and come back in a bunch would otherwise read as a path that carried
-            // their frames in the gaps between them. Only a frame that crossed alone shows
-            // more.
-            let heels = (bytes > 0 && busy > Duration::ZERO)
-                .then(|| scale(bytes, LATENESS, busy).min(self.carries));
-            // A round that did not test what the path carries, or none of whose frames
-            // said anything, says nothing.
-            if let (true, Some(says)) = (met.saturating_mul(2) >= self.carries, alone.max(heels)) {
-                self.carries = says
-                    .min(met.saturating_mul(TRUST))
-                    .max(self.carries / FALL)
-                    .clamp(self.least, self.most);
-            }
-            self.round = Round::new(back);
+    }
+
+    /// Where a round of `round` that read `read` moves the window.
+    fn verdict(&self, read: Reading, round: Duration) -> usize {
+        let Reading {
+            says,
+            pace,
+            counted,
+            queue,
+        } = read;
+        // The queue's distance from `LATENESS / 2`, over twice the round: as much again of
+        // the window is what one round adds or takes away.
+        let half = (LATENESS / 2).as_nanos() as i128;
+        let step = |from: usize, short: i128| {
+            let from = from as i128;
+            (from + from * short / (2 * round.as_nanos().max(1) as i128)).max(0) as usize
+        };
+        let short = half - queue.as_nanos() as i128;
+        // The window held the stream back, or a reading counted half of it: it was tested.
+        let tested = match self.round.sent {
+            Sent::Filled => true,
+            Sent::Nothing | Sent::Short => counted.saturating_mul(2) >= self.carries,
+        };
+        match (tested, pace, short >= 0) {
+            // The path set the pace and held every frame past `LATENESS / 2`: it carries
+            // what it delivered, and the window gives up the queue's excess as well; but not
+            // under `START` while the path delivered that much: nothing says it carries less.
+            (true, Pace::Path, false) => step(says, short).max(says.min(START)),
+            // The path kept up with all the window let through.
+            (true, Pace::Path, true) => step(says.max(self.carries), short),
+            // The stream set the pace: the path kept up whatever the frames' lateness says
+            // (a path whose own delay rose looks queued until a ping knows it).
+            (true, Pace::Stream, _) => step(says.max(self.carries), half),
+            // The stream sent what it had: the path carries at least what it delivered.
+            (false, Pace::Path | Pace::Stream, _) => says.max(self.carries),
         }
+    }
+
+    /// At `at` the window moves to `carries`. That changes how fast the queue drains, never
+    /// how many bytes it holds: `busy` moves so that the queue at `at` is the same bytes at
+    /// the new `carries` as at the old. Left where it was, a fall to half would count half
+    /// the bytes really queued, and open room into the path just found slower.
+    fn moves(&mut self, at: Instant, carries: usize) {
+        let queued = self.model(at);
+        self.carries = carries;
+        self.lowest = self.lowest.min(carries);
+        // Past `at` there was nothing queued, and still is not.
+        self.busy = self.busy.min(at) + self.time(queued);
     }
 }
 
-/// The window against a link that is the oracle: a rate, a round trip, and a queue that
-/// serves in order; with stalls, and with acknowledgements that come late.
+/// The window against one oracle: a path of a rate and a round trip whose bottleneck serves
+/// in order and stalls, and whose acks and pongs come back as late as a real page's did,
+/// driven as the server drives a viewer's window from the moment the viewer connects.
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct Rng(u64);
-    impl Rng {
-        fn range(&mut self, lo: u64, hi: u64) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            lo + self.0 % (hi - lo)
-        }
-    }
+    use crate::xorshift::Xorshift;
 
     const FRAME: Duration = Duration::from_micros(16_667);
 
-    /// A frame on its way.
-    struct Flying {
-        acked: Instant,
-        left: Left,
-        bytes: usize,
+    /// How late answers come back, past the path's own trip: as the page's acks in
+    /// `acks-late-us.txt` did, in their order from anywhere among them, those without their
+    /// slowest hundredth, or not at all.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Late {
+        Page,
+        PageBelowTop,
+        None,
     }
 
-    /// One viewer on one link, a frame time at a tick.
-    struct Sim {
-        now: Instant,
-        /// The link: bytes a second, its round trip, when it is free again, and the
-        /// stalls (from, to) in which it carries nothing.
+    /// The page's measured lates, in their order, and those under the 99th hundredth of them.
+    fn measured() -> &'static (Vec<Duration>, Vec<Duration>) {
+        static MEASURED: std::sync::OnceLock<(Vec<Duration>, Vec<Duration>)> =
+            std::sync::OnceLock::new();
+        MEASURED.get_or_init(|| {
+            let all: Vec<Duration> = include_str!("acks-late-us.txt")
+                .lines()
+                .filter(|l| !l.starts_with('#'))
+                .map(|l| Duration::from_micros(l.parse().unwrap()))
+                .collect();
+            let mut sorted = all.clone();
+            sorted.sort();
+            let top = sorted[sorted.len() * 99 / 100];
+            let below = all.iter().copied().filter(|&l| l < top).collect();
+            (all, below)
+        })
+    }
+
+    /// What a ping weighs on the path: its JSON, a token of 16 hex digits.
+    const PING: usize = 40;
+
+    /// The oracle: what a viewer's path does with what the server sends it.
+    struct Path {
+        /// Bytes a second through its bottleneck, and its own round trip.
         rate: f64,
-        rtt: Duration,
-        free: Instant,
+        trip: Duration,
+        /// (from, to): its bottleneck carries nothing.
         stalls: Vec<(Instant, Instant)>,
-        /// Each acknowledgement comes up to this late, at random.
-        jitter: Duration,
-        rng: Rng,
-        flying: VecDeque<Flying>,
-        /// (comes back at, left at) of the pings on their way.
-        pings: VecDeque<(Instant, Instant)>,
-        ticks: u32,
-        in_flight: usize,
-        /// The least a frame comes to, whatever room it was given (x264 cannot make a
-        /// picture smaller than its highest quantizer makes it): 0, as small as its room.
-        floor: usize,
-        window: Window,
-        /// Since `reset`: how late each frame came back (beyond the round trip), the bytes
-        /// sent, the smallest share of what it wanted that a frame got, the most that was
-        /// in flight, and the biggest load a frame carried.
-        lates: Vec<Duration>,
-        sent: usize,
-        worst_share: f64,
-        most_in_flight: usize,
-        most_load: usize,
+        /// (from, to): the viewer holds its answers, and sends them all at `to`.
+        held: Vec<(Instant, Instant)>,
+        /// When its bottleneck has carried everything it was given.
+        free: Instant,
+        /// When the last answer on its way back comes back: answers come back in order.
+        last: Instant,
+        /// How late answers come back, and where among the measured lates the next is.
+        late: Late,
+        next: usize,
+        rng: Xorshift,
     }
 
-    impl Sim {
-        fn new(rate: f64, rtt_ms: u64) -> Self {
-            let now = Instant::now();
-            Sim {
-                now,
-                rate,
-                rtt: Duration::from_millis(rtt_ms),
-                free: now,
-                stalls: Vec::new(),
-                jitter: Duration::ZERO,
-                rng: Rng(0x9E3779B97F4A7C15),
-                flying: VecDeque::new(),
-                pings: VecDeque::new(),
-                ticks: 0,
-                in_flight: 0,
-                floor: 0,
-                window: {
-                    // The server pings a client as it connects, before any frame leaves.
-                    let mut window = Window::new(now, 0, usize::MAX);
-                    let rtt = Duration::from_millis(rtt_ms);
-                    window.pinged(now + rtt, rtt);
-                    window
-                },
-                lates: Vec::new(),
-                sent: 0,
-                worst_share: 1.0,
-                most_in_flight: 0,
-                most_load: 0,
-            }
+    impl Path {
+        /// How late the next answer comes back.
+        fn late(&mut self) -> Duration {
+            let (all, below) = measured();
+            let lates = match self.late {
+                Late::Page => all,
+                Late::PageBelowTop => below,
+                Late::None => return Duration::ZERO,
+            };
+            self.next += 1;
+            lates[self.next % lates.len()]
         }
 
-        fn reset(&mut self) {
-            self.lates.clear();
-            self.sent = 0;
-            self.worst_share = 1.0;
-        }
-
-        /// When the link has carried `bytes` more, starting no sooner than `from`: its
-        /// rate, less the stalls on the way.
-        fn carried(&self, from: Instant, bytes: usize) -> Instant {
-            let mut at = from;
+        /// `bytes` given at `at`: when its bottleneck has carried them.
+        fn through(&mut self, at: Instant, bytes: usize) -> Instant {
+            let mut t = self.free.max(at);
             let mut left = Duration::from_secs_f64(bytes as f64 / self.rate);
             for &(a, b) in &self.stalls {
-                if b <= at {
+                if b <= t {
                     continue;
                 }
-                if a > at {
-                    let run = a - at;
-                    if run >= left {
-                        return at + left;
+                if a > t {
+                    if a - t >= left {
+                        break;
                     }
-                    left -= run;
+                    left -= a - t;
                 }
-                at = b;
+                t = b;
             }
-            at + left
+            self.free = t + left;
+            self.free
         }
 
-        /// One frame time passes; the screen wants to send `want` bytes (0: it is still).
-        fn tick(&mut self, want: usize) {
-            self.now += FRAME;
-            self.ticks += 1;
-            // A ping twice a second, behind whatever is on the link, as the server sends.
-            if self.ticks.is_multiple_of(30) {
-                let stalled = self.carried(self.free.max(self.now), 0);
-                self.pings.push_back((stalled + self.rtt, self.now));
-            }
-            while self.pings.front().is_some_and(|p| p.0 <= self.now) {
-                let (back, left) = self.pings.pop_front().unwrap();
-                self.window.pinged(back, back - left);
-            }
-            while self.flying.front().is_some_and(|f| f.acked <= self.now) {
-                let f = self.flying.pop_front().unwrap();
-                self.in_flight -= f.bytes;
-                self.lates
-                    .push((f.acked - f.left.at).saturating_sub(self.rtt));
-                self.window.came_back(f.left, f.acked, f.bytes);
-            }
-            if want == 0 {
-                return;
-            }
-            let Some(room) = self.window.room(self.now) else {
-                return;
+        /// What was through at `through`, answered `held` after it reached the viewer: when
+        /// the answer comes back, late by a draw, behind every answer before it.
+        fn answer(&mut self, through: Instant, held: Duration) -> Instant {
+            let sent = through + self.trip / 2 + held;
+            let sent = match self.held.iter().find(|h| h.0 <= sent && sent < h.1) {
+                Some(&(_, to)) => to,
+                None => sent,
             };
-            // The encoder under its cap: a frame holds at most the room it was given, but
-            // no less than the least it comes to.
-            let bytes = want.min(room).max(self.floor.min(want));
-            self.worst_share = self.worst_share.min(bytes as f64 / want as f64);
-            let left = self.window.leave(self.now, bytes);
-            self.in_flight += bytes;
-            self.most_in_flight = self.most_in_flight.max(self.in_flight);
-            self.most_load = self.most_load.max(self.in_flight);
-            self.free = self.carried(self.free.max(self.now), bytes);
-            let jitter = match self.jitter.as_micros() as u64 {
-                0 => Duration::ZERO,
-                most => Duration::from_micros(self.rng.range(0, most + 1)),
+            self.last = self.last.max(sent + self.trip / 2 + self.late());
+            self.last
+        }
+
+        /// What the path carries in `LATENESS`.
+        fn carries(&self) -> usize {
+            (self.rate * LATENESS.as_secs_f64()) as usize
+        }
+    }
+
+    /// What the screen wants sent in a frame time.
+    #[derive(Clone, Copy)]
+    enum Want {
+        Nothing,
+        /// A frame of this many bytes, or less if its room is less.
+        Frame(usize),
+        /// A keyframe of this many bytes, or less if what the path carries in `KEY_TIME` is
+        /// less: the capture loop's budget, whatever the room.
+        Key(usize),
+    }
+
+    /// The server's side of one viewer, as video.rs and hub.rs drive its window, from the
+    /// moment it connects: a ping then and every `PING_EVERY`, a frame a frame time as its
+    /// room allows, and the acks and pongs the oracle brings back.
+    struct Viewer {
+        now: Instant,
+        window: Window,
+        path: Path,
+        /// Frames on their way: when the ack of each comes back, and what the viewer says it
+        /// held it.
+        frames: VecDeque<(Instant, Duration)>,
+        /// Pongs on their way: when each comes back, when its ping left, and what was on its
+        /// way ahead of it then. The first may be later than the viewer's answers after it:
+        /// it sent it late.
+        pongs: VecDeque<(Instant, Instant, Ahead)>,
+        ping: Instant,
+        rng: Xorshift,
+        /// Since `reset`: the bytes sent, and the longest a frame waited behind the queue.
+        sent: usize,
+        worst: Duration,
+        /// The most `fastest` has been over the path's own trip, and the window over what
+        /// the path carries (`carries` over it, less one), since `reset`.
+        over: Duration,
+        past: f64,
+    }
+
+    impl Viewer {
+        /// A viewer connects at `t0` over `path`: the first ping goes first, its pong coming
+        /// back `extra` later than the path brings it, then the hello and cursor (`ahead`
+        /// bytes). It says it watches as its socket opens (the hub forgets what is on its
+        /// way), and the capture loop sends it its keyframe at once (and forgets again).
+        fn connect(t0: Instant, mut path: Path, ahead: usize, extra: Duration) -> Viewer {
+            let mut window = Window::new(t0, 0, usize::MAX);
+            let through = path.through(t0, PING);
+            let pong = path.answer(through, Duration::ZERO) + extra;
+            path.through(t0, ahead);
+            let watch = t0 + path.trip + path.late();
+            window.forget(watch);
+            let rng = Xorshift::new(path.rng.next());
+            Viewer {
+                now: watch,
+                window,
+                frames: VecDeque::new(),
+                pongs: VecDeque::from([(pong, t0, Ahead::Nothing)]),
+                ping: t0 + crate::hub::PING_EVERY,
+                rng,
+                path,
+                sent: 0,
+                worst: Duration::ZERO,
+                over: Duration::ZERO,
+                past: 0.0,
+            }
+        }
+
+        /// Forget what was measured.
+        fn reset(&mut self) {
+            self.sent = 0;
+            self.worst = Duration::ZERO;
+            self.over = Duration::ZERO;
+            self.past = 0.0;
+        }
+
+        /// The next answer due by `by`, if any: its time, and whether it is a pong.
+        fn next(&self, by: Instant) -> Option<(Instant, bool)> {
+            let ack = self.frames.front().map(|&(at, _)| (at, false));
+            let pong = self.pongs.iter().map(|&(at, _, _)| (at, true)).min();
+            ack.into_iter().chain(pong).filter(|a| a.0 <= by).min()
+        }
+
+        /// One frame time: what came back in it comes back, pings go, and the frame the
+        /// screen wants leaves.
+        fn tick(&mut self, want: Want) {
+            let end = self.now + FRAME;
+            while self.ping <= end {
+                let through = self.path.through(self.ping, PING);
+                let pong = self.path.answer(through, Duration::ZERO);
+                self.pongs.push_back((pong, self.ping, self.window.ahead()));
+                self.ping += crate::hub::PING_EVERY;
+            }
+            while let Some((at, pong)) = self.next(end) {
+                match pong {
+                    true => {
+                        let i = self.pongs.iter().position(|p| p.0 == at).unwrap();
+                        let (_, left, ahead) = self.pongs.remove(i).unwrap();
+                        self.window.pinged(at, at - left, ahead);
+                    }
+                    false => {
+                        let (_, held) = self.frames.pop_front().unwrap();
+                        self.window.came_back(at - held);
+                    }
+                }
+            }
+            self.now = end;
+            if let Some(fastest) = self.window.fastest() {
+                self.over = self.over.max(fastest.saturating_sub(self.path.trip));
+            }
+            let past = self.window.carries() as f64 / self.path.carries() as f64 - 1.0;
+            self.past = self.past.max(past);
+            let bytes = match want {
+                Want::Nothing => return,
+                Want::Key(bytes) => bytes.min(scale(
+                    self.window.carries(),
+                    crate::video::KEY_TIME,
+                    LATENESS,
+                )),
+                Want::Frame(bytes) => match self.window.room(self.now) {
+                    Some(room) => bytes.min(room),
+                    None => return,
+                },
             };
-            // Acknowledgements come in the order their frames left.
-            let acked = (self.free + self.rtt + jitter)
-                .max(self.flying.back().map_or(self.now, |f| f.acked));
-            self.flying.push_back(Flying { acked, left, bytes });
+            let waits = self.path.free.saturating_duration_since(self.now);
+            self.worst = self.worst.max(waits);
+            self.window.leave(self.now, bytes);
+            let through = self.path.through(self.now, bytes);
+            let held = Duration::from_micros(self.rng.below(5_000));
+            let ack = self.path.answer(through, held);
+            self.frames.push_back((ack, held));
             self.sent += bytes;
         }
+    }
 
-        fn run(&mut self, ticks: u32, mut want: impl FnMut(u32) -> usize) {
-            for i in 0..ticks {
-                self.tick(want(i));
-            }
-        }
-
-        /// The `share` of frames since `reset` that came back no later than this.
-        fn late(&self, share: f64) -> Duration {
-            let mut l = self.lates.clone();
-            l.sort();
-            l[((l.len() - 1) as f64 * share) as usize]
-        }
-
-        /// What the link carries in `LATENESS`.
-        fn fits(&self) -> f64 {
-            self.rate * LATENESS.as_secs_f64()
+    /// A path that carries `carries` bytes in `LATENESS`, a round trip of `trip`, from `t0`.
+    fn path(t0: Instant, carries: f64, trip: Duration, late: Late, seed: u64) -> Path {
+        let mut rng = Xorshift::new(seed);
+        Path {
+            rate: carries / LATENESS.as_secs_f64(),
+            trip,
+            stalls: Vec::new(),
+            held: Vec::new(),
+            free: t0,
+            last: t0,
+            late,
+            next: rng.below(measured().0.len() as u64) as usize,
+            rng,
         }
     }
 
-    /// A desktop at rest: a cursor and a clock, a few hundred bytes now and then.
-    fn rest(i: u32) -> usize {
-        if i.is_multiple_of(7) {
-            600
-        } else {
-            0
-        }
+    /// What a path from `START` to 1 Gbit/s carries in `LATENESS`, evenly spread in its
+    /// logarithm.
+    fn any_carries(rng: &mut Xorshift) -> f64 {
+        let most = 1e9 / 8.0 * LATENESS.as_secs_f64();
+        START as f64 * (most / START as f64).powf(rng.below(1001) as f64 / 1000.0)
     }
 
-    /// Motion that wants more than any link here carries.
-    const HEAVY: usize = 4_000_000;
+    /// The share `q` of a lateness model's draws come back no later than this.
+    fn quantile(late: Late, q: f64) -> Duration {
+        let (all, below) = measured();
+        let lates = match late {
+            Late::Page => all,
+            Late::PageBelowTop => below,
+            Late::None => return Duration::ZERO,
+        };
+        let mut sorted = lates.clone();
+        sorted.sort();
+        sorted[((sorted.len() - 1) as f64 * q) as usize]
+    }
 
-    /// Sustained motion that wants everything, on any link, settles where the link is
-    /// used and frames come back within about twice `LATENESS` (the queue it allows, and
-    /// the frame in it that is all but through): from 150 kbit/s to 80 Mbit/s, round trips
-    /// of 2 to 300 ms.
+    /// The lateness models, one a case in turn.
+    const LATES: [Late; 3] = [Late::None, Late::Page, Late::PageBelowTop];
+
+    /// A cold load: a new viewer of a page of text on any path that carries from `START` to
+    /// 1 Gbit/s, from 2 to 300 ms, its acks and pongs as late as one of the lateness models
+    /// says, its connect ping ahead of a hello and cursor of up to 17 KB. Its keyframe (60 to
+    /// 400 KB), the passes that fill the page in (frames of up to 20 KB as their room allows,
+    /// for 1 to 10 s, some frame times with nothing), then 222 B frames at 60 a second, to a
+    /// minute. Among the cases the first pong comes back late by up to 120 ms, or after the
+    /// keyframe's ack, when nothing is read until a later frame.
+    ///
+    /// The window never falls under `START`, or under what the path carries if that is less,
+    /// but by what a late ack can stretch a reading: an ack late by `δ`, all but the model's
+    /// slowest hundredth, stretches a reading's time (of `LATENESS / 2` at least) by `δ`, so the
+    /// bound is that times `(LATENESS / 2) / (LATENESS / 2 + δ)`.
+    ///
+    /// And no frame waits behind the queue longer than `3 * LATENESS`, plus `E`, the most the
+    /// fastest ping's trip was over the path's own (a frame's queue is measured `E` short, so
+    /// the window sees a queue only past `H = LATENESS / 2 + E`), plus what the window adds
+    /// while `E` hides it. Over the path by `x` (its most `carries` over what the path
+    /// carries, less one), the queue grows by `x` of every moment, for as long as it takes a
+    /// whole round of frames to show it: two rounds at most, each the trip and the queue. So
+    /// `wait <= 3 * LATENESS + E + 2 * (trip + wait) * x`, which bounds the wait only while
+    /// `x < 1/2`; past that it says nothing. No bound from the constants alone closes it: a
+    /// round grows the window by up to `LATENESS / (4 * round)` while the queue is hidden, and
+    /// the `n`-th such round adds about `n * LATENESS / 4` of queue, so up to
+    /// `sqrt(8 * H / LATENESS)` of them fit under `H`, and `x` may reach
+    /// `(1 + LATENESS / (4 * trip))^n - 1`, over a half on short trips (on a 34 ms trip
+    /// with `E` 43 ms, 3.3). So the property takes the `x` the window reached.
     #[test]
-    fn sustained_motion_fills_the_link_and_adds_about_the_lateness() {
-        let mut rng = Rng(0x2545F4914F6CDD1D);
-        for _ in 0..200 {
-            let rate = rng.range(19_000, 10_000_000) as f64;
-            let mut sim = Sim::new(rate, rng.range(2, 300));
-            sim.run(600, |_| HEAVY);
-            sim.reset();
-            sim.run(1200, |_| HEAVY);
-            let used = sim.sent as f64 / (rate * 20.0);
-            let what = format!(
-                "{rate} B/s, {:?}: used {used:.2}, late p50 {:?} max {:?}, window {} of {:.0}",
-                sim.rtt,
-                sim.late(0.5),
-                sim.late(1.0),
-                sim.window.carries(),
-                sim.fits()
-            );
-            // A link that carries only a couple of packets in `LATENESS` spends much of
-            // its time waiting for a packet of room.
-            let least = if sim.fits() < 4.0 * PACKET as f64 {
-                0.5
-            } else {
-                0.8
+    fn a_cold_load_keeps_the_window_at_start_or_what_the_path_carries() {
+        let mut rng = Xorshift::new(0x3C6E_F372_FE94_F82B);
+        let ms = Duration::from_millis;
+        let (mut late_pong, mut pong_after_key, mut over) = (0, 0, 0);
+        for case in 0..201 {
+            let t0 = Instant::now();
+            let carries = any_carries(&mut rng);
+            let trip = ms(2 + rng.below(299));
+            let late = LATES[case % LATES.len()];
+            let path = path(t0, carries, trip, late, rng.next());
+            let extra = ms(rng.below(121));
+            // In half the cases the first pong is held until after the keyframe's ack.
+            let after_key = rng.below(2) == 1;
+            let held = match after_key {
+                false => extra,
+                true => Duration::from_secs(3600),
             };
-            assert!(used > least, "{what}");
-            assert!(sim.late(0.5) <= LATENESS * 2, "{what}");
-            assert!(sim.late(1.0) <= LATENESS * 3, "{what}");
-        }
-    }
-
-    /// The window is never more than twice a load the path has carried, whatever is sent
-    /// and however its acknowledgements come; and never more is in flight than the window
-    /// allowed when the last frame left.
-    #[test]
-    fn the_window_is_never_more_than_twice_a_load_the_path_carried() {
-        let mut rng = Rng(0x9E3779B97F4A7C15);
-        for _ in 0..300 {
-            let mut sim = Sim::new(rng.range(19_000, 10_000_000) as f64, rng.range(2, 300));
-            sim.jitter = Duration::from_millis(rng.range(0, 3000));
-            for _ in 0..rng.range(1, 6) {
-                let from = sim.now + Duration::from_millis(rng.range(0, 20_000));
-                sim.stalls
-                    .push((from, from + Duration::from_millis(rng.range(100, 4000))));
+            let mut v = Viewer::connect(t0, path, rng.below(17_000) as usize, held);
+            v.tick(Want::Key(60_000 + rng.below(340_000) as usize));
+            let key = v.frames.back().map(|a| a.0);
+            if let (Some(key), true) = (key, after_key) {
+                let first = v.pongs.iter_mut().find(|p| p.1 == t0).unwrap();
+                first.0 = key + extra;
             }
-            sim.stalls.sort();
-            let mut most = START;
-            for _ in 0..2000 {
-                let want = match rng.range(0, 4) {
-                    0 => 0,
-                    1 => rng.range(200, 2000) as usize,
-                    2 => rng.range(2000, 60_000) as usize,
-                    _ => HEAVY,
+            match (v.pongs.iter().map(|p| p.0).min(), key) {
+                (Some(pong), Some(key)) if pong > key => pong_after_key += 1,
+                _ => late_pong += 1,
+            }
+            let fill = 60 + rng.below(540);
+            let chunk = 1_000 + rng.below(19_000) as usize;
+            for i in 0..3600 {
+                let want = match i < fill {
+                    true if rng.below(4) == 0 => Want::Nothing,
+                    true => Want::Frame(chunk),
+                    false => Want::Frame(222),
                 };
-                sim.tick(want);
-                most = most.max(sim.most_load * TRUST);
-                assert!(sim.window.carries() <= most);
-                assert!(sim.window.carries() >= PACKET);
+                v.tick(want);
             }
-        }
-    }
-
-    /// Typing does not move the window, however late each of its frames comes back, while
-    /// they come back one at a time: a frame that met less than half of what the path
-    /// carries did not test it.
-    #[test]
-    fn frames_that_did_not_test_the_window_do_not_move_it() {
-        let mut rng = Rng(0xD1B54A32D192ED03);
-        for _ in 0..200 {
-            let mut sim = Sim::new(rng.range(19_000, 10_000_000) as f64, rng.range(2, 300));
-            // A scroll first, so the window is the path's and not the start.
-            sim.run(600, |_| HEAVY);
-            // The scroll's last round ends with the first frame that leaves after the
-            // scroll has all come back.
-            sim.run(180, |i| if i % 60 == 59 { 700 } else { 0 });
-            let before = sim.window.carries();
-            // A key every 200 ms, each frame up to 150 ms late.
-            sim.jitter = Duration::from_millis(rng.range(0, 150));
-            let small = (before / 2).saturating_sub(1).min(700);
-            sim.run(1200, |i| if i % 12 == 0 { small } else { 0 });
-            assert_eq!(
-                sim.window.carries(),
-                before,
-                "{} B/s, {:?}, jitter {:?}, keys of {small}",
-                sim.rate,
-                sim.rtt,
-                sim.jitter
-            );
-        }
-    }
-
-    /// A scroll after stillness gets what it asks for from its first frame, on a link with
-    /// room: stillness does not shrink the window.
-    #[test]
-    fn a_scroll_after_stillness_is_whole_from_its_first_frame() {
-        let mut rng = Rng(0x2545F4914F6CDD1D);
-        for _ in 0..100 {
-            // 60 KB a frame at 60 fps is 3.6 MB/s.
-            let rate = rng.range(4_500_000, 10_000_000) as f64;
-            let mut sim = Sim::new(rate, rng.range(20, 150));
-            sim.run(120, rest);
-            sim.run(180, |_| 60_000);
-            sim.run(rng.range(60, 3600) as u32, rest);
-            sim.reset();
-            sim.run(60, |_| 60_000);
-            assert_eq!(sim.worst_share, 1.0, "{rate} B/s, {:?}", sim.rtt);
-            assert!(sim.late(1.0) <= LATENESS, "{rate} B/s: {:?}", sim.late(1.0));
-        }
-    }
-
-    /// A viewer in motion from its first frame learns a fast path: the window is found by
-    /// the frames themselves, with nothing held back for a path not yet known.
-    #[test]
-    fn motion_from_the_first_frame_finds_a_fast_path() {
-        let mut rng = Rng(0x9E3779B97F4A7C15);
-        for _ in 0..100 {
-            let rate = rng.range(4_500_000, 125_000_000) as f64;
-            let mut sim = Sim::new(rate, rng.range(1, 100));
-            sim.run(60, |_| 60_000);
-            sim.reset();
-            sim.run(60, |_| 60_000);
-            assert_eq!(sim.worst_share, 1.0, "{rate} B/s, {:?}", sim.rtt);
-        }
-    }
-
-    /// A stall halves the window at most a few times and motion after it wins it back:
-    /// within two seconds of the stall's end the link is used again.
-    #[test]
-    fn a_stall_is_not_a_slow_path() {
-        let mut rng = Rng(0xD1B54A32D192ED03);
-        for _ in 0..200 {
-            let rate = rng.range(19_000, 10_000_000) as f64;
-            let mut sim = Sim::new(rate, rng.range(2, 300));
-            sim.run(600, |_| HEAVY);
-            let from = sim.now + Duration::from_millis(rng.range(0, 500));
-            let to = from + Duration::from_millis(rng.range(100, 4000));
-            sim.stalls.push((from, to));
-            // In a stall nothing comes back, and soon nothing more goes out. What is on
-            // its way is what was when the stall began (a round trip and a queue's worth)
-            // and what left until the frames on their way were later than the window allows
-            // (as much again, and the queue that fills while it waits): never more than
-            // the path is taken to carry in two round trips and four times `LATENESS`,
-            // however long the stall lasts.
-            // (By the most the path was taken to carry on the way: the window falls while
-            // the stall lasts, and what left before it fell is still out.)
-            let mut carries = 0;
-            while sim.now < to {
-                carries = carries.max(sim.window.carries());
-                let most = scale(carries, sim.rtt * 2 + LATENESS * 4, LATENESS) + PACKET;
-                sim.tick(HEAVY);
-                assert!(
-                    sim.in_flight <= most,
-                    "{rate} B/s: {} of {most}",
-                    sim.in_flight
-                );
-            }
-            sim.run(120, |_| HEAVY);
-            sim.reset();
-            sim.run(600, |_| HEAVY);
-            let used = sim.sent as f64 / (rate * 10.0);
-            assert!(
-                used > 0.9,
-                "{rate} B/s, {:?}, stall {:?}: used {used:.2}",
-                sim.rtt,
-                to - from
-            );
-        }
-    }
-
-    /// A link that slows to a tenth or a quarter is followed down, and one that quickens
-    /// up: five seconds after the change the link is used and frames come back within
-    /// about twice `LATENESS`.
-    #[test]
-    fn a_link_that_changes_is_followed() {
-        let mut rng = Rng(0x2545F4914F6CDD1D);
-        for _ in 0..200 {
-            let rate = rng.range(60_000, 5_000_000) as f64;
-            let to = rate * [0.1, 0.25, 4.0, 10.0][rng.range(0, 4) as usize];
-            let mut sim = Sim::new(rate, rng.range(2, 300));
-            sim.run(600, |_| HEAVY);
-            sim.rate = to;
-            sim.run(300, |_| HEAVY);
-            sim.reset();
-            sim.run(600, |_| HEAVY);
-            let used = sim.sent as f64 / (to * 10.0);
+            // An ack late by up to the model's 99th hundredth stretches a path-paced
+            // reading's time, of `LATENESS / 2` at least, by that much: a fall may land that
+            // much under what the path carries.
+            let stretched =
+                (LATENESS / 2).as_secs_f64() / (LATENESS / 2 + quantile(late, 0.99)).as_secs_f64();
+            let floor = (START.min(v.path.carries()) as f64 * stretched) as usize;
             let what = format!(
-                "{rate} to {to} B/s, {:?}: used {used:.2}, late p50 {:?}",
-                sim.rtt,
-                sim.late(0.5)
+                "case {case}: {carries:.0} B in LATENESS, {trip:?}, {late:?}, first pong {extra:?} \
+                 late, after the keyframe's ack: {after_key}: window at its lowest {}, worst \
+                 wait {:?}, fastest over the trip by {:?}",
+                v.window.lowest(),
+                v.worst,
+                v.over
             );
-            // A link that carries only a couple of packets in `LATENESS` spends much of
-            // its time waiting for a packet of room.
-            let least = if to * LATENESS.as_secs_f64() < 4.0 * PACKET as f64 {
-                0.5
-            } else {
-                0.8
-            };
-            assert!(used > least, "{what}");
-            // A queue left over from before the change stands at the most the window
-            // allows before it sees it: `LATENESS`, the frame in it, and a frame time.
-            // (A link that carries less than two packets in `LATENESS` is as late as its
-            // packets make it.)
-            if to * LATENESS.as_secs_f64() >= 2.0 * PACKET as f64 {
-                assert!(sim.late(0.5) <= LATENESS * 5 / 2, "{what}");
-            }
-        }
-    }
-
-    /// Acknowledgements that come late at random (a busy server, a path with jitter) do
-    /// not starve the stream: with every one up to 40 ms late, motion still uses most of
-    /// the link.
-    #[test]
-    fn late_acknowledgements_do_not_starve_the_stream() {
-        let mut rng = Rng(0x9E3779B97F4A7C15);
-        for _ in 0..200 {
-            let rate = rng.range(19_000, 10_000_000) as f64;
-            let mut sim = Sim::new(rate, rng.range(2, 300));
-            sim.jitter = Duration::from_millis(rng.range(1, 40));
-            sim.run(600, |_| HEAVY);
-            sim.reset();
-            sim.run(1200, |_| HEAVY);
-            let used = sim.sent as f64 / (rate * 20.0);
+            assert!(v.window.lowest() >= floor, "{what}");
+            let lag = (trip + v.worst).mul_f64(2.0 * v.past);
             assert!(
-                used > 0.5,
-                "{rate} B/s, {:?}, jitter {:?}: used {used:.2}",
-                sim.rtt,
-                sim.jitter
+                v.worst <= LATENESS * 3 + v.over + lag,
+                "{what}, over it by {:.2}",
+                v.past
             );
+            over += usize::from(v.worst > LATENESS * 3 + v.over);
+        }
+        assert!(
+            late_pong > 50 && pong_after_key > 50 && over > 0,
+            "{late_pong} first pongs before the keyframe's ack, {pong_after_key} after, {over} \
+             waits past 3 LATENESS and E"
+        );
+    }
+
+    /// A move changes how fast the queue drains, never how many bytes it holds: from any
+    /// window and any queue, to any other window, the bytes queued at the move are the same
+    /// just after it as just before.
+    #[test]
+    fn a_move_keeps_the_bytes_queued() {
+        let mut rng = Xorshift::new(0x1F83_D9AB_FB41_BD6B);
+        for _ in 0..10_000 {
+            let at = Instant::now();
+            let mut w = Window::new(at, 0, usize::MAX);
+            w.carries = PACKET + rng.below(8_000_000) as usize;
+            w.busy = at + Duration::from_nanos(rng.below(2_000_000_000));
+            let before = w.model(at);
+            let to = PACKET + rng.below(8_000_000) as usize;
+            w.moves(at, to);
+            assert_eq!((w.carries, w.model(at)), (to, before));
         }
     }
 
-    /// A window starts at `START` within its bounds, and stays within them whatever its
-    /// path does: never under `least` or over `most`, never under a packet, and where the
-    /// two cross `most` wins; and the room it gives a frame is never more than it carries,
-    /// nor less than a packet. Over random bounds (crossing, under a packet, or none) and
-    /// 2000 frame times of random paths, wants, stalls and late acks.
+    /// A round moves the window once, within the rule written here. A round ends at the
+    /// first frame back that left after it began, or that came back a round trip and
+    /// `LATENESS` after it began, once a ping has come back; every other ack leaves the window
+    /// bit-equal. A round moves the window to no less than half of it and no more than twice
+    /// it, and below it only if every frame back in it waited longer than `LATENESS / 2` past
+    /// the fastest ping's trip and its own crossing; and the bytes queued are the same across
+    /// a move. Over generated runs of pings and frames (frames that take all their room or any
+    /// size), rises, falls and rounds that move nothing are all seen.
     #[test]
-    fn a_window_starts_and_stays_within_its_bounds() {
-        let mut rng = Rng(0xA076_1D64_78BD_642F);
+    fn a_round_moves_the_window_once_within_half_and_twice() {
+        const MOST: usize = 7_500_000;
+        let mut rng = Xorshift::new(0x5BE0_CD19_137E_2179);
+        let ms = |n: u64| Duration::from_millis(n);
+        let (mut rises, mut falls, mut held) = (0, 0, 0);
         for _ in 0..300 {
-            let pick = |rng: &mut Rng| match rng.range(0, 5) {
-                0 => 0,
-                1 => rng.range(1, PACKET as u64) as usize,
-                2 => usize::MAX,
-                _ => rng.range(PACKET as u64, 400_000) as usize,
-            };
-            let (least, most) = (pick(&mut rng), pick(&mut rng));
-            let mut sim = Sim::new(rng.range(19_000, 10_000_000) as f64, rng.range(2, 300));
-            sim.jitter = Duration::from_millis(rng.range(0, 300));
-            let from = sim.now + Duration::from_millis(rng.range(0, 20_000));
-            sim.stalls
-                .push((from, from + Duration::from_millis(rng.range(100, 4000))));
-            sim.window = Window::new(sim.now, least, most);
-            let hi = most.max(PACKET);
-            let lo = least.clamp(PACKET, hi);
-            let what = format!("least {least}, most {most}");
-            assert_eq!(sim.window.carries(), START.clamp(lo, hi), "{what}");
-            for _ in 0..2000 {
-                let want = match rng.range(0, 3) {
-                    0 => 0,
-                    1 => rng.range(200, 60_000) as usize,
-                    _ => HEAVY,
+            let t0 = Instant::now();
+            // Up to what 1 Gbit/s carries in `LATENESS`: the queue's bytes are kept across a
+            // move to the byte under 60 MB.
+            let mut w = Window::new(t0, 0, MOST);
+            // Frames on their way: when each left, its bytes, and when its ack comes back.
+            let mut flying = VecDeque::<(Instant, usize, Instant)>::new();
+            let (mut now, mut acks, mut ping) = (t0, t0, t0 + ms(rng.below(2_000)));
+            // The trip pings and acks take, plus up to 20 ms or up to 600 ms.
+            let trip = 20 + rng.below(280);
+            let jitter = [20, 600][rng.below(2) as usize];
+            // The connect ping, with nothing on its way.
+            w.pinged(t0, ms(trip + rng.below(jitter)), Ahead::Nothing);
+            let gap = 1 + rng.below(40);
+            // Whether frames take all their room, as motion's do, or any size up to 30 KB.
+            let fill = rng.below(2) == 0;
+            // The rule's own round: when it began, and whether every frame that came back in
+            // it by its own ack waited past `LATENESS / 2`.
+            let (mut began, mut queued) = (t0, true);
+            for _ in 0..600 {
+                now += ms(1 + rng.below(gap));
+                if now >= ping {
+                    let ahead = w.ahead();
+                    w.pinged(now, ms(trip + rng.below(jitter)), ahead);
+                    ping += crate::hub::PING_EVERY;
+                }
+                // The next ack: it names the oldest frame on its way.
+                while let Some(&(left, bytes, at)) = flying.front().filter(|f| f.2 <= now) {
+                    flying.pop_front();
+                    let (carries, before) = (w.carries, w.model(at));
+                    w.came_back(at);
+                    let Some(fastest) = w.fastest else {
+                        assert_eq!(w.carries, carries);
+                        continue;
+                    };
+                    let late = at.saturating_duration_since(left + fastest);
+                    let crossing = scale(bytes, LATENESS, Duration::from_nanos(carries as u64));
+                    let wait = late.saturating_sub(Duration::from_nanos(crossing as u64));
+                    queued &= wait > LATENESS / 2;
+                    let ends = left >= began || at - began >= fastest + LATENESS;
+                    if !ends {
+                        assert_eq!(w.carries, carries);
+                        continue;
+                    }
+                    let (low, high) = ((carries / FALL).max(PACKET), (carries * FALL).min(MOST));
+                    assert!(
+                        (low..=high).contains(&w.carries),
+                        "{carries} to {}: {low} to {high}",
+                        w.carries
+                    );
+                    assert!(w.carries >= carries || queued, "{carries} to {}", w.carries);
+                    if !flying.is_empty() {
+                        assert_eq!(w.model(at), before, "the queue across a move");
+                    }
+                    rises += usize::from(w.carries > carries);
+                    falls += usize::from(w.carries < carries);
+                    held += usize::from(w.carries == carries);
+                    (began, queued) = (at, true);
+                }
+                let bytes = match (fill, w.room(now)) {
+                    (true, Some(room)) => room,
+                    (true, None) => continue,
+                    (false, _) => 100 + rng.below(30_000) as usize,
                 };
-                sim.tick(want);
-                let carries = sim.window.carries();
-                assert!(lo <= carries && carries <= hi, "{carries}: {what}");
-                if let Some(room) = sim.window.room(sim.now) {
-                    assert!(PACKET <= room && room <= carries, "{room}: {what}");
-                }
+                w.leave(now, bytes);
+                acks = acks.max(now + ms(trip + rng.below(jitter)));
+                flying.push_back((now, bytes, acks));
             }
         }
+        assert!(
+            rises > 100 && falls > 100 && held > 100,
+            "{rises} rises, {falls} falls, {held} rounds read and held"
+        );
     }
 
-    /// The first frame of a scroll after stillness is whole on a link the scroll
-    /// overfills, once a scroll has shown the window the path: what the path carries in
-    /// `LATENESS` is all its room. The frames after it get what the link sustains and come
-    /// back within three times `LATENESS`. A scroll of 45 KB frames (2.7 MB/s) on links of
-    /// 1 to 2.5 MB/s, round trips of 20 to 150 ms, after 2 to 20 s of a desktop at rest.
+    /// The path's fastest trip, as the rule written here says it: the least trip of the
+    /// pings of the last `FASTEST_FOR` that left an empty path or came back faster than it,
+    /// once two are there; until then, the least of those of them that came back. A ping
+    /// that left behind frames before any had the path to itself says nothing. Over
+    /// generated runs of pings, a fifth of them clean, pings come and go from the record,
+    /// and it both rises and falls.
     #[test]
-    fn the_first_frame_of_a_scroll_is_whole_on_a_link_it_overfills() {
-        let mut rng = Rng(0x94D0_49BB_1331_11EB);
-        for _ in 0..100 {
-            let rate = rng.range(1_000_000, 2_500_000) as f64;
-            let mut sim = Sim::new(rate, rng.range(20, 150));
-            sim.run(120, rest);
-            sim.run(40, |_| 45_000);
-            sim.run(60 * rng.range(2, 20) as u32, rest);
-            sim.reset();
-            sim.run(1, |_| 45_000);
-            assert_eq!(sim.worst_share, 1.0, "{rate} B/s, {:?}", sim.rtt);
-            sim.run(120, |_| 45_000);
-            let late = sim.late(1.0);
-            assert!(late <= LATENESS * 3, "{rate} B/s, {:?}: {late:?}", sim.rtt);
-        }
-    }
-
-    /// Acks a few ms late on a long path never read as a faster path: a late ack makes a
-    /// frame look slower, and the one after it at most that much faster, so the window
-    /// never carries more than the link does in `LATENESS` and the lateness (measured: at
-    /// most 3.5% over at 6 ms, of the 10% allowed). Rest and scrolls in turn on 2.5 to
-    /// 7.5 MB/s links with round trips of 120 to 180 ms, every ack up to 1, 3 or 6 ms late.
-    #[test]
-    fn late_acks_on_a_long_path_do_not_read_as_a_faster_one() {
-        let mut rng = Rng(0xE703_7ED1_A0B4_28DB);
-        for late_ms in [1, 3, 6] {
-            for _ in 0..30 {
-                let rate = rng.range(2_500_000, 7_500_000) as f64;
-                let mut sim = Sim::new(rate, rng.range(120, 180));
-                sim.jitter = Duration::from_millis(late_ms);
-                let mut most = 0;
-                for _ in 0..4 {
-                    for i in 0..240 {
-                        sim.tick(if i < 120 { rest(i) } else { 62_000 });
-                        most = most.max(sim.window.carries());
-                    }
-                }
-                let read = most as f64 / sim.fits();
-                let over = sim.jitter.as_secs_f64() / LATENESS.as_secs_f64();
-                assert!(
-                    read <= 1.0 + over,
-                    "{rate} B/s, acks {late_ms} ms late: read {read:.3}"
-                );
-            }
-        }
-    }
-
-    /// A path that slows while the screen only types is followed once a scroll tests it:
-    /// typing did not move the window, so the scroll's first frames find the old path's
-    /// room, and from two seconds into it the stream sends no more than the link carries
-    /// (but what is queued when it ends, under what the link carries in `LATENESS`) and
-    /// comes back within about twice `LATENESS`. 5 MB/s links that drop to a tenth, round
-    /// trips of 20 to 150 ms, 10 s of a key every 200 ms between.
-    #[test]
-    fn a_path_that_slows_under_typing_is_followed_by_the_scroll_after() {
-        let mut rng = Rng(0x2545_F491_4F6C_DD1D);
-        for _ in 0..100 {
-            let mut sim = Sim::new(5_000_000.0, rng.range(20, 150));
-            sim.run(600, |_| HEAVY);
-            sim.rate = 500_000.0;
-            sim.run(600, |i| if i % 12 == 0 { 400 } else { 0 });
-            sim.run(120, |_| 60_000);
-            sim.reset();
-            sim.run(600, |_| 60_000);
-            let carried = sim.rate * 10.0;
-            let what = format!(
-                "{:?}: sent {} of {carried}, late p50 {:?}",
-                sim.rtt,
-                sim.sent,
-                sim.late(0.5)
-            );
-            assert!(sim.sent as f64 <= carried + sim.fits(), "{what}");
-            assert!(sim.late(0.5) <= LATENESS * 5 / 2, "{what}");
-        }
-    }
-
-    /// A frame that comes out bigger than its room (x264 cannot make a picture smaller than
-    /// its highest quantizer makes it) is paid for by the frames after it: the window gives
-    /// none until it is through, so a minute of such frames sends no more than the link
-    /// carries (but what is queued when it ends: under one such frame and what the link
-    /// carries in `LATENESS`), and none comes back later than the crossing of its own bytes
-    /// and the rest of the one before it, and three times `LATENESS`. Frames of at least
-    /// 1.5 to 4 times what the link carries in `LATENESS`, on 0.3 to 5 MB/s links, round
-    /// trips of 2 to 300 ms.
-    #[test]
-    fn a_frame_bigger_than_its_room_is_paid_for_by_the_frames_after_it() {
-        let mut rng = Rng(0xBF58_476D_1CE4_E5B9);
-        for _ in 0..100 {
-            let rate = rng.range(300_000, 5_000_000) as f64;
-            let mut sim = Sim::new(rate, rng.range(2, 300));
-            sim.floor = (sim.fits() * rng.range(15, 40) as f64 / 10.0) as usize;
-            sim.run(600, |_| HEAVY);
-            sim.reset();
-            sim.run(3600, |_| HEAVY);
-            let carried = rate * 60.0;
-            let own = Duration::from_secs_f64(sim.floor as f64 / rate);
-            let what = format!(
-                "{rate} B/s, {:?}, floor {}: sent {} of {carried}, late {:?}",
-                sim.rtt,
-                sim.floor,
-                sim.sent,
-                sim.late(1.0)
-            );
-            assert!(
-                sim.sent as f64 <= carried + sim.fits() + sim.floor as f64,
-                "{what}"
-            );
-            assert!(sim.late(1.0) <= own * 2 + LATENESS * 3, "{what}");
-        }
-    }
-
-    /// Every ack and ping that would come back before `until` comes back at `until`
-    /// instead, one behind the other a microsecond apart, in the order they left: what a
-    /// return path or a client that stalls and then catches up hands the server.
-    fn hold_acks(sim: &mut Sim, until: Instant) {
-        let mut at = until;
-        for f in sim.flying.iter_mut().filter(|f| f.acked < until) {
-            f.acked = at;
-            at += Duration::from_micros(1);
-        }
-        for p in sim.pings.iter_mut().filter(|p| p.0 < until) {
-            p.0 = until;
-        }
-    }
-
-    /// Acks that a stall held back and that then come together (a client that stopped
-    /// reading its socket and catches up, a busy server, a return path that stalled) do
-    /// not read as a faster path: they say nothing of what the path carried while they
-    /// were held. So after them the window never carries more than the link does in
-    /// `LATENESS`, and the frames that leave after them come back within the lateness of
-    /// sustained motion (three times `LATENESS`, as in
-    /// `sustained_motion_fills_the_link_and_adds_about_the_lateness`). Sustained motion on
-    /// links of 1 to 80 Mbit/s and round trips of 2 to 300 ms, whose acks are held for 20
-    /// ms to 2 s, then 5 s more of it.
-    #[test]
-    fn acks_that_bunch_after_a_stall_do_not_read_as_a_faster_path() {
-        let mut rng = Rng(0x5851_F42D_4C95_7F2D);
+    fn the_fastest_trip_is_the_least_of_the_pings_that_had_the_path() {
+        let mut rng = Xorshift::new(0x9B05_688C_2B3E_6C1F);
+        let (mut rises, mut falls) = (0, 0);
         for _ in 0..200 {
-            let rate = rng.range(125_000, 10_000_000) as f64;
-            let mut sim = Sim::new(rate, rng.range(2, 300));
-            sim.run(600, |_| HEAVY);
-            let held = Duration::from_millis(rng.range(20, 2000));
-            let until = sim.now + held;
-            while sim.now < until {
-                hold_acks(&mut sim, until);
-                sim.tick(HEAVY);
-            }
-            // The frames that left before the acks came together, and how late each of
-            // those that left after came back.
-            let after = sim.now;
-            let mut most = 0;
-            let mut late = Duration::ZERO;
-            for _ in 0..300 {
-                for f in sim.flying.iter().filter(|f| f.left.at > after) {
-                    if f.acked <= sim.now + FRAME {
-                        late = late.max((f.acked - f.left.at).saturating_sub(sim.rtt));
-                    }
+            let t0 = Instant::now();
+            let mut w = Window::new(t0, 0, usize::MAX);
+            let mut pings: Vec<(Instant, Duration)> = Vec::new();
+            let mut now = t0;
+            for _ in 0..400 {
+                now += Duration::from_millis(100 + rng.below(1_500));
+                let trip = Duration::from_millis(20 + rng.below(400));
+                let ahead = match rng.below(5) {
+                    0 => Ahead::Nothing,
+                    _ => Ahead::Frames,
+                };
+                let was = w.fastest;
+                w.pinged(now, trip, ahead);
+                if ahead == Ahead::Nothing || was.is_some_and(|f| trip < f) {
+                    pings.push((now, trip));
                 }
-                sim.tick(HEAVY);
-                most = most.max(sim.window.carries());
+                pings.retain(|&(at, _)| now - at <= FASTEST_FOR);
+                let least = pings.iter().map(|p| p.1).min();
+                let want = match (pings.len() >= 2, was, least) {
+                    (true, _, least) => least,
+                    (false, was, Some(least)) => Some(was.map_or(least, |f| f.min(least))),
+                    (false, was, None) => was,
+                };
+                assert_eq!(w.fastest, want);
+                rises += usize::from(w.fastest > was && was.is_some());
+                falls += usize::from(w.fastest < was);
             }
-            let what = format!(
-                "{rate} B/s, {:?}, acks held {held:?}: window {:.2} of the link, late {late:?}",
-                sim.rtt,
-                most as f64 / sim.fits()
-            );
-            assert!(most as f64 <= sim.fits() * 1.1, "{what}");
-            assert!(late <= LATENESS * 3, "{what}");
         }
+        assert!(rises > 100 && falls > 100, "{rises} rises, {falls} falls");
     }
 
-    /// Acks late at random under sustained motion (a busy server or client: at a load of
-    /// 300 the lag was 5 ms at p10 and 17 ms at p50) do not read as a faster path: a late
-    /// ack makes its frame look slower and the one after it at most that much faster, so
-    /// the window never carries more than the link does in `LATENESS` and the lateness, as
-    /// `late_acks_on_a_long_path_do_not_read_as_a_faster_one` bounds it; and frames come back
-    /// within the lateness of sustained motion and that of their acks. Links of 1 to 80
-    /// Mbit/s, round trips of 2 to 300 ms, every ack up to 1 to 40 ms late, 30 s.
+    /// What changes on a path under load.
+    #[derive(Clone, Copy, Debug)]
+    enum Change {
+        /// Nothing: the load runs on from its cold start.
+        None,
+        /// Its bottleneck carries nothing for this long.
+        Stall(Duration),
+        /// Its rate becomes this many tenths of what it was.
+        Rate(u64),
+        /// Its own round trip grows by this much, for good.
+        Trip(Duration),
+        /// The viewer holds its answers this long, and then sends them all.
+        Held(Duration),
+    }
+
+    /// Saturating demand from any state: a viewer that connects as production's do, on any
+    /// path (0.2 to 100 Mbit/s, 2 to 300 ms), under motion that wants more than any path
+    /// carries, its answers as late as one of the lateness models says; after 10 s one change
+    /// (a stall of 0.5 to 3 s, a rate from a tenth to ten times, a round trip 40 to 300 ms
+    /// longer, answers held 0.2 to 2 s), or none; then 30 s more, past any memory the window
+    /// has. Over the last 30 s the path is used at least `LATENESS / (3 * LATENESS / 2 + δ)`, δ
+    /// the lateness of the model's middle answer, and no frame waits behind the queue longer
+    /// than `3 * LATENESS` and the lateness of all but the model's slowest hundredth.
     #[test]
-    fn late_acks_under_motion_do_not_read_as_a_faster_path() {
-        let mut rng = Rng(0x1405_7B7E_F767_814F);
-        for _ in 0..200 {
-            let rate = rng.range(125_000, 10_000_000) as f64;
-            let mut sim = Sim::new(rate, rng.range(2, 300));
-            sim.jitter = Duration::from_millis(rng.range(1, 40));
-            sim.run(600, |_| HEAVY);
-            sim.reset();
-            let mut most = 0;
+    fn saturating_demand_from_any_state_uses_the_path() {
+        let mut rng = Xorshift::new(0xA54F_F53A_5F1D_36F1);
+        let ms = Duration::from_millis;
+        let mut changes = [0; 5];
+        for case in 0..201 {
+            let t0 = Instant::now();
+            let (slow, fast): (f64, f64) = (0.2e6 / 8.0, 100e6 / 8.0);
+            let rate = slow * (fast / slow).powf(rng.below(1001) as f64 / 1000.0);
+            let trip = ms(2 + rng.below(299));
+            let late = LATES[case % LATES.len()];
+            let path = path(t0, rate * LATENESS.as_secs_f64(), trip, late, rng.next());
+            let mut v = Viewer::connect(t0, path, rng.below(17_000) as usize, Duration::ZERO);
+            v.tick(Want::Key(usize::MAX));
+            for _ in 0..600 {
+                v.tick(Want::Frame(usize::MAX));
+            }
+            let at = v.now;
+            let change = match rng.below(5) {
+                0 => Change::None,
+                1 => Change::Stall(ms(500 + rng.below(2501))),
+                2 => Change::Rate(1 + rng.below(100)),
+                3 => Change::Trip(ms(40 + rng.below(261))),
+                _ => Change::Held(ms(200 + rng.below(1801))),
+            };
+            match change {
+                Change::None => changes[0] += 1,
+                Change::Stall(d) => {
+                    v.path.stalls.push((at, at + d));
+                    changes[1] += 1;
+                }
+                Change::Rate(tenths) => {
+                    v.path.rate *= tenths as f64 / 10.0;
+                    changes[2] += 1;
+                }
+                Change::Trip(d) => {
+                    v.path.trip += d;
+                    changes[3] += 1;
+                }
+                Change::Held(d) => {
+                    v.path.held.push((at, at + d));
+                    changes[4] += 1;
+                }
+            }
+            for _ in 0..600 {
+                v.tick(Want::Frame(usize::MAX));
+            }
+            // A path whose own delay rose is known for it only once pings have had it to
+            // themselves and the trips of before are forgotten: the motion pauses once the
+            // last ping that had the path to itself before the rise, at the start, is
+            // `FASTEST_FOR` old. The window then grows back by at least
+            // `1 + LATENESS / (4 * round)` a round, a round no longer than the trip and twice
+            // `LATENESS`: it is given that many rounds to reach the path.
+            if let Change::Trip(_) = change {
+                while v.now < t0 + FASTEST_FOR + LATENESS {
+                    v.tick(Want::Frame(usize::MAX));
+                }
+                for _ in 0..150 {
+                    v.tick(Want::Nothing);
+                }
+                let round = (v.path.trip + LATENESS * 2).as_secs_f64();
+                let grow = 1.0 + LATENESS.as_secs_f64() / (4.0 * round);
+                let short = v.path.carries() as f64 / v.window.carries() as f64;
+                let rounds = short.max(1.0).ln() / grow.ln();
+                let until = v.now + Duration::from_secs_f64(rounds.ceil() * round);
+                while v.now < until {
+                    v.tick(Want::Frame(usize::MAX));
+                }
+            }
             for _ in 0..1200 {
-                sim.tick(HEAVY);
-                most = most.max(sim.window.carries());
+                v.tick(Want::Frame(usize::MAX));
             }
-            let read = most as f64 / sim.fits();
-            let over = sim.jitter.as_secs_f64() / LATENESS.as_secs_f64();
+            v.reset();
+            let from = v.now;
+            for _ in 0..1800 {
+                v.tick(Want::Frame(usize::MAX));
+            }
+            let used = v.sent as f64 / (v.path.rate * (v.now - from).as_secs_f64());
+            // The window lets the queue grow to `LATENESS / 2` past the fastest trip before
+            // it gives way, learns of it a middle answer's lateness late, and gives way as far
+            // under the path as it went over: at worst the path idles that long in every
+            // `LATENESS` and that.
+            let middle = quantile(late, 0.5);
+            let least = LATENESS.as_secs_f64() / (LATENESS + LATENESS / 2 + middle).as_secs_f64();
             let what = format!(
-                "{rate} B/s, {:?}, acks up to {:?} late: window {read:.2} of the link, late {:?}",
-                sim.rtt,
-                sim.jitter,
-                sim.late(1.0)
+                "case {case}: {:.0} B in LATENESS, {trip:?}, {late:?}, {change:?}: used \
+                 {used:.2}, worst wait {:?}, window {} B",
+                v.path.carries(),
+                v.worst,
+                v.window.carries()
             );
-            assert!(read <= 1.0 + over, "{what}");
-            assert!(sim.late(1.0) <= LATENESS * 3 + sim.jitter, "{what}");
+            assert!(used >= least, "{what}");
+            assert!(v.worst <= LATENESS * 3 + quantile(late, 0.99), "{what}");
         }
+        assert!(changes.iter().all(|&n| n > 25), "{changes:?}");
     }
 }

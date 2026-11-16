@@ -142,9 +142,8 @@ pub struct Display {
 pub struct Inflight {
     pub id: FrameId,
     pub bytes: usize,
-    /// When it left, and what its viewer's path was asked to carry with it, as its window
-    /// took it in.
-    pub left: window::Left,
+    /// When it left.
+    pub left: Instant,
 }
 
 /// How long a client says it kept a frame between its arrival and the ack (decode,
@@ -223,11 +222,12 @@ impl serde::Serialize for Token {
     }
 }
 
-/// A ping sent to a client: what names it, and when it went. The time never leaves the
-/// server.
+/// A ping sent to a client: what names it, when it went, and what was on its way to the
+/// client ahead of it, as its window had it then. The time never leaves the server.
 struct Ping {
     token: Token,
     sent: Instant,
+    ahead: window::Ahead,
 }
 
 /// The pings sent to a client and not yet answered, oldest first, at most `PINGS_KEPT`. A
@@ -236,23 +236,27 @@ struct Ping {
 pub struct Pings(VecDeque<Ping>);
 
 impl Pings {
-    /// A ping named `token`, sent at `now`. The oldest unanswered one leaves once the
-    /// record holds `PINGS_KEPT`.
-    pub fn send(&mut self, now: Instant, token: Token) {
+    /// A ping named `token`, sent at `now` with `ahead` on its way ahead of it. The oldest
+    /// unanswered one leaves once the record holds `PINGS_KEPT`.
+    pub fn send(&mut self, now: Instant, token: Token, ahead: window::Ahead) {
         if self.0.len() == PINGS_KEPT {
             self.0.pop_front();
         }
-        self.0.push_back(Ping { token, sent: now });
+        self.0.push_back(Ping {
+            token,
+            sent: now,
+            ahead,
+        });
     }
 
-    /// At `now`, a reply echoing `token`: the round trip of the ping it names, if that ping
-    /// is in the record, which it then leaves. A reply echoing anything else (a ping
-    /// already answered, one older than the record keeps, a token never sent, or a time,
-    /// as replies used to) is no round trip.
-    pub fn answer(&mut self, now: Instant, token: Token) -> Option<Duration> {
+    /// At `now`, a reply echoing `token`: the round trip of the ping it names, and what
+    /// was ahead of it, if that ping is in the record, which it then leaves. A reply echoing
+    /// anything else (a ping already answered, one older than the record keeps, a token
+    /// never sent, or a time, as replies used to) is no round trip.
+    pub fn answer(&mut self, now: Instant, token: Token) -> Option<(Duration, window::Ahead)> {
         let i = self.0.iter().position(|p| p.token == token)?;
         let ping = self.0.remove(i)?;
-        now.checked_duration_since(ping.sent)
+        Some((now.checked_duration_since(ping.sent)?, ping.ahead))
     }
 }
 
@@ -482,8 +486,12 @@ impl Client {
                 Takes::Close
             }
             Viewer::Started => {
-                let left = v.window.leave(now, bytes);
-                let frame = Inflight { id, bytes, left };
+                v.window.leave(now, bytes);
+                let frame = Inflight {
+                    id,
+                    bytes,
+                    left: now,
+                };
                 v.inflight.push_back(frame);
                 self.trace.lock().sent(frame, key);
                 Takes::Frame
@@ -497,12 +505,12 @@ impl Client {
     /// At `now`, the ack for frame `id` (and every one before it) arrived. It names a frame
     /// only if that frame is in flight to this client: an id that is not (one acked or
     /// covered already, one sent to another client, one never given) takes nothing out of
-    /// flight. Each frame it covers comes back to the window, oldest first. The one it
-    /// names came back when the client had it: what the client says it held of the trip is
-    /// its own time, not the path's. Any it covers without an ack of its own, and one whose
-    /// hold cannot be true (unreadable, or longer than the trip it is part of), came back
-    /// at `now`: later, so what the window reads of the path can only be lower. One left
-    /// behind wants its keyframe once the last of what is on its way is back.
+    /// flight. Each frame it covers comes back to the window, oldest first, when the one it
+    /// names did: when the client had it, as what the client says it held of the trip is its
+    /// own time, not the path's. One whose hold cannot be true (unreadable, or longer than
+    /// the trip it is part of) arrived at `now`: later, so what the window reads of the path
+    /// can only be lower. One left behind wants its keyframe once the last of what is on its
+    /// way is back.
     pub fn on_ack(&self, now: Instant, id: u32, hold: Hold) {
         self.trace.lock().acked(now, id, hold);
         let mut v = self.viewing.lock();
@@ -514,18 +522,15 @@ impl Client {
         let Some(named) = inflight.iter().position(|f| f.id.get() == id) else {
             return;
         };
-        let mut said = None;
-        for f in inflight.drain(..=named) {
-            let back = match hold {
-                Hold::Said(held)
-                    if f.id.get() == id && held <= now.saturating_duration_since(f.left.at) =>
-                {
-                    said = Some(held);
-                    now - held
-                }
-                Hold::Unsaid | Hold::Said(_) | Hold::Unreadable => now,
-            };
-            window.came_back(f.left, back, f.bytes);
+        // When the frame it names was at the client, and so every frame it covers.
+        let (at, said) = match hold {
+            Hold::Said(held) if held <= now.saturating_duration_since(inflight[named].left) => {
+                (now - held, Some(held))
+            }
+            Hold::Unsaid | Hold::Said(_) | Hold::Unreadable => (now, None),
+        };
+        for _ in inflight.drain(..=named) {
+            window.came_back(at);
         }
         if let (Viewer::Behind, true) = (*viewer, inflight.is_empty()) {
             *viewer = Viewer::Waiting;
@@ -537,9 +542,17 @@ impl Client {
         }
     }
 
-    /// At `now` a ping came back, `trip` after it went: a round trip that carried nothing.
-    pub fn pinged(&self, now: Instant, trip: Duration) {
-        self.viewing.lock().window.pinged(now, trip);
+    /// A ping came back at `now`, `trip` after it went with `ahead` on its way ahead of it:
+    /// a round trip that carried nothing.
+    pub fn pinged(&self, now: Instant, trip: Duration, ahead: window::Ahead) {
+        self.viewing.lock().window.pinged(now, trip, ahead);
+    }
+
+    /// A ping goes to it at `now`, named `token`: it is recorded with what is on its way
+    /// ahead of it.
+    pub fn ping(&self, now: Instant, token: Token) {
+        let ahead = self.viewing.lock().window.ahead();
+        self.pings.lock().send(now, token, ahead);
     }
 
     /// What it has in flight at `now`, if anything.
@@ -547,7 +560,7 @@ impl Client {
         let q = &self.viewing.lock().inflight;
         Some(Backlog {
             frames: NonZeroUsize::new(q.len())?,
-            oldest: now.saturating_duration_since(q.front()?.left.at),
+            oldest: now.saturating_duration_since(q.front()?.left),
         })
     }
 }
@@ -558,8 +571,12 @@ impl Client {
     /// flight, and on its way in its window.
     pub fn fly(&self, id: FrameId, at: Instant, bytes: usize) {
         let mut v = self.viewing.lock();
-        let left = v.window.leave(at, bytes);
-        v.inflight.push_back(Inflight { id, bytes, left });
+        v.window.leave(at, bytes);
+        v.inflight.push_back(Inflight {
+            id,
+            bytes,
+            left: at,
+        });
     }
 }
 
@@ -1326,6 +1343,10 @@ mod tests {
         );
     }
 
+    /// The round trip of the ping each run's client has had back before its first frame:
+    /// as fast as a frame of the run can come back.
+    const PING_TRIP: Duration = Duration::from_millis(1);
+
     /// What a client's window says at `at`: what its path carries, what is on its way,
     /// the fastest round trip, and the room it leaves a frame.
     type Said = (usize, usize, Option<Duration>, Option<usize>);
@@ -1383,21 +1404,23 @@ mod tests {
     }
 
     /// `frames` on a new client of `hub` that has started: each is sent when it leaves,
-    /// and each acked is acked at what `when` says with what `hold` says, in the order the
-    /// acks arrive.
+    /// and each acked is acked as its ack arrives, in order between the frames sent, as of
+    /// what `when` says with what `hold` says.
     fn acked(
         hub: &Hub,
         frames: &[Sent],
         when: impl Fn(&Sent) -> Instant,
         hold: impl Fn(&Sent) -> Hold,
     ) -> Arc<Client> {
-        // It joins as the run starts: before the first frame, by the run's own clock.
+        // It joins as the run starts: before the first frame, by the run's own clock; and
+        // a ping of `PING_TRIP` has come back, so its frames are read.
         let c = hub.add_client(mpsc::unbounded_channel().0, frames[0].at);
         c.viewing.lock().viewer = Viewer::Started;
+        c.pinged(frames[0].at, PING_TRIP, window::Ahead::Nothing);
         let mut acks = frames.iter().filter(|f| f.acked).peekable();
         for f in frames {
             // The acks that arrive before it leaves, of frames already sent.
-            while let Some(a) = acks.next_if(|a| a.id.get() < f.id.get() && when(a) <= f.at) {
+            while let Some(a) = acks.next_if(|a| a.id.get() < f.id.get() && a.acks <= f.at) {
                 c.on_ack(when(a), a.id.get(), hold(a));
             }
             let took = c.takes(f.id, f.at, f.bytes, false, usize::MAX);
@@ -1410,9 +1433,10 @@ mod tests {
     }
 
     /// The time a client keeps a frame (decoding, drawing) is its own, not the path's: a
-    /// client that says how long it held each frame reads, in its window, as a twin that
-    /// acked each the moment it arrived and said nothing. One that does not say reads
-    /// otherwise, in nearly every run. Over 50 generated runs, every frame acked.
+    /// client that says how long it held each frame reads, in its window, as a twin whose
+    /// acks, taken at the same moments, are as of the moment each frame arrived, and say
+    /// nothing. One that does not say reads otherwise, in nearly every run. Over 50
+    /// generated runs, every frame acked.
     #[test]
     fn the_clients_own_time_is_not_the_paths() {
         let mut otherwise = 0;
@@ -1429,46 +1453,43 @@ mod tests {
         assert!(otherwise > 40, "{otherwise} of 50");
     }
 
-    /// A frame an ack covers without one of its own comes back to the window when the ack
-    /// arrives, before the frame it names: as for a twin that acked it then itself, saying
-    /// no hold. Over 50 generated runs, about one frame in four covered.
+    /// An ack names one frame, and what left before it and has not come back came back with
+    /// it. A client's window is the one the rule written here makes of the same run: each
+    /// frame leaves as it is sent, and the frame an ack names, and each still on its way
+    /// before it, come back when the ack does less what the client says it held the one it
+    /// names. Over 50 generated runs, about one frame in four with no ack of its own.
     #[test]
-    fn a_frame_an_ack_covers_comes_back_when_the_ack_arrives() {
+    fn a_frame_an_ack_covers_comes_back_with_it() {
         for seed in 1..=50u64 {
             let hub = Hub::new(Paths::ANY);
             let frames = run(&hub, seed.wrapping_mul(0x2545_F491_4F6C_DD1D), true);
             let end = frames.last().unwrap().acks + Duration::from_secs(1);
-            // Each frame acked, a covered one when the ack that covers it arrives.
-            let mut each = frames.clone();
-            for i in (0..each.len()).rev() {
-                if !each[i].acked {
-                    each[i].acks = each[i + 1].acks;
+            let c = acked(&hub, &frames, |f| f.acks, |f| Hold::Said(f.held()));
+            let mut w = Window::new(frames[0].at, 0, usize::MAX);
+            w.pinged(frames[0].at, PING_TRIP, window::Ahead::Nothing);
+            let mut flying = VecDeque::<FrameId>::new();
+            let ack = |w: &mut Window, flying: &mut VecDeque<FrameId>, a: &Sent| {
+                while let Some(id) = flying.pop_front() {
+                    w.came_back(a.arrives);
+                    if id == a.id {
+                        break;
+                    }
                 }
-            }
-            let says = |f: &Sent| match f.acked {
-                true => Hold::Said(f.held()),
-                false => Hold::Unsaid,
             };
-            let c = acked(&hub, &frames, |f| f.acks, says);
-            for f in &mut each {
-                f.acked = true;
+            let mut acks = frames.iter().filter(|f| f.acked).peekable();
+            for f in &frames {
+                while let Some(a) = acks.next_if(|a| a.id.get() < f.id.get() && a.acks <= f.at) {
+                    ack(&mut w, &mut flying, a);
+                }
+                w.leave(f.at, f.bytes);
+                flying.push_back(f.id);
             }
-            let covered: std::collections::HashSet<u32> = frames
-                .iter()
-                .filter(|f| !f.acked)
-                .map(|f| f.id.get())
-                .collect();
-            let twin = acked(
-                &hub,
-                &each,
-                |f| f.acks,
-                |f| match covered.contains(&f.id.get()) {
-                    true => Hold::Unsaid,
-                    false => Hold::Said(f.held()),
-                },
-            );
-            assert!(!covered.is_empty());
-            assert_eq!(said(&c, end), said(&twin, end), "seed {seed}");
+            for a in acks {
+                ack(&mut w, &mut flying, a);
+            }
+            assert!(frames.iter().any(|f| !f.acked));
+            let rule = (w.carries(), w.flying(), w.fastest(), w.room(end));
+            assert_eq!(said(&c, end), rule, "seed {seed}");
         }
     }
 
@@ -1531,14 +1552,15 @@ mod tests {
         let ms = Duration::from_millis;
         let t0 = Instant::now();
         let mut pings = Pings::default();
-        for (at, token) in [(0, 10), (500, 11), (1000, 12)] {
-            pings.send(t0 + ms(at), Token(token));
+        let (nothing, frames) = (window::Ahead::Nothing, window::Ahead::Frames);
+        for (at, token, ahead) in [(0, 10, nothing), (500, 11, frames), (1000, 12, nothing)] {
+            pings.send(t0 + ms(at), Token(token), ahead);
         }
         for (now, echoes, round_trip) in [
-            // The latest ping.
-            (1040, 12, Some(ms(40))),
+            // The latest ping, and what was ahead of it.
+            (1040, 12, Some((ms(40), nothing))),
             // An older one, still out.
-            (1060, 11, Some(ms(560))),
+            (1060, 11, Some((ms(560), frames))),
             // One already answered.
             (1080, 12, None),
             // One never sent.
@@ -1550,13 +1572,13 @@ mod tests {
         // One older than the record keeps: the first of PINGS_KEPT + 1, a ping apart.
         let mut pings = Pings::default();
         for i in 0..=PINGS_KEPT as u32 {
-            pings.send(t0 + PING_EVERY * i, Token(i.into()));
+            pings.send(t0 + PING_EVERY * i, Token(i.into()), nothing);
         }
         let now = t0 + PING_EVERY * (PINGS_KEPT as u32 + 1);
         assert_eq!(pings.answer(now, Token(0)), None);
         assert_eq!(
             pings.answer(now, Token(1)),
-            Some(PING_EVERY * PINGS_KEPT as u32)
+            Some((PING_EVERY * PINGS_KEPT as u32, nothing))
         );
         assert_eq!(PINGS_KEPT, 8);
 
@@ -1593,7 +1615,7 @@ mod tests {
         let mut had = vec![];
         for (k, &l) in late.iter().enumerate().take(3) {
             let token = Token::random();
-            pings.send(due(k as u32) + l, token);
+            pings.send(due(k as u32) + l, token, window::Ahead::Nothing);
             assert!(pings
                 .answer(due(k as u32) + l + real_round_trip, token)
                 .is_some());
@@ -1601,7 +1623,7 @@ mod tests {
         }
         // The fourth goes out; the viewer has not had it yet. 1 ms after it is due, a
         // burst arrives naming everything it could have guessed.
-        pings.send(due(3) + late[3], Token::random());
+        pings.send(due(3) + late[3], Token::random(), window::Ahead::Nothing);
         let now = due(3) + Duration::from_millis(1);
         // Each microsecond it could have gone out at, as replies wrote it and as a token.
         let times = (0..1000u64).flat_map(|j| {
@@ -1614,6 +1636,7 @@ mod tests {
         let shortest = times
             .chain(neighbours)
             .filter_map(|guess| pings.answer(now, Token::parse(&guess)?))
+            .map(|(trip, _)| trip)
             .min();
         assert!(
             shortest.is_none_or(|rt| rt >= real_round_trip),

@@ -177,9 +177,11 @@ async fn stats(State(s): State<AppState>) -> Response {
         .map(|c| {
             let backlog = c.backlog(now);
             let (n, age) = backlog.map_or((0, 0), |b| (b.frames.get(), b.oldest.as_millis()));
-            let (carries, flying, fastest) = c.window(|w| (w.carries(), w.flying(), w.fastest()));
+            let (carries, lowest, flying, fastest) =
+                c.window(|w| (w.carries(), w.lowest(), w.flying(), w.fastest()));
             serde_json::json!({"id": c.id, "video": c.viewer() != crate::hub::Viewer::NotWatching, "inflight": n, "oldest_ms": age,
-                "min_rtt_ms": c.min_rtt_ms.load(Ordering::Relaxed), "carries_bytes": carries, "flying_bytes": flying,
+                "min_rtt_ms": c.min_rtt_ms.load(Ordering::Relaxed), "carries_bytes": carries,
+                "lowest_carries_bytes": lowest, "flying_bytes": flying,
                 "fastest_ms": fastest.map(|t| t.as_secs_f64() * 1000.0),
                 "client_ms": (*c.client_ms.lock() * 10.0).round() / 10.0})
         })
@@ -275,6 +277,27 @@ async fn ws_handler(ws: WebSocketUpgrade, State(s): State<AppState>) -> Response
         .on_upgrade(move |socket| handle_socket(socket, s))
 }
 
+/// What a viewer is sent as it connects, in this order: a ping, its hello, and the cursor's
+/// image. The ping goes first so that nothing is on the path ahead of it: the window takes
+/// the path's fastest trip from pings alone, and under motion from the first frame no later
+/// ping may have the path to itself. Behind the hello and the cursor's image (4 bytes a
+/// pixel: 16.4 KB at 64 px) its trip would hold their crossing for as long as the motion
+/// lasts.
+pub(crate) fn greet(hub: &Hub, c: &Client) {
+    ping(c);
+    c.send(Out::Text(hub.hello()));
+    if let Some(cursor) = hub.cursor.lock().clone() {
+        c.send(Out::Bin(cursor));
+    }
+}
+
+/// Pings `c`: the ping goes into its record, then to it.
+fn ping(c: &Client) {
+    let token = crate::hub::Token::random();
+    c.ping(Instant::now(), token);
+    c.send(Out::Text(ServerMessage::Ping { s: token }));
+}
+
 async fn handle_socket(socket: WebSocket, s: AppState) {
     use futures_util::{SinkExt, StreamExt};
     let (mut sink, mut stream) = socket.split();
@@ -290,10 +313,7 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
         s.hub.add_client(tx, Instant::now())
     };
     log::info!("client {} connected", client.id);
-    client.send(Out::Text(s.hub.hello()));
-    if let Some(c) = s.hub.cursor.lock().clone() {
-        client.send(Out::Bin(c));
-    }
+    greet(&s.hub, &client);
     let dbg = s.debug.marker.is_some();
     let hub = s.hub.clone();
     let writer = tokio::spawn(async move {
@@ -323,15 +343,15 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
             }
         }
     });
+    // The first ping went with the greeting; the next goes a `PING_EVERY` after it.
     let pinger = {
         let c = client.clone();
         tokio::spawn(async move {
-            let mut iv = tokio::time::interval(crate::hub::PING_EVERY);
+            let every = crate::hub::PING_EVERY;
+            let mut iv = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
             loop {
                 iv.tick().await;
-                let token = crate::hub::Token::random();
-                c.pings.lock().send(Instant::now(), token);
-                c.send(Out::Text(ServerMessage::Ping { s: token }));
+                ping(&c);
             }
         })
     };
@@ -673,10 +693,10 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
         }
         Command::Pong { token } => {
             let now = Instant::now();
-            let Some(rtt) = c.pings.lock().answer(now, token) else {
+            let Some((rtt, ahead)) = c.pings.lock().answer(now, token) else {
                 return;
             };
-            c.pinged(now, rtt);
+            c.pinged(now, rtt, ahead);
             // Whole ms, and at least 1: a client's min_rtt_ms is 0 until it has one. A
             // ping in the record went out at most a few seconds ago, so a u32 holds it.
             rtts.push_back((rtt.as_millis() as u32).max(1));
@@ -1072,13 +1092,46 @@ mod tests {
         let client = hub.add_client(tx, Instant::now());
         let mut rtts = Default::default();
         let token = crate::hub::Token::random();
-        client.pings.lock().send(Instant::now(), token);
+        client.ping(Instant::now(), token);
         handle_text(&s, &client, &format!("po,{token}"), &mut rtts);
         assert!(
             client.min_rtt_ms.load(Ordering::Relaxed) > 0
                 && client.window(|w| w.fastest()).is_some(),
             "the reply to a ping was no round trip"
         );
+    }
+
+    /// A connecting viewer is sent a ping before anything else, so that nothing is on the
+    /// path ahead of it, then its hello and the cursor's image if there is one; and the
+    /// ping is in its record, with nothing ahead of it, so its reply is a round trip. With
+    /// no cursor and with cursors of 24 to 64 px.
+    #[test]
+    fn a_viewer_is_pinged_before_anything_else_is_sent() {
+        for cursor in [None, Some(24), Some(32), Some(48), Some(64)] {
+            let hub = Hub::new(crate::hub::Paths::ANY);
+            *hub.cursor.lock() = cursor.map(|px: usize| Bytes::from(vec![3u8; px * px * 4 + 14]));
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let client = hub.add_client(tx, Instant::now());
+            greet(&hub, &client);
+            let sent: Vec<Out> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            let Some(Out::Text(ServerMessage::Ping { s: token })) = sent.first() else {
+                panic!("cursor {cursor:?}: the first message is no ping");
+            };
+            assert!(matches!(
+                sent.get(1),
+                Some(Out::Text(ServerMessage::Hello(_)))
+            ));
+            assert_eq!(
+                sent.len(),
+                2 + usize::from(cursor.is_some()),
+                "cursor {cursor:?}"
+            );
+            let answer = client.pings.lock().answer(Instant::now(), *token);
+            assert!(
+                answer.is_some_and(|(_, ahead)| ahead == crate::window::Ahead::Nothing),
+                "cursor {cursor:?}: the ping is not in the record, or not alone: {answer:?}"
+            );
+        }
     }
 
     /// Every command the web client sends parses here (a display switch only on
