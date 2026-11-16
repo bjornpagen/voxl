@@ -43,7 +43,8 @@ lowest `carries` since it connected (`lowest_carries_bytes`: what its window sai
 carries in `LATENESS`, at its least), and the window's own `LATENESS`, `START` and `FALL`.
 The run fails (exit status 1) when:
 - the window went below what it may: `START`, or what the emulated link carries in
-  `LATENESS` if less, and over `FALL` once if any stall began (`floor_of` says why once);
+  `LATENESS` if less, and over `FALL` once if any stall began (`floor_of` says why once;
+  a floor under one packet, as on a link under about 195 kbit/s, is not measured);
 - a frame waited behind the link's queue more than `3 x LATENESS` (a stall is not a wait);
 - or it was not measured: no /stats, a /stats without those fields, or this viewer not in it.
 
@@ -81,6 +82,9 @@ import link  # noqa: E402  (beside this file; python3 -I leaves the script's dir
 HEADER_FIXTURE = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "web", "src", "video-header.json"))
 VIDEO = 0x01  # a video message's type byte
 HEADER_LEN = 16
+# An Ethernet packet's payload (a 1,500-byte frame less IP's and TCP's headers): the least a
+# window says a path carries.
+PACKET = 1460
 
 
 def read_header(m):
@@ -411,14 +415,19 @@ def floor_of(start, fall, lateness, path, rtt, began):
     fall a stall may cost. A second fall before the first is won back is the stall talking
     the window down twice, which is what the bench is here to catch, so it fails. A schedule
     whose stalls leave less than one round (the round trip and `LATENESS`) between them has
-    no round that is not a stall's, so nothing can be said of it: not measured."""
-    floor = min(start, path.rate.carries(lateness))
+    no round that is not a stall's, so nothing can be said of it: not measured. Nor of a
+    floor under one packet: the window never says less than one, so no window could fail it."""
     if began == 0:
-        return floor, "START, or what the link carries in LATENESS if less"
-    between = path.stalls.every - path.stalls.length
-    if between < rtt + lateness:
-        raise NotMeasured(f"stalls {between * 1000:.0f} ms apart leave no round ({(rtt + lateness) * 1000:.0f} ms) between them")
-    return floor / fall, f"START, or what the link carries in LATENESS if less, over FALL {fall} once for {began} stalls"
+        floor, why = min(start, path.rate.carries(lateness)), "START, or what the link carries in LATENESS if less"
+    else:
+        between = path.stalls.every - path.stalls.length
+        if between < rtt + lateness:
+            raise NotMeasured(f"stalls {between * 1000:.0f} ms apart leave no round ({(rtt + lateness) * 1000:.0f} ms) between them")
+        floor = min(start, path.rate.carries(lateness)) / fall
+        why = f"START, or what the link carries in LATENESS if less, over FALL {fall} once for {began} stalls"
+    if floor < PACKET:
+        raise NotMeasured(f"the floor, {floor:.0f} B, is under one packet ({PACKET} B): no window could fail it")
+    return floor, why
 
 
 def verdict(final, before, waits, path, rtt, began):
