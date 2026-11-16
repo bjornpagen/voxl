@@ -1,7 +1,7 @@
 //! Shared state between media producers (video/audio/cursor/clipboard) and websocket clients.
 
 use crate::timeline::FrameId;
-use crate::window::{self, Way, Window};
+use crate::window::{self, Window};
 use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -269,7 +269,7 @@ pub enum Viewer {
     /// It waits for a keyframe, and none has been planned for it, and nothing is on its way
     /// to it: the capture loop plans one.
     Waiting,
-    /// Its path stalled beside others' and it was left behind (`falls_behind`): it waits
+    /// Its path stalled beside others' and it was left behind (`left_behind`): it waits
     /// for a keyframe, but frames are still on their way to it. It is sent nothing, and
     /// wants its keyframe once all of them have come back, so that no keyframe goes into a
     /// path that is still clogged. A viewer that asks for a keyframe is not left behind:
@@ -387,6 +387,13 @@ impl Client {
         read(&self.viewing.lock().window)
     }
 
+    /// What it is to the stream and what its window says, as one read sees both: what the
+    /// capture loop decides of it, it decides from this one state.
+    pub fn look<R>(&self, read: impl FnOnce(Viewer, &Window) -> R) -> R {
+        let v = self.viewing.lock();
+        read(v.viewer, &v.window)
+    }
+
     /// What it is to the stream, as one read sees it.
     pub fn viewer(&self) -> Viewer {
         self.viewing.lock().viewer
@@ -425,17 +432,22 @@ impl Client {
         self.send(Out::Text(hello));
     }
 
-    /// At `now` a capture goes to the viewers that have room. One that has started and
-    /// whose path has stalled (the oldest frame on its way has been on its way for
-    /// `STALLED`) is left behind: it is sent nothing more, so it has missed frames, and it
+    /// The capture loop looked at it, saw it started and its path stalled (the oldest
+    /// frame on its way had been on its way for `STALLED`), and sends a capture without
+    /// it: it is left behind. It is sent nothing more, so it has missed frames, and it
     /// wants a keyframe once everything on its way has come back. Its window keeps what is
-    /// on its way, which is how its path is known to be still clogged.
-    pub fn falls_behind(&self, now: Instant) {
+    /// on its way, which is how its path is known to be still clogged. What it saw is not
+    /// read again: an ack since may have unstalled it, but the capture was sized without
+    /// it. One that has since asked for a keyframe or stopped watching is what that made
+    /// it.
+    pub fn left_behind(&self) {
         let mut v = self.viewing.lock();
-        let stall = crate::video::STALLED;
-        if let (Viewer::Started, Way::Stalled) = (v.viewer, v.window.way(now, stall)) {
-            v.viewer = Viewer::Behind;
-        }
+        v.viewer = match v.viewer {
+            Viewer::Started => Viewer::Behind,
+            other @ (Viewer::NotWatching | Viewer::Waiting | Viewer::Behind | Viewer::Promised) => {
+                other
+            }
+        };
     }
 
     /// The capture loop planned a keyframe: one waiting for one is promised it. Whether it
@@ -857,10 +869,26 @@ impl Hub {
 
     /// Every client that watches, with what it is to the stream as one read of it saw it:
     /// whatever is decided from them is decided from that read.
+    #[cfg(test)]
     pub fn viewers(&self) -> Vec<(Arc<Client>, Viewer)> {
         let mut v = Vec::new();
         self.viewers_into(&mut v);
         v
+    }
+
+    /// Each watching client and what `read` makes of one look at it (`Client::look`), into
+    /// `into` in place of what it held, in the hub's order: one look a capture keeps one
+    /// vector, and allocates nothing once it is big enough.
+    pub fn look_into<R>(
+        &self,
+        into: &mut Vec<(Arc<Client>, R)>,
+        read: impl Fn(Viewer, &Window) -> R,
+    ) {
+        into.clear();
+        for c in self.clients.lock().iter() {
+            let seen = c.look(|viewer, w| (viewer != Viewer::NotWatching).then(|| read(viewer, w)));
+            into.extend(seen.map(|seen| (c.clone(), seen)));
+        }
     }
 
     /// As `viewers`, into `into` in place of what it held: one asking every frame keeps one
@@ -1145,8 +1173,8 @@ mod tests {
             Step::AskKeyframe(i) => c[i].ask_keyframe(),
             Step::StartOver(i) => c[i].start_over(t0, hub.hello()),
             Step::Stall(i) => {
-                // Its frames went at `t0`: it has stalled `STALLED` later.
-                c[i].falls_behind(t0 + crate::video::STALLED);
+                // The capture loop saw it started with frames on their way for `STALLED`.
+                c[i].left_behind();
             }
             Step::Restart => {
                 hub.restart_clients(t0);
