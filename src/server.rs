@@ -247,9 +247,10 @@ async fn stats(State(s): State<AppState>) -> Response {
         .map(|bytes| bytes as f64 * 8.0 / crate::window::LATENESS.as_secs_f64() / 1000.0);
     let body = serde_json::json!({
         "now_us": s.hub.timeline.us(now),
-        // What a window's numbers are in: the time it carries `carries` bytes in, where it
-        // starts, and the most it falls in a round.
+        // What a window's numbers are in: the time it carries `carries` bytes in, the least
+        // it carries, where it starts, and the most it falls in a round.
         "lateness_us": crate::window::LATENESS.as_micros() as u64,
+        "packet_bytes": crate::window::PACKET,
         "start_bytes": crate::window::START,
         "fall": crate::window::FALL,
         "captured": st.captured.load(Ordering::Relaxed),
