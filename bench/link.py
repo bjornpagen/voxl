@@ -83,6 +83,13 @@ class Stalls:
             busy -= stall - t
             t = stall + self.length
 
+    def begun(self, a, b):
+        """How many stalls begin in [a, b)."""
+        if not self.every:
+            return 0
+        first = max(1, -(-a // self.every))  # the first stall at or after a
+        return max(0, int(-(-b // self.every) - first))
+
     def within(self, a, b):
         """Seconds of stall in [a, b)."""
         if not self.every or b <= a:

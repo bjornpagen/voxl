@@ -40,11 +40,12 @@ is its log. CBR from 30 Mbps, with congestion control down to 2 Mbps.
   leave together name only the newest frame, `--stall EVERY_S,LENGTH_MS` stops the link
   periodically and `--jitter MS` jitters its arrivals. The `cold` scenario is a first
   load: the terminal is filled with dense text before the viewer connects, and it is
-  measured from the connect. It reads the window's `carries_bytes` from `/stats` as it
-  watches, and the run fails (exit 1) when the window says the path carries less than
-  `START` (or the link's own rate, if less), or a frame waits more than three times
-  `LATENESS` behind the link's queue. It does not decode: it is for rate control, and
-  writes when each message arrived and each ack left.
+  measured from the connect. At the end it reads from `/stats` the viewer's lowest
+  `carries` since it connected and the window's `LATENESS`, `START` and `FALL`, and the
+  run fails (exit 1) when the window went below `START` (or the link's own rate, if less)
+  divided by `FALL` once a stall, when a frame waited more than three times `LATENESS`
+  behind the link's queue, or when any of that was not measured. It does not decode: it
+  is for rate control, and writes when each message arrived and each ack left.
 - `link.py`: the link model both use: a rate through an unbounded queue served in order,
   half the round trip each way, one-sided jitter, a page's lateness, periodic stalls.
   `python3 -I link.py` checks it against an oracle that serves the queue a tick at a time.

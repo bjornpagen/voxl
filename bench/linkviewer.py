@@ -38,21 +38,22 @@ OUT.marks.tsv says how many characters were sent (`sent`: the down and its repea
 The `cold` scenario is a first load: the terminal is filled with dense text before the
 viewer connects, and everything is measured from the connect, with no input.
 
-While it watches it reads the server's /stats every `STATS_EVERY` (`--stats`), and keeps
-this viewer's `carries_bytes` (what its window says the path carries in `LATENESS`). The
-run fails (exit status 1) when, from the connect on:
-- the window says the path carries less than `START` or than the emulated link does in
-  `LATENESS`, whichever is less (not measured against a server whose /stats has no
-  `carries_bytes`);
-- or a frame waits behind the link's queue more than `3 x LATENESS` (a stall is not a
-  wait).
+At the end, still connected, it reads the server's /stats once (`--stats`): this viewer's
+lowest `carries` since it connected (`lowest_carries_bytes`: what its window said the path
+carries in `LATENESS`, at its least), and the window's own `LATENESS`, `START` and `FALL`.
+The run fails (exit status 1) when:
+- the window went below what it may: `START`, or what the emulated link carries in
+  `LATENESS` if less, divided by `FALL` once for each stall begun since the connect (a
+  stall is the one thing that may cost the window a fall it cannot win back at rest);
+- a frame waited behind the link's queue more than `3 x LATENESS` (a stall is not a wait);
+- or it was not measured: no /stats, a /stats without those fields, or this viewer not in it.
 
 Writes OUT.msgs.tsv (each video message: when received, when it arrived on the link,
 frame, key, paint-over, bytes, server pipeline ms, ms it waited behind the queue),
 OUT.acks.tsv (frame, when it arrived, when its ack reached the server, the hold, the
 lateness in ms, and the frame whose ack covered it), OUT.marks.tsv (the scenario's phases),
 OUT.scroll.tsv (scroll input), OUT.keys.tsv (key messages, when each was due and when it
-was sent) and OUT.stats.tsv (from the connect: seconds, carries, flying and fastest).
+was sent) and OUT.stats.json (the /stats it read at the end).
 
 usage: linkviewer.py HOST:PORT SCENARIO OUT [--kbps N] [--rtt MS] [--jitter MS]
        [--stall EVERY_S,LENGTH_MS] [--late page] [--cumulative] [--hold]
@@ -81,12 +82,6 @@ import link  # noqa: E402  (beside this file; python3 -I leaves the script's dir
 HEADER_FIXTURE = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "web", "src", "video-header.json"))
 VIDEO = 0x01  # a video message's type byte
 HEADER_LEN = 16
-# src/window.rs: how late a frame may be behind the path (LATENESS), and what a window
-# starts with and must never be talked below on a path that carries it (START, ten packets).
-LATENESS = 0.060
-START = 14_600
-# A window moves at most once a round, and a round is at least LATENESS: two reads a round.
-STATS_EVERY = LATENESS / 2
 
 
 def read_header(m):
@@ -258,7 +253,6 @@ async def main():
     acked = {}  # frame: [arrived, ack at the server, hold ms, late ms, covered by]
     last_ack = None  # (frame, when it left the page, its entry in sendq)
     waits = []  # (from the connect, ms behind the queue) of each video message
-    carried = []  # (from the connect, carries, flying, fastest) of this viewer
 
     def schedule(at, msg):
         nonlocal seq
@@ -310,8 +304,8 @@ async def main():
     await run(PREPARE.get(a.scenario, []))
     try:
         before = {c["id"] for c in (await asyncio.to_thread(fetch_stats, stats_url))["clients"]}
-    except OSError:
-        before = None  # no /stats to read: nothing to say of the window
+    except OSError as e:
+        sys.exit(f"no /stats at {stats_url} ({e}): nothing could be measured")
     async with websockets.connect(f"ws://{a.hostport}/ws", max_size=None, compression=None) as ws:
         connected = clock()
         marks.write(f"connect\t{connected:.4f}\n")
@@ -367,21 +361,7 @@ async def main():
                     acked[last_ack[0]][4] = fid
                 last_ack = (fid, leaves, entry)
 
-        async def sampler():
-            # This viewer's window: the client /stats lists that was not there before.
-            while before is not None:
-                t = clock()
-                try:
-                    st = await asyncio.to_thread(fetch_stats, stats_url)
-                except OSError:
-                    st = {"clients": []}
-                mine = [c for c in st["clients"] if c["id"] not in before]
-                if mine and "carries_bytes" in mine[-1]:
-                    c = mine[-1]
-                    carried.append((t - connected, c["carries_bytes"], c.get("flying_bytes"), c.get("fastest_ms")))
-                await asyncio.sleep(max(0, t + STATS_EVERY - clock()))
-
-        tasks = [asyncio.create_task(sender()), asyncio.create_task(receiver()), asyncio.create_task(sampler())]
+        tasks = [asyncio.create_task(sender()), asyncio.create_task(receiver())]
         await ws.send("v,1")
         await asyncio.wait_for(got_key.wait(), 30)
         if a.passive:
@@ -395,39 +375,58 @@ async def main():
             await ws.send("m,1512,1000")
             await asyncio.sleep(a.settle)
             await run(SCENARIOS[a.scenario])
+        # Read while the viewer is still connected, so /stats still lists it.
+        ended = clock()
+        try:
+            final = await asyncio.to_thread(fetch_stats, stats_url)
+        except OSError as e:
+            sys.exit(f"no /stats at {stats_url} at the end ({e}): the window was not measured")
         for t in tasks:
             t.cancel()
     with open(f"{a.out}.acks.tsv", "w") as f:
         for fid, (arrived, ack_at, hold, late, covered_by) in acked.items():
             f.write(f"{fid}\t{arrived:.4f}\t{ack_at:.4f}\t{hold:.1f}\t{late:.1f}\t{covered_by}\n")
-    with open(f"{a.out}.stats.tsv", "w") as f:
-        f.write("t\tcarries_bytes\tflying_bytes\tfastest_ms\n")
-        for row in carried:
-            f.write("\t".join(str(v) for v in row) + "\n")
+    with open(f"{a.out}.stats.json", "w") as f:
+        json.dump(final, f)
     for f in (msgs, marks, scrolls, keys):
         f.close()
-    return verdict(carried, waits, rate)
+    return verdict(final, before, waits, rate, stalls.begun(connected, ended))
 
 
-def verdict(carried, waits, rate):
-    """Prints the run's two bounds and whether it kept them; True when it did."""
-    ok = True
-    floor = min(START, rate / 8 * LATENESS) if rate else START
-    if carried:
-        t, low = min(((t, c) for t, c, _, _ in carried), key=lambda tc: tc[1])
-        kept = low >= floor
-        ok &= kept
-        print(f"carries_bytes: lowest {low} B, {t:.1f} s from the connect, over {len(carried)} reads;"
-              f" bound {floor:.0f} B (START, or what the link carries in LATENESS if less): {'pass' if kept else 'FAIL'}")
-    else:
-        print("carries_bytes: not in /stats, not measured")
-    if waits:
-        t, longest = max(waits, key=lambda tw: tw[1])
-        kept = longest <= 3 * LATENESS * 1000
-        ok &= kept
-        print(f"wait behind the queue: longest {longest:.1f} ms, {t:.1f} s from the connect;"
-              f" bound {3 * LATENESS * 1000:.0f} ms (3 x LATENESS): {'pass' if kept else 'FAIL'}")
-    return ok
+class NotMeasured(Exception):
+    """What a run needed /stats to say, and it did not."""
+
+
+def window_of(final, before):
+    """What /stats said of this viewer's window at the end: its `LATENESS` in seconds,
+    `START`, `FALL` and its lowest `carries` since it connected."""
+    mine = [c for c in final["clients"] if c["id"] not in before]
+    if len(mine) != 1:
+        raise NotMeasured(f"/stats lists {len(mine)} viewers that came after the run's start, not one")
+    try:
+        return final["lateness_us"] / 1e6, final["start_bytes"], final["fall"], mine[0]["lowest_carries_bytes"]
+    except KeyError as e:
+        raise NotMeasured(f"/stats has no {e}") from None
+
+
+def verdict(final, before, waits, rate, stalls):
+    """Prints the run's bounds and whether it kept them; True when it did. `final` is the
+    /stats read at the end, `stalls` how many stalls began since the viewer connected."""
+    try:
+        lateness, start, fall, lowest = window_of(final, before)
+    except NotMeasured as e:
+        print(f"not measured: {e}: FAIL")
+        return False
+    floor = (min(start, rate / 8 * lateness) if rate else start) / fall**stalls
+    kept_floor = lowest >= floor
+    print(f"carries: lowest {lowest} B since the connect; bound {floor:.0f} B (START {start} B, or what the link"
+          f" carries in LATENESS if less, / FALL {fall} for each of {stalls} stalls): {'pass' if kept_floor else 'FAIL'}")
+    t, longest = max(waits, key=lambda tw: tw[1])
+    bound = 3 * lateness * 1000
+    kept_wait = longest <= bound
+    print(f"wait behind the queue: longest {longest:.1f} ms, {t:.1f} s from the connect;"
+          f" bound {bound:.0f} ms (3 x LATENESS): {'pass' if kept_wait else 'FAIL'}")
+    return kept_floor and kept_wait
 
 
 if __name__ == "__main__":
