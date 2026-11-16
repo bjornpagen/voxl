@@ -229,6 +229,8 @@ mod tests {
     /// (`-noreset`: it does not start over when its last client leaves); stopped when dropped.
     struct Xvfb {
         child: std::process::Child,
+        /// The display's number, as Xvfb picked it.
+        number: String,
         display: String,
     }
 
@@ -254,18 +256,35 @@ mod tests {
             std::io::BufReader::new(child.stdout.take().unwrap())
                 .read_line(&mut n)
                 .unwrap();
+            let number = n.trim().to_string();
             Xvfb {
                 child,
-                display: format!(":{}", n.trim()),
+                display: format!(":{number}"),
+                number,
             }
         }
     }
 
     impl Drop for Xvfb {
+        /// SIGTERM, then waits: Xvfb removes its socket and its lock file only when it is
+        /// let finish (SIGKILL, `Child::kill`, leaves both behind, and the display's number
+        /// taken).
         fn drop(&mut self) {
-            let _ = self.child.kill();
+            let pid = nix::unistd::Pid::from_raw(self.child.id() as i32);
+            let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
             let _ = self.child.wait();
         }
+    }
+
+    /// What a stopped Xvfb of display `number` left behind: its socket and its lock file.
+    fn left_behind(number: &str) -> Vec<String> {
+        [
+            format!("/tmp/.X11-unix/X{number}"),
+            format!("/tmp/.X{number}-lock"),
+        ]
+        .into_iter()
+        .filter(|p| std::path::Path::new(p).exists())
+        .collect()
     }
 
     /// The X server's own answer: the screen's size, and each size's modes.
@@ -331,8 +350,9 @@ mod tests {
     /// not), sizes earlier connections made, and the screen's start size, with a restart
     /// (a new connection, as a new voxl process has) before one ask in four, the X server
     /// says after each ask that the screen has the size asked for, and at the end that no
-    /// size has two modes. Each kind of ask is counted, so none passes unasked. Needs Xvfb
-    /// on PATH: `cargo test -- --ignored modes_left`.
+    /// size has two modes. Each kind of ask is counted, so none passes unasked. Stopped, its
+    /// Xvfb leaves no socket or lock file behind. Needs Xvfb on PATH:
+    /// `cargo test -- --ignored modes_left`.
     #[test]
     #[ignore = "needs Xvfb on PATH"]
     fn modes_left_behind_are_found_and_no_size_is_made_twice() {
@@ -381,5 +401,8 @@ mod tests {
             let n = modes.iter().filter(|&&m| m == size).count();
             assert_eq!(n, 1, "{}x{} has {n} modes", size.0, size.1);
         }
+        let number = x.number.clone();
+        drop(x);
+        assert_eq!(left_behind(&number), Vec::<String>::new());
     }
 }
