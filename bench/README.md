@@ -42,7 +42,7 @@ is its log. CBR from 30 Mbps, with congestion control down to 2 Mbps.
   stream, seeded by `--seed`. The `cold` scenario is a first
   load: the terminal is filled with dense text before the viewer connects, and it is
   measured from the connect. At the end it reads from `/stats` the viewer's lowest
-  `carries` since it connected and the window's `LATENESS`, `START` and `FALL`, and the
+  `carries` since it connected and the window's `LATENESS`, `START`, `FALL` and `PACKET`, and the
   run fails (exit 1) when the window went below `START` (or the link's own rate, if less),
   over `FALL` once if any stall began, when a frame waited more than three times
   `LATENESS` behind the link's queue, or when any of that was not measured (stalls with

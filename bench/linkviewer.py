@@ -40,7 +40,8 @@ viewer connects, and everything is measured from the connect, with no input.
 
 At the end, still connected, it reads the server's /stats once (`--stats`): this viewer's
 lowest `carries` since it connected (`lowest_carries_bytes`: what its window said the path
-carries in `LATENESS`, at its least), and the window's own `LATENESS`, `START` and `FALL`.
+carries in `LATENESS`, at its least), and the window's own `LATENESS`, `START`, `FALL` and
+`PACKET`.
 The run fails (exit status 1) when:
 - the window went below what it may: `START`, or what the emulated link carries in
   `LATENESS` if less, and over `FALL` once if any stall began (`floor_of` says why once;
@@ -71,6 +72,7 @@ import os
 import random
 import sys
 import time
+import typing
 import urllib.request
 
 sys.dont_write_bytecode = True  # nothing written beside the bench
@@ -82,9 +84,6 @@ import link  # noqa: E402  (beside this file; python3 -I leaves the script's dir
 HEADER_FIXTURE = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "web", "src", "video-header.json"))
 VIDEO = 0x01  # a video message's type byte
 HEADER_LEN = 16
-# An Ethernet packet's payload (a 1,500-byte frame less IP's and TCP's headers): the least a
-# window says a path carries.
-PACKET = 1460
 
 
 def read_header(m):
@@ -398,19 +397,29 @@ class NotMeasured(Exception):
     """What a run needed /stats to say, and it did not."""
 
 
+class Window(typing.NamedTuple):
+    """What /stats said of a viewer's window at the end of a run."""
+
+    lateness: float  # its `LATENESS`, in seconds
+    start: int  # `START`
+    fall: int  # `FALL`
+    packet: int  # `PACKET`: the least it ever says a path carries
+    lowest: float  # its lowest `carries` since the viewer connected
+
+
 def window_of(final, before):
-    """What /stats said of this viewer's window at the end: its `LATENESS` in seconds,
-    `START`, `FALL` and its lowest `carries` since it connected."""
+    """The `Window` /stats said this viewer had at the end."""
     mine = [c for c in final["clients"] if c["id"] not in before]
     if len(mine) != 1:
         raise NotMeasured(f"/stats lists {len(mine)} viewers that came after the run's start, not one")
     try:
-        return final["lateness_us"] / 1e6, final["start_bytes"], final["fall"], mine[0]["lowest_carries_bytes"]
+        return Window(final["lateness_us"] / 1e6, final["start_bytes"], final["fall"], final["packet_bytes"],
+                      mine[0]["lowest_carries_bytes"])
     except KeyError as e:
         raise NotMeasured(f"/stats has no {e}") from None
 
 
-def floor_of(start, fall, lateness, path, rtt, began):
+def floor_of(window, path, rtt, began):
     """The least the window may say the path carries: `START`, or what the link carries in
     `LATENESS` if less; and if a stall began during the run, that over `FALL`, once.
 
@@ -422,15 +431,17 @@ def floor_of(start, fall, lateness, path, rtt, began):
     no round that is not a stall's, so nothing can be said of it: not measured. Nor of a
     floor under one packet: the window never says less than one, so no window could fail it."""
     if began == 0:
-        floor, why = min(start, path.rate.carries(lateness)), "START, or what the link carries in LATENESS if less"
+        floor = min(window.start, path.rate.carries(window.lateness))
+        why = "START, or what the link carries in LATENESS if less"
     else:
         between = path.stalls.every - path.stalls.length
-        if between < rtt + lateness:
-            raise NotMeasured(f"stalls {between * 1000:.0f} ms apart leave no round ({(rtt + lateness) * 1000:.0f} ms) between them")
-        floor = min(start, path.rate.carries(lateness)) / fall
-        why = f"START, or what the link carries in LATENESS if less, over FALL {fall} once for {began} stalls"
-    if floor < PACKET:
-        raise NotMeasured(f"the floor, {floor:.0f} B, is under one packet ({PACKET} B): no window could fail it")
+        round_ = rtt + window.lateness
+        if between < round_:
+            raise NotMeasured(f"stalls {between * 1000:.0f} ms apart leave no round ({round_ * 1000:.0f} ms) between them")
+        floor = min(window.start, path.rate.carries(window.lateness)) / window.fall
+        why = f"START, or what the link carries in LATENESS if less, over FALL {window.fall} once for {began} stalls"
+    if floor < window.packet:
+        raise NotMeasured(f"the floor, {floor:.0f} B, is under one packet ({window.packet} B): no window could fail it")
     return floor, why
 
 
@@ -439,39 +450,53 @@ def verdict(final, before, waits, a, path, began):
     /stats read at the end, `a` and `path` the run's options and link, `began` how many
     stalls began since the viewer connected."""
     try:
-        lateness, start, fall, lowest = window_of(final, before)
-        floor, why = floor_of(start, fall, lateness, path, a.rtt / 1000, began)
+        window = window_of(final, before)
+        floor, why = floor_of(window, path, a.rtt / 1000, began)
     except NotMeasured as e:
         print(f"not measured: {e}: FAIL")
         return False
-    kept_floor = lowest >= floor
-    print(f"carries: lowest {lowest} B since the connect; bound {floor:.0f} B ({why}): {'pass' if kept_floor else 'FAIL'}")
+    kept_floor = window.lowest >= floor
+    print(f"carries: lowest {window.lowest} B since the connect; bound {floor:.0f} B ({why}): {'pass' if kept_floor else 'FAIL'}")
     t, longest = max(waits, key=lambda tw: tw[1])
-    bound = 3 * lateness * 1000
+    bound = 3 * window.lateness * 1000
     kept_wait = longest <= bound
     print(f"wait behind the queue: longest {longest:.1f} ms, {t:.1f} s from the connect;"
           f" bound {bound:.0f} ms (3 x LATENESS): {'pass' if kept_wait else 'FAIL'}")
     return kept_floor and kept_wait
 
 
-# The verdict's rule as a table, for a window that reports LATENESS 60 ms, START 14,600 B
-# and FALL 2, behind a 110 ms round trip: for a link (kbit/s, 0 for none) and a stall
-# schedule, the floor the window must keep when no stall began and when one did, worked
-# out by hand from the rule (None: not measured). A round is 110 + 60 = 170 ms.
+# The windows the table is for, as /stats reports them: (lateness_us, start_bytes, fall,
+# packet_bytes), with their wait bound, three times LATENESS, in ms. Today's; today's with a
+# jumbo packet; and one whose every constant is different, so that a verdict that kept
+# constants of its own could not follow it.
+TODAY = ((60_000, 14_600, 2, 1_460), 180.0)
+JUMBO = ((60_000, 14_600, 2, 9_000), 180.0)
+OTHER = ((40_000, 20_000, 4, 1_000), 120.0)
+
+# The verdict's rule as a table, behind a 110 ms round trip: for a window, a link (kbit/s, 0
+# for none) and a stall schedule, the floor the window must keep when no stall began and
+# when one did, worked out by hand from the rule (None: not measured). A round is 110 ms
+# and the window's LATENESS: 170 ms for today's, 150 ms for the other.
 VERDICT_TABLE = [
-    # kbit/s, --stall,     no stall, a stall
-    (0, "10,100", 14_600, 7_300),  # no bottleneck: START, and half of it
-    (20_000, "10,100", 14_600, 7_300),  # 150,000 B in LATENESS: START is less
-    (1_000, "10,100", 7_500, 3_750),  # 7,500 B in LATENESS
-    (400, "10,100", 3_000, 1_500),  # half of 3,000 is still a packet
-    (300, "10,100", 2_250, None),  # half of 2,250 is under a packet
-    (195, "10,100", 1_462.5, None),  # just over a packet; half is under
-    (194, "10,100", None, None),  # 1,455 B: under a packet
-    (20_000, "0.271,100", 14_600, 7_300),  # 171 ms between stalls: a round fits
-    (20_000, "0.269,100", 14_600, None),  # 169 ms: none does
+    # window, kbit/s, --stall, no stall, a stall
+    (TODAY, 0, "10,100", 14_600, 7_300),  # no bottleneck: START, and half of it
+    (TODAY, 20_000, "10,100", 14_600, 7_300),  # 150,000 B in LATENESS: START is less
+    (TODAY, 1_000, "10,100", 7_500, 3_750),  # 7,500 B in LATENESS
+    (TODAY, 400, "10,100", 3_000, 1_500),  # half of 3,000 is still a packet
+    (TODAY, 300, "10,100", 2_250, None),  # half of 2,250 is under a packet
+    (TODAY, 195, "10,100", 1_462.5, None),  # just over a packet; half is under
+    (TODAY, 194, "10,100", None, None),  # 1,455 B: under a packet
+    (TODAY, 20_000, "0.271,100", 14_600, 7_300),  # 171 ms between stalls: a round fits
+    (TODAY, 20_000, "0.269,100", 14_600, None),  # 169 ms: none does
+    (JUMBO, 20_000, "10,100", 14_600, None),  # half of START is under a jumbo packet
+    (JUMBO, 1_000, "10,100", None, None),  # 7,500 B: under one
+    (OTHER, 20_000, "10,100", 20_000, 5_000),  # START 20,000 B, and a quarter of it
+    (OTHER, 1_000, "10,100", 5_000, 1_250),  # 5,000 B in its LATENESS; a quarter is over a packet
+    (OTHER, 800, "10,100", 4_000, 1_000),  # a quarter of 4,000 is exactly a packet
+    (OTHER, 200, "10,100", 1_000, None),  # 1,000 B in its LATENESS: exactly a packet
+    (OTHER, 20_000, "0.255,100", 20_000, 5_000),  # 155 ms between stalls: its round (150) fits
+    (OTHER, 20_000, "0.245,100", 20_000, None),  # 145 ms: none does
 ]
-# The wait bound for that window: three times its LATENESS, in ms.
-VERDICT_WAIT = 180.0
 
 
 def check_verdict(seed=0x5EED):
@@ -483,32 +508,35 @@ def check_verdict(seed=0x5EED):
 
     It kills: stalls costing FALL once a stall (`fall**began`), a round without
     `LATENESS`, `>` for `>=` on the floor and `<` for `<=` on the wait, a floor that is
-    `START` whatever the link, a floor under a packet that is measured, `lateness_us` read
-    as milliseconds, two new viewers measured, the round trip halved on its way to the
-    floor, and `--kbps` read as kilobytes. It does not kill a floor of exactly one packet
-    taken as under one (no row's floor is exactly 1,460 B)."""
+    `START` whatever the link, a floor under a packet that is measured, a floor of exactly
+    a packet taken as under one, `lateness_us` read as milliseconds, two new viewers
+    measured, the round trip halved on its way to the floor, `--kbps` read as kilobytes,
+    a /stats without `packet_bytes` measured, and any of `LATENESS`, `START`, `FALL` and
+    `PACKET` taken as today's value rather than read (the other window's rows). It does not
+    kill a wait bound of three `LATENESS` plus a twentieth of a millisecond: the waits drawn
+    just over it are a tenth over."""
     import contextlib
     import io
 
     rng = random.Random(seed)
     reach = {"pass": 0, "fail on carries": 0, "fail on the wait": 0, "not measured": 0,
              "a field missing": 0, "not one new viewer": 0}
-    window = {"lateness_us": 60_000, "start_bytes": 14_600, "fall": 2}
     for _ in range(4_000):
-        kbps, schedule, floor_still, floor_stalled = rng.choice(VERDICT_TABLE)
+        ((lateness_us, start, fall, packet), wait_bound), kbps, schedule, floor_still, floor_stalled = rng.choice(VERDICT_TABLE)
         began = rng.choice([0, 1, rng.randint(2, 50)])
         floor = floor_still if began == 0 else floor_stalled
         argv = ["127.0.0.1:1", "cold", "out", "--fifo", "fifo", "--rtt", "110", "--kbps", str(kbps), "--stall", schedule]
         a, path = arguments(argv)
-        bound = floor if floor is not None else 14_600
+        bound = floor if floor is not None else start
         lowest = rng.choice([bound, int(bound) - 1, bound + 1, rng.uniform(0, 2 * bound)])
-        wait = rng.choice([VERDICT_WAIT, VERDICT_WAIT + 0.1, rng.uniform(0, 2 * VERDICT_WAIT)])
-        final = dict(window, clients=[{"id": 7, "lowest_carries_bytes": lowest}])
-        want = "not measured" if floor is None else "pass" if lowest >= floor and wait <= VERDICT_WAIT else "fail"
+        wait = rng.choice([wait_bound, wait_bound + 0.1, rng.uniform(0, 2 * wait_bound)])
+        final = {"lateness_us": lateness_us, "start_bytes": start, "fall": fall, "packet_bytes": packet,
+                 "clients": [{"id": 7, "lowest_carries_bytes": lowest}]}
+        want = "not measured" if floor is None else "pass" if lowest >= floor and wait <= wait_bound else "fail"
         broken = rng.random() < 0.1
         if broken and rng.random() < 0.5:
             if rng.random() < 0.75:
-                del final[rng.choice(list(window))]
+                del final[rng.choice(["lateness_us", "start_bytes", "fall", "packet_bytes"])]
             else:
                 del final["clients"][0]["lowest_carries_bytes"]
             want = "not measured"
