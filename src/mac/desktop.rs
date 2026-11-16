@@ -2,7 +2,7 @@
 //! Clients draw the cursor themselves from the images sent here, as on Linux.
 
 use super::ffi::*;
-use crate::hub::{Hub, Out};
+use crate::hub::{Hub, Out, ServerMessage};
 use bytes::Bytes;
 use objc2::rc::Retained;
 #[allow(deprecated)]
@@ -141,7 +141,7 @@ fn clipboard_loop(hub: Arc<Hub>, state: Arc<Mutex<ClipState>>) {
                     }
                     *last = Some(text.clone());
                 }
-                let msg = serde_json::json!({"t": "clip", "d": text}).to_string();
+                let msg = ServerMessage::Clip { d: text };
                 hub.broadcast(|| Out::Text(msg.clone()));
                 return;
             }

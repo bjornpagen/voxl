@@ -1,6 +1,6 @@
 //! HTTP + WebSocket front end. Serves the embedded web client and the media/input socket.
 
-use crate::hub::{Client, Hub, Out};
+use crate::hub::{Client, Hub, Out, ServerMessage};
 use crate::input::InputEvent;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -233,7 +233,7 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
             let big = matches!(&m, Out::Bin(b) if b.len() > 2000);
             let msg = match m {
                 Out::Bin(b) => Message::Binary(b),
-                Out::Text(t) => Message::Text(t.into()),
+                Out::Text(m) => Message::Text(m.json().into()),
             };
             if sink.send(msg).await.is_err() {
                 break;
@@ -255,7 +255,7 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
                 iv.tick().await;
                 let token = crate::hub::Token::random();
                 c.pings.lock().send(Instant::now(), token);
-                c.send(Out::Text(format!("{{\"t\":\"ping\",\"s\":\"{token}\"}}")));
+                c.send(Out::Text(ServerMessage::Ping { s: token }));
             }
         })
     };

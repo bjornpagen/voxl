@@ -49,7 +49,7 @@ export interface Hello {
 	displays?: { selected: number; available: { id: number; name: string }[] };
 }
 
-/** JSON text messages from the server. */
+/** JSON text messages from the server: src/hub.rs's `ServerMessage`, the same five. */
 export type ServerMessage =
 	| Hello
 	/** `s` names the ping (16 hex digits); the reply echoes it as it is. */
