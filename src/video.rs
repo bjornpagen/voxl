@@ -2215,7 +2215,7 @@ fn marker_age(ms: u32) -> Result<i64, std::time::SystemTimeError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     #[cfg(target_os = "linux")]
     use crate::lanes::wire::Outcome;
@@ -3683,7 +3683,7 @@ mod tests {
     #[global_allocator]
     static COUNTING: counting::Counting = counting::Counting;
 
-    mod counting {
+    pub(crate) mod counting {
         use std::alloc::{GlobalAlloc, Layout, System};
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{Mutex, MutexGuard};
@@ -3806,7 +3806,7 @@ mod tests {
     /// they please: so `name` runs in a process of its own, the test binary started again
     /// with only that test selected. True in that process; in the first, starts it and
     /// checks that it ran the test and the test passed.
-    fn in_a_process_of_its_own(name: &str) -> bool {
+    pub(crate) fn in_a_process_of_its_own(name: &str) -> bool {
         const ALONE: &str = "VOXL_TEST_IN_A_PROCESS_OF_ITS_OWN";
         if std::env::var_os(ALONE).is_some() {
             return true;

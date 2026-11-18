@@ -184,6 +184,8 @@ pub struct Table {
     fresh: [Vec<Vec<f64>>; 2],
     /// `above[n − 1][m]`: the chance more than m of n are erased.
     above: Vec<Vec<f64>>,
+    /// The most symbols a block asked of it.
+    asked: usize,
     work: u64,
 }
 
@@ -204,6 +206,7 @@ impl Table {
             runs,
             fresh: [Vec::new(), Vec::new()],
             above: Vec::new(),
+            asked: 0,
             work: 0,
         }
     }
@@ -285,10 +288,18 @@ impl Table {
         self.above.push(above);
     }
 
+    /// Reckons to `n` symbols, if it has not.
+    pub fn prepare(&mut self, n: usize) {
+        while self.above.len() < n {
+            self.step();
+        }
+    }
+
     /// The chance a block of `k` sources sent with `m` repairs misses: more than m of its
     /// k + m symbols erased.
     pub fn miss(&mut self, k: NonZeroUsize, m: usize) -> f64 {
         let n = k.get() + m;
+        self.asked = self.asked.max(n);
         while self.above.len() < n {
             self.step();
         }
@@ -360,6 +371,20 @@ impl Tables {
     /// misses.
     pub fn miss(&mut self, k: NonZeroUsize, m: usize) -> f64 {
         self.0.iter_mut().map(|t| t.miss(k, m)).fold(0.0, f64::max)
+    }
+
+    /// The most symbols a plan asked of either table: the largest block sized from them
+    /// (not what [`Tables::prepare`] reckoned ahead).
+    pub fn asked(&self) -> usize {
+        self.0.iter().map(|t| t.asked).max().unwrap_or(0)
+    }
+
+    /// Both tables reckoned to `n` symbols ahead of any plan, so that a plan sizing no larger
+    /// block only reads them.
+    pub fn prepare(&mut self, n: usize) {
+        for t in &mut self.0 {
+            t.prepare(n);
+        }
     }
 
     /// Multiply-adds spent so far, both tables'.

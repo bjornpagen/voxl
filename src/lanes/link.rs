@@ -166,8 +166,11 @@ impl Link {
             path,
             since: 0,
             miss: 0.0,
-            largest: VecDeque::new(),
-            stalled: VecDeque::new(),
+            // Room for every block of the last MEMORY symbols, each at least one: a plan never
+            // grows them, and so never allocates for them. A stall holding more blocks than
+            // that (ten thousand a second over a quarter-second stall) grows `stalled` once.
+            largest: VecDeque::with_capacity(MEMORY),
+            stalled: VecDeque::with_capacity(MEMORY),
             within: 0,
             planned: 0,
             next: 0,
@@ -377,10 +380,15 @@ impl Link {
         self.since += n;
         if self.since >= MEMORY {
             self.since = 0;
-            self.tables = [
-                Tables::new(self.path.fits(Wait::Spread)),
-                Tables::new(self.path.fits(Wait::Stall)),
-            ];
+            // Each wait's new tables reckoned at the refit to twice the largest block its old
+            // ones sized, so that a plan only reads them: it extends them, and allocates, only
+            // for a block more than twice as large as any of the last fit's (never sized short
+            // for want of room).
+            for (tables, wait) in self.tables.iter_mut().zip([Wait::Spread, Wait::Stall]) {
+                let asked = tables.asked();
+                *tables = Tables::new(self.path.fits(wait));
+                tables.prepare(2 * asked);
+            }
             self.share = [(0, 0), self.share[0]];
         }
         Ok(())
@@ -446,4 +454,91 @@ pub struct Stats {
     /// The share of time the picture is expected to be stale: the last video plan's chance of
     /// a miss times the update rate times the recovery, a miss leaving it stale that long.
     pub stale: f64,
+}
+
+/// On Linux, where the test binary's counting allocator runs, as its other allocation
+/// properties do.
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use crate::lanes::code::Encoder;
+    use crate::lanes::model::Runs;
+    use crate::lanes::sim::PRODUCTION;
+    use crate::lanes::wire::{Arrivals, Epoch, Late, Number, OneWay, Outcome};
+    use crate::video::tests::{counting, in_a_process_of_its_own};
+    use crate::xorshift::Xorshift;
+
+    /// A plan allocates nothing once the link is warm: production's workload, one update every
+    /// 57 ms on one lane, its symbols erased by a two-state chain (9% lost, bursts of three)
+    /// and every block reported 110 ms after it leaves; over the second 20,000 plans, after
+    /// 20,000 to warm up, the allocations made inside [`Link::plan`] (counted by the test
+    /// binary's allocator, in a process of its own) are none. The refits, in the reports, may
+    /// allocate.
+    #[test]
+    fn a_plan_allocates_nothing_in_steady_state() {
+        if !in_a_process_of_its_own("lanes::link::tests::a_plan_allocates_nothing_in_steady_state")
+        {
+            return;
+        }
+        let (p, b) = (0.09, 2.0 / 3.0);
+        let truth = Runs::geometric(p * (1.0 - b) / (1.0 - p), b);
+        let (mut rng, mut drawn) = (Xorshift::new(1), Xorshift::new(2));
+        let mut outcomes = truth.draw(&mut drawn);
+        let mut link = Link::new(Stamp(0), Stamp(500));
+        let mut enc = Encoder::new();
+        let mut number = Number::first();
+        let (mut bits, mut delays) = (Vec::new(), Vec::new());
+        let mut allocations = 0;
+        for i in 0..40_000u32 {
+            let t = Stamp(i * 570);
+            let bytes = PRODUCTION.draw(&mut rng, 1.0);
+            let frame: Vec<u8> = (0..bytes).map(|j| j as u8).collect();
+            let tracks = [Track::Video {
+                number,
+                epoch: Epoch::Start,
+            }];
+            number = number.next();
+            let assembled = enc
+                .assemble(std::iter::once((tracks[0], frame.as_slice())))
+                .unwrap();
+            let counted = i >= 20_000;
+            if counted {
+                counting::arm();
+            }
+            let plan = link.plan(assembled.bytes(), &tracks, Lanes::ONE, t);
+            if counted {
+                let (threads, others) = counting::disarm();
+                allocations += threads.iter().map(|t| t.allocations).sum::<usize>() + others;
+            }
+            let head = *assembled.code(plan.m, plan.due).unwrap().head();
+            let n = head.n();
+            bits.clear();
+            bits.resize(n.div_ceil(8), 0);
+            delays.clear();
+            let mut arrived = 0;
+            for (i, a) in outcomes.by_ref().take(n).enumerate() {
+                if a == Arrival::Arrived {
+                    bits[i / 8] |= 1 << (i % 8);
+                    let d = OneWay::of(t, t.plus(500 + (i % 7) as i64));
+                    delays.extend_from_slice(&d.0.to_be_bytes());
+                    arrived += 1;
+                }
+            }
+            let report = Report {
+                block: head.block,
+                sent: t.plus(600),
+                fate: Fate::Seen {
+                    outcome: match arrived >= head.k() {
+                        true => Outcome::Decoded,
+                        false => Outcome::Missed,
+                    },
+                    arrivals: Arrivals::written(n as u16, &bits, &delays),
+                },
+                late: Late::written(&[]),
+            };
+            link.reported(&plan.flight(&head, tracks.to_vec()), &report, t.plus(1100))
+                .unwrap();
+        }
+        assert_eq!(allocations, 0, "allocations inside the plans after warm-up");
+    }
 }

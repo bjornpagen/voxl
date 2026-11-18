@@ -100,6 +100,13 @@ bindgen = "0.72"
 cc = "1"
 pkg-config = "0.3"
 
+# The tests of this crate built optimised: the lane simulator's properties each run minutes of
+# a session, and the plan's and the code's loops run some thirty times slower unoptimised.
+# Debug assertions and overflow checks stay on (the test profile inherits dev's), and the
+# dependencies keep dev's level, so their build does not grow.
+[profile.test.package.voxl-server]
+opt-level = 3
+
 [profile.release]
 opt-level = 3
 lto = "thin"
