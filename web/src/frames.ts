@@ -1,17 +1,31 @@
-// The worker's record of the screen: its one decoder. Every update the relay gives the page
-// after a stream's keyframe is decodable (the encoder refers only to pictures it knows the
-// page has), so a stream, whose codec its hello names, decodes from its keyframe on, in
-// order. Before the keyframe the lane's kind decides: on a datagram lane the keyframe may
-// have missed its deadline, and the deltas after it pass undecoded (counted) until the
-// daemon, told of the miss, starts the stream again with a new hello and keyframe; on a
-// stream lane every frame arrives, so a delta before the keyframe is a fault. Every fault (a
-// decoder error, a codec the browser cannot decode) ends the session for its cause. Nothing
-// asks for a keyframe, and nothing is reconfigured. Events go in as calls; what the record
-// does goes out through a `World`, which in the worker is WebCodecs and the page, and in
-// frames.test.ts a fake of them.
+// The worker's record of the screen: its one decoder. The session's first hello names the
+// codec, which stays the session's (the daemon declares the level of the largest desktop);
+// a later hello (a resize) changes the layout and nothing here. Every update says which
+// keyframe it descends from, and refers only to that keyframe and pictures after it that
+// the page reported decoded. So the record decodes a keyframe always, and a delta exactly
+// when the keyframe it descends from is the last one it decoded, whatever order the
+// keyframe, the delta and the hellos arrive in (the hello comes over the control stream,
+// the updates over the lane, and nothing orders the two). A delta whose keyframe the page
+// never decoded is passed over, counted, on a datagram lane, where the keyframe may have
+// missed its deadline and the daemon, told of the miss, sends another; on a stream lane
+// every update arrives, so such a delta is a fault. Every fault (a decoder error, a codec
+// the browser cannot decode, a hello that changes the codec) ends the session for its
+// cause. Nothing asks for a keyframe, and nothing is reconfigured. Events go in as calls;
+// what the record does goes out through a `World`, which in the worker is WebCodecs and the
+// page, and in frames.test.ts a fake of them.
 
 /** How the session's lane carries the frames (the relay's lanes description). */
 export type LaneKind = 'datagram' | 'stream';
+
+/** What an update says of itself (its video header). */
+export interface Update {
+	/** It is a keyframe. */
+	key: boolean;
+	/** Its number: the daemon's count of the frames it sent, wrapping. */
+	frame: number;
+	/** The number of the keyframe it descends from (a keyframe's own). */
+	from: number;
+}
 
 /** What the record does. `D` is a decoder, `P` a picture, `B` an update's bytes. */
 export interface World<D, P, B> {
@@ -27,29 +41,35 @@ export interface World<D, P, B> {
 	letGo(picture: P): void;
 	/** Shows a picture. */
 	show(picture: P): void;
-	/** A delta passed undecoded while a datagram lane's stream waits for its keyframe. */
+	/** A delta passed undecoded: its keyframe never reached the decoder (a datagram lane). */
 	passed(): void;
 	/** The screen cannot go on: the session ends, for `why`. */
 	end(why: string): void;
 }
 
 /**
- * The screen: no stream (before a hello, after the session ended or failed); a stream of a
- * codec, on a lane of a kind, waiting for its keyframe; or decoding with the decoder opened
- * on it.
+ * The screen: no session (before its hello, after it ended or failed); a session of a codec
+ * on a lane of a kind, no keyframe decoded yet; or decoding, with the decoder opened on the
+ * session's first keyframe and the number of the last keyframe it decoded.
  */
 type Screen<D> =
 	| { readonly s: 'none' }
-	| { readonly s: 'waiting'; readonly lane: LaneKind; readonly codec: string }
-	| { readonly s: 'decoding'; readonly dec: D; readonly codec: string };
+	| { readonly s: 'ready'; readonly lane: LaneKind; readonly codec: string }
+	| {
+			readonly s: 'decoding';
+			readonly lane: LaneKind;
+			readonly codec: string;
+			readonly dec: D;
+			readonly key: number;
+	  };
 
 const NONE = { s: 'none' } as const;
 
 export class Frames<D, P, B> {
 	readonly #world: World<D, P, B>;
 	#screen: Screen<D> = NONE;
-	/** The streams begun so far: the newest is the one the record is in, if any. */
-	#streams = 0;
+	/** The sessions begun so far: the newest is the one the record is in, if any. */
+	#sessions = 0;
 
 	constructor(world: World<D, P, B>) {
 		this.#world = world;
@@ -60,20 +80,25 @@ export class Frames<D, P, B> {
 		return this.#screen.s === 'decoding' ? this.#screen.codec : null;
 	}
 
-	/** A stream of `codec` starts on a lane of kind `lane` (a hello): the decoder, if any, is
-	 * closed, so no picture of the old stream is shown. The stream's number, for
-	 * `unsupported`. */
-	hello(lane: LaneKind, codec: string): number {
-		this.#close();
-		this.#screen = { s: 'waiting', lane, codec };
-		return ++this.#streams;
+	/** A hello naming `codec`, on a lane of kind `lane`. The session's first begins it and
+	 * returns its number, for `unsupported` (its codec is checked once); a later one names
+	 * the same codec and changes nothing here (null), or ends the session. */
+	hello(lane: LaneKind, codec: string): number | null {
+		const s = this.#screen;
+		if (s.s === 'none') {
+			this.#screen = { s: 'ready', lane, codec };
+			return ++this.#sessions;
+		}
+		if (s.codec !== codec)
+			this.#fail(`a hello changed the codec from ${s.codec} to ${codec}`);
+		return null;
 	}
 
-	/** Stream `stream`'s codec cannot be decoded here: if the record is still in it, the
+	/** Session `session`'s codec cannot be decoded here: if the record is still in it, the
 	 * session ends. */
-	unsupported(stream: number) {
+	unsupported(session: number) {
 		const s = this.#screen;
-		if (s.s === 'none' || stream !== this.#streams) return;
+		if (s.s === 'none' || session !== this.#sessions) return;
 		this.#fail(`this browser cannot decode ${s.codec}`);
 	}
 
@@ -84,36 +109,37 @@ export class Frames<D, P, B> {
 	}
 
 	/** An update arrived at `at`. */
-	part(at: number, key: boolean, data: B) {
+	part(at: number, u: Update, data: B) {
 		const s = this.#screen;
 		switch (s.s) {
 			case 'none':
-				return this.#fail('an update outside a stream');
-			case 'waiting': {
-				if (!key)
-					switch (s.lane) {
-						// Its keyframe missed: the daemon starts the stream again.
-						case 'datagram':
-							return this.#world.passed();
-						case 'stream':
-							return this.#fail("a delta before the stream's keyframe");
-					}
+				return this.#fail("an update before the session's hello");
+			case 'ready': {
+				if (!u.key) return this.#unrooted(s.lane);
 				let dec: D;
 				try {
 					dec = this.#world.open(s.codec);
 				} catch (e) {
 					return this.#fail(`cannot decode ${s.codec}: ${e}`);
 				}
-				this.#screen = { s: 'decoding', dec, codec: s.codec };
-				return this.#decode(dec, key, at, data);
+				this.#screen = {
+					s: 'decoding',
+					lane: s.lane,
+					codec: s.codec,
+					dec,
+					key: u.frame,
+				};
+				return this.#decode(dec, u, at, data);
 			}
 			case 'decoding':
-				return this.#decode(s.dec, key, at, data);
+				if (u.key) this.#screen = { ...s, key: u.frame };
+				else if (u.from !== s.key) return this.#unrooted(s.lane);
+				return this.#decode(s.dec, u, at, data);
 		}
 	}
 
 	/** Decoder `dec` put out `picture`: shown if the record still decodes with it, let go
-	 * otherwise (a decoder closed by a hello may still put out what it held). */
+	 * otherwise (a decoder closed with its session may still put out what it held). */
 	output(dec: D, picture: P) {
 		const s = this.#screen;
 		if (s.s === 'decoding' && s.dec === dec) this.#world.show(picture);
@@ -128,9 +154,20 @@ export class Frames<D, P, B> {
 		this.#world.end(`the decoder failed: ${name}: ${message}`);
 	}
 
-	#decode(dec: D, key: boolean, at: number, data: B) {
+	/** A delta whose keyframe the decoder never had: passed over where updates can miss,
+	 * a fault where every update arrives. */
+	#unrooted(lane: LaneKind) {
+		switch (lane) {
+			case 'datagram':
+				return this.#world.passed();
+			case 'stream':
+				return this.#fail('a delta whose keyframe never came');
+		}
+	}
+
+	#decode(dec: D, u: Update, at: number, data: B) {
 		try {
-			this.#world.decode(dec, key, at, data);
+			this.#world.decode(dec, u.key, at, data);
 		} catch (e) {
 			this.#fail(`the decoder refused an update: ${e}`);
 		}

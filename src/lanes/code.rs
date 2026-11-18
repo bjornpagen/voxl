@@ -8,15 +8,16 @@
 //! The decoder holds each live frame as one linear system over its unknown sources, in reduced
 //! row echelon form: a source that arrives is substituted into every row, a repair that
 //! arrives is reduced by the rows and becomes one, and a row left with one unknown is that
-//! source recovered. A frame leaves the decoder when its deadline passes: its rows go with it.
+//! source recovered. A frame leaves the decoder when its deadline passes, or when the relay's
+//! memory, [`WINDOW`] symbols, needs its room for a newer one: its rows go with it.
 //!
 //! Neither end allocates per symbol: the encoder's repairs and each frame's buffers are reused
 //! from frame to frame, and grow only to the largest frame seen.
 
 use super::gf;
 use super::wire::{
-    symbols, write_entry, Arrivals, Fate, Head, Lane, Late, Malformed, OneWay, Outcome, Report,
-    Seq, Stamp, Symbol, Symbolic, Track, DATAGRAM, DELAY, LATE, SYMBOL, WINDOW,
+    symbols, write_entry, Arrivals, Fate, Head, Lane, Late, LateArrival, Malformed, OneWay,
+    Outcome, Report, Seq, Stamp, Symbol, Symbolic, Track, DATAGRAM, LATE, SYMBOL, WINDOW,
 };
 use std::collections::VecDeque;
 use std::num::{NonZeroU32, NonZeroU8, NonZeroUsize};
@@ -210,7 +211,8 @@ pub enum Took<'a> {
     Held,
     /// Its frame was already whole, it had come before, or it told nothing new.
     Spare,
-    /// It came after its frame's deadline: only its delay is kept, for the next report.
+    /// It came after its frame's deadline, or after its frame was decided: which symbol it
+    /// was and its delay are kept, for the next report.
     Late,
 }
 
@@ -219,10 +221,6 @@ pub enum Took<'a> {
 pub enum Refused {
     /// Its head differs from the head its frame's earlier messages carried.
     Conflict,
-    /// Its frame is [`WINDOW`] or more frames past the oldest undecided one.
-    Ahead,
-    /// Holding its frame would hold more than [`WINDOW`] symbols.
-    Full,
     /// A whole frame, which a stream lane carries: a datagram lane carries only pieces and
     /// repairs.
     Frame,
@@ -449,10 +447,13 @@ pub struct Decoder {
     /// nothing of which has come.
     live: VecDeque<Option<Frame>>,
     base: Seq,
-    /// The symbols the live frames hold room for.
+    /// The symbols the live frames hold room for: at most [`WINDOW`].
     held: usize,
     spare: Vec<Frame>,
-    late: VecDeque<OneWay>,
+    /// The blocks before `base` decided to make room and not yet reported, oldest first.
+    closed: VecDeque<Closed>,
+    /// The symbols that came late since the last report, in the order they came.
+    late: VecDeque<LateArrival>,
     /// The newest block a piece of which came after its deadline: every block up to it is
     /// past its deadline, whatever else of them came.
     overdue: Option<Head>,
@@ -462,6 +463,33 @@ pub struct Decoder {
     late_bytes: Vec<u8>,
 }
 
+/// Blocks decided before their deadline, for the room their symbols held.
+enum Closed {
+    /// `count` blocks from `from` nothing of which came, each deciding the frames up to
+    /// `last`: closed when a symbol came at `at`.
+    Unseen {
+        from: Seq,
+        count: u64,
+        last: Seq,
+        at: Stamp,
+    },
+    /// A block something of which came: whether it was whole, and each symbol's arrival.
+    Seen {
+        head: Head,
+        whole: bool,
+        arrivals: Vec<Option<OneWay>>,
+        at: Stamp,
+    },
+}
+
+impl Closed {
+    fn at(&self) -> Stamp {
+        match self {
+            Closed::Unseen { at, .. } | Closed::Seen { at, .. } => *at,
+        }
+    }
+}
+
 impl Decoder {
     pub fn new() -> Decoder {
         Decoder {
@@ -469,23 +497,60 @@ impl Decoder {
             base: Seq(0),
             held: 0,
             spare: Vec::new(),
-            late: VecDeque::with_capacity(LATE),
+            closed: VecDeque::new(),
+            late: VecDeque::new(),
             overdue: None,
             bits: Vec::new(),
             delays: Vec::new(),
-            late_bytes: Vec::with_capacity(DELAY * LATE),
+            late_bytes: Vec::new(),
         }
     }
 
-    fn late(&mut self, d: OneWay) -> Took<'static> {
-        if self.late.len() == LATE {
-            self.late.pop_front();
+    /// Decides the oldest undecided blocks now, to make room for `next`'s, which came at `at`:
+    /// the frame `base`, if something of it came, else the run of blocks from `base` nothing
+    /// of which came, up to the first that something of did, or, if none did, up to `upto`.
+    /// A run decides the frames before the first known after it (that block's, or `next`'s).
+    fn close_front(&mut self, next: Head, upto: Seq, at: Stamp) {
+        match self.live.pop_front() {
+            Some(Some(mut f)) => {
+                self.held -= f.head.n();
+                self.base = Seq(self.base.get() + 1);
+                self.closed.push_back(Closed::Seen {
+                    head: f.head,
+                    whole: f.whole(),
+                    arrivals: std::mem::take(&mut f.arrivals),
+                    at,
+                });
+                self.spare.push(f);
+            }
+            front => {
+                if let Some(None) = front {
+                    self.live.push_front(None);
+                }
+                let empty = self.live.iter().take_while(|f| f.is_none()).count() as u64;
+                let known = self.live.iter().flatten().next().map_or(next, |f| f.head);
+                let count = match empty as usize == self.live.len() {
+                    // Nothing after the run has come: it reaches `upto`.
+                    true => upto.get().saturating_sub(self.base.get()).max(empty).max(1),
+                    false => empty,
+                };
+                let gone = (count as usize).min(self.live.len());
+                self.live.drain(..gone);
+                self.closed.push_back(Closed::Unseen {
+                    from: self.base,
+                    count,
+                    last: Seq(known.first.get().saturating_sub(1)),
+                    at,
+                });
+                self.base = Seq(self.base.get() + count);
+            }
         }
-        self.late.push_back(d);
-        Took::Late
     }
 
-    /// A piece or repair, arrived at `arrived` on the relay's clock.
+    /// A piece or repair, arrived at `arrived` on the relay's clock. It is never refused for
+    /// room: a frame that would hold more than [`WINDOW`] symbols, or be [`WINDOW`] or more
+    /// blocks past the oldest undecided one, first decides the oldest undecided blocks (missed
+    /// unless whole), which are reported as any block.
     pub fn take(&mut self, lane: Lane<'_>, arrived: Stamp) -> Result<Took<'_>, Refused> {
         let (s, piece) = match lane {
             Lane::Piece(s) => (s, true),
@@ -496,20 +561,37 @@ impl Decoder {
             true => s.index as usize,
             false => s.head.k() + s.index as usize,
         };
-        let delay = OneWay::of(s.sent, arrived);
-        if s.head.block < self.base {
-            return Ok(self.late(delay));
-        }
-        if s.head.due.to(arrived) > 0 {
-            if self.overdue.is_none_or(|o| o.block < s.head.block) {
-                self.overdue = Some(s.head);
+        let late = LateArrival {
+            block: s.head.block,
+            position: position as u16,
+            delay: OneWay::of(s.sent, arrived),
+        };
+        let block = s.head.block;
+        let at = loop {
+            if block < self.base {
+                self.late.push_back(late);
+                return Ok(Took::Late);
             }
-            return Ok(self.late(delay));
-        }
-        let at = (s.head.block.get() - self.base.get()) as usize;
-        if at >= WINDOW {
-            return Err(Refused::Ahead);
-        }
+            if s.head.due.to(arrived) > 0 {
+                if self.overdue.is_none_or(|o| o.block < block) {
+                    self.overdue = Some(s.head);
+                }
+                self.late.push_back(late);
+                return Ok(Took::Late);
+            }
+            let at = (block.get() - self.base.get()) as usize;
+            if at >= WINDOW {
+                self.close_front(s.head, block, arrived);
+                continue;
+            }
+            let opened = self.live.get(at).is_some_and(|f| f.is_some());
+            if !opened && self.held + s.head.n() > WINDOW {
+                let oldest = self.live.iter().flatten().next().map(|f| f.head.block);
+                self.close_front(s.head, oldest.unwrap_or(block), arrived);
+                continue;
+            }
+            break at;
+        };
         if self.live.len() <= at {
             self.live.resize_with(at + 1, || None);
         }
@@ -517,9 +599,6 @@ impl Decoder {
             Some(f) if f.head != s.head => return Err(Refused::Conflict),
             Some(f) => f,
             slot @ None => {
-                if self.held + s.head.n() > WINDOW {
-                    return Err(Refused::Full);
-                }
                 self.held += s.head.n();
                 let mut f = self.spare.pop().unwrap_or_else(Frame::empty);
                 f.open(s.head);
@@ -529,7 +608,7 @@ impl Decoder {
         if frame.arrivals[position].is_some() {
             return Ok(Took::Spare);
         }
-        frame.arrivals[position] = Some(delay);
+        frame.arrivals[position] = Some(late.delay);
         if frame.whole() {
             return Ok(Took::Spare);
         }
@@ -549,8 +628,12 @@ impl Decoder {
         })
     }
 
-    /// When [`Decoder::decide`] next has a frame to decide, if any frame is held.
+    /// When [`Decoder::decide`] next has a frame to decide, if any frame is held: at once for
+    /// a block closed for room.
     pub fn wake(&self) -> Option<Stamp> {
+        if let Some(c) = self.closed.front() {
+            return Some(c.at());
+        }
         let live = self.live.iter().flatten().next().map(|f| f.head.due);
         let overdue = self.overdue.filter(|o| o.block >= self.base).map(|o| o.due);
         match (live, overdue) {
@@ -577,11 +660,102 @@ impl Decoder {
         }
     }
 
+    /// Writes the late arrivals a report of `block` carries: those of it and of earlier
+    /// blocks, the first [`LATE`] of them; the rest wait for a later report.
+    fn write_late(&mut self, block: Seq) {
+        self.late_bytes.clear();
+        let mut taken = 0;
+        let out = &mut self.late_bytes;
+        self.late.retain(|l| {
+            let take = l.block <= block && taken < LATE;
+            if take {
+                l.write(out);
+                taken += 1;
+            }
+            !take
+        });
+    }
+
+    /// Writes a block's arrivals: the bitmap of those that came by its deadline, and their
+    /// delays.
+    fn write_arrivals(&mut self, arrivals: &[Option<OneWay>]) {
+        self.bits.clear();
+        self.bits.resize(arrivals.len().div_ceil(8), 0);
+        self.delays.clear();
+        for (i, a) in arrivals.iter().enumerate() {
+            if let Some(d) = a {
+                self.bits[i / 8] |= 1 << (i % 8);
+                self.delays.extend_from_slice(&d.0.to_be_bytes());
+            }
+        }
+    }
+
+    /// The report of `block` written, as `fate` makes it: nothing came of it (`None`), or
+    /// it was whole or not.
+    fn written(
+        &self,
+        block: Seq,
+        fate: Option<(Head, bool)>,
+        now: Stamp,
+        last: Seq,
+    ) -> Decided<'_> {
+        let fate = match fate {
+            None => Fate::Unseen,
+            Some((head, whole)) => Fate::Seen {
+                outcome: match whole {
+                    true => Outcome::Decoded,
+                    false => Outcome::Missed,
+                },
+                arrivals: Arrivals::written(head.n() as u16, &self.bits, &self.delays),
+            },
+        };
+        Decided {
+            report: Report {
+                block,
+                sent: now,
+                fate,
+                late: Late::written(&self.late_bytes, block),
+            },
+            last,
+        }
+    }
+
     /// The oldest undecided frame, if it is decided by `now`, with its report, leaving at
     /// `now`. Frames are decided in the order of their numbers; call it until it gives none.
     /// A block nothing of which came on time is decided once a piece of it or of a later one
-    /// shows that block's deadline passed.
+    /// shows that block's deadline passed; a block closed for room, at once.
     pub fn decide(&mut self, now: Stamp) -> Option<Decided<'_>> {
+        if let Some(c) = self.closed.pop_front() {
+            return Some(match c {
+                Closed::Unseen {
+                    from,
+                    count,
+                    last,
+                    at,
+                } => {
+                    if count > 1 {
+                        self.closed.push_front(Closed::Unseen {
+                            from: Seq(from.get() + 1),
+                            count: count - 1,
+                            last,
+                            at,
+                        });
+                    }
+                    self.write_late(from);
+                    self.written(from, None, now, last)
+                }
+                Closed::Seen {
+                    head,
+                    whole,
+                    arrivals,
+                    ..
+                } => {
+                    self.write_late(head.block);
+                    self.write_arrivals(&arrivals);
+                    self.written(head.block, Some((head, whole)), now, head.last())
+                }
+            });
+        }
         let next = match self.live.front() {
             // The oldest came on time: its own deadline decides it.
             Some(Some(f)) if f.head.due.to(now) < 0 => return None,
@@ -590,54 +764,23 @@ impl Decoder {
         };
         let block = self.base;
         self.base = Seq(block.get() + 1);
-        self.late_bytes.clear();
-        for d in self.late.drain(..) {
-            self.late_bytes.extend_from_slice(&d.0.to_be_bytes());
-        }
-        let late = Late::written(&self.late_bytes);
+        self.write_late(block);
         match self.live.pop_front().flatten() {
-            None => Some(Decided {
-                report: Report {
-                    block,
-                    sent: now,
-                    fate: Fate::Unseen,
-                    late,
-                },
-                last: match next.block == block {
+            None => {
+                let last = match next.block == block {
                     true => next.last(),
                     // A later block's frames follow this one's; a peer's head numbering its
                     // first frame 0 past block 0 decides no frame before it.
                     false => Seq(next.first.get().saturating_sub(1)),
-                },
-            }),
+                };
+                Some(self.written(block, None, now, last))
+            }
             Some(f) => {
                 self.held -= f.head.n();
-                let n = f.head.n();
-                self.bits.clear();
-                self.bits.resize(n.div_ceil(8), 0);
-                self.delays.clear();
-                for (i, a) in f.arrivals.iter().enumerate() {
-                    if let Some(d) = a {
-                        self.bits[i / 8] |= 1 << (i % 8);
-                        self.delays.extend_from_slice(&d.0.to_be_bytes());
-                    }
-                }
-                let outcome = match f.whole() {
-                    true => Outcome::Decoded,
-                    false => Outcome::Missed,
-                };
-                let head = f.head;
+                self.write_arrivals(&f.arrivals);
+                let (head, whole) = (f.head, f.whole());
                 self.spare.push(f);
-                let arrivals = Arrivals::written(n as u16, &self.bits, &self.delays);
-                Some(Decided {
-                    report: Report {
-                        block,
-                        sent: now,
-                        fate: Fate::Seen { outcome, arrivals },
-                        late,
-                    },
-                    last: head.last(),
-                })
+                Some(self.written(block, Some((head, whole)), now, head.last()))
             }
         }
     }
@@ -869,6 +1012,150 @@ mod tests {
                 "k {k} m {m} p {p}: {degenerate} singular of {exact} with exactly k, bound {bound}"
             );
         }
+    }
+
+    /// The relay's memory is a deadline of its own. Over generated arrival streams (blocks of
+    /// up to 4,000 sources with deadlines up to 20 s out and of 1 to 4 within 0.2 s, in the
+    /// blocks' order as the daemon
+    /// stamps them, their symbols arriving in any order,
+    /// on time or late, and now and then a block more than [`WINDOW`] blocks past the last),
+    /// `take` never refuses and the live frames never hold more than [`WINDOW`] symbols; every
+    /// block from the first to the newest a symbol came of is reported exactly once, in order,
+    /// once the last deadline has passed; and every symbol
+    /// taken late is in exactly one report's late arrivals, of that report's block or an
+    /// earlier one, with its delay; and no block comes out whole once a decision has released
+    /// its frames.
+    #[test]
+    fn the_decoder_never_refuses_for_room() {
+        let mut rng = Xorshift::new(0x6A09_E667_F3BC_C908);
+        let zeros = vec![0u8; SYMBOL];
+        // Blocks closed for room: something of which came, and runs nothing of which did; and
+        // blocks that came out whole.
+        let (mut seen, mut unseen, mut whole) = (0, 0, 0);
+        for _ in 0..6 {
+            let mut dec = Decoder::new();
+            let mut heads: Vec<Head> = Vec::new();
+            let (mut block, mut first, mut now) = (0u64, 0u64, 0u32);
+            let mut last_due = Stamp(0);
+            let mut taken_late = Vec::new();
+            let mut reported_late = Vec::new();
+            let mut next_report = 0u64;
+            let mut newest = 0u64;
+            // The newest frame decided: none up to it may come out whole after.
+            let mut released: Option<u64> = None;
+            let mut check = |d: Decided<'_>, next_report: &mut u64, released: &mut Option<u64>| {
+                assert_eq!(d.report.block, Seq(*next_report), "reported in order");
+                *next_report += 1;
+                *released = Some(released.map_or(d.last.get(), |r| r.max(d.last.get())));
+                for l in d.report.late.iter() {
+                    assert!(
+                        l.block <= d.report.block,
+                        "a late arrival ahead of its report"
+                    );
+                    reported_late.push(l);
+                }
+            };
+            for _ in 0..4000 {
+                if heads.is_empty() || rng.below(20) == 0 {
+                    // Half of them small, which come out whole; half up to 4,000 sources,
+                    // which fill the window.
+                    let k = match rng.below(2) {
+                        0 => rng.range(1, 5),
+                        _ => rng.range(1, 4001),
+                    } as usize;
+                    let head = Head {
+                        block: Seq(block),
+                        first: Seq(first),
+                        members: NonZeroU8::MIN,
+                        bytes: NonZeroU32::new((k * SYMBOL) as u32).unwrap(),
+                        m: rng.below(4) as u16,
+                        // Deadlines follow the blocks' order, as the daemon stamps them.
+                        due: {
+                            let out = match k < 5 {
+                                true => 2_000,
+                                false => 200_000,
+                            };
+                            let d = Stamp(now).plus(rng.range(0, out) as i64);
+                            last_due = match d.to(last_due) > 0 {
+                                true => last_due,
+                                false => d,
+                            };
+                            last_due
+                        },
+                    };
+                    heads.push(head);
+                    first += 1;
+                    block += match rng.below(200) {
+                        0 => WINDOW as u64 + rng.range(1, 1000),
+                        _ => 1,
+                    };
+                }
+                now += rng.below(50) as u32;
+                let recent = heads.len().saturating_sub(40);
+                let head = heads[rng.range(recent as u64, heads.len() as u64) as usize];
+                let position = rng.below(head.n() as u64) as usize;
+                let sent = Stamp(now.saturating_sub(rng.below(100) as u32));
+                let (lane, index) = match position < head.k() {
+                    true => (true, position as u16),
+                    false => (false, (position - head.k()) as u16),
+                };
+                let s = Symbol {
+                    head,
+                    sent,
+                    index,
+                    data: match lane {
+                        true => &zeros[..head.source_len(index as usize)],
+                        false => &zeros[..head.repair_len()],
+                    },
+                };
+                let lane = match lane {
+                    true => Lane::Piece(s),
+                    false => Lane::Repair(s),
+                };
+                newest = newest.max(head.block.get());
+                let took = dec.take(lane, Stamp(now)).expect("never refused");
+                if let Took::Whole(h, _) = took {
+                    whole += 1;
+                    assert!(
+                        released.is_none_or(|r| h.first.get() > r),
+                        "block {:?} whole after its frames were released",
+                        h.block
+                    );
+                }
+                if took == Took::Late {
+                    taken_late.push(LateArrival {
+                        block: head.block,
+                        position: position as u16,
+                        delay: OneWay::of(sent, Stamp(now)),
+                    });
+                }
+                assert!(dec.held <= WINDOW, "{} symbols held", dec.held);
+                if rng.below(10) == 0 {
+                    for c in &dec.closed {
+                        match c {
+                            Closed::Seen { .. } => seen += 1,
+                            Closed::Unseen { .. } => unseen += 1,
+                        }
+                    }
+                    while let Some(d) = dec.decide(Stamp(now)) {
+                        check(d, &mut next_report, &mut released);
+                    }
+                }
+            }
+            let end = Stamp(now).plus(400_000);
+            while let Some(d) = dec.decide(end) {
+                check(d, &mut next_report, &mut released);
+            }
+            assert_eq!(next_report, newest + 1, "every block heard of reported");
+            let key = |l: &LateArrival| (l.block, l.position, l.delay.0);
+            taken_late.sort_by_key(key);
+            reported_late.sort_by_key(key);
+            assert_eq!(reported_late, taken_late, "every late symbol reported once");
+        }
+        assert!(
+            seen > 0 && unseen > 0 && whole > 0,
+            "{seen} blocks and {unseen} runs closed for room, {whole} whole"
+        );
     }
 
     /// The m chosen for a miss target meets it, and three quarters of it miss it: frames sent

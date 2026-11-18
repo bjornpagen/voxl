@@ -53,10 +53,10 @@ pub const SYMBOL: usize = DATAGRAM - HEADER;
 /// The most symbols a frame may have (k + m), and the most the relay holds at once of all its
 /// live frames together: what a symbol's 16-bit index and a report's 16-bit count can number.
 /// It bounds the relay's memory for symbols at `WINDOW · SYMBOL`, 71 MB, which it takes only
-/// as symbols arrive. The daemon keeps no more than this unreported
-/// ([`super::budget::Budget::lane_bound`]), which at a round trip and allowance of 300 ms
-/// together is 2 Gbit/s, over the 960 Mbit/s a High-profile H.264 stream may carry at its
-/// highest level (ITU-T H.264 Table A-1, level 6.2: MaxBR 800 000 × cpbBrVclFactor 1200).
+/// as symbols arrive. The relay's memory is a deadline of its own: a block that would hold
+/// more decides the oldest live blocks first, missed unless whole, and reports them as any
+/// block ([`super::code::Decoder::take`]). Nothing on the daemon's side bounds what it sends
+/// unreported: the transport's rate does.
 pub const WINDOW: usize = u16::MAX as usize;
 
 /// The longest control message: the most the page's WebSocket took of one message before the
@@ -68,8 +68,20 @@ pub const MAX_CONTROL: usize = 64 << 20;
 /// byte.
 pub const MAX_DOWN_BINARY: usize = MAX_CONTROL - std::mem::size_of::<u8>();
 
-/// The most late arrivals one report carries: its count is one byte.
-pub const LATE: usize = u8::MAX as usize;
+/// A late arrival's bytes on the wire: its block (8), its position among the block's n symbols
+/// (2: sources, then repairs) and its delay ([`DELAY`]).
+pub const LATE_ENTRY: usize = 8 + 2 + DELAY;
+
+/// The longest report of a block, without its late arrivals: block (8), sent (4), fate (1),
+/// n (2), a bitmap of [`WINDOW`] bits and every one of them arrived, with its delay.
+const REPORT_MOST: usize = 8 + 4 + 1 + 2 + WINDOW.div_ceil(8) + DELAY * WINDOW;
+
+/// The most late arrivals one report carries: as many as a control message holds after its
+/// kind (1), the longest report of a block and the late arrivals' 4-byte count.
+///
+/// Derived: `(MAX_CONTROL - 1 - REPORT_MOST - 4) / LATE_ENTRY`, 4,774,330. The decoder holds
+/// the rest for the next report: none is dropped.
+pub const LATE: usize = (MAX_CONTROL - 1 - REPORT_MOST - 4) / LATE_ENTRY;
 
 /// How many symbols a frame of `bytes` is cut into: one, and one more for each whole
 /// `SYMBOL` after its first byte.
@@ -814,9 +826,11 @@ pub struct Report<'a> {
     /// daemon's sample of the delay toward it.
     pub sent: Stamp,
     pub fate: Fate<'a>,
-    /// The delays of pieces and repairs that arrived after their frame was decided, since the
-    /// last report: the arrivals the deadline left out, without which the spread of arrivals
-    /// could only be read below the deadline it sets.
+    /// The pieces and repairs that arrived after their block's deadline, or after it was
+    /// decided, since the last report, each of this block or an earlier one: which symbol it
+    /// was, and its delay. The arrivals the deadline left out: a late symbol is delay, never
+    /// loss, and without its delay the spread of arrivals could only be read below the
+    /// deadline it sets.
     pub late: Late<'a>,
 }
 
@@ -887,32 +901,65 @@ impl<'a> Arrivals<'a> {
     }
 }
 
-/// Late delays, as on the wire: 4 bytes each, at most [`LATE`].
+/// A symbol that arrived after its block's deadline: which it was, and its delay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LateArrival {
+    pub block: Seq,
+    /// Its position among the block's n symbols: a source's index, or k and a repair's.
+    pub position: u16,
+    pub delay: OneWay,
+}
+
+impl LateArrival {
+    pub(super) fn write(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.block.0.to_be_bytes());
+        out.extend_from_slice(&self.position.to_be_bytes());
+        out.extend_from_slice(&self.delay.0.to_be_bytes());
+    }
+}
+
+/// Late arrivals, as on the wire: [`LATE_ENTRY`] bytes each, at most [`LATE`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Late<'a>(&'a [u8]);
 
 impl<'a> Late<'a> {
-    /// Late delays as the relay wrote them: 4 bytes each.
-    pub fn new(b: &'a [u8]) -> Result<Late<'a>, Malformed> {
+    /// Late arrivals as the relay wrote them for the report of `block`: each of it or an
+    /// earlier block.
+    pub fn new(b: &'a [u8], block: Seq) -> Result<Late<'a>, Malformed> {
         match () {
-            _ if !b.len().is_multiple_of(DELAY) => Err(Malformed::Length),
-            _ if b.len() / DELAY > LATE => Err(Malformed::TooLarge),
+            _ if !b.len().is_multiple_of(LATE_ENTRY) => Err(Malformed::Length),
+            _ if b.len() / LATE_ENTRY > LATE => Err(Malformed::TooLarge),
+            _ if Late(b).iter().any(|l| l.block > block) => Err(Malformed::Ahead),
             _ => Ok(Late(b)),
         }
     }
 
-    /// Late delays the decoder wrote, at most `LATE` of 4 bytes each.
-    pub(super) fn written(b: &'a [u8]) -> Late<'a> {
-        debug_assert!(Late::new(b).is_ok());
+    /// Late arrivals the decoder wrote, which hold by how it wrote them.
+    pub(super) fn written(b: &'a [u8], block: Seq) -> Late<'a> {
+        debug_assert!(Late::new(b, block).is_ok());
         Late(b)
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = OneWay> + 'a {
+    pub fn len(&self) -> usize {
+        self.0.len() / LATE_ENTRY
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = LateArrival> + 'a {
         self.0
-            .as_chunks::<DELAY>()
+            .as_chunks::<LATE_ENTRY>()
             .0
             .iter()
-            .map(|d| OneWay(u32::from_be_bytes(*d)))
+            .map(|e| LateArrival {
+                block: Seq(u64::from_be_bytes([
+                    e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7],
+                ])),
+                position: u16::from_be_bytes([e[8], e[9]]),
+                delay: OneWay(u32::from_be_bytes([e[10], e[11], e[12], e[13]])),
+            })
     }
 }
 
@@ -936,7 +983,7 @@ impl<'a> Report<'a> {
                 out.extend_from_slice(arrivals.delays);
             }
         }
-        out.push((self.late.0.len() / DELAY) as u8);
+        out.extend_from_slice(&(self.late.len() as u32).to_be_bytes());
         out.extend_from_slice(self.late.0);
     }
 
@@ -964,8 +1011,11 @@ impl<'a> Report<'a> {
             }
             o => return Err(Malformed::Outcome(o)),
         };
-        let late = r.u8()? as usize;
-        let late = Late::new(r.bytes(DELAY * late)?)?;
+        let late = r.u32()? as usize;
+        if late > LATE {
+            return Err(Malformed::TooLarge);
+        }
+        let late = Late::new(r.bytes(LATE_ENTRY * late)?, block)?;
         Ok(Report {
             block,
             sent,
@@ -991,8 +1041,10 @@ pub enum Malformed {
     /// A frame of no bytes.
     Empty,
     /// A frame, or a report of one, of more than [`WINDOW`] symbols; or more than [`LATE`]
-    /// late delays.
+    /// late arrivals.
     TooLarge,
+    /// A late arrival of a block after the one its report is of.
+    Ahead,
     /// A piece's index at or past k, or a repair's at or past m.
     Index,
     /// A part whose length is not the one the message's other fields make it.
@@ -1013,6 +1065,7 @@ impl std::fmt::Display for Malformed {
             Malformed::Outcome(t) => write!(f, "no outcome has tag {t}"),
             Malformed::Empty => write!(f, "a frame of no bytes"),
             Malformed::TooLarge => write!(f, "a frame or report too large"),
+            Malformed::Ahead => write!(f, "a late arrival of a block not yet reported"),
             Malformed::Index => write!(f, "a symbol index out of its frame"),
             Malformed::Length => write!(f, "a part of the wrong length"),
             Malformed::Utf8 => write!(f, "text that is not UTF-8"),
@@ -1340,10 +1393,16 @@ mod tests {
                 delays.extend_from_slice(&(rng.next() as u32).to_be_bytes());
             }
         }
-        let late = {
-            let n = DELAY * rng.below(LATE as u64 + 1) as usize;
-            bytes(rng, n)
-        };
+        let block = Seq(rng.next());
+        let mut late = Vec::new();
+        for _ in 0..rng.below(300) {
+            LateArrival {
+                block: Seq(rng.below(block.0.saturating_add(1))),
+                position: rng.next() as u16,
+                delay: OneWay(rng.next() as u32),
+            }
+            .write(&mut late);
+        }
         let fate = match rng.below(3) {
             0 => Fate::Unseen,
             o => Fate::Seen {
@@ -1357,10 +1416,10 @@ mod tests {
         };
         let mut out = Vec::new();
         Up::Report(Report {
-            block: Seq(rng.next()),
+            block,
             sent: Stamp(rng.next() as u32),
             fate,
-            late: Late::new(&late).unwrap(),
+            late: Late::new(&late, block).unwrap(),
         })
         .encode(&mut out);
         out[CONTROL_PREFIX..].to_vec()

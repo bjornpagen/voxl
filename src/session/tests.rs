@@ -724,7 +724,7 @@ fn the_room_never_waits_on_a_report() {
                     outcome,
                     arrivals: Arrivals::new(n as u16, &bits, &delays).expect("arrivals"),
                 },
-                late: Late::new(&[]).expect("none late"),
+                late: Late::new(&[], head.block).expect("none late"),
             };
             let before = s.room();
             s.reported(&report, now).expect("its own block, in order");
@@ -831,7 +831,7 @@ fn a_stream_lane_has_no_reports() {
         block: Seq::first(),
         sent: Stamp::since(now, now),
         fate: Fate::Unseen,
-        late: Late::new(&[]).expect("none late"),
+        late: Late::new(&[], Seq::first()).expect("none late"),
     };
     assert_eq!(s.reported(&report, now), Err(Broken::Unsent(Seq::first())));
 }
@@ -889,5 +889,73 @@ fn the_drain_is_the_transports_rate() {
             }
         }
         assert!(checked > 0);
+    }
+}
+
+/// Deadlines follow the blocks' order, whatever the wait does between them. The relay decides
+/// a block nothing of which came once a later block's deadline has passed, and with it every
+/// frame before that later block's; that is sound only while no earlier block is still due
+/// after it. Over generated waits that shrink between two blocks by more than the time between
+/// them (three blocks: the first of which nothing comes, the second part of which comes on
+/// time, the third of which a piece comes just past its own deadline), stamped by the daemon's
+/// queue and taken by the relay's decoder: no block comes out whole once a decision has
+/// released its frames. Without the daemon keeping each deadline at or after the one before,
+/// the third block's deadline falls before the second's, the first is decided with the
+/// second's frame, and the second then comes out whole.
+#[test]
+fn no_frame_is_released_before_an_earlier_one_is_decided() {
+    use crate::lanes::code::{Decoder, Took};
+    use crate::lanes::wire::{Lane, Number, SYMBOL};
+    use crate::session::sender::Sender;
+    let mut rng = crate::xorshift::Xorshift::new(0x510e_527f_ade6_82d1);
+    for _ in 0..300 {
+        let start = Instant::now();
+        let mut now = start;
+        let (mut s, queue, _control) = Sender::with_lane(now);
+        let mut number = Number::first();
+        let first_wait = rng.range(1_000, 3_000) as i64;
+        let mut blocks = Vec::new();
+        for i in 0..3 {
+            // The wait, in tenths: the third block's shrinks by more than the time since the
+            // second's (under 50).
+            queue.lock().after = match i {
+                2 => rng.range(0, (first_wait - 60) as u64) as i64,
+                _ => first_wait,
+            };
+            let bytes = rng.range(2 * SYMBOL as u64, 20_000) as usize;
+            s.video(number, &bytes::Bytes::from(vec![1u8; bytes]), now);
+            number = number.next();
+            blocks.push(accepted(&queue, now));
+            now += Duration::from_micros(100 * rng.range(1, 50));
+        }
+        let [_, second, third] = &blocks[..] else {
+            panic!("three blocks")
+        };
+        let mut dec = Decoder::new();
+        let on_time = second[0].2.plus(1);
+        let took = dec
+            .take(Lane::decode(&second[0].0).unwrap(), on_time)
+            .unwrap();
+        assert_eq!(took, Took::Held, "a block of two sources or more, one come");
+        // Just past the third block's own deadline.
+        let past = third[0].1.due.plus(1);
+        assert_eq!(
+            dec.take(Lane::decode(&third[0].0).unwrap(), past).unwrap(),
+            Took::Late
+        );
+        let mut released = None;
+        while let Some(d) = dec.decide(past) {
+            released = Some(d.last);
+        }
+        for (m, _, _) in &second[1..] {
+            if let Took::Whole(head, _) = dec.take(Lane::decode(m).unwrap(), past).unwrap() {
+                assert!(
+                    released.is_none_or(|r| head.first > r),
+                    "block {:?} whole after its frame {:?} was released",
+                    head.block,
+                    head.first
+                );
+            }
+        }
     }
 }

@@ -506,9 +506,15 @@ pub struct Hub {
     pub settings: Mutex<Settings>,
     /// The updates' numbers, and what the sessions' relays decided of them, for the encoder.
     pub updates: Arc<crate::video::Updates>,
-    /// How the stream is coded, once the first pipeline is built: its hello's codec and its
-    /// recordings' `vpcC`.
+    /// How the stream is coded, once the first pipeline is built: its recordings' `vpcC`.
     pub stream: Mutex<Option<crate::vp9::Stream>>,
+    /// The codec every hello names, the same for the daemon's whole life: the level of the
+    /// largest picture the desktop can take (the most it can be resized to, or its one size),
+    /// so that a page configures its decoder once. VP9 carries no level in its bitstream, so
+    /// a decoder told the higher level decodes every smaller stream; a hello that named each
+    /// stream's own level would have to reach the page before that stream's keyframe, which
+    /// the control stream and the lane do not order.
+    pub codec: std::sync::OnceLock<String>,
     pub stats: Stats,
     /// Screenshots asked for (`voxl screenshot`), answered by the capture thread with the
     /// screen as it is.
@@ -536,6 +542,7 @@ impl Hub {
             settings: Mutex::new(Settings::default()),
             updates: Arc::default(),
             stream: Mutex::new(None),
+            codec: std::sync::OnceLock::new(),
             stats: Stats::default(),
             snapshots: Mutex::new(Vec::new()),
             start: Instant::now(),
@@ -672,7 +679,7 @@ impl Hub {
         ServerMessage::Hello(Hello {
             w: self.width.load(Ordering::Relaxed),
             h: self.height.load(Ordering::Relaxed),
-            codec: self.stream.lock().map(|s| s.codec()),
+            codec: self.codec.get().cloned(),
             settings,
         })
     }

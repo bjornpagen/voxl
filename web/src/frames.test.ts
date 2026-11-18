@@ -1,33 +1,33 @@
 // Checks the worker's record of the screen (frames.ts) against a fake of the relay and
 // WebCodecs, over many seeded runs:
 //   node web/src/frames.test.ts
-// The fake relay sends streams: a hello naming the stream's codec, then a keyframe, then
-// deltas, now and then another keyframe, now and then a new hello (a resize) between any
-// two updates; and now and then a fault: a delta before the stream's keyframe, a codec the
-// browser cannot configure (`open` throws) or lacks (its decoder fails with
-// NotSupportedError, and the check of the hello's codec says so, some time later), an
-// update the decoder refuses (`decode` throws), or a decoder failing at any time. The fake
-// browser runs the decoders' outputs and errors and the checks' answers as tasks in the
-// order queued, between the socket's messages in any order; a task queued before the record
-// closed a decoder may still run.
-//
-// Each session's lane is drawn: datagrams, where a stream's keyframe may miss and runs of
-// deltas come before the next keyframe or hello, or a stream, where a delta before the
-// keyframe is a fault.
+// A fake daemon numbers its updates and roots each delta in the newest keyframe before it;
+// the session's first message is its hello, naming the session's codec. Over a datagram lane
+// any update may miss (a keyframe too), so deltas can arrive whose keyframe never did; over
+// a stream lane every update arrives, and only a session that starts on a delta has one.
+// More hellos (resizes) come at any point between updates, before or after the keyframe
+// that follows them, as the control stream and the lane leave them unordered; now and then
+// one names another codec. And now and then a fault: a codec the browser cannot configure
+// (`open` throws) or lacks (its decoder fails with NotSupportedError, and the check of the
+// session's codec says so, some time later), an update the decoder refuses (`decode`
+// throws), or a decoder failing at any time. The fake browser runs the decoders' outputs and
+// errors and the checks' answers as tasks in the order queued, between the socket's messages
+// in any order; a task queued before the record closed a decoder may still run.
 //
 // What it checks are the fake's own facts. After every step:
-// - on a datagram lane, a stream waiting for its keyframe survives any run of deltas: none
-//   decodes, each is counted passed, the session goes on, and it decodes from the next
-//   keyframe; on a stream lane the first delta before the keyframe ends the session;
-// - each update of a stream with no fault goes, in order, to the decoder opened, for the
-//   hello's codec, on the stream's keyframe, and only to it;
+// - a keyframe decodes; a delta decodes exactly when the keyframe it descends from is the
+//   last keyframe the decoder took, into that decoder, in arrival order;
+// - any other delta is passed over and counted on a datagram lane, and the session goes on;
+//   on a stream lane it ends the session;
+// - a hello after the first changes nothing, unless it names another codec, which ends the
+//   session;
 // - each fault ends the session exactly once, at once, and nothing is decoded after it
 //   until the next session: no keyframe is asked for, no decoder reconfigured;
 // - a picture is shown exactly when it comes out of the decoder the record decodes with,
 //   and let go otherwise, each once;
 // - the record never decodes into, or closes, a decoder that is closed, and closes each
 //   decoder it opened once, unless the decoder failed first.
-import { Frames, type LaneKind, type World } from './frames.ts';
+import { Frames, type LaneKind, type Update, type World } from './frames.ts';
 
 const RUNS = 20_000;
 /** Steps in a run before it is drained. */
@@ -71,22 +71,25 @@ interface Picture {
 }
 
 type Message =
-	| { t: 'part'; key: boolean; bytes: Bytes }
+	| { t: 'part'; u: Update; bytes: Bytes }
 	| { t: 'hello'; codec: string };
 
 type Task =
 	| { t: 'output'; dec: Dec; at: number }
 	| { t: 'error'; dec: Dec; name: string }
 	/** The check of a stream's codec answers that it is unsupported. */
-	| { t: 'unsupported'; codec: string; stream: number };
+	| { t: 'unsupported'; codec: string; session: number };
 
 /** How often each clause was reached, over every run. */
 const reached = {
 	opened: 0,
 	keyAgain: 0,
 	deltaFirst: 0,
-	passedWaiting: 0,
+	passedUnrooted: 0,
+	passedAfterDecoding: 0,
 	keyAfterPassing: 0,
+	codecChanged: 0,
+	helloAfterItsKey: 0,
 	configureThrew: 0,
 	notSupported: 0,
 	checkedUnsupported: 0,
@@ -96,6 +99,7 @@ const reached = {
 	lateOutput: 0,
 	shown: 0,
 	helloMidStream: 0,
+	beforeHello: 0,
 };
 
 function run(seed: number) {
@@ -110,28 +114,31 @@ function run(seed: number) {
 	const tasks: Task[] = [];
 	const decs: Dec[] = [];
 	const pictures: Picture[] = [];
-	/** The relay's stream: its codec, and whether its keyframe went. */
+	/** The session's codec, as its first hello names it. */
 	let codec = GOOD[0];
 	/** The session's lane: drawn for each session. */
 	let lane: LaneKind = draw(2) ? 'datagram' : 'stream';
-	/** Deltas passed while waiting, as the fake counts them and as the record says. */
+	/** Deltas passed, as the fake counts them and as the record says. */
 	let passedExpected = 0;
 	let passed = 0;
-	/** The stream passed deltas since its hello. */
-	let passedSince = false;
-	let socket: Message[] = [{ t: 'hello', codec }];
-	let keyed = false;
-	let n = 0;
-	/** The record's stream as the fake knows it: its number, its codec, whether the session
-	 * ended, and the decoder its keyframe opened. */
-	let stream = 0;
-	let streamCodec = codec;
-	let inStream = false;
+	/** The fake daemon: the next update's number, and the newest keyframe's. */
+	let n = 1;
+	let rootKey: number | null = null;
+	/** A hello waits to follow the next keyframe (a resize's, arriving after it). */
+	let helloAfterKey = false;
+	let socket: Message[] = [];
+	/** The record's session as the fake knows it: its number, whether it is in one, whether
+	 * it ended, the decoder its first keyframe opened, and the last keyframe it decoded. */
+	let session = 0;
+	let inSession = false;
 	let ended = false;
 	let ends = 0;
 	let expectedEnds = 0;
 	let live: Dec | null = null;
-	/** The check of the stream's codec has not been queued yet. */
+	let decodedKey: number | null = null;
+	/** The stream passed deltas since it last decoded a keyframe. */
+	let passedSince = false;
+	/** The check of the session's codec has not been queued yet. */
 	let checkOwed = false;
 	/** The update being delivered, and what the record did with it. */
 	let delivering: Extract<Message, { t: 'part' }> | null = null;
@@ -142,10 +149,9 @@ function run(seed: number) {
 	const world: World<Dec, Picture, Bytes> = {
 		open(c) {
 			const part = delivering ?? fail('a decoder opened outside an update');
-			if (!part.key) fail('a decoder opened on a delta');
-			if (c !== streamCodec)
-				fail(`a decoder opened for ${c}, not ${streamCodec}`);
-			if (live?.open) fail('a second decoder in a stream');
+			if (!part.u.key) fail('a decoder opened on a delta');
+			if (c !== codec) fail(`a decoder opened for ${c}, not ${codec}`);
+			if (live?.open) fail('a second decoder in a session');
 			if (c === INVALID) throw new TypeError(`${c} is not a codec`);
 			const dec: Dec = {
 				codec: c,
@@ -158,7 +164,7 @@ function run(seed: number) {
 			live = dec;
 			if (c === LACKED) {
 				tasks.push({ t: 'error', dec, name: 'NotSupportedError' });
-				if (checkOwed) tasks.push({ t: 'unsupported', codec: c, stream });
+				if (checkOwed) tasks.push({ t: 'unsupported', codec: c, session });
 				checkOwed = false;
 			}
 			return dec;
@@ -166,8 +172,9 @@ function run(seed: number) {
 		decode(dec, key, at, bytes) {
 			const part = delivering ?? fail('a decode outside an update');
 			if (!dec.open) fail('a decode into a closed decoder');
-			if (dec !== live) fail('a decode into another decoder than the stream’s');
-			if (key !== part.key || at !== step || bytes !== part.bytes)
+			if (dec !== live)
+				fail("a decode into another decoder than the session's");
+			if (key !== part.u.key || at !== step || bytes !== part.bytes)
 				fail('a decode of another update than the one that arrived');
 			decodedInto = dec;
 			if (!draw(300)) {
@@ -208,34 +215,63 @@ function run(seed: number) {
 		if (ends !== expectedEnds)
 			fail(`${ends} ends where the faults make ${expectedEnds}`);
 		if (passed !== passedExpected)
-			fail(`${passed} deltas passed where ${passedExpected} waited`);
+			fail(`${passed} deltas passed where ${passedExpected} had no keyframe`);
 	};
 
-	/** The relay's next message: a hello now and then, else an update. */
+	/** A session's first messages: its hello, or, rarely, an update before it. */
+	const begin = () => {
+		codec = draw(15) ? GOOD[draw(2)] : [LACKED, INVALID][draw(2)];
+		lane = draw(2) ? 'datagram' : 'stream';
+		rootKey = null;
+		helloAfterKey = false;
+		socket = draw(200) ? [{ t: 'hello', codec }] : [];
+	};
+	begin();
+
+	/** The fake daemon's next message: a hello now and then (before or after the keyframe
+	 * that follows it), else an update, which on a datagram lane may miss. */
 	const produce = () => {
 		if (!draw(40)) {
-			if (keyed) reached.helloMidStream++;
-			codec = draw(15) ? GOOD[draw(2)] : [LACKED, INVALID][draw(2)];
-			socket.push({ t: 'hello', codec });
-			keyed = false;
+			reached.helloMidStream++;
+			const other = !draw(10);
+			const c = other ? GOOD.find((g) => g !== codec)! : codec;
+			if (!other && draw(2)) helloAfterKey = true;
+			else socket.push({ t: 'hello', codec: c });
 			return;
 		}
-		// Now and then a stream starts on deltas: on a datagram lane its keyframe missed, and
-		// runs of deltas come before the next hello; on a stream lane, a fault.
-		const key = keyed ? !draw(20) : draw(lane === 'datagram' ? 3 : 30) !== 0;
-		socket.push({ t: 'part', key, bytes: { n: n++ } });
-		keyed ||= key;
+		const key =
+			rootKey === null ? draw(lane === 'datagram' ? 3 : 30) !== 0 : !draw(20);
+		const frame = n++;
+		if (key) rootKey = frame;
+		const u: Update = { key, frame, from: rootKey ?? frame - 1 };
+		if (lane === 'datagram' && !draw(6)) return;
+		socket.push({ t: 'part', u, bytes: { n: frame } });
+		if (key && helloAfterKey) {
+			helloAfterKey = false;
+			reached.helloAfterItsKey++;
+			socket.push({ t: 'hello', codec });
+		}
 	};
 
 	/** The session closes and another starts (the viewer asked, after an end). */
 	const reconnect = () => {
 		frames.closed();
 		ended = false;
-		inStream = false;
+		inSession = false;
 		live = null;
-		socket = [{ t: 'hello', codec }];
-		keyed = false;
-		lane = draw(2) ? 'datagram' : 'stream';
+		decodedKey = null;
+		passedSince = false;
+		begin();
+	};
+
+	/** A fault the record must end the session for. */
+	const faulted = (fault: keyof typeof reached, decoded: boolean) => {
+		reached[fault]++;
+		expectedEnds++;
+		inSession = false;
+		if (!ended) fail(`${fault} did not end the session`);
+		if (decoded && fault !== 'refused') fail(`${fault} decoded`);
+		if (live?.open) fail(`${fault} left a decoder open`);
 	};
 
 	const deliver = () => {
@@ -244,71 +280,70 @@ function run(seed: number) {
 		while (!socket.length) produce();
 		const m = socket.shift()!;
 		if (m.t === 'hello') {
-			streamCodec = m.codec;
-			inStream = true;
-			live = null;
-			stream = frames.hello(lane, m.codec);
-			passedSince = false;
-			// The check of a codec the browser lacks answers later: before the decoder's own
-			// error, or after it.
-			checkOwed = m.codec === LACKED;
-			if (checkOwed && draw(2)) {
-				tasks.push({ t: 'unsupported', codec: m.codec, stream });
-				checkOwed = false;
+			if (!inSession) {
+				inSession = true;
+				// The session's codec is what its first hello names.
+				codec = m.codec;
+				session =
+					frames.hello(lane, m.codec) ??
+					fail("a session's first hello returned no session");
+				// The check of a codec the browser lacks answers later: before the decoder's
+				// own error, or after it.
+				checkOwed = m.codec === LACKED;
+				if (checkOwed && draw(2)) {
+					tasks.push({ t: 'unsupported', codec: m.codec, session });
+					checkOwed = false;
+				}
+				return;
 			}
+			const again = frames.hello(lane, m.codec);
+			if (again !== null) fail('a later hello began a session');
+			if (m.codec !== codec) return faulted('codecChanged', false);
+			if (ended) fail('a hello of the same codec ended the session');
 			return;
 		}
 		const before = live;
 		delivering = m;
 		decodedInto = null;
 		threw = false;
-		frames.part(step, m.key, m.bytes);
+		frames.part(step, m.u, m.bytes);
 		delivering = null;
 		const into = decodedInto as Dec | null;
-		// What this update should have done.
-		let fault: keyof typeof reached | null = null;
-		if (!inStream) fault = 'deltaFirst';
-		else if (before === null) {
-			if (!m.key && lane === 'datagram') {
-				// Waiting survives it: undecoded, counted, the session goes on.
-				passedExpected++;
-				reached.passedWaiting++;
-				passedSince = true;
-				if (ended) fail('a delta while a datagram stream waits ended it');
-				if (into) fail('a delta while waiting decoded');
-				return;
-			}
-			if (!m.key) fault = 'deltaFirst';
-			else if (streamCodec === INVALID) fault = 'configureThrew';
-		}
-		if (threw) fault = 'refused';
-		if (fault) {
-			reached[fault]++;
-			expectedEnds++;
-			inStream = false;
-			if (!ended) fail(`${fault} did not end the session`);
-			if (into && fault !== 'refused') fail(`${fault} decoded`);
-			if (before?.open || live?.open) fail(`${fault} left a decoder open`);
+		if (!inSession) return faulted('beforeHello', into !== null);
+		const rooted = m.u.key || m.u.from === decodedKey;
+		if (!rooted) {
+			if (lane === 'stream') return faulted('deltaFirst', into !== null);
+			passedExpected++;
+			reached[decodedKey === null ? 'passedUnrooted' : 'passedAfterDecoding']++;
+			passedSince = true;
+			if (ended) fail('a passed delta ended the session');
+			if (into) fail('a delta without its keyframe decoded');
 			return;
 		}
-		if (into === null) fail('an update of a sound stream decoded nowhere');
-		if (before === null) {
-			reached.opened++;
-			if (passedSince) reached.keyAfterPassing++;
-		} else if (m.key) reached.keyAgain++;
+		if (m.u.key && codec === INVALID && before === null)
+			return faulted('configureThrew', into !== null);
+		if (threw) return faulted('refused', true);
+		if (into === null) fail('a rooted update decoded nowhere');
+		if (before === null) reached.opened++;
+		else if (m.u.key) reached.keyAgain++;
+		if (m.u.key && passedSince) reached.keyAfterPassing++;
+		if (m.u.key) {
+			decodedKey = m.u.frame;
+			passedSince = false;
+		}
 		if (before !== null && into !== before)
 			fail('an update went to a new decoder');
 	};
 
 	const runTask = (task: Task) => {
 		if (task.t === 'unsupported') {
-			// It ends the session only while the record is still in that stream.
-			const ours = !ended && inStream && stream === task.stream;
-			frames.unsupported(task.stream);
+			// It ends the session only while the record is still in that session.
+			const ours = !ended && inSession && session === task.session;
+			frames.unsupported(task.session);
 			if (ours) {
 				reached.checkedUnsupported++;
 				expectedEnds++;
-				inStream = false;
+				inSession = false;
 			}
 			return;
 		}
@@ -339,7 +374,7 @@ function run(seed: number) {
 		if (ours) {
 			reached[task.name === 'NotSupportedError' ? 'notSupported' : 'failed']++;
 			expectedEnds++;
-			inStream = false;
+			inSession = false;
 		}
 	};
 
@@ -356,11 +391,11 @@ function run(seed: number) {
 			const task = tasks.shift();
 			if (task) runTask(task);
 		} else if (roll < 99) {
-			const open = decs.filter((d) => d.open);
-			if (open.length)
+			const alive = decs.filter((d) => d.open);
+			if (alive.length)
 				tasks.push({
 					t: 'error',
-					dec: open[draw(open.length)],
+					dec: alive[draw(alive.length)],
 					name: 'EncodingError',
 				});
 		} else reconnect();

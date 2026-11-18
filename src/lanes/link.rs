@@ -12,16 +12,17 @@
 //!   the bytes their blocks put on the wire, repairs and headers with them. The encoder's
 //!   target is the lane's drain rate times it.
 
-use super::model::{Arrival, Tables};
+use super::model::{Came, Correction, Tables};
 use super::path::{Kind, Path, MEMORY};
 use super::wire::{symbols, Fate, Head, Report, Stamp, Track, HEADER, SYMBOL, WINDOW};
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
 /// How often a busy screen may freeze, picture or sound: at most once in this long. A video
-/// update missed freezes the picture until the update after the miss is known; an Opus packet
-/// missed is a dropout of the sound. At f frames a second of a track, a block may then miss
-/// with chance r* = 1 / (f × FREEZE_EVERY) ([`Link::target`]), so that f × r* of the track's
+/// update missed freezes the picture until the update after the miss is known; a block of
+/// Opus packets missed (those that waited under a backlog go in one block) is a dropout of the
+/// sound. At f frames a second of a track, a block may then miss with chance
+/// r* = 1 / (f × FREEZE_EVERY) ([`Link::target`]), so that at most f × r* of the track's
 /// blocks a second miss, one per FREEZE_EVERY. How long a freeze lasts does not enter: it is
 /// the freeze, not its length, the requirement counts.
 ///
@@ -63,6 +64,8 @@ pub enum Mismatch {
     Block,
     /// It has another count of symbols.
     Symbols,
+    /// A late arrival at a position past its block's symbols.
+    Position,
 }
 
 /// The datagram lane's view.
@@ -171,21 +174,27 @@ impl Link {
         }
         self.path.up(report.sent, received);
         match report.fate {
-            Fate::Unseen => (0..n).for_each(|_| self.path.erasure(Arrival::Erased)),
+            Fate::Unseen => self
+                .path
+                .block(head.block, std::iter::repeat_n(Came::Never, n)),
             Fate::Seen { arrivals, .. } => {
-                for a in arrivals.iter() {
-                    match a {
-                        None => self.path.erasure(Arrival::Erased),
-                        Some(d) => {
-                            self.path.erasure(Arrival::Arrived);
-                            self.path.down(d, received);
-                        }
-                    }
+                for d in arrivals.iter().flatten() {
+                    self.path.down(d, received);
                 }
+                self.path.block(
+                    head.block,
+                    arrivals.iter().map(|a| match a {
+                        Some(_) => Came::OnTime,
+                        None => Came::Never,
+                    }),
+                );
             }
         }
-        for d in report.late.iter() {
-            self.path.down(d, received);
+        // After the block's own outcomes, so that a symbol of it that came late finds them.
+        for late in report.late.iter() {
+            if self.path.late(late, received) == Correction::Outside {
+                return Err(Mismatch::Position);
+            }
         }
         self.since += n;
         if self.since >= MEMORY {
@@ -226,4 +235,121 @@ pub struct Stats {
     pub miss: f64,
     /// The frames' share of the wire.
     pub share: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lanes::model::Erasures;
+    use crate::lanes::wire::{Arrivals, Late, LateArrival, OneWay, Outcome, Seq};
+    use crate::xorshift::Xorshift;
+    use std::num::{NonZeroU32, NonZeroU8};
+
+    /// Late is delay, never loss. Over generated report streams (blocks of 1 to 40 symbols,
+    /// each symbol on time, late or never, in bursts; a late one reported in its own block's
+    /// report or up to five reports after it), the link's two fits equal the fits of the
+    /// symbols as they finally came, run for run: its loss is the loss over the symbols that
+    /// never came. A link that counted a late symbol as erased fails this.
+    #[test]
+    fn a_late_symbol_is_never_loss() {
+        let mut rng = Xorshift::new(0x3C6E_F372_FE94_F82B);
+        for _ in 0..20 {
+            let mut link = Link::new(Stamp(0), Stamp(0), Duration::from_millis(100));
+            let mut truth = Erasures::new();
+            // Each late symbol, with the report it is told in.
+            let mut pending: Vec<(u64, LateArrival)> = Vec::new();
+            let blocks = 1000u64;
+            let (p_late, p_never) = (
+                rng.range(0, 300) as f64 / 1e3,
+                rng.range(0, 300) as f64 / 1e3,
+            );
+            let mut last = Came::OnTime;
+            for b in 0..blocks {
+                let k = rng.range(1, 30) as usize;
+                let m = rng.below(11) as u16;
+                let head = Head {
+                    block: Seq(b),
+                    first: Seq(b),
+                    members: NonZeroU8::MIN,
+                    bytes: NonZeroU32::new((k * SYMBOL) as u32).unwrap(),
+                    m,
+                    due: Stamp(0),
+                };
+                let n = head.n();
+                let came: Vec<Came> = (0..n)
+                    .map(|_| {
+                        // A burst goes on with chance one half.
+                        last = match (last, rng.below(1000) as f64 / 1e3) {
+                            (Came::OnTime, _) | (_, 0.5..) => {
+                                let u = rng.below(1000) as f64 / 1e3;
+                                match () {
+                                    _ if u < p_late => Came::Late,
+                                    _ if u < p_late + p_never => Came::Never,
+                                    _ => Came::OnTime,
+                                }
+                            }
+                            (c, _) => c,
+                        };
+                        last
+                    })
+                    .collect();
+                let mut bits = vec![0u8; n.div_ceil(8)];
+                let mut delays = Vec::new();
+                for (i, c) in came.iter().enumerate() {
+                    match c {
+                        Came::OnTime => {
+                            bits[i / 8] |= 1 << (i % 8);
+                            delays.extend_from_slice(&7u32.to_be_bytes());
+                        }
+                        Came::Late => {
+                            let told = (b + rng.below(6)).min(blocks - 1);
+                            pending.push((
+                                told,
+                                LateArrival {
+                                    block: Seq(b),
+                                    position: i as u16,
+                                    delay: OneWay(9),
+                                },
+                            ));
+                        }
+                        Came::Never => {}
+                    }
+                }
+                let mut late = Vec::new();
+                pending.retain(|(told, l)| {
+                    let now = *told == b;
+                    if now {
+                        l.write(&mut late);
+                    }
+                    !now
+                });
+                let fate = match came.contains(&Came::OnTime) {
+                    false => Fate::Unseen,
+                    true => Fate::Seen {
+                        outcome: Outcome::Missed,
+                        arrivals: Arrivals::new(n as u16, &bits, &delays).unwrap(),
+                    },
+                };
+                let report = Report {
+                    block: Seq(b),
+                    sent: Stamp(0),
+                    fate,
+                    late: Late::new(&late, Seq(b)).unwrap(),
+                };
+                let flight = Flight {
+                    head,
+                    tracks: Vec::new(),
+                    miss: 0.0,
+                };
+                link.reported(&flight, &report, Stamp(0)).unwrap();
+                truth.block(Seq(b), came.into_iter());
+            }
+            assert!(pending.is_empty());
+            assert_eq!(
+                link.path.fits(),
+                truth.fits(),
+                "late {p_late} never {p_never}"
+            );
+        }
+    }
 }

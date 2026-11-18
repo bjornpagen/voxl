@@ -75,6 +75,12 @@ pub struct Header {
     pub key: bool,
     /// The frame's number: the encode loop's count of the frames it sent, wrapping.
     pub frame: u32,
+    /// The number of the keyframe the frame descends from (a keyframe's own): every
+    /// reference it makes is to that keyframe or to a frame after it. The page decodes a
+    /// delta only if it decoded this keyframe, so a delta whose keyframe it missed is passed
+    /// over, whatever order the keyframe, the delta and the stream's hello (on the control
+    /// stream) arrive in.
+    pub from: u32,
     pub pipe: Pipe,
 }
 
@@ -96,16 +102,17 @@ impl Pipe {
 
 impl Header {
     /// The VP9 starts this far into a frame.
-    pub const LEN: usize = 9;
+    pub const LEN: usize = 13;
     /// The flags byte's one bit.
     const KEY: u8 = 1;
 
-    /// Flags, frame, pipe: the integers big-endian.
+    /// Flags, frame, from, pipe: the integers big-endian.
     pub fn bytes(&self) -> [u8; Header::LEN] {
         let mut b = [0; Header::LEN];
         b[0] = if self.key { Header::KEY } else { 0 };
         b[1..5].copy_from_slice(&self.frame.to_be_bytes());
-        b[5..9].copy_from_slice(&self.pipe.0.to_be_bytes());
+        b[5..9].copy_from_slice(&self.from.to_be_bytes());
+        b[9..13].copy_from_slice(&self.pipe.0.to_be_bytes());
         b
     }
 
@@ -123,7 +130,8 @@ impl Header {
         Header {
             key: b[0] & Header::KEY != 0,
             frame: u32::from_be_bytes([b[1], b[2], b[3], b[4]]),
-            pipe: Pipe(u32::from_be_bytes([b[5], b[6], b[7], b[8]])),
+            from: u32::from_be_bytes([b[5], b[6], b[7], b[8]]),
+            pipe: Pipe(u32::from_be_bytes([b[9], b[10], b[11], b[12]])),
         }
     }
 }
@@ -334,6 +342,8 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<(Capturer, vp9::Stream), S
     hub.width.store(w, Ordering::Relaxed);
     hub.height.store(h, Ordering::Relaxed);
     *hub.stream.lock() = Some(coded);
+    // A desktop that cannot be resized declares its one size's codec, at its first build.
+    hub.codec.get_or_init(|| coded.codec());
     log::info!(
         "capturing {w}x{h} @ {FRAMERATE} fps as {}, {} threads",
         coded.codec(),
@@ -1235,6 +1245,8 @@ fn encode_frames(
     let mut viewers = Vec::new();
     // A frame's number, which its header carries: the encode loop's own count, wrapping.
     let mut frame_number = 0u32;
+    // The newest keyframe's number: what every frame after it descends from.
+    let mut descends = 0u32;
     // A picture goes home only once its frame is on its viewers' lanes: the capture loop,
     // woken by it, asks the lanes for room next, and they must count that frame. A
     // capture loop gone has no home to send it to, and ends this loop at its next job.
@@ -1249,6 +1261,9 @@ fn encode_frames(
         let enc_us = t0.elapsed().as_micros() as u64;
         frame_number = frame_number.wrapping_add(1);
         let key = matches!(job.frame, Plan::Key(_));
+        if key {
+            descends = frame_number;
+        }
         let Coded {
             number,
             came,
@@ -1257,6 +1272,7 @@ fn encode_frames(
         let header = Header {
             key,
             frame: frame_number,
+            from: descends,
             pipe: Pipe::of(job.damage.elapsed()),
         };
         bytes[..Header::LEN].copy_from_slice(&header.bytes());
@@ -2636,6 +2652,7 @@ pub(crate) mod tests {
         Header {
             key: rng.next() & 1 == 1,
             frame: rng.any() as u32,
+            from: rng.any() as u32,
             pipe: Pipe(rng.any() as u32),
         }
     }
@@ -2685,6 +2702,7 @@ pub(crate) mod tests {
         picture: String,
         key: bool,
         frame: u32,
+        from: u32,
         pipe: u32,
     }
 
@@ -2706,6 +2724,7 @@ pub(crate) mod tests {
             let header = Header {
                 key: c.key,
                 frame: c.frame,
+                from: c.from,
                 pipe: Pipe(c.pipe),
             };
             let page = hex(&c.header);

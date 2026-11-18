@@ -4,8 +4,8 @@
 //! is not here: the transport under the lane owns it, and the daemon reads it from its own
 //! socket ([`crate::session::sender`]).
 
-use super::model::{Arrival, Erasures, Runs};
-use super::wire::{tenths, OneWay, Stamp, Track};
+use super::model::{Came, Correction, Erasures, Runs};
+use super::wire::{tenths, LateArrival, OneWay, Seq, Stamp, Track};
 use std::collections::VecDeque;
 use std::time::Duration;
 
@@ -122,9 +122,15 @@ impl Path {
         down.spread.push(v);
     }
 
-    /// What became of one symbol, in send order.
-    pub fn erasure(&mut self, a: Arrival) {
-        self.erasures.record(a);
+    /// What became of a block's symbols, in send order, the blocks in the order they were sent.
+    pub fn block(&mut self, block: Seq, came: impl Iterator<Item = Came>) {
+        self.erasures.block(block, came);
+    }
+
+    /// A symbol came after its block's deadline, reported at `at`: its delay, and that it came.
+    pub fn late(&mut self, late: LateArrival, at: Stamp) -> Correction {
+        self.down(late.delay, at);
+        self.erasures.late(late.block, late.position)
     }
 }
 

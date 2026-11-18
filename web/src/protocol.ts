@@ -72,12 +72,14 @@ export const cmd = {
 	resize: (w: number, h: number) => `sz,${w},${h}`,
 } as const;
 
-/** The header of a video message: the relay's type byte, then the 9 bytes src/video.rs's
- * `Header` writes (flags, frame, pipe), before the VP9 frame. Checked against video-header.json, as the
- * server's reader is: `node web/src/video-header.test.ts`. */
+/** The header of a video message: the relay's type byte, then the 13 bytes src/video.rs's
+ * `Header` writes (flags, frame, from, pipe), before the VP9 frame. Checked against
+ * video-header.json, as the server's reader is: `node web/src/video-header.test.ts`. */
 export interface VideoHeader {
 	key: boolean;
 	frame: number;
+	/** The number of the keyframe the update descends from (a keyframe's own). */
+	from: number;
 	/** Server-side pipeline time (capture to send), in 0.1 ms. */
 	pipe: number;
 }
@@ -98,10 +100,10 @@ export function parseVideoHeader(b: Uint8Array): ReadHeader {
 		((b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3]) >>> 0;
 	return {
 		ok: true,
-		header: { key: flags === KEY, frame: u32(2), pipe: u32(6) },
+		header: { key: flags === KEY, frame: u32(2), from: u32(6), pipe: u32(10) },
 	};
 }
-export const VIDEO_HEADER_BYTES = 10;
+export const VIDEO_HEADER_BYTES = 14;
 
 // ---- page <-> worker ----
 

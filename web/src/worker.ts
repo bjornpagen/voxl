@@ -116,6 +116,22 @@ function start(init: Init) {
 		});
 	}
 
+	/** Session `begun`'s codec is checked: one this browser cannot decode ends it. */
+	function checkCodec(codec: string, begun: number) {
+		void (async () => {
+			let r: VideoDecoderSupport;
+			try {
+				r = await VideoDecoder.isConfigSupported({
+					codec,
+					optimizeForLatency: true,
+				});
+			} catch (e) {
+				return end(`the codec ${codec} could not be checked: ${e}`);
+			}
+			if (!r.supported) frames.unsupported(begun);
+		})();
+	}
+
 	function onText(s: string) {
 		let m: ServerMessage;
 		try {
@@ -131,21 +147,11 @@ function start(init: Init) {
 		if (m.t === 'hello') {
 			if (lane === null) return end('the relay sent a hello before its lane');
 			const codec = m.codec;
-			const stream = frames.hello(lane, codec);
+			const begun = frames.hello(lane, codec);
 			recorded();
-			// Checked once a stream: a codec this browser cannot decode ends the session.
-			void (async () => {
-				let r: VideoDecoderSupport;
-				try {
-					r = await VideoDecoder.isConfigSupported({
-						codec,
-						optimizeForLatency: true,
-					});
-				} catch (e) {
-					return end(`the codec ${codec} could not be checked: ${e}`);
-				}
-				if (!r.supported) frames.unsupported(stream);
-			})();
+			// Checked once a session, at its first hello: a codec this browser cannot decode
+			// ends it.
+			if (begun !== null) checkCodec(codec, begun);
 		}
 		post(m);
 	}
@@ -211,7 +217,7 @@ function start(init: Init) {
 		Atomics.add(counts, Count.Bytes, b.length);
 		Atomics.add(counts, Count.Updates, 1);
 		Atomics.add(counts, Count.PipeTenths, h.pipe);
-		frames.part(performance.now(), h.key, b.subarray(VIDEO_HEADER_BYTES));
+		frames.part(performance.now(), h, b.subarray(VIDEO_HEADER_BYTES));
 		recorded();
 	}
 

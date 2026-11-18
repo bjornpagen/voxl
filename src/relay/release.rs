@@ -21,7 +21,7 @@ use std::collections::VecDeque;
 /// What goes to the page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Give<'a> {
-    /// An update: its 9-byte header and the picture.
+    /// An update: its 13-byte header (`video::Header`) and the picture.
     Video(&'a [u8]),
     /// An Opus packet.
     Audio(&'a [u8]),

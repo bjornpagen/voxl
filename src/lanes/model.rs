@@ -10,8 +10,43 @@
 //! chance of a miss is the runs' over n symbols in a row, from the long-run state: the sender
 //! cannot know the state when a block starts, since what it hears is a round trip old.
 
+use super::wire::Seq;
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
+
+/// What became of one symbol sent, as its block's report and the late arrivals after it tell:
+/// it came by its block's deadline, it came after it, or it has not come. A symbol that came
+/// late is delay, which the deadline answers, and never loss: only one that never came is
+/// erased ([`Came::arrival`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Came {
+    OnTime,
+    Late,
+    Never,
+}
+
+impl Came {
+    /// The model's state for it: erased only if it never came.
+    pub fn arrival(self) -> Arrival {
+        match self {
+            Came::OnTime | Came::Late => Arrival::Arrived,
+            Came::Never => Arrival::Erased,
+        }
+    }
+}
+
+/// What a late arrival did to the remembered outcomes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Correction {
+    /// Its symbol, remembered as never come, came late.
+    Late,
+    /// Its symbol is remembered as come already (a copy came late).
+    Already,
+    /// Its symbol is no longer remembered, or its block was never reported.
+    Forgotten,
+    /// Its block has fewer symbols than its position.
+    Outside,
+}
 
 /// What became of one symbol: the model's two states.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -360,9 +395,15 @@ impl Tables {
 }
 
 /// The reported outcomes the runs are fitted to: the last [`Erasures::MEMORY`] symbols' in
-/// send order.
+/// send order. Every symbol reported has a number, counting from the session's first, so that
+/// a late arrival reported after its block finds its symbol by its block and position.
 pub struct Erasures {
-    ring: VecDeque<Arrival>,
+    ring: VecDeque<Came>,
+    /// The number of the ring's first symbol.
+    first: u64,
+    /// The blocks with symbols in the ring, in order: each one's number and its first
+    /// symbol's.
+    blocks: VecDeque<(Seq, u64)>,
 }
 
 impl Erasures {
@@ -387,15 +428,61 @@ impl Erasures {
     pub fn new() -> Erasures {
         Erasures {
             ring: VecDeque::with_capacity(Erasures::MEMORY),
+            first: 0,
+            // Every symbol in the ring may be a block of its own, and the oldest block's first
+            // symbols may have left it.
+            blocks: VecDeque::with_capacity(Erasures::MEMORY + 1),
         }
     }
 
-    /// Symbol after symbol, in the order they were sent: what became of each.
-    pub fn record(&mut self, now: Arrival) {
-        if self.ring.len() == Erasures::MEMORY {
-            self.ring.pop_front();
+    /// A block reported, its blocks after the last reported: what became of each of its
+    /// symbols, in the order they were sent.
+    pub fn block(&mut self, block: Seq, came: impl Iterator<Item = Came>) {
+        self.blocks
+            .push_back((block, self.first + self.ring.len() as u64));
+        for c in came {
+            if self.ring.len() == Erasures::MEMORY {
+                self.ring.pop_front();
+                self.first += 1;
+            }
+            self.ring.push_back(c);
         }
-        self.ring.push_back(now);
+        while self
+            .blocks
+            .get(1)
+            .is_some_and(|&(_, start)| start <= self.first)
+        {
+            self.blocks.pop_front();
+        }
+    }
+
+    /// The symbol at `position` of `block` came after its deadline.
+    pub fn late(&mut self, block: Seq, position: u16) -> Correction {
+        let Ok(i) = self.blocks.binary_search_by_key(&block, |&(b, _)| b) else {
+            return Correction::Forgotten;
+        };
+        let start = self.blocks[i].1;
+        let end = self
+            .blocks
+            .get(i + 1)
+            .map_or(self.first + self.ring.len() as u64, |&(_, s)| s);
+        let at = start + position as u64;
+        if at >= end {
+            return Correction::Outside;
+        }
+        let Some(c) = at
+            .checked_sub(self.first)
+            .and_then(|i| self.ring.get_mut(i as usize))
+        else {
+            return Correction::Forgotten;
+        };
+        match *c {
+            Came::Never => {
+                *c = Came::Late;
+                Correction::Late
+            }
+            Came::OnTime | Came::Late => Correction::Already,
+        }
     }
 
     /// The outcomes the short fit reads: the last refit's worth, the same count as the path's
@@ -441,7 +528,12 @@ impl Erasures {
         };
         let mut run: Option<(Arrival, usize)> = None;
         let mut first = true;
-        for &a in self.ring.iter().skip(self.ring.len().saturating_sub(last)) {
+        for a in self
+            .ring
+            .iter()
+            .skip(self.ring.len().saturating_sub(last))
+            .map(|c| c.arrival())
+        {
             run = match run {
                 Some((state, len)) if state == a => Some((state, len + 1)),
                 Some((state, len)) => {
@@ -464,6 +556,21 @@ impl Erasures {
 impl Default for Erasures {
     fn default() -> Erasures {
         Erasures::new()
+    }
+}
+
+#[cfg(test)]
+impl Erasures {
+    /// One symbol, as a block of its own after the last: on time, or never come.
+    pub(crate) fn record(&mut self, a: Arrival) {
+        let block = self.blocks.back().map_or(Seq::first(), |&(b, _)| b.next());
+        self.block(
+            block,
+            std::iter::once(match a {
+                Arrival::Arrived => Came::OnTime,
+                Arrival::Erased => Came::Never,
+            }),
+        );
     }
 }
 

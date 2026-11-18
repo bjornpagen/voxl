@@ -203,7 +203,8 @@ pub(super) struct Waiting {
     /// The session's clock, for the writer's stamps.
     pub(super) origin: Instant,
     /// What a datagram block's deadline waits past the socket's acceptance, in tenths
-    /// ([`Link::after`]), and the block whose deadline is stamped, with it.
+    /// ([`Link::after`]), and the last block whose deadline is stamped, with it: the next
+    /// block's is never before it.
     pub(super) after: i64,
     pub(super) due: Option<(Seq, Stamp)>,
     /// The send buffer the socket is to have, and the one it was given.
@@ -365,7 +366,9 @@ impl Queue {
         to.backlog += from.backlog;
         from.backlog = 0;
         to.messages.append(&mut from.messages);
-        to.due = None;
+        // The last deadline stamped goes with the messages: the rest of a block half sent
+        // keeps its head, and the next block's deadline is not before it.
+        to.due = from.due.take();
         drop((from, to));
         self.wake();
     }
@@ -457,7 +460,10 @@ impl Waiting {
     /// Stamps the front message, a datagram, as the socket is about to take it at `now`: when
     /// it left, and its block's deadline, stamped as the socket takes the block's first piece:
     /// that moment, the drain of the block's pieces behind it (if any wait), and what a
-    /// deadline waits past it ([`Link::after`]).
+    /// deadline waits past it ([`Link::after`]); and never before the deadline of the block
+    /// before it. The relay decides a block nothing of which came by a later block's deadline
+    /// passing, which says the earlier one's passed only while deadlines follow the blocks'
+    /// order; a wait that shrinks between two blocks would break it.
     pub(super) fn stamp(&mut self, now: Instant) {
         let sent = Stamp::since(self.origin, now);
         let Some(Message {
@@ -485,6 +491,10 @@ impl Waiting {
                     }
                 };
                 let due = sent.plus(drain + self.after);
+                let due = match self.due {
+                    Some((_, before)) if due.to(before) > 0 => before,
+                    _ => due,
+                };
                 self.due = Some((block, due));
                 due
             }
@@ -1152,7 +1162,7 @@ impl Received {
             block: self.head.block,
             sent: self.sent,
             fate,
-            late: wire::Late::new(&[]).expect("no late"),
+            late: wire::Late::new(&[], self.head.block).expect("no late"),
         })
     }
 }

@@ -42,6 +42,9 @@ pub struct Path {
     pub jitter: f64,
     /// The tunnel's rate, bytes a second: the path's capacity.
     pub capacity: f64,
+    /// A queue standing under the path toward the relay from when to when, in seconds, and
+    /// the seconds it adds to each crossing while it stands.
+    pub queue: (f64, f64, f64),
 }
 
 /// Linux's default send buffer (`net.core.wmem_default`), the socket's until the sender sizes
@@ -59,6 +62,8 @@ pub struct Measured {
     pub missed: usize,
     /// Pieces and repairs that arrived after their block's deadline.
     pub late: usize,
+    /// The most loss the daemon's short fit read, after any report counted.
+    pub loss_most: f64,
     /// The sum of the plans' miss chances over the same blocks.
     pub expected: f64,
     /// Bytes on the wire, and those of repairs.
@@ -75,6 +80,9 @@ pub struct Measured {
     /// Opus packets counted, and those lost.
     pub opus: usize,
     pub opus_lost: usize,
+    /// Dropouts of the sound: missed blocks that carried Opus packets (packets waiting under a
+    /// backlog go together in one block, and a block missed is one gap in the sound).
+    pub dropouts: usize,
     /// The frames' bytes sent.
     pub data: usize,
     /// Each update shown: from its capture to its showing, past the base one-way delay, in
@@ -346,7 +354,12 @@ pub fn run(
                         measured.erased += usize::from(erased);
                     }
                 }
-                let natural = now + one_way + path.jitter * rng.below(1000) as f64 / 1000.0;
+                let queued = match now >= path.queue.0 && now < path.queue.1 {
+                    true => path.queue.2,
+                    false => 0.0,
+                };
+                let natural =
+                    now + one_way + queued + path.jitter * rng.below(1000) as f64 / 1000.0;
                 match (path.kind, lost) {
                     (Kind::Datagram, true) => {}
                     (Kind::Datagram, false) => {
@@ -405,8 +418,9 @@ pub fn run(
                         }
                     };
                     if missed {
-                        for track in sender.tracks_of(report.block).unwrap_or_default() {
-                            match track {
+                        let tracks = sender.tracks_of(report.block).unwrap_or_default();
+                        for track in &tracks {
+                            match *track {
                                 Track::Video { number } => {
                                     shown.held.insert(number.get(), false);
                                     shown.release(now);
@@ -414,6 +428,9 @@ pub fn run(
                                 Track::Audio if now >= warm => measured.opus_lost += 1,
                                 Track::Audio => {}
                             }
+                        }
+                        if now >= warm && tracks.contains(&Track::Audio) {
+                            measured.dropouts += 1;
                         }
                     }
                     out.clear();
@@ -426,8 +443,10 @@ pub fn run(
                     panic!("a report")
                 };
                 sender.reported(&report, at(now)).expect("in order");
+                // The fit changes only with a report: read after each one.
                 if now >= warm {
                     measured.blocks += 1;
+                    measured.loss_most = measured.loss_most.max(loss(&sender));
                 }
             }
         }
@@ -499,6 +518,14 @@ fn expected(sender: &Sender) -> f64 {
     }
 }
 
+/// The loss the daemon's short fit reads (a datagram lane's).
+fn loss(sender: &Sender) -> f64 {
+    match sender.stats() {
+        crate::session::sender::Way::Datagram { loss, .. } => loss,
+        _ => 0.0,
+    }
+}
+
 fn missed_of(sender: &Sender) -> usize {
     match sender.stats() {
         crate::session::sender::Way::Datagram { missed, .. } => missed as usize,
@@ -512,7 +539,8 @@ pub fn row(path: Path, work: Workload, audio: bool, m: &Measured) -> String {
     format!(
         "{:?} {:.0} kB/s over {:.0} kB/s rtt {:.0} audio {}: {} freezes in {:.0} min, stale \
          {:.4}; repair {:.3}; erased {:.3}; data {:.3} of {:.3} MB/s; delay p50 {:.0} p99 {:.0} \
-         ms; backlog most {} B; held {}; {} missed ({:.1} expected), {} late",
+         ms; backlog most {} B; held {}; {} missed ({:.1} expected), {} late; loss most {:.3} \
+         (bound {:.3})",
         path.kind,
         work.demand() / 1e3,
         path.capacity / 1e3,
@@ -535,6 +563,8 @@ pub fn row(path: Path, work: Workload, audio: bool, m: &Measured) -> String {
         m.missed,
         m.expected,
         m.late,
+        m.loss_most,
+        loss_bound(path, m.blocks),
     )
 }
 
@@ -550,7 +580,33 @@ pub fn lossy(kind: Kind, rtt: f64, capacity: f64) -> Path {
         lossy: (0.0, f64::INFINITY),
         jitter: 0.002,
         capacity,
+        queue: (0.0, 0.0, 0.0),
     }
+}
+
+/// The chance a run of the sim may have to read its most loss above [`loss_bound`]: once in a
+/// million runs, whatever the seed and the length.
+pub const ALPHA: f64 = 1e-6;
+
+/// The most loss the daemon's short fit may read over `reports` reports on `path`, outside a
+/// chance of [`ALPHA`] for the whole run.
+///
+/// Derived. The short fit's loss after a report is a share over [`Erasures::SHORT`]
+/// symbols of the path's two-state chain: about normal, of mean p = a / (a + 1 − b) and
+/// standard error sqrt(p(1 − p) · (1 + λ) / (1 − λ) / SHORT), λ = b − a the outcomes'
+/// correlation from one symbol to the next. Its most is over the values it took, one after
+/// each report: by the union bound (Bonferroni) over the `reports` of them, each above
+/// p + z·se with chance at most ALPHA / reports, and with the normal tail's bound
+/// P(Z > z) ≤ exp(−z²/2) / 2, z = sqrt(2 ln(reports / (2 ALPHA))).
+///
+/// [`Erasures::SHORT`]: super::model::Erasures::SHORT
+pub fn loss_bound(path: Path, reports: usize) -> f64 {
+    let (a, b) = (path.after_arrival, path.after_erasure);
+    let (p, lambda) = (a / (a + 1.0 - b), b - a);
+    let short = super::model::Erasures::SHORT as f64;
+    let se = (p * (1.0 - p) * (1.0 + lambda) / (1.0 - lambda) / short).sqrt();
+    let z = (2.0 * (reports.max(1) as f64 / (2.0 * ALPHA)).ln()).sqrt();
+    p + z * se
 }
 
 #[cfg(test)]
@@ -605,16 +661,18 @@ mod tests {
                         let se = (p * (1.0 - p) * 3.0 / m.carried.max(1) as f64).sqrt();
                         let erased = m.erased as f64 / m.carried.max(1) as f64;
                         eprintln!(
-                            "{} ({} of {} Opus lost; bound {bound} each, misses {expected})",
+                            "{} ({} dropouts, {} of {} Opus lost; bound {bound} each, misses \
+                             {expected})",
                             row(path, work, audio, &m),
+                            m.dropouts,
                             m.opus_lost,
                             m.opus,
                         );
                         assert!(
-                            m.freezes <= bound && m.opus_lost <= bound,
+                            m.freezes <= bound && m.dropouts <= bound,
                             "{path:?} {work:?} audio {audio}: {} freezes, {} dropouts, bound {bound}",
                             m.freezes,
-                            m.opus_lost
+                            m.dropouts
                         );
                         assert!(
                             m.missed <= expected,
@@ -632,6 +690,46 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    /// A queue is delay, never loss. Over a path whose delay toward the relay steps up by two
+    /// seconds for a minute and back (a queue filling under it), the symbols the step made late
+    /// count as come: the most loss the daemon's short fit reads, with the queue and without
+    /// it, stays within [`loss_bound`] of the path's 9% (a chance of [`ALPHA`] for the run, by
+    /// the union bound over its reports), and the repairs' share of the wire stays the same
+    /// path's without the queue. Counting a late symbol as erased read 15–61% on such a path,
+    /// and sized blocks to a thousand symbols.
+    #[test]
+    fn a_queue_raises_no_repair() {
+        for capacity in [500e3, 5e6] {
+            for work in [PRODUCTION, BUSY] {
+                let plain = lossy(Kind::Datagram, 0.1, capacity);
+                let queued = Path {
+                    queue: (60.0, 120.0, 2.0),
+                    ..plain
+                };
+                let seed = 0x9B05_688C_2B3E_6C1F;
+                let a = run(plain, work, false, seed, 180.0, 15.0);
+                let b = run(queued, work, false, seed, 180.0, 15.0);
+                let share = |m: &Measured| m.repair as f64 / m.wire.max(1) as f64;
+                eprintln!("plain:  {}", row(plain, work, false, &a));
+                eprintln!("queued: {}", row(queued, work, false, &b));
+                for (m, path) in [(&a, plain), (&b, queued)] {
+                    let bound = loss_bound(path, m.blocks);
+                    assert!(
+                        m.loss_most <= bound,
+                        "{work:?} over {capacity}: the fit read {} lost, bound {bound}",
+                        m.loss_most
+                    );
+                }
+                assert!(
+                    share(&b) <= share(&a) + 0.02,
+                    "{work:?} over {capacity}: repair {} with the queue, {} without",
+                    share(&b),
+                    share(&a)
+                );
             }
         }
     }

@@ -383,6 +383,21 @@ async fn serve(flags: Flags, runtime: session::Runtime, env: env::Desktop) {
     let screen = match screen::Screen::open(&display) {
         Ok(s) => {
             log::info!("dynamic resolution on, up to {}x{}", s.max().0, s.max().1);
+            let (width, height) = s.max();
+            let largest = vp9::Shape {
+                width,
+                height,
+                fps: video::FRAMERATE,
+            };
+            match vp9::Stream::new(largest, std::num::NonZeroUsize::MIN) {
+                Ok(stream) => {
+                    let _ = hub.codec.set(stream.codec());
+                }
+                Err(e) => {
+                    log::error!("no VP9 level holds the largest desktop, {:?}", e.0);
+                    logging::exit(1)
+                }
+            }
             Some(s)
         }
         Err(e) => {
