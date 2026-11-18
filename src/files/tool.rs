@@ -687,4 +687,76 @@ mod tests {
             }
         }
     }
+
+    /// A folder zipped reads back, with the zip crate's own reader, as exactly the same
+    /// tree: every folder (empty ones too) and every file under the top name, with its
+    /// bytes. Over generated trees (names of ASCII and of other scripts, nesting, empty
+    /// files, files of one repeated byte, of noise, and of either under a name that is
+    /// stored whole), against the tree as it was generated.
+    #[test]
+    fn a_folder_zipped_reads_back_as_the_same_tree() {
+        use std::collections::BTreeMap;
+        use std::io::Read;
+        const PARTS: [&str; 8] = ["a", "Z9", "é", "日本", "ж", "ü-ß", "😀", " x y"];
+        const EXTS: [&str; 4] = ["", ".txt", ".zip", ".GZ"];
+        let mut rng = crate::xorshift::Xorshift::new(0x3c6e_f372_fe94_f82b);
+        for case in 0..25 {
+            let root = Root::new(&format!("zip{case}"));
+            let top = format!("{}-top", PARTS[rng.below(8) as usize]);
+            let base = root.0.join("src");
+            std::fs::create_dir_all(&base).unwrap();
+            // The expected tree: a folder is `None`, a file its bytes.
+            let mut want: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
+            want.insert(format!("{top}/"), None);
+            let mut dirs = vec![(base.clone(), format!("{top}/"))];
+            let mut n = 0;
+            for _ in 0..rng.range(1, 40) {
+                let (at, rel) = dirs[rng.below(dirs.len() as u64) as usize].clone();
+                // The index keeps names apart, whatever the file system folds together.
+                n += 1;
+                let name = format!(
+                    "{}{}-{n}{}",
+                    PARTS[rng.below(8) as usize],
+                    PARTS[rng.below(8) as usize],
+                    EXTS[rng.below(4) as usize]
+                );
+                if rng.below(4) == 0 {
+                    std::fs::create_dir(at.join(&name)).unwrap();
+                    want.insert(format!("{rel}{name}/"), None);
+                    dirs.push((at.join(&name), format!("{rel}{name}/")));
+                    continue;
+                }
+                let len = match rng.below(4) {
+                    0 => 0,
+                    1 => rng.below(100),
+                    _ => rng.below(150_000),
+                } as usize;
+                let body: Vec<u8> = if rng.below(2) == 0 {
+                    let byte = rng.below(256) as u8;
+                    vec![byte; len]
+                } else {
+                    (0..len).map(|_| rng.below(256) as u8).collect()
+                };
+                std::fs::write(at.join(&name), &body).unwrap();
+                want.insert(format!("{rel}{name}"), Some(body));
+            }
+            let mut zipped = Vec::new();
+            write_zip(&base, &top, &mut zipped).unwrap();
+            let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zipped)).unwrap();
+            let mut got: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
+            for i in 0..archive.len() {
+                let mut entry = archive.by_index(i).unwrap();
+                let name = entry.name().unwrap().into_owned();
+                let body = if entry.is_dir() {
+                    None
+                } else {
+                    let mut b = Vec::new();
+                    entry.read_to_end(&mut b).unwrap();
+                    Some(b)
+                };
+                assert!(got.insert(name, body).is_none(), "an entry twice");
+            }
+            assert!(got == want, "case {case}: the tree read back differs");
+        }
+    }
 }
