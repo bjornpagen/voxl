@@ -581,11 +581,20 @@ impl Sender {
         capture.audio = None;
     }
 
-    /// An Opus packet at `now`: it waits for the next capture, and the one before it, whose
-    /// play time has passed with none, goes alone.
-    pub fn audio(&mut self, packet: &[u8], now: Instant) {
-        let State::Open(o) = &mut self.state else {
-            return;
+    /// An Opus packet at `now`, `silent` frames of silence after the one before: on lanes
+    /// it waits for the next capture, and the one before it, whose play time has passed
+    /// with none, goes alone; a recording takes it as it is, with the silence it follows.
+    pub fn audio(&mut self, packet: &[u8], silent: u32, now: Instant) {
+        let o = match &mut self.state {
+            State::Recording(to) => {
+                let packet = bytes::Bytes::copy_from_slice(packet);
+                if to.send(Out::Audio { packet, silent }).is_err() {
+                    log::debug!("a recording ended before its viewer left");
+                }
+                return;
+            }
+            State::Closed => return,
+            State::Open(o) => o,
         };
         let Open {
             capture,

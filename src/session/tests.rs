@@ -279,7 +279,7 @@ async fn after_the_close_no_lane_gets_a_byte() {
     }
     for _ in 0..5 {
         client.lanes(|s| s.video((Number::first(), Epoch::Start), &frame, Instant::now()));
-        client.lanes(|s| s.audio(&frame[..200], Instant::now()));
+        client.lanes(|s| s.audio(&frame[..200], 0, Instant::now()));
     }
     let carried = to_the_end(&mut lane).await;
     // Every message the lane carried is of the five frames sent before the close.

@@ -23,6 +23,13 @@ pub enum Out {
     },
     /// The lanes the session's link wants the relay to deal its frames over.
     Lanes(crate::lanes::model::Lanes),
+    /// An Opus packet of desktop audio, to a recording alone (a session's audio goes on
+    /// its lanes): the packet, and the frames of silence the encoder left out since the
+    /// one before.
+    Audio {
+        packet: Bytes,
+        silent: u32,
+    },
 }
 
 /// A text message to a viewer: JSON, named by its `t`. `ServerMessage` in
@@ -549,9 +556,11 @@ impl Hub {
     }
 
     /// A recording joins: it takes every frame, as a page's video messages on `to`, and
-    /// starts on a keyframe as any viewer does.
+    /// starts on a keyframe as any viewer does; it wants the desktop's audio, which a
+    /// desktop without audio never sends.
     pub fn add_recorder(&self, to: mpsc::UnboundedSender<Out>) -> Arc<Client> {
         let c = self.add_client(to.clone(), Sender::recording(to));
+        self.set_audio(&c, true);
         c.watch();
         self.wake();
         c
@@ -667,12 +676,13 @@ impl Hub {
     }
 
     #[cfg(target_os = "linux")]
-    /// An Opus packet of desktop audio: onto the lanes of every session that wants it.
-    pub fn audio(&self, packet: &[u8]) {
+    /// An Opus packet of desktop audio, `silent` frames of silence after the one before:
+    /// onto the lanes of every session that wants it.
+    pub fn audio(&self, packet: &[u8], silent: u32) {
         let now = Instant::now();
         for c in self.clients.lock().iter() {
             if c.audio.load(Ordering::Relaxed) {
-                c.lanes(|s| s.audio(packet, now));
+                c.lanes(|s| s.audio(packet, silent, now));
             }
         }
     }

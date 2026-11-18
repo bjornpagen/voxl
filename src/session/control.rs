@@ -146,6 +146,8 @@ async fn control_writer(
             }
             .encode(&mut out),
             Out::Lanes(lanes) => Down::Lanes(*lanes).encode(&mut out),
+            // A recording's alone: a session's audio goes on its lanes.
+            Out::Audio { .. } => continue,
         }
         if write.write_all(&out).await.is_err() {
             return;

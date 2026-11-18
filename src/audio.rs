@@ -1,6 +1,7 @@
 //! Desktop audio: PulseAudio's monitor of the desktop's output, coded as Opus in
 //! `sound::DESKTOP` frames, sent to the sessions that want it. It reads only while a
-//! session wants audio, and sends nothing for silence.
+//! session wants audio, and sends nothing for silence: a packet says how many frames of
+//! it came before, which a recording keeps as a gap.
 
 use crate::hub::Hub;
 use crate::sound::{DESKTOP, PACKET_MOST, RATE};
@@ -135,6 +136,8 @@ fn run(hub: &Hub) -> Result<(), String> {
     };
     let mut pcm = vec![0i16; samples];
     let mut out = vec![0u8; PACKET_MOST];
+    // The frames of silence skipped since the last packet.
+    let mut silent = 0u32;
     loop {
         hub.wait_for_audio();
         // SAFETY: every pointer is to a live value of the type pa_simple_new reads.
@@ -155,6 +158,7 @@ fn run(hub: &Hub) -> Result<(), String> {
             return Err(format!("PulseAudio's monitor: error {err}"));
         }
         log::info!("audio capture started");
+        silent = 0;
         while hub.audio_wanted() {
             // SAFETY: `pcm` holds the bytes asked for.
             let read =
@@ -165,6 +169,7 @@ fn run(hub: &Hub) -> Result<(), String> {
                 return Err(format!("PulseAudio's read: error {err}"));
             }
             if pcm.iter().all(|&s| s == 0) {
+                silent = silent.saturating_add(1);
                 continue;
             }
             // SAFETY: a live encoder, a frame of samples, and room for a packet.
@@ -178,7 +183,10 @@ fn run(hub: &Hub) -> Result<(), String> {
                 )
             };
             match usize::try_from(n) {
-                Ok(n) => hub.audio(&out[..n]),
+                Ok(n) => {
+                    hub.audio(&out[..n], silent);
+                    silent = 0;
+                }
                 Err(_) => {
                     unsafe { pa_simple_free(s) };
                     return Err(format!("Opus's encode: error {n}"));

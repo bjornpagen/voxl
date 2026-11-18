@@ -251,7 +251,8 @@ ssh desktop voxl stats
 ```
 
 A recording is the H.264 voxl already encodes, saved as MP4 without encoding it again,
-so it costs almost no CPU. It doesn't include the cursor (viewers draw it), and a restart
+so it costs almost no CPU. With `--audio-enabled`, it carries the desktop's sound as an
+Opus track beside the video, with the silences kept as gaps. It doesn't include the cursor (viewers draw it), and a restart
 of the stream (a resize) or five minutes ends it. Each command
 takes `--runtime DIR`, as `voxl attach` does, for a daemon whose runtime folder is not
 `/run/voxl`.

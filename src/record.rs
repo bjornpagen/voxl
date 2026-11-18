@@ -5,6 +5,9 @@
 //! joins as one more viewer, whose way out is the recording itself (`Sender::recording`),
 //! so it costs almost no CPU and bounds no real viewer. Like the stream, it holds frames
 //! only when the screen changes, and it doesn't include the cursor (viewers draw it).
+//! The desktop's audio is in it too, as the Opus packets the desktop sends, a track of the
+//! MP4 beside the video; where the desktop is silent, or has no audio, the track has a
+//! gap, or (with no sound at all) isn't there.
 
 use crate::hub::{Hub, Out, ServerMessage};
 use crate::mp4;
@@ -81,7 +84,7 @@ pub async fn record(hub: &Arc<Hub>, until: Until, max: Duration) -> Result<Vec<u
     res
 }
 
-/// The frames on `rx` until `until`, `max`, or (once there is a frame) a hello (the
+/// The frames and audio on `rx` until `until`, `max`, or (once there is a frame) a hello (the
 /// stream restarted): the MP4.
 async fn collect(
     hub: &Hub,
@@ -108,7 +111,10 @@ async fn collect(
         }
     };
     tokio::pin!(stopped);
-    let mut frames: Vec<mp4::Frame> = Vec::new();
+    let mut tracks = mp4::Tracks {
+        frames: Vec::new(),
+        audio: Vec::new(),
+    };
     // The picture's size, read at the first frame: a restart (a new size) ends the
     // recording before it could change.
     let mut size = (0, 0);
@@ -121,22 +127,33 @@ async fn collect(
                     // Not a picture: the stream sends no empty frame.
                     Ok(Video::Empty(_)) | Err(crate::video::Short) => return Taken::On,
                 };
-                if frames.is_empty() {
+                if tracks.frames.is_empty() {
                     use std::sync::atomic::Ordering::Relaxed;
                     size = (hub.width.load(Relaxed), hub.height.load(Relaxed));
                 }
                 // Time the frame was captured: now, less the pipeline time in its header.
                 let ms = (start.elapsed().as_millis() as u64).saturating_sub(h.pipe.millis());
-                let ms = frames.last().map_or(ms, |l: &mp4::Frame| ms.max(l.ms + 1));
-                frames.push(mp4::Frame {
+                let ms = tracks.frames.last().map_or(ms, |l| ms.max(l.ms + 1));
+                tracks.frames.push(mp4::Frame {
                     ms,
                     key: h.key,
                     data: b.slice(Header::LEN..),
                 });
                 Taken::On
             }
+            // A packet follows the one before by the silence the encoder skipped between
+            // them, so the audio keeps its own clock; the first, by the time it came,
+            // less its own length.
+            Out::Audio { packet, silent } => {
+                let ms = match tracks.audio.last() {
+                    Some(l) => l.ms + mp4::AUDIO_MS * (1 + u64::from(silent)),
+                    None => (start.elapsed().as_millis() as u64).saturating_sub(mp4::AUDIO_MS),
+                };
+                tracks.audio.push(mp4::AudioPacket { ms, data: packet });
+                Taken::On
+            }
             // A restart of the stream ends this recording.
-            Out::Text(ServerMessage::Hello(_)) if !frames.is_empty() => Taken::End,
+            Out::Text(ServerMessage::Hello(_)) if !tracks.frames.is_empty() => Taken::End,
             Out::Text(_) | Out::Attached { .. } | Out::Lanes(_) => Taken::On,
         }
     };
@@ -160,7 +177,7 @@ async fn collect(
         }
     }
     let end = start.elapsed().as_millis() as u64;
-    tokio::task::spawn_blocking(move || mp4::write(&frames, size.0, size.1, end))
+    tokio::task::spawn_blocking(move || mp4::write(&tracks, size.0, size.1, end))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -232,5 +249,71 @@ mod tests {
                 n => assert_eq!(samples(&mp4.unwrap()), n),
             }
         }
+    }
+
+    /// The desktop's audio is a track of its own beside the video, whatever order the
+    /// messages come in: each packet beginning the time of the one before and the silence
+    /// the encoder skipped between them, in the order sent, the audio the recording began
+    /// before its first frame left out (a suffix of what was sent); and with no audio sent,
+    /// no audio track. Over generated runs of 0 to 12 packets among 0 to 12 frames more,
+    /// each after 0 to 3 frames of silence; the runs with and without audio and silence
+    /// are counted.
+    #[tokio::test]
+    async fn a_recording_carries_the_audio_on_the_clock_its_packets_say() {
+        let mut rng = crate::xorshift::Xorshift::new(0x510e_527f_ade6_82d1);
+        let hub = Hub::new().unwrap();
+        // Without audio; with audio and no silence; with silence.
+        let mut reached = [0u32; 3];
+        for _ in 0..1_000 {
+            let (tx, rx) = mpsc::unbounded_channel();
+            tx.send(video(0)).unwrap();
+            let mut sent: Vec<(Vec<u8>, u32)> = Vec::new();
+            for id in 1..1 + rng.next() % 12 {
+                tx.send(video(id as u32)).unwrap();
+            }
+            for _ in 0..rng.next() % 13 {
+                let packet: Vec<u8> = (0..1 + rng.below(30))
+                    .map(|_| rng.below(256) as u8)
+                    .collect();
+                let silent = rng.below(4) as u32;
+                tx.send(Out::Audio {
+                    packet: packet.clone().into(),
+                    silent,
+                })
+                .unwrap();
+                sent.push((packet, silent));
+                if rng.next() & 1 == 1 {
+                    tx.send(video(99)).unwrap();
+                }
+            }
+            reached[match (sent.len(), sent.iter().any(|(_, s)| *s > 0)) {
+                (0, _) => 0,
+                (_, false) => 1,
+                _ => 2,
+            }] += 1;
+            drop(tx);
+            let (_keep, stop) = oneshot::channel();
+            let until = Until::Stopped(stop);
+            let mp4 = collect(&hub, rx, until, Duration::from_secs(3600))
+                .await
+                .unwrap();
+            let (tracks, _) = mp4::tests::read(&mp4);
+            let Some(audio) = tracks.get(1) else {
+                // None kept: none sent, or all before the first frame.
+                assert_eq!(tracks.len(), 1);
+                continue;
+            };
+            assert_eq!(&audio.kind, b"soun");
+            let kept = &sent[sent.len() - audio.samples.len()..];
+            for (i, ((begin, data), (packet, silent))) in audio.samples.iter().zip(kept).enumerate()
+            {
+                assert_eq!(data, packet);
+                if let Some((before, _)) = i.checked_sub(1).map(|j| audio.samples[j]) {
+                    let ticks = mp4::AUDIO_MS * (1 + u64::from(*silent)) * audio.scale / 1000;
+                    assert_eq!(begin - before, ticks);
+                }
+            }
+        }
+        assert!(reached.iter().all(|&n| n > 0), "cases reached: {reached:?}");
     }
 }
