@@ -136,8 +136,6 @@ fn run(hub: &Hub) -> Result<(), String> {
     };
     let mut pcm = vec![0i16; samples];
     let mut out = vec![0u8; PACKET_MOST];
-    // The frames of silence skipped since the last packet.
-    let mut silent = 0u32;
     loop {
         hub.wait_for_audio();
         // SAFETY: every pointer is to a live value of the type pa_simple_new reads.
@@ -158,7 +156,8 @@ fn run(hub: &Hub) -> Result<(), String> {
             return Err(format!("PulseAudio's monitor: error {err}"));
         }
         log::info!("audio capture started");
-        silent = 0;
+        // The frames of silence skipped since this stream's last packet.
+        let mut silent = 0u32;
         while hub.audio_wanted() {
             // SAFETY: `pcm` holds the bytes asked for.
             let read =
