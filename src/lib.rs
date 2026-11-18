@@ -226,6 +226,11 @@ fn runtime(dir: std::path::PathBuf) -> session::Runtime {
     })
 }
 
+/// What `voxl --version` prints, on every platform.
+fn version_line() -> String {
+    format!("voxl {}", env!("CARGO_PKG_VERSION"))
+}
+
 /// Runs voxl with these command-line arguments (without the program name) until it is
 /// told to stop: on Linux the daemon or one of its subcommands, elsewhere the relay alone.
 pub fn run(args: impl IntoIterator<Item = String>) {
@@ -262,6 +267,8 @@ pub fn run(args: impl IntoIterator<Item = String>) {
     #[cfg(not(target_os = "linux"))]
     match args.first().map(String::as_str) {
         Some("relay") => relay::run(&args[1..]),
+        // A build is checked by running it: the version answers on every platform.
+        Some("--version" | "-V") => println!("{}", version_line()),
         _ => {
             eprintln!("voxl: here only `voxl relay ...`: the daemon runs on Linux");
             std::process::exit(2)

@@ -67,7 +67,7 @@ pub fn print_if_asked(args: &[String]) -> bool {
             true
         }
         Some(Request::Version) => {
-            println!("voxl {version}");
+            println!("{}", crate::version_line());
             true
         }
         None => false,
