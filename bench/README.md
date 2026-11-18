@@ -9,7 +9,7 @@ Tools used to compare voxl with selkies, KasmVNC, Neko, noVNC and Sunshine. Ever
 cc -O2 -o loadgen loadgen.c -lX11 -lXext      # 60 Hz animation with a frame/time marker
 cc -O2 -o rootlat rootlat.c -lX11             # marker latency on the root window
 env/xvfb.sh & sleep 1; env/openbox.sh &       # 2560x1600 @ 144 DPI, like production
-env/voxl.sh                                   # voxl on :6902 (VOXL_BIN to override)
+env/voxl.sh                                   # the voxl daemon (VOXL_BIN to override); its relay serves :6902
 env/selkies.sh                                # selkies (own Xvfb) :3, port 6912 (SELKIES_IMAGE to override)
 BENCH_DISPLAY=:3 env/openbox.sh &
 KASMVNC=/path/to/kasmvncserver XKB_DIR=/path/to/xkb env/kasmvnc.sh &  # KasmVNC (own X server) :5, port 6922
@@ -30,26 +30,9 @@ is its log. CBR from 30 Mbps, with congestion control down to 2 Mbps.
 ## Measuring
 
 - `nclient.py voxl|selkies host:port secs [x y]`: native client (FFmpeg decode)
-  that reads the marker at (x, y). Reports unique FPS, latency and Mbps.
-- `linkviewer.py host:port scenario out`: a headless viewer behind an emulated link
-  (`link.py`'s, the one `shaper.py` imposes). It acks each frame once its last part has
-  crossed the link, after a decode hold (3 ms, or a software decoder's with `--hold`,
-  carried in the ack as the page's is), and can scroll and type into a terminal on
-  the benchmark display (`--fifo`). With `--late page` its acks and pongs leave late as
-  a real page's did, drawn from that page's 4,091 measured answers (`page-late.txt`;
-  `--late page-99` without their top 1 %), `--stall EVERY_S,LENGTH_MS` stops the link
-  periodically and `--jitter MS` jitters its arrivals; every kind of draw has its own
-  stream, seeded by `--seed`. The `cold` scenario is a first
-  load: the terminal is filled with dense text before the viewer connects, and it is
-  measured from the connect. At the end it reads from `/stats` the viewer's lowest
-  `carries` since it connected and the window's `LATENESS`, `START`, `FALL` and `PACKET`, and the
-  run fails (exit 1) when the window went below `START` (or the link's own rate, if less),
-  over `FALL` once if any stall began, when a frame waited more than three times
-  `LATENESS` behind the link's queue, or when any of that was not measured (stalls with
-  less than a round between them, and a floor under one packet, among it). `linkviewer.py
-  --check-verdict` checks that verdict against the rule written as a table. It does not decode: it
-  is for rate control, and writes when each message arrived and each ack left.
-- `link.py`: the link model both use: a rate through an unbounded queue served in order,
+  that reads the marker at (x, y): for voxl, through the relay's page socket. Reports
+  unique FPS, latency and Mbps.
+- `link.py`: the link model `shaper.py` imposes: a rate through an unbounded queue served in order,
   half the round trip each way, one-sided jitter, a page's lateness, periodic stalls.
   `python3 -I link.py` checks it against an oracle that serves the queue a tick at a time,
   the lateness against the measured values, and the answers against a page's order.
@@ -87,54 +70,26 @@ is its log. CBR from 30 Mbps, with congestion control down to 2 Mbps.
   `shaper.py`). Needs the `daytona` SDK and `DAYTONA_API_KEY`.
 - `suite.sh`: every config (`CONFIGS`: selkies with and without picom, voxl and
   KasmVNC with and without picom) x workload
-  (Chromium scroll, 1080p and full-screen animation, and for voxl `linkviewer.py`'s `cold`)
+  (Chromium scroll, 1080p and full-screen animation)
   x link (`NETS`: LAN, 10 Mbps/40 ms, 5 Mbps/60 ms, and 50 Mbps/20 ms with arrivals
   jittered by up to 10 ms) via `shaper.py`, a userspace bottleneck proxy (`--jitter`,
-  `--late page`, `--stall` as `linkviewer.py`). `cold` prints its page through a terminal:
-  start `env/term.sh FIFO` (xterm on the benchmark display, `XTERM` to override) and set
-  `COLD_FIFO=FIFO`. The suite exits 1 if any `cold` run failed its bounds.
+  `--late page`, `--stall`).
 - `ab.sh <workload> <reps>`: interleaved voxl vs selkies runs.
 - `cpusuite.sh`: server CPU (X server + streamer) per workload with one client connected.
 - `scroll.html`: the long page `scrolltarget.mjs` smooth-scrolls, with a marker drawn every frame.
-- `cpu.sh <pid> <secs>`, `rate.sh <secs>` (voxl `/stats`), `srcfps.py` (true
+- `cpu.sh <pid> <secs>`, `srcfps.py` (true
   source frame rate from the Xvfb framebuffer), `measure.mjs` (in-browser unique FPS; `VIEWPORT=WxH`).
 - `inputtest.mjs`, `keytest.sh`: input and clipboard checks through the web client.
 
-## Feature tests
+## What is here
 
-`tests/` drives the web client with Playwright against a running voxl
-(`VOXL_PORT`, default 6903, started with `--enable-basic-auth=false`) on a test display
-(`BENCH_DISPLAY`, default `:3`). The tests that start their own voxl say so below.
-For smooth scrolling, start that display with the patched server:
-`XVFB=$(nix-build -E 'with import <nixpkgs> {}; callPackage ../xvfb.nix {}')/bin/Xvfb BENCH_DISPLAY=:3 env/xvfb.sh`.
-
-- `smoothtest.mjs <display> <port>`: precise scroll steps reach Chromium pixel by pixel.
-- `featuretest.mjs`: wheel/trackpad scrolling, tap, two-finger scroll, long press,
-  touch toolbar (uses `target.html`; `SCROLL_PAGE` for the scroll page).
-- `cliptest.mjs`, `cliptext.mjs`: PNG and text clipboard in both directions
-  (`TEST_PNG`, needs `xclip`).
-- `fstest.mjs`, `fsiframe.mjs`: fullscreen toolbar and Keyboard Lock, top level and embedded.
-- `resizetest.mjs`: re-fit in a resizable sidebar iframe and at several tab sizes.
-- `filestest.mjs`: file panel, uploads (button and drag and drop) and downloads; starts its own voxl.
-- `foldertest.mjs`: folders download as zips (checked byte for byte) and upload through
-  the API and the folder picker, merged and confined to the root; starts its own voxl.
-- `resizedyn.mjs`: dynamic resolution end to end with its own Xvfb (`XVFB`) and voxl:
-  desktop follows the window, clamping, decoded size, pointer mapping, zero-copy capture.
-- `mictest.mjs`: microphone end to end with a fake 440 Hz microphone, a private PulseAudio
-  pipe source and its own voxl (`PULSEAUDIO`: the pulseaudio package).
-
-## macOS
-
-`macos/` tests voxl on a Mac against a running instance (`PORT`, default 6960, started
-with `--enable-basic-auth=false`), as raw WebSocket clients plus Playwright
-(`playwright-core` and Google Chrome) where a page is the target. They act on the real
-desktop (pointer, keyboard, clipboard), so run them when nobody is using the Mac.
-
-- `features.js`: hello, keyframe, cursor image, clipboard text both ways, system audio,
-  typing and mouse in a scratch TextEdit document and, with `--enable-resize`, a
-  display mode switch and back.
-- `input.js`: clicks, typing (symbols, accents, CJK, emoji), Command shortcuts, drag
-  selection, pixel scrolling, cursor shape, on a page in a temporary Chrome.
-- `clipimage.js`: clipboard images both ways.
-- `mic.js`: a 440 Hz tone through the microphone path (see voxl's log for drops).
-- `perf.js`: full-screen animation; viewer FPS, pipeline and encode times.
+Everything above runs against `voxl relay` on port 6902 (`env/voxl.sh` starts the daemon;
+the relay reaches it over ssh and the lanes, as it reaches a real desktop):
+`nclient.py voxl` reads the relay's page socket, `measure.mjs`, `shot.mjs`,
+`inputtest.mjs` and `keytest.mjs` drive its page in Chromium, `keyhold.py` and `smoke.py`
+talk to its socket as the page does. The other clients (`kclient.py`, `nkclient.py`,
+`mlclient.py`, `daytona_bench.py`) and `env/` scripts are the compared servers'. The
+Playwright feature tests and the macOS tests that drove voxl's old built-in server are
+gone. What they drove end to end (files, clipboard, the microphone, resizing) has no
+end-to-end test against the relay yet; `smoke.py` covers the hello, video, the cursor,
+input and the clipboard.

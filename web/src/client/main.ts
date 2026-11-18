@@ -1,7 +1,8 @@
 // Main thread: layout, input capture, cursor, clipboard, files, microphone and audio.
 // Video decode/paint and the socket live in the worker (worker.ts).
 import { cmd } from '../protocol';
-import type { FromWorker, ToWorker } from '../protocol';
+import { Count, COUNTS } from '../protocol';
+import type { FromWorker, Stats, ToWorker } from '../protocol';
 import type { App } from './app';
 import { el } from './app';
 import { createAudio } from './audio';
@@ -14,60 +15,52 @@ import { setupPointer } from './pointer';
 import { createResize } from './resize';
 import { setupToolbar } from './toolbar';
 import { createVideo } from './video';
-import { createZoom } from './zoom';
 
-/**
- * Commands a read-only viewer sends: acks, video and audio on/off, keyframe requests
- * and ping replies. Anything else would act on the desktop (input, clipboard,
- * microphone, resizing). The server accepts only these from read-only viewers too
- * (Command::watches in server.rs), so a page that ignores the hello flag cannot
- * drive the desktop either; this keeps it from sending what would be dropped.
- */
-const READ_ONLY_COMMANDS = new Set(['a', 'v', 'au', 'kf', 'po']);
+/** What the page says when video and audio come over separate connections, one a lane:
+ * a lost packet holds its whole connection until TCP resends it. */
+const CONNECTIONS_LAG =
+	'Interactive sessions lag under loss on this transport; Hysteria2 or HTTP/3 is recommended.';
 
-function blocksInput(app: App, command: string): boolean {
-	return (
-		(app.readOnly || !app.desk.w) &&
-		!READ_ONLY_COMMANDS.has(command.split(',')[0])
-	);
-}
+/** What the page cannot run without, each by the name the refusal gives it. WebCodecs and
+ * a secure context (the relay's 127.0.0.1 is one) for the stream; MediaStreamTrackGenerator
+ * to present it; ClipboardItem for clipboard images; Keyboard Lock for the desktop's
+ * shortcuts in fullscreen; cross-origin isolation (which the relay's headers give) for the
+ * counters the worker shares with the page. */
+const REQUIRED: [string, () => boolean][] = [
+	['a secure context (HTTPS or localhost)', () => window.isSecureContext],
+	['WebCodecs video decoding', () => 'VideoDecoder' in window],
+	['WebCodecs audio decoding', () => 'AudioDecoder' in window],
+	['WebCodecs audio encoding', () => 'AudioEncoder' in window],
+	['MediaStreamTrackGenerator', () => 'MediaStreamTrackGenerator' in window],
+	['ClipboardItem', () => 'ClipboardItem' in window],
+	['the Keyboard Lock API', () => 'keyboard' in navigator],
+	['cross-origin isolation', () => window.crossOriginIsolated],
+];
 
 function main() {
-	const canvas = el<HTMLCanvasElement>('screen');
 	const statusEl = el('status');
-	const statsEl = el('stats');
-	const params = new URLSearchParams(location.search);
-	window.fps = 0;
-	window.voxlStats = {};
+	const noticeEl = el('notice');
 
-	// Browsers only offer WebCodecs on HTTPS pages and localhost, so a page opened over
-	// plain HTTP from another machine can't decode the stream whatever the browser.
-	if (!window.isSecureContext) {
-		statusEl.textContent =
-			'voxl needs HTTPS or localhost: browsers only decode video on secure pages. Serve it over HTTPS, or forward the port and open localhost.';
-		return;
-	}
-	if (!('VideoDecoder' in window) || !canvas.transferControlToOffscreen) {
-		statusEl.textContent =
-			'This browser lacks WebCodecs/OffscreenCanvas support.';
+	// What the page needs, checked once: a browser without one of them is refused, by name,
+	// rather than run with that part missing.
+	const missing = REQUIRED.filter(([, has]) => !has()).map(([name]) => name);
+	if (missing.length) {
+		statusEl.textContent = `voxl needs a browser with ${missing.join(', ')}. Use a current Chrome or Edge on a desktop, at 127.0.0.1.`;
 		return;
 	}
 
 	const wsUrl = new URL('ws', location.href);
 	wsUrl.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-	wsUrl.search = location.search;
-	const worker = new Worker('worker.js' + location.search);
+	const worker = new Worker('worker.js');
 	const post = (m: ToWorker, transfer: Transferable[] = []) =>
 		worker.postMessage(m, transfer);
 	const app: App = {
 		worker,
 		post,
 		send: (d) => {
-			if (!blocksInput(app, d)) post({ t: 'send', d });
+			post({ t: 'send', d });
 		},
 		sendBin: (type, bytes) => {
-			// The server drops every binary message from read-only viewers.
-			if (app.readOnly || !app.desk.w) return;
 			const msg = new Uint8Array(bytes.byteLength + 1);
 			msg[0] = type;
 			msg.set(bytes, 1);
@@ -76,22 +69,19 @@ function main() {
 		surface: el('surface'),
 		kbd: el<HTMLTextAreaElement>('kbd'),
 		tools: el('tools'),
-		isMac: /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent),
-		remoteMac: false,
-		readOnly: false,
+		// navigator.platform is deprecated and empty in some browsers; the user agent names
+		// Apple's platforms too.
+		isMac: /Mac|iPhone|iPad/.test(
+			`${navigator.platform} ${navigator.userAgent}`
+		),
 		inIframe: window !== window.top,
-		desk: { w: 0, h: 0 },
+		desk: { s: 'none' },
 		view: { scale: 1 },
 	};
 
 	const cursor = createCursor(app);
-	const zoom = createZoom(app);
-	const useVideo =
-		params.get('present') !== 'canvas' &&
-		typeof MediaStreamTrackGenerator !== 'undefined';
-	const video = createVideo(app, canvas, useVideo, () => {
+	const video = createVideo(app, () => {
 		cursor.apply();
-		zoom.fit();
 	});
 	const clipboard = createClipboard(app);
 	const audio = createAudio(app);
@@ -100,18 +90,38 @@ function main() {
 		audio.start();
 		clipboard.flush();
 	};
-	setupPointer(app, zoom, onInteract);
+	setupPointer(app, onInteract);
 	setupKeyboard(app, clipboard, onInteract);
-	const updateDisplays = setupToolbar(app, video.layout);
+	setupToolbar(app, video.layout);
 	const files = createFiles(app);
 	const mic = createMic(app);
 	const resize = createResize(app);
 
-	const offscreen = canvas.transferControlToOffscreen();
-	post(
-		{ t: 'init', canvas: offscreen, url: wsUrl.href, presentToMain: useVideo },
-		[offscreen]
-	);
+	const counts = new Uint32Array(new SharedArrayBuffer(COUNTS * 4));
+	post({ t: 'init', url: wsUrl.href, counts });
+	/** What the decoder decodes, as the worker last said. */
+	let codec: string | null = null;
+	// Read by the bench tools (measure.mjs) and handy in the console: the worker's counters
+	// since the last read, as rates and means, computed when read.
+	let last = { at: performance.now(), counts: counts.slice() };
+	Object.defineProperty(window, 'voxlStats', {
+		get(): Stats {
+			const now = { at: performance.now(), counts: counts.slice() };
+			const d = (i: number) => (now.counts[i] - last.counts[i]) >>> 0;
+			const dt = (now.at - last.at) / 1000;
+			last = now;
+			const frames = d(Count.Frames);
+			const updates = d(Count.Updates);
+			return {
+				fps: frames / dt,
+				kbps: (d(Count.Bytes) * 8) / 1000 / dt,
+				decodeMs: frames ? d(Count.DecodeUs) / 1000 / frames : null,
+				pipeMs: updates ? d(Count.PipeTenths) / 10 / updates : null,
+				codec,
+				dropped: now.counts[Count.Dropped],
+			};
+		},
+	});
 
 	// Stop video when nobody can see it.
 	let videoOn: boolean | null = null;
@@ -136,32 +146,37 @@ function main() {
 	worker.addEventListener('message', (e: MessageEvent<FromWorker>) => {
 		const m = e.data;
 		switch (m.t) {
-			case 'frames':
-				video.present(m.parts);
+			case 'frame':
+				video.present(m.frame);
 				break;
-			case 'hello':
-				app.desk.w = m.w;
-				app.desk.h = m.h;
-				app.remoteMac = m.os === 'macos';
-				app.readOnly = !!m.readOnly;
-				app.tools.classList.toggle('read-only', app.readOnly);
-				video.build(m.stripes);
+			case 'lanes':
+				noticeEl.textContent = m.kind === 'connections' ? CONNECTIONS_LAG : '';
+				noticeEl.style.display = m.kind === 'connections' ? '' : 'none';
+				break;
+			case 'hello': {
+				app.desk = { s: 'shown', w: m.w, h: m.h };
 				video.layout();
 				files.setup(m.files);
-				mic.setup(m.mic && !app.readOnly);
-				updateDisplays(m.displays);
+				mic.setup();
 				resize.setup(m.resize);
 				statusEl.style.display = 'none';
 				break;
+			}
 			case 'status':
 				if (m.s === 'closed') {
-					app.desk.w = 0;
+					app.desk = { s: 'none' };
 					mic.stop();
 					resize.closed();
+					noticeEl.style.display = 'none';
 					statusEl.style.display = '';
-					statusEl.textContent = 'Reconnecting…';
+					statusEl.classList.add('ended');
+					statusEl.textContent = `Ended: ${m.why}. Click to connect again.`;
 				}
-				if (m.s === 'open') updateVisibility(true);
+				if (m.s === 'open') {
+					statusEl.classList.remove('ended');
+					statusEl.textContent = 'Connecting…';
+					updateVisibility(true);
+				}
 				break;
 			case 'cursor':
 				cursor.set(m.buf);
@@ -175,20 +190,18 @@ function main() {
 			case 'mic':
 				if (!m.on) mic.stop();
 				break;
-			case 'stats':
-				window.fps = Math.round(m.fps);
-				window.voxlStats = m;
-				if (params.has('stats')) {
-					statsEl.style.display = 'block';
-					statsEl.textContent =
-						`${m.fps.toFixed(1)} fps  ${(m.kbps / 1000).toFixed(2)} Mbps\n` +
-						`decode ${m.decodeMs.toFixed(1)} ms  server ${m.pipeMs.toFixed(1)} ms\n${m.codec || ''} q=${m.queue}`;
-				}
+			case 'codec':
+				codec = m.codec;
 				break;
 			case 'log':
 				console.warn('[voxl]', m.s);
 				break;
 		}
+	});
+
+	// A session that ended is opened again when the viewer asks, never by itself.
+	statusEl.addEventListener('click', () => {
+		if (statusEl.classList.contains('ended')) post({ t: 'connect' });
 	});
 
 	// Autoplay may be allowed (iframe allow="autoplay"); try right away.

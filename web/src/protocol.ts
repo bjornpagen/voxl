@@ -1,62 +1,55 @@
-// Wire protocol between the browser and the server (src/server.rs), and the messages
-// the page and its worker exchange. One WebSocket carries everything: binary messages
-// start with a type byte, text messages are JSON from the server and short
-// comma-separated commands from the client.
+// Wire protocol between the browser and the relay (src/relay/), and the messages the page
+// and its worker exchange. One WebSocket carries everything: binary messages start with a
+// type byte, text messages are JSON from the relay and short comma-separated commands from
+// the page.
+import wire from './wire.json' with { type: 'json' };
 
-/** Type byte of binary messages. */
-export const Bin = {
-	/** Server: H.264 stripe update (16-byte header, then Annex-B). */
-	Video: 0x01,
-	/** Server: Opus desktop audio. */
-	Audio: 0x02,
-	/** Server: cursor image (RGBA). */
-	Cursor: 0x03,
-	/** Server: clipboard image (PNG). */
-	ClipImage: 0x04,
-	/** Client: clipboard image (PNG). */
-	ClipImageUp: 0x11,
-	/** Client: microphone Opus packet. */
-	MicOpus: 0x12,
-	/** Client: microphone PCM (s16le mono 48 kHz). */
-	MicPcm: 0x13,
-} as const;
+/** Type byte of binary messages, as web/src/wire.json has them: the one source the relay
+ * and the daemon check theirs against. Relay and server send video, audio, cursors and
+ * clipboard images; the page sends clipboard images and the microphone (Opus, or s16le
+ * PCM where the browser has no Opus encoder). */
+export const Bin = wire.bin;
 
-/** A horizontal band of the screen encoded as its own H.264 stream: [y, height]. */
-export type Stripe = [y: number, h: number];
+/** Desktop audio as the daemon encodes it: Opus at this rate and channel count, one
+ * packet a frame of this many samples (wire.json). */
+export const DESKTOP_AUDIO = wire.desktopAudio;
+
+/** The microphone as the daemon decodes it: mono at this rate, a frame of this many
+ * samples (wire.json). */
+export const MICROPHONE = wire.microphone;
+
+/** Microseconds of a frame of `samples` at `rate`. */
+export const frameMicros = (samples: number, rate: number) =>
+	(samples * 1_000_000) / rate;
 
 export interface FilesConfig {
-	upload: boolean;
-	download: boolean;
 	/** Folder (relative to the shared root) the panel opens and uploads into. */
 	dir: string;
+	/** The shared root on the server, which the relay hands `voxl files`. */
+	root: string;
 }
 
 export interface Hello {
 	t: 'hello';
 	w: number;
 	h: number;
-	/** The server's platform: 'linux' (X11) or 'macos'. */
-	os: string;
-	audio: boolean;
-	mic: boolean;
-	stripes: Stripe[];
 	files: FilesConfig;
-	/** The server only shows the desktop: the viewer cannot send input. */
-	readOnly?: boolean;
 	/** Dynamic resolution: desktop pixels per CSS pixel of the viewer's window. */
 	resize?: { scale: number };
-	/** macOS: one shared display, selected by its CoreGraphics ID. */
-	displays?: { selected: number; available: { id: number; name: string }[] };
 }
 
-/** JSON text messages from the server: src/hub.rs's `ServerMessage`, the same five. */
+/** How the relay reaches the server for video and audio (its lanes description):
+ * datagrams, streams on one connection, or a connection a stream. */
+export type LanesKind = 'datagram' | 'streams' | 'connections';
+
+/** JSON text messages from the relay: src/hub.rs's `ServerMessage` as the server sends
+ * them, the lanes the session has, and the session's end with its cause. */
 export type ServerMessage =
 	| Hello
-	/** `s` names the ping (16 hex digits); the reply echoes it as it is. */
-	| { t: 'ping'; s: string }
 	| { t: 'clip'; d: string }
 	| { t: 'mic'; on: boolean }
-	| { t: 'close' };
+	| { t: 'lanes'; kind: LanesKind }
+	| { t: 'close'; why: string };
 
 /** What a key did. */
 export type KeyAct = 'down' | 'repeat' | 'up';
@@ -64,9 +57,6 @@ const KEY_ACT: Record<KeyAct, number> = { down: 1, repeat: 2, up: 0 };
 
 /** Text commands to the server. */
 export const cmd = {
-	/** A frame was shown, `held` ms after it finished arriving (decode, draw, frames
-	 * ahead of it): the server takes that out of the path's delay. */
-	ack: (frame: number, held: number) => `a,${frame},${held.toFixed(1)}`,
 	move: (x: number, y: number) => `m,${x},${y}`,
 	button: (button: number, down: boolean) => `b,${button},${down ? 1 : 0}`,
 	/** Scroll in desktop pixels; the server turns it into smooth scrolling or wheel clicks. */
@@ -80,28 +70,19 @@ export const cmd = {
 	mic: (on: boolean) => `mi,${on ? 1 : 0}`,
 	/** Ask for a desktop of this size (dynamic resolution). */
 	resize: (w: number, h: number) => `sz,${w},${h}`,
-	display: (id: number) => `ds,${id}`,
 	keyframe: 'kf',
-	pong: (token: string) => `po,${token}`,
 } as const;
 
-/** The header of a video message, as src/video.rs's `Header` writes it. Checked
- * against video-header.json, as the server's and the bench's readers are:
- * `node web/src/video-header.test.ts`. */
+/** The header of a video message: the relay's type byte, then the 9 bytes src/video.rs's
+ * `Header` writes (flags, frame, pipe). Checked against video-header.json, as the
+ * server's reader is: `node web/src/video-header.test.ts`. */
 export interface VideoHeader {
 	key: boolean;
-	/** The frame sharpens what it codes. */
+	/** The update sharpens what it codes. */
 	sharpens: boolean;
 	frame: number;
 	/** Server-side pipeline time (capture to send), in 0.1 ms. */
 	pipe: number;
-	stripe: number;
-	/** How many stripes the screen is cut into. */
-	stripes: number;
-	/** Stripe updates that make up this frame. */
-	parts: number;
-	/** The stripe's top row. */
-	y: number;
 }
 
 export function parseVideoHeader(b: Uint8Array): VideoHeader {
@@ -112,47 +93,63 @@ export function parseVideoHeader(b: Uint8Array): VideoHeader {
 		sharpens: (b[1] & 2) === 2,
 		frame: u32(2),
 		pipe: u32(6),
-		stripe: b[10],
-		stripes: b[11],
-		parts: b[12],
-		y: (b[14] << 8) | b[15],
 	};
 }
-export const VIDEO_HEADER_BYTES = 16;
+export const VIDEO_HEADER_BYTES = 10;
 
 // ---- page <-> worker ----
 
-export interface StripeFrame {
-	i: number;
-	y: number;
-	frame: VideoFrame;
-}
+/** The counters the worker keeps and the page reads when asked (`window.voxlStats`),
+ * shared between them: each a running total, wrapping at 2^32, so the reader takes the
+ * difference since its last read. */
+export const Count = {
+	/** Updates shown. */
+	Frames: 0,
+	/** Updates arrived. */
+	Updates: 1,
+	/** Bytes of updates arrived. */
+	Bytes: 2,
+	/** Arrival to shown of the updates shown, in µs. */
+	DecodeUs: 3,
+	/** The server's capture to send of the updates arrived, in tenths of a ms. */
+	PipeTenths: 4,
+	/** Updates that came out of no decoder: not a running rate, the record's own total. */
+	Dropped: 5,
+} as const;
+export const COUNTS = 6;
 
+/** What `window.voxlStats` reads. */
 export interface Stats {
-	t: 'stats';
 	fps: number;
 	kbps: number;
-	decodeMs: number;
-	pipeMs: number;
+	/** Mean arrival to shown, and the server's capture to send, since the last read; null
+	 * when none came since. */
+	decodeMs: number | null;
+	pipeMs: number | null;
+	/** What the decoder decodes; null while there is none (before a keyframe). */
 	codec: string | null;
-	stripes: number;
 	dropped: number;
-	queue: number;
 }
 
-/** Worker -> page. Server messages other than ping and close are forwarded as is. */
+/** Worker -> page. Relay messages other than close are forwarded as is; the session's
+ * end is the status `closed`, with its cause. */
 export type FromWorker =
-	| { t: 'frames'; parts: StripeFrame[] }
-	| { t: 'status'; s: 'open' | 'closed' }
+	/** A decoded update, handed to the page to present. */
+	| { t: 'frame'; frame: VideoFrame }
+	/** The decoder now decodes this codec, or none. */
+	| { t: 'codec'; codec: string | null }
+	| { t: 'status'; s: 'open' }
+	| { t: 'status'; s: 'closed'; why: string }
 	| { t: 'cursor'; buf: ArrayBuffer }
 	| { t: 'clipImage'; buf: ArrayBuffer }
 	| { t: 'log'; s: string }
-	| Stats
-	| Exclude<ServerMessage, { t: 'ping' } | { t: 'close' }>;
+	| Exclude<ServerMessage, { t: 'close' }>;
 
 /** Page -> worker. */
 export type ToWorker =
-	| { t: 'init'; canvas: OffscreenCanvas; url: string; presentToMain: boolean }
+	| { t: 'init'; url: string; counts: Uint32Array }
+	/** Open a new session after the last one ended (the viewer asked). */
+	| { t: 'connect' }
 	| { t: 'send'; d: string }
 	| { t: 'sendBin'; d: ArrayBuffer }
 	| { t: 'video'; on: boolean }

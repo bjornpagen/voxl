@@ -2,5 +2,10 @@
 	// The AudioWorklet processors (AudioWorkletGlobalScope types in src/types/worklet.d.ts).
 	"extends": "./tsconfig.base.json",
 	"compilerOptions": { "lib": ["ES2022", "WebWorker"] },
-	"include": ["src/worklets", "src/protocol.ts", "src/types/worklet.d.ts"]
+	"include": [
+		"src/worklets",
+		"src/protocol.ts",
+		"src/wire.json",
+		"src/types/worklet.d.ts"
+	]
 }

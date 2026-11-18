@@ -14,24 +14,38 @@ Fixes go into the latest release, so upgrade to get them.
 
 ## What voxl protects, and what it leaves to you
 
-Whoever signs in to voxl gets the desktop it streams: they see the screen and, unless
-voxl runs with `--read-only`, type, click, use the clipboard and move files. So:
+Whoever gets a session gets the desktop voxl streams: they see the screen, type, click,
+use the clipboard and move files. voxl's one door is ssh, and it adds no login or
+encryption of its own: ssh already decides who gets in and encrypts the control stream,
+the tunnel the lanes cross encrypts them, and every other hop is on one machine. So:
 
-- **Login:** on by default. Every request needs the password except the page's scripts
-  and assets and `/healthz`. Without `--basic-auth-password` or `VOXL_PASSWORD`, voxl
-  makes up a random 128-bit one when it starts. A `?token=` link carries the password,
-  so treat the link like the password. `--enable-basic-auth=false` turns the login off;
-  only do that behind a proxy that signs people in itself.
-- **TLS:** voxl serves plain HTTP. Away from localhost, put it behind a TLS proxy or an
-  SSH tunnel, or the password and the stream cross the network unencrypted.
-- **Listen address:** on Linux voxl listens on `0.0.0.0`, since a VM's display usually
-  sits behind its platform's proxy. On macOS and Windows, where it streams your own
-  screen, it listens on `127.0.0.1`. `--addr` changes either.
-- **Other sites:** voxl only answers requests for an IP address, `localhost` or a host
-  `--allowed-hosts` names, and turns away browsers' requests from other sites' pages
-  unless `--allowed-origins` names them. That keeps out DNS rebinding and pages that
-  open a WebSocket to voxl.
-- **Files:** the Files panel only reaches `--files-root` (`$HOME` by default); nothing
-  outside it is reachable. `--file-transfers=none` turns transfers off.
-- **Watch-only viewers:** `--read-only` refuses input, clipboard writes, the
-  microphone, uploads and resizing.
+- **ssh is the door:** a session starts as `ssh <host> voxl attach`, and whoever ssh lets
+  in as the daemon's user gets the desktop. Keep that account's keys as you would its
+  shell.
+- **The daemon listens on no network port:** its three sockets are unix sockets. The
+  control socket is mode 0600 and takes a connection only from the daemon's own user
+  (checked by the peer's uid); anything else is closed unread. The two lane sockets are
+  mode 0660, for a group the server's proxy runs in, which reaches them as
+  `localhost:6901`.
+- **Lanes:** for each control connection the daemon makes a 256-bit capability from the
+  system's random source and sends it as the session's first control message, over ssh.
+  A lane's first message must present it, with its place and generation; a wrong or stale
+  one gets the lane closed or the datagram dropped, without a reply, and the daemon acts
+  on nothing else a lane sends. A datagram lane belongs to the session by the address its
+  attach came from. Lanes carry video and audio one way, from the daemon to the relay:
+  input, clipboard, files and the microphone go only over ssh. The capability is never in
+  argv, the environment, a file or a log line, is compared in constant time and zeroed
+  when it drops, and both ends turn core dumps off. When the control stream closes, the
+  capability is forgotten and every lane attached with it is dropped.
+- **Agent commands:** `voxl stats`, `voxl screenshot` and `voxl record`, run over ssh,
+  ask the daemon through the same control socket, so the same uid rule admits them. Each
+  is answered once on its own connection; none gets a capability or reaches a lane.
+- **Malformed input:** every reader of a lane message, a control message or an attach
+  checks lengths before it reads, has a fixed maximum, and returns a typed error; none
+  allocates by a length it read.
+- **The relay:** `voxl relay` serves the page on `127.0.0.1` only, and answers only
+  requests for an IP address or `localhost` from its own page, turning away other sites'
+  pages (and DNS rebinding) that browsers would let connect to it. Anyone who can reach
+  127.0.0.1 on the viewer's machine can use its session, so run the relay on a machine
+  only you use.
+- **Files:** the Files panel only reaches `$HOME`; nothing outside it is reachable.

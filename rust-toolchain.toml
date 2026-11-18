@@ -1,0 +1,7 @@
+# The one place the toolchain is named: rustup reads it here, in CI and on every machine.
+# nightly-2026-11-01 is rustc 1.101.0-nightly (f9ceb4a4d), installed and verified with clippy
+# and rustfmt. No nightly language feature is used.
+[toolchain]
+channel = "nightly-2026-11-01"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

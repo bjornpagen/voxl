@@ -15,7 +15,7 @@ cores() { # pids... : cores used over 10 s
 }
 for srv in ${SERVERS:-voxl kasm}; do
   case $srv in
-    voxl) BD=:2; pids="$(pid_of '--port=6902') $(pid_of 'Xvfb :2 ')"; cli="nclient.py voxl localhost:6902" ;;
+    voxl) BD=:2; pids="$(pid_of '--runtime=/tmp/voxl-bench') $(pid_of 'Xvfb :2 ')"; cli="nclient.py voxl localhost:6902" ;;
     selkies) BD=${SELKIES_DISPLAY:-:3}; pids="$(pid_of '--port=6912') $(pid_of "Xvfb $BD ")"; cli="nclient.py selkies localhost:6912" ;;
     kasm) BD=${KASM_DISPLAY:-:5}; pids="$(pid_of "Xvnc $BD ")"; cli="kclient.py localhost:6922" ;;
   esac

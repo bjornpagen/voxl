@@ -1,132 +1,44 @@
-//! `--help` and `--version`: printed instead of starting the server.
+//! `--help` and `--version`: printed instead of starting the daemon.
 
 const USAGE: &str = "
 Usage: voxl [--flag=value]...
+       voxl attach [--runtime DIR]
+       voxl stats [--runtime DIR]           the pipeline's counts and each viewer, as JSON
+       voxl screenshot [--runtime DIR]      the screen as a PNG on stdout
+       voxl record [--seconds N] [--runtime DIR]
+                                            an MP4 on stdout, of N seconds or until
+                                            stdin ends
+       voxl files list|get|put ...
+       voxl relay ...
 
-Streams this machine's desktop to a browser at http://ADDR:PORT/ as H.264 over a
-WebSocket, and prints a link that signs you in. Flags take --name=value or
---name value; true/false flags also work on their own (--read-only).
+Runs the daemon: streams the X display in $DISPLAY to the sessions that attach to it. A
+session is `voxl attach` run over ssh (its control stream) and the lanes its relay opens
+through a proxy (video and audio); the daemon listens on unix sockets only. Flags take
+--name=value or --name value; a flag alone is true.
 
-Server:
-  --addr, --port                listen address (default ADDR_DEFAULT, 6901)
-  --title                       the page's title (default: Voxl Computer Stream)
-  --favicon                     the page's icon: an .ico, .png, .gif, .webp or .svg
-                                file (default: voxl's own)
-  --allowed-hosts               host names to answer for besides IP addresses and
-                                localhost (.example.com covers subdomains, * any)
-  --allowed-origins             other sites whose pages may connect (* any)
-  --tls                         serve HTTPS with a self-signed certificate, made once
-                                and kept (VOXL_TLS_DIR, else %LOCALAPPDATA%\\voxl or
-                                ~/.config/voxl)
-  --tls-cert, --tls-key         serve HTTPS with this PEM certificate chain and key
-
-Login:
-  --enable-basic-auth           ask for a password (default true)
-  --basic-auth-password         the password (default: $VOXL_PASSWORD, else one is
-                                made up and printed at startup)
-  --basic-auth-user             the user name a browser's sign-in has to give
-                                (default: any)
-
-Video:
-  --framerate                   max frames per second (default 60)
-  --crf                         base quality (default 24)
-  --max-kbps, --min-kbps        adaptive bitrate ceiling and floor
-                                (default 30000, 0; ceiling 0: none;
-                                a ceiling under the floor wins)
-  --preset                      x264 preset (default ultrafast)
-  --encoder-threads             x264 sliced threads (default min(4, cores/4))
-  --paintover-crf, --paintover-delay-ms
-                                sharpening once the screen goes still
-                                (default 16, 150)
-  --stripes                     encode the screen as N independent streams
-                                (experimental, default 1)
-  --convert-threads, --coalesce-us
-                                tuning (default 4, 0)
+Flags:
 ";
 
-#[cfg(not(any(target_os = "macos", windows)))]
-const DESKTOP: &str = "
-Desktop (the X11 display in $DISPLAY):
-  --enable-clipboard            true, in, out or false (default true)
-  --audio-enabled               desktop audio (default true)
-  --audio-device-name           PulseAudio source (default output.monitor)
-  --audio-bitrate               Opus bitrate (default 128000)
-  --microphone-enabled          the browser's microphone into the desktop
-                                (default false)
-  --microphone-fifo             FIFO a PulseAudio pipe source reads
-                                (default /tmp/voxl-mic.fifo)
-  --enable-resize               the desktop follows the viewer's window
-                                (default false)
-  --resize-scale                desktop pixels per CSS pixel (default 1.5)
-  --read-only                   viewers only watch (default false)
-  --scroll-px-per-notch         desktop pixels one wheel notch scrolls (default 180)
-  --round-corners               corner radius for top-level windows (default 0)
-  --round-windows               title:radius,... rounds windows with that title
-";
-
-#[cfg(target_os = "macos")]
-const DESKTOP: &str = "
-Desktop (this Mac's screen):
-  --display                     display to stream: an index (0 is the main
-                                display) or a display ID
-  --capture-scale               streamed pixels per point (default: native,
-                                within the budget)
-  --max-capture-pixels          pixel budget for the automatic scale
-                                (default 4096000)
-  --enable-clipboard            true, in, out or false (default true)
-  --audio-enabled               system audio (default true)
-  --audio-bitrate               Opus bitrate (default 128000)
-  --microphone-enabled          the browser's microphone into the Mac
-                                (default false)
-  --microphone-device           output device to play it into (default: the
-                                first loopback device found)
-  --enable-resize               the display follows the viewer's window
-                                (default false)
-  --resize-scale                display pixels per CSS pixel (default: the
-                                capture scale)
-  --read-only                   viewers only watch (default false)
-  --show-cursor                 include the host cursor in the video stream
-                                (default: true with --read-only, else false)
-  --scroll-px-per-notch         pixels one wheel notch scrolls (default 180)
-";
-
-#[cfg(windows)]
-const DESKTOP: &str = "
-Desktop (this PC's screen):
-  --display                     display to stream, by index (0 is the primary)
-  --enable-clipboard            true, in, out or false (default true)
-  --audio-enabled               system audio (default true)
-  --audio-device-name           output device whose sound to stream
-                                (default: the default output device)
-  --audio-bitrate               Opus bitrate (default 128000)
-  --microphone-enabled          the browser's microphone into the PC
-                                (default false)
-  --microphone-device           output device to play it into (default: the
-                                first virtual cable found)
-  --enable-resize               the display follows the viewer's window
-                                (default false)
-  --resize-scale                display pixels per CSS pixel (default: the
-                                display's scaling)
-  --read-only                   viewers only watch (default false)
-  --scroll-px-per-notch         pixels one wheel notch scrolls (default 180)
-";
-
-const FILES: &str = "
-Files and recordings:
-  --file-transfers              upload, download, upload,download or none
-                                (default upload,download)
-  --files-root                  folder the Files panel can see (default $HOME)
-  --upload-dir                  folder under the root that uploads go to
-                                (default Downloads)
-  --max-upload-mb               largest upload, 0 for no limit (default 0)
-  --max-record-seconds          longest recording (default 300)
-
+const END: &str = "
   -h, --help                    print this and exit
   -V, --version                 print the version and exit
-
-Agents and scripts can use GET /screenshot, /record and /wait; see
-https://github.com/tembo/voxl#for-agents-and-scripts
 ";
+
+/// What `--help` prints.
+fn help(version: &str) -> String {
+    format!(
+        "voxl {version}: low-latency desktop streaming for the browser.\n{USAGE}{}{END}",
+        flags()
+    )
+}
+
+/// The daemon's flags as `--help` lists them: each with what it is and its default.
+fn flags() -> String {
+    crate::FLAGS
+        .iter()
+        .map(|f| format!("  --{:<28}{} (default {})\n", f.name, f.says, f.default))
+        .collect()
+}
 
 /// Which of the two the arguments ask for, if either. Help wins over version.
 #[derive(Debug, PartialEq)]
@@ -145,21 +57,13 @@ fn request(args: &[String]) -> Option<Request> {
     }
 }
 
+#[cfg(target_os = "linux")]
 /// Prints the help or the version if the arguments ask for either, and says whether it did.
 pub fn print_if_asked(args: &[String]) -> bool {
     let version = env!("CARGO_PKG_VERSION");
     match request(args) {
         Some(Request::Help) => {
-            // A Mac's or a PC's own screen is only served locally by default (see serve()).
-            let addr = if cfg!(target_os = "linux") {
-                "0.0.0.0"
-            } else {
-                "127.0.0.1"
-            };
-            print!(
-                "voxl {version}: low-latency desktop streaming for the browser.\n{}{DESKTOP}{FILES}",
-                USAGE.replace("ADDR_DEFAULT", addr)
-            );
+            print!("{}", help(version));
             true
         }
         Some(Request::Version) => {
@@ -174,31 +78,62 @@ pub fn print_if_asked(args: &[String]) -> bool {
 mod tests {
     use super::*;
 
-    fn args(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
+    /// `-h` or `--help` anywhere asks for the help, else `-V` or `--version` anywhere for
+    /// the version, else neither: over generated command lines of those, the daemon's
+    /// flags, near misses of them, and values.
+    #[test]
+    fn help_wins_then_version_then_the_daemon() {
+        let mut rng = crate::xorshift::Xorshift::new(0x6a09_e667_f3bc_c908);
+        let words = [
+            "-h",
+            "--help",
+            "-V",
+            "--version",
+            "--runtime",
+            "/run/voxl",
+            "-help",
+            "--helpx",
+            "-v",
+            "--Version",
+            "help",
+            "version",
+            "--resize-scale=2",
+            "-",
+            "--",
+        ];
+        for _ in 0..20_000 {
+            let args: Vec<String> = (0..rng.below(6))
+                .map(|_| words[rng.below(words.len() as u64) as usize].to_string())
+                .collect();
+            let has = |w: &[&str]| args.iter().any(|a| w.contains(&a.as_str()));
+            let want = match (has(&["-h", "--help"]), has(&["-V", "--version"])) {
+                (true, _) => Some(Request::Help),
+                (false, true) => Some(Request::Version),
+                (false, false) => None,
+            };
+            assert_eq!(request(&args), want, "{args:?}");
+        }
     }
 
+    /// The help lists every flag the daemon reads, each once, on a line with what it is
+    /// and its default, and no flag it does not read.
     #[test]
-    fn help_and_version_flags_are_recognized_anywhere() {
-        assert_eq!(request(&args(&["--help"])), Some(Request::Help));
-        assert_eq!(request(&args(&["--port=6901", "-h"])), Some(Request::Help));
-        assert_eq!(request(&args(&["-V"])), Some(Request::Version));
-        assert_eq!(
-            request(&args(&["--version", "--port", "6901"])),
-            Some(Request::Version)
-        );
-        assert_eq!(
-            request(&args(&["--version", "--help"])),
-            Some(Request::Help)
-        );
-    }
-
-    #[test]
-    fn other_flags_start_the_server() {
-        assert_eq!(request(&args(&[])), None);
-        assert_eq!(
-            request(&args(&["--port=6901", "--read-only", "--title", "help"])),
-            None
-        );
+    fn the_help_lists_every_flag_with_its_default() {
+        let text = help("0");
+        for f in &crate::FLAGS {
+            let lines: Vec<&str> = text
+                .lines()
+                .filter(|l| l.trim_start().starts_with(&format!("--{} ", f.name)))
+                .collect();
+            assert_eq!(lines.len(), 1, "--{}", f.name);
+            assert!(lines[0].contains(f.says), "{}", lines[0]);
+            assert!(
+                lines[0].ends_with(&format!("(default {})", f.default)),
+                "{}",
+                lines[0]
+            );
+        }
+        let listed = text.lines().filter(|l| l.starts_with("  --")).count();
+        assert_eq!(listed, crate::FLAGS.len());
     }
 }

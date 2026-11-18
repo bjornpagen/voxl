@@ -7,25 +7,23 @@ export function createClipboard(app: App) {
 	let pending: string | Blob | null = null;
 
 	function flush() {
-		if (
-			pending === null ||
-			!navigator.clipboard ||
-			(app.inIframe && !document.hasFocus())
-		)
-			return;
+		// Nothing to write, or not allowed now: a frame without focus may not write.
+		if (pending === null || (app.inIframe && !document.hasFocus())) return;
 		void write(pending);
 	}
 	async function write(c: string | Blob) {
 		try {
 			if (typeof c === 'string') await navigator.clipboard.writeText(c);
-			else if (typeof ClipboardItem !== 'undefined')
+			else
 				await navigator.clipboard.write([
 					new ClipboardItem({ 'image/png': c }),
 				]);
-			else return;
 			if (pending === c) pending = null;
-		} catch {
-			// Not allowed right now (no focus); retried on the next interaction.
+		} catch (e) {
+			// Chromium refuses a clipboard write while the document has no focus
+			// (NotAllowedError, "Document is not focused"): it stays pending, and goes at the
+			// next interaction or focus.
+			if (!(e instanceof DOMException && e.name === 'NotAllowedError')) throw e;
 		}
 	}
 	window.addEventListener('focus', flush);

@@ -1,0 +1,19 @@
+{
+	"bin": {
+		"video": 1,
+		"audio": 2,
+		"cursor": 3,
+		"clipImage": 4,
+		"clipImageUp": 17,
+		"micOpus": 18
+	},
+	"desktopAudio": {
+		"sampleRate": 48000,
+		"channels": 2,
+		"frameSamples": 480
+	},
+	"microphone": {
+		"sampleRate": 48000,
+		"frameSamples": 960
+	}
+}

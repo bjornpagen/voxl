@@ -1,15 +1,23 @@
-"""End-to-end smoke test of a running voxl: screenshot, hello, video, cursor, input and
-clipboard. Typing must change the screen, so run it with a text editor focused (CI
-opens Notepad). Exits non-zero on failure. SMOKE_SHOT=<path> saves the last screenshot;
-VOXL_PASSWORD is the password voxl was started with.
-Usage: smoke.py <host:port> [expected os]"""
-import asyncio, json, os, sys, time, urllib.parse, urllib.request
+"""End-to-end smoke test of a running voxl through its relay: hello, video, cursor, input
+and clipboard, and the screen before and after through the daemon's own screenshots
+(`voxl screenshot` on its local control socket). Typing must change the screen, so run it
+with a text editor focused. Exits non-zero on failure. VOXL_BIN is the voxl binary
+(default: voxl on PATH); VOXL_RUNTIME its runtime folder (default: voxl's own default).
+SMOKE_SHOT=<path> saves the last screenshot.
+Usage: smoke.py <relay host:port>"""
+import asyncio, json, os, subprocess, sys, time
 import websockets
 
 hostport = sys.argv[1]
-want_os = sys.argv[2] if len(sys.argv) > 2 else None
-password = os.environ.get('VOXL_PASSWORD', '')
 fails = []
+
+
+def screenshot():
+    """The screen as a PNG, from the daemon over its control socket."""
+    args = [os.environ.get('VOXL_BIN', 'voxl'), 'screenshot']
+    if os.environ.get('VOXL_RUNTIME'):
+        args += ['--runtime', os.environ['VOXL_RUNTIME']]
+    return subprocess.run(args, check=True, capture_output=True, timeout=30).stdout
 
 
 def check(ok, what):
@@ -18,16 +26,8 @@ def check(ok, what):
         fails.append(what)
 
 
-def screenshot():
-    req = urllib.request.Request(f'http://{hostport}/screenshot')
-    if password:
-        req.add_header('Authorization', f'Bearer {password}')
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return r.read()
-
-
 async def frames(ws, secs, stats):
-    """Receives (and acknowledges) for `secs`; counts video frames, keyframes, cursors."""
+    """Receives for `secs`; counts video frames, keyframes, cursors."""
     t0 = time.time()
     while time.time() - t0 < secs:
         try:
@@ -36,24 +36,20 @@ async def frames(ws, secs, stats):
             continue
         if isinstance(msg, str):
             m = json.loads(msg)
-            if m.get('t') == 'ping':
-                await ws.send(f"po,{m['s']}")
-            elif m.get('t') == 'clip':
+            if m.get('t') == 'clip':
                 stats['clip'] = m.get('d')
             continue
         if msg[0] == 1:
             stats['video'] += 1
             stats['key'] += msg[1] & 1
-            await ws.send(f'a,{int.from_bytes(msg[2:6], "big")},0.0')
         elif msg[0] == 3:
             stats['cursor'] += 1
 
 
 async def main():
     png = screenshot()
-    check(png[:8] == b'\x89PNG\r\n\x1a\n' and len(png) > 1000, f'GET /screenshot: {len(png)} byte PNG')
-    query = f'?token={urllib.parse.quote(password)}' if password else ''
-    async with websockets.connect(f'ws://{hostport}/ws{query}', max_size=None, compression=None) as ws:
+    check(png[:8] == b'\x89PNG\r\n\x1a\n' and len(png) > 1000, f'voxl screenshot: {len(png)} byte PNG')
+    async with websockets.connect(f'ws://{hostport}/ws', max_size=None, compression=None) as ws:
         hello = None
         t0 = time.time()
         while hello is None and time.time() - t0 < 10:
@@ -61,8 +57,6 @@ async def main():
             if isinstance(m, str) and '"hello"' in m:
                 hello = json.loads(m)
         check(hello is not None and hello.get('w', 0) > 0, f'hello: {hello}')
-        if want_os:
-            check(hello and hello.get('os') == want_os, f'hello os is {want_os}')
         w, h = hello['w'], hello['h']
         stats = {'video': 0, 'key': 0, 'cursor': 0, 'clip': None}
         await ws.send('v,1')

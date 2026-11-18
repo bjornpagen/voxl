@@ -16,7 +16,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, TrySendError};
 use std::sync::Arc;
 
-/// Lines the queue holds while the log thread cannot write. The busiest minute of a week of
+/// Lines the queue holds while the log thread cannot write. Provisional: measured on a week
+/// of a live desktop's journal, which was not kept; `journalctl --user -u voxl` over a week
+/// measures it again (its busiest minute's lines). The busiest minute of a week of
 /// a live desktop's journal logged 1,683 lines (a resize failing over and over, 39 a
 /// second). Each line is a slot of `LINE` bytes, made when voxl starts, so the queue is
 /// half a megabyte. At 1,024 that minute's lines would be dropped after 26 s of a stalled
@@ -24,7 +26,8 @@ use std::sync::Arc;
 const QUEUED: usize = 2048;
 
 /// The longest line kept, target and message, in bytes; a longer one is cut at a character
-/// and ends in `CUT`. The longest a week of a live desktop's journal held was 236: a RandR
+/// and ends in `CUT`. Provisional, measured as `QUEUED` was (the week's longest line). The
+/// longest a week of a live desktop's journal held was 236: a RandR
 /// error of 225 under `voxl::video`. At 128 that line and every other X error would be cut;
 /// at 512 the queue doubles and no line of that week needed it.
 const LINE: usize = 256;

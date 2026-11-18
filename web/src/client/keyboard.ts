@@ -64,9 +64,8 @@ export function setupKeyboard(
 		AltRight: 0xffea,
 		NumpadEnter: 0xff0d,
 	};
-	// The shortcut key is Command on a Mac and Control elsewhere. Linux desktops get
-	// Control for a Mac viewer's Command; a Mac desktop gets Command for another
-	// viewer's Control (and Control for its Windows/Super key).
+	// The shortcut key is Command on a Mac and Control elsewhere: the desktop (Linux) gets
+	// Control for a Mac viewer's Command.
 	function modifierKeysym(code: string): number | undefined {
 		const isCtrl = code.startsWith('Control');
 		const isMeta = code.startsWith('Meta') || code.startsWith('OS');
@@ -74,7 +73,6 @@ export function setupKeyboard(
 		const right = code.endsWith('Right');
 		const ctrl = right ? XK_CONTROL_R : XK_CONTROL_L;
 		const sup = right ? XK_SUPER_R : XK_SUPER_L;
-		if (app.remoteMac) return isMac === isCtrl ? ctrl : sup;
 		if (isMac && code.startsWith('Meta')) return ctrl;
 		return isCtrl ? ctrl : sup;
 	}
@@ -94,11 +92,9 @@ export function setupKeyboard(
 	}
 
 	const down = new Map<string, number>(); // code -> keysym
-	let pendingPaste: {
-		code: string;
-		ks: number;
-		timer: ReturnType<typeof setTimeout>;
-	} | null = null;
+	/** The paste shortcut held back until the browser's paste event (or the key's release)
+	 * has put the local clipboard on the desktop; none while no paste is pending. */
+	let pendingPaste: { code: string; ks: number } | null = null;
 	const press = (code: string, ks: number) => {
 		down.set(code, ks);
 		send(cmd.key(ks, 'down'));
@@ -121,7 +117,6 @@ export function setupKeyboard(
 		if (!pendingPaste) return;
 		const p = pendingPaste;
 		pendingPaste = null;
-		clearTimeout(p.timer);
 		press(p.code, p.ks);
 	}
 
@@ -134,7 +129,7 @@ export function setupKeyboard(
 		if (accel && !e.altKey && (e.key === 'v' || e.key === 'V') && !e.repeat) {
 			// Let the browser deliver a paste event to the hidden textarea first, so the
 			// remote clipboard holds the local contents before the shortcut lands.
-			pendingPaste = { code: e.code, ks, timer: setTimeout(flushPaste, 150) };
+			pendingPaste = { code: e.code, ks };
 			return;
 		}
 		e.preventDefault();
@@ -162,30 +157,25 @@ export function setupKeyboard(
 
 	kbd.addEventListener('paste', (e) => {
 		e.preventDefault();
-		const dt = e.clipboardData;
-		const text = dt?.getData('text/plain');
+		// A paste event always carries its clipboard.
+		const dt = e.clipboardData!;
+		const text = dt.getData('text/plain');
 		if (text) {
 			clipboard.noteLocal(text);
 			send(cmd.clipboard(text));
 			flushPaste();
 			return;
 		}
-		const file = dt
-			? [...dt.items]
-					.find((i) => i.kind === 'file' && i.type.startsWith('image/'))
-					?.getAsFile()
-			: null;
+		const file = [...dt.items]
+			.find((i) => i.kind === 'file' && i.type.startsWith('image/'))
+			?.getAsFile();
 		if (!file) {
 			flushPaste();
 			return;
 		}
-		// Hold the paste shortcut until the image is on the remote clipboard.
-		if (pendingPaste) {
-			clearTimeout(pendingPaste.timer);
-			pendingPaste.timer = setTimeout(flushPaste, 3000);
-		}
+		// The paste shortcut waits for the image to reach the remote clipboard.
 		toPng(file)
-			.then((png) => app.sendBin(Bin.ClipImageUp, new Uint8Array(png)))
+			.then((png) => app.sendBin(Bin.clipImageUp, new Uint8Array(png)))
 			.catch((err) => console.warn('[voxl] image paste failed', err))
 			.finally(flushPaste);
 	});

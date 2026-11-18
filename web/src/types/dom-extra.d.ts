@@ -15,11 +15,10 @@ interface Keyboard {
 	unlock(): void;
 }
 interface Navigator {
-	readonly keyboard?: Keyboard;
+	readonly keyboard: Keyboard;
 }
 
-// Read by the bench tools (measure.mjs) and handy in the console.
+// Read by the bench tools (measure.mjs) and handy in the console: computed when read.
 interface Window {
-	fps: number;
-	voxlStats: unknown;
+	readonly voxlStats: import('../protocol').Stats;
 }

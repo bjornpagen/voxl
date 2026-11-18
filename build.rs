@@ -1,10 +1,6 @@
 fn main() {
-    let target = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    let include_paths = if target == "windows" {
-        windows_libs()
-    } else {
-        unix_libs(&target)
-    };
+    let target = std::env::var("CARGO_CFG_TARGET_OS").expect("cargo sets CARGO_CFG_TARGET_OS");
+    let include_paths = unix_libs(&target);
     let mut b = bindgen::Builder::default()
         .header_contents(
             "wrap.h",
@@ -42,17 +38,14 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 }
 
-/// x264, libyuv, Opus and PulseAudio (with the pulseaudio feature) from pkg-config;
-/// returns x264's include paths.
+/// x264, libyuv, Opus and PulseAudio from pkg-config; returns x264's include paths. The
+/// daemon runs on Linux alone; elsewhere its core is built for its tests, which code
+/// with x264 and nothing else.
 fn unix_libs(target: &str) -> Vec<std::path::PathBuf> {
     let x264 = pkg_config::probe_library("x264").expect("x264");
-    // macOS captures NV12 (no libyuv) and gets audio from ScreenCaptureKit (no PulseAudio).
-    let libs: &[&str] = if target == "macos" {
-        &["opus"]
-    } else if std::env::var_os("CARGO_FEATURE_PULSEAUDIO").is_some() {
-        &["libyuv", "opus", "libpulse-simple"]
-    } else {
-        &["libyuv", "opus"]
+    let libs: &[&str] = match target {
+        "linux" => &["libyuv", "opus", "libpulse-simple"],
+        _ => &[],
     };
     let others: Vec<_> = libs
         .iter()
@@ -80,32 +73,10 @@ fn unix_libs(target: &str) -> Vec<std::path::PathBuf> {
     x264.include_paths
 }
 
-/// x264, libyuv and Opus from vcpkg (`vcpkg install x264 libyuv opus`, triplet from
-/// VCPKGRS_TRIPLET, e.g. x64-windows-static-md for a self-contained voxl.exe); returns
-/// x264's include paths. Capture, audio and input use system DLLs.
-fn windows_libs() -> Vec<std::path::PathBuf> {
-    let x264 = vcpkg::Config::new()
-        .find_package("x264")
-        .expect("x264 from vcpkg");
-    for lib in ["libyuv", "opus"] {
-        vcpkg::Config::new()
-            .find_package(lib)
-            .unwrap_or_else(|e| panic!("{lib} from vcpkg: {e}"));
-    }
-    println!("cargo:rerun-if-env-changed=VCPKGRS_TRIPLET");
-    x264.include_paths
-}
-
 /// Bundles the TypeScript web client (web/src) into OUT_DIR/web, which the server
-/// embeds. Needs esbuild on PATH (or ESBUILD); shell.nix and default.nix provide it.
+/// embeds. Needs esbuild on PATH (or ESBUILD); shell.nix provides it.
 fn bundle_web(out: &std::path::Path) {
-    // npm installs esbuild on Windows as a .cmd shim.
-    let default = if cfg!(windows) {
-        "esbuild.cmd"
-    } else {
-        "esbuild"
-    };
-    let esbuild = std::env::var("ESBUILD").unwrap_or_else(|_| default.into());
+    let esbuild = std::env::var("ESBUILD").unwrap_or_else(|_| "esbuild".into());
     let status = std::process::Command::new(&esbuild)
         .args([
             "client=web/src/client/main.ts",

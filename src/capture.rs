@@ -1,7 +1,7 @@
 //! X11 screen capture: MIT-SHM GetImage into a persistent BGRX frame, driven by XDamage.
 
 use crate::env::Debugging;
-use crate::video::Damage;
+use crate::video::{Band, Damage};
 use std::os::fd::{AsFd, BorrowedFd};
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::damage::{self, ConnectionExt as _};
@@ -12,8 +12,6 @@ use x11rb::protocol::xproto::{
 };
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
-
-pub static DAMAGE_EVENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub struct ShmBuf {
     pub ptr: *mut u8,
@@ -75,12 +73,6 @@ impl Drop for ShmBuf {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct Band {
-    pub y0: u32,
-    pub y1: u32,
-}
-
 pub struct Capturer {
     pub conn: RustConnection,
     root: u32,
@@ -101,15 +93,15 @@ pub struct Capturer {
     /// Macroblocks (16x16) touched since the last take, row-major.
     mb_dirty: Vec<u8>,
     pub mb_cols: usize,
-    /// Areas (x0, y0, x1, y1) changed since the video thread last took them, for `/wait`.
-    pub changes: Vec<(u32, u32, u32, u32)>,
     debug: Debugging,
+    /// The threads that convert its captures.
+    rows: crate::convert::Rows,
 }
 
 impl Capturer {
-    pub fn new(display: Option<&str>, debug: Debugging) -> Result<Self, String> {
+    pub fn new(display: &str, debug: Debugging, convert_threads: usize) -> Result<Self, String> {
         let (conn, screen_num) =
-            RustConnection::connect(display).map_err(|e| format!("X connect: {e}"))?;
+            RustConnection::connect(Some(display)).map_err(|e| format!("X connect: {e}"))?;
         let screen = &conn.setup().roots[screen_num];
         let root = screen.root;
         // Subscribe before querying geometry so a resize during initialization is not lost.
@@ -147,32 +139,34 @@ impl Capturer {
             .map_err(|e| e.to_string())?;
         let mut stride = width as usize * 4;
         let seg = conn.generate_id().map_err(|e| e.to_string())?;
-        let server_pid = display.and_then(xserver_pid);
-        let (buf, offset, direct) =
-            match find_xvfb_framebuffer(&conn, root, width, height, server_pid, debug) {
-                Some((buf, offset, fb_stride)) => {
-                    log::info!(
-                        "capturing directly from the Xvfb framebuffer (shmid {})",
-                        buf.shmid
-                    );
-                    stride = fb_stride;
-                    (buf, offset, true)
-                }
-                None => {
-                    log::warn!(
-                    "Xvfb framebuffer not found (start Xvfb with -shmem); falling back to GetImage"
+        // Two ways to read the screen, chosen by what the X server is: an Xvfb run with
+        // `-shmem` on this machine keeps its screen in a segment it made, read in place; any
+        // other server is read with MIT-SHM GetImage.
+        let framebuffer = match (debug.direct_fb, xserver_pid(display)) {
+            (true, Some(pid)) => xvfb_framebuffer(pid, width, height),
+            (true, None) | (false, _) => None,
+        };
+        let (buf, offset, direct) = match framebuffer {
+            Some((buf, offset, fb_stride)) => {
+                log::info!(
+                    "capturing directly from the Xvfb framebuffer (shmid {})",
+                    buf.shmid
                 );
-                    let buf = ShmBuf::new(stride * height as usize)?;
-                    conn.shm_attach(seg, buf.shmid as u32, false)
-                        .map_err(|e| e.to_string())?
-                        .check()
-                        .map_err(|e| e.to_string())?;
-                    // Mark for removal now; it stays alive while attached.
-                    unsafe { libc::shmctl(buf.shmid, libc::IPC_RMID, std::ptr::null_mut()) };
-                    log::info!("capturing via MIT-SHM GetImage");
-                    (buf, 0, false)
-                }
-            };
+                stride = fb_stride;
+                (buf, offset, true)
+            }
+            None => {
+                let buf = ShmBuf::new(stride * height as usize)?;
+                conn.shm_attach(seg, buf.shmid as u32, false)
+                    .map_err(|e| e.to_string())?
+                    .check()
+                    .map_err(|e| e.to_string())?;
+                // Mark for removal now; it stays alive while attached.
+                unsafe { libc::shmctl(buf.shmid, libc::IPC_RMID, std::ptr::null_mut()) };
+                log::info!("capturing via MIT-SHM GetImage");
+                (buf, 0, false)
+            }
+        };
         let damage = conn.generate_id().map_err(|e| e.to_string())?;
         conn.damage_create(damage, root, damage::ReportLevel::RAW_RECTANGLES)
             .map_err(|e| e.to_string())?;
@@ -192,8 +186,8 @@ impl Capturer {
             damage: Damage::Unreported,
             mb_dirty: vec![0; (width as usize).div_ceil(16) * (height as usize).div_ceil(16)],
             mb_cols: (width as usize).div_ceil(16),
-            changes: Vec::new(),
             debug,
+            rows: crate::convert::Rows::new(convert_threads)?,
         })
     }
 
@@ -212,7 +206,6 @@ impl Capturer {
                 }
             }
             if let Event::DamageNotify(e) = ev {
-                DAMAGE_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if self.debug.damage {
                     log::info!(
                         "dmg {:?} x{} y{} {}x{}",
@@ -241,7 +234,6 @@ impl Capturer {
                     for row in (top as usize / 16)..(bot as usize).div_ceil(16) {
                         self.mb_dirty[row * self.mb_cols + x0..row * self.mb_cols + x1].fill(1);
                     }
-                    self.changes.push((left, top, right, bot));
                     self.damage.add(top, bot, std::time::Instant::now());
                 }
             }
@@ -256,9 +248,10 @@ impl Capturer {
     }
 
     /// Take the dirty-macroblock map accumulated with the current damage.
-    pub fn take_mb_map(&mut self) -> Vec<u8> {
-        let n = self.mb_dirty.len();
-        std::mem::replace(&mut self.mb_dirty, vec![0; n])
+    /// The macroblocks damaged since the last take; `fresh`, a map of none of them as
+    /// long, takes its place.
+    pub fn take_mb_map(&mut self, fresh: Vec<u8>) -> Vec<u8> {
+        std::mem::replace(&mut self.mb_dirty, fresh)
     }
 
     pub fn full(&self) -> Band {
@@ -268,15 +261,19 @@ impl Capturer {
         }
     }
 
-    /// Convert rows [y0, y1) of the current frame into `dst`.
-    pub fn convert(&self, dst: &mut crate::convert::I420, y0: usize, y1: usize, threads: usize) {
-        crate::convert::convert_band(self.pixels(), self.stride, dst, y0, y1, threads);
+    /// Convert rows [y0, y1) of the current frame into `dst`, on the capturer's threads.
+    pub fn convert(
+        &self,
+        dst: &mut crate::convert::I420,
+        y0: usize,
+        y1: usize,
+    ) -> Result<(), String> {
+        self.rows.convert(self.pixels(), self.stride, dst, y0, y1)
     }
 
-    /// The current frame as packed BGRX (`width * 4` bytes per row), for screenshots,
-    /// with the damage for exactly these pixels taken into `changes`. Nothing draws while
-    /// the server is grabbed (a few ms for the copy), so a repaint can't land in the
-    /// pixels without its damage, or after them with it.
+    /// The current frame as packed BGRX (`width * 4` bytes per row), for screenshots.
+    /// Nothing draws while the server is grabbed (a few ms for the copy), so a repaint
+    /// can't land in the pixels without its damage, or after them with it.
     pub fn snapshot(&mut self) -> Result<Vec<u8>, String> {
         self.conn.grab_server().map_err(|e| e.to_string())?;
         let shot = self.snapshot_grabbed();
@@ -314,12 +311,14 @@ impl Capturer {
     }
 
     /// A resize can race a GetImage request before its configure event is processed.
-    pub fn geometry_changed(&self) -> bool {
-        self.conn
+    pub fn geometry_changed(&self) -> Result<bool, String> {
+        let g = self
+            .conn
             .get_geometry(self.root)
-            .ok()
-            .and_then(|cookie| cookie.reply().ok())
-            .is_some_and(|g| (u32::from(g.width), u32::from(g.height)) != (self.width, self.height))
+            .map_err(|e| e.to_string())?
+            .reply()
+            .map_err(|e| e.to_string())?;
+        Ok((u32::from(g.width), u32::from(g.height)) != (self.width, self.height))
     }
 
     /// Current frame pixels (BGRX, `stride` bytes per row).
@@ -353,7 +352,8 @@ impl Capturer {
     }
 }
 
-/// Pid of the local X server for `display` (":N" or "host:N.S"), from its lock file.
+/// Pid of the local X server for `display` (":N" or "host:N.S"), from its lock file:
+/// none for a display that is not this machine's server.
 fn xserver_pid(display: &str) -> Option<u32> {
     let after = display.rsplit(':').next()?;
     let n: u32 = after.split('.').next()?.parse().ok()?;
@@ -368,96 +368,53 @@ fn be32(b: &[u8], i: usize) -> u32 {
     u32::from_be_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]])
 }
 
-/// Xvfb started with `-shmem` keeps each screen as an XWD image in a SysV segment.
-/// Find it, check the header and verify pixels against the server before trusting it.
-/// After a RandR resize the header still describes the size Xvfb started with: the
-/// screen is the top-left `width`x`height` of it, at the header's stride.
-fn find_xvfb_framebuffer(
-    conn: &RustConnection,
-    root: u32,
-    width: u32,
-    height: u32,
-    server_pid: Option<u32>,
-    debug: Debugging,
-) -> Option<(ShmBuf, usize, usize)> {
-    if !debug.direct_fb {
-        return None;
-    }
+/// The XWD header's fields this reads (X11/XWDFile.h, each a big-endian CARD32): the
+/// header's size, its version, the image's width and height, bits per pixel, bytes per
+/// line, and the colour map's entries, each 12 bytes (`XWDColor`).
+const XWD_HEADER_SIZE: usize = 0;
+const XWD_FILE_VERSION: usize = 1;
+const XWD_PIXMAP_WIDTH: usize = 4;
+const XWD_PIXMAP_HEIGHT: usize = 5;
+const XWD_BITS_PER_PIXEL: usize = 11;
+const XWD_BYTES_PER_LINE: usize = 12;
+const XWD_NCOLORS: usize = 19;
+const XWD_VERSION: u32 = 7;
+const XWD_COLOR: usize = 12;
+
+/// The screen of the Xvfb whose pid is `pid`, if it runs with `-shmem`: Xvfb keeps each
+/// screen as an XWD image in a SysV segment it made, and the segment its pid made whose
+/// header is a 32-bit image the screen fits in is that screen. After a RandR resize the
+/// header still describes the size Xvfb started with: the screen is the top-left
+/// `width`x`height` of it, at the header's stride.
+fn xvfb_framebuffer(pid: u32, width: u32, height: u32) -> Option<(ShmBuf, usize, usize)> {
     let table = std::fs::read_to_string("/proc/sysvipc/shm").ok()?;
-    for line in table.lines().skip(1) {
-        let f: Vec<&str> = line.split_whitespace().collect();
-        if f.len() < 4 {
-            continue;
-        }
-        let (Ok(shmid), Ok(size)) = (f[1].parse::<i32>(), f[3].parse::<usize>()) else {
-            continue;
-        };
-        // Several Xvfbs can run side by side with similar (or blank) screens, so only
-        // look at segments our X server created when we know its pid.
-        if server_pid.is_some_and(|pid| f.get(4).and_then(|c| c.parse::<u32>().ok()) != Some(pid)) {
-            continue;
-        }
-        if size < (width * height * 4) as usize {
-            continue;
-        }
-        let Some(buf) = ShmBuf::attach_readonly(shmid, size) else {
-            continue;
-        };
+    // Columns of /proc/sysvipc/shm (proc(5)): key, shmid, perms, size, cpid, ...
+    let rows = table
+        .lines()
+        .skip(1)
+        .map(|l| l.split_whitespace().collect::<Vec<_>>());
+    rows.filter_map(|f| {
+        let shmid = f.get(1)?.parse::<i32>().ok()?;
+        let size = f.get(3)?.parse::<usize>().ok()?;
+        let cpid = f.get(4)?.parse::<u32>().ok()?;
+        (cpid == pid && size >= (width * height * 4) as usize).then_some((shmid, size))
+    })
+    .find_map(|(shmid, size)| {
+        let buf = ShmBuf::attach_readonly(shmid, size)?;
         let b = buf.as_slice();
-        let header_size = be32(b, 0) as usize;
-        let (w, h, bpp, bpl, ncolors) = (
-            be32(b, 4),
-            be32(b, 5),
-            be32(b, 11),
-            be32(b, 12) as usize,
-            be32(b, 19) as usize,
+        let (w, h, bpp, bpl) = (
+            be32(b, XWD_PIXMAP_WIDTH),
+            be32(b, XWD_PIXMAP_HEIGHT),
+            be32(b, XWD_BITS_PER_PIXEL),
+            be32(b, XWD_BYTES_PER_LINE) as usize,
         );
-        if be32(b, 1) != 7 || w < width || h < height || bpp != 32 || bpl < (w * 4) as usize {
-            continue;
-        }
-        let offset = header_size + ncolors * 12;
-        if offset + bpl * h as usize > size {
-            continue;
-        }
-        // Compare a strip of real pixels with what the server reports. The screen may be
-        // animating between the two reads, so retry and accept a near-total match.
-        let (sy, sh) = (height / 2, 16u32.min(height / 2));
-        let mut ok = false;
-        for _ in 0..10 {
-            let Ok(Ok(img)) = conn
-                .get_image(
-                    ImageFormat::Z_PIXMAP,
-                    root,
-                    0,
-                    sy as i16,
-                    width as u16,
-                    sh as u16,
-                    !0,
-                )
-                .map(|c| c.reply())
-            else {
-                break;
-            };
-            let mut same = 0usize;
-            let total = (width * sh) as usize;
-            for r in 0..sh as usize {
-                let fb = &b[offset + (sy as usize + r) * bpl..][..width as usize * 4];
-                let im = &img.data[r * width as usize * 4..][..width as usize * 4];
-                same += fb
-                    .chunks_exact(4)
-                    .zip(im.chunks_exact(4))
-                    .filter(|(a, c)| a[..3] == c[..3])
-                    .count();
-            }
-            if same * 100 >= total * 98 {
-                ok = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(30));
-        }
-        if ok {
-            return Some((buf, offset, bpl));
-        }
-    }
-    None
+        let offset = be32(b, XWD_HEADER_SIZE) as usize + be32(b, XWD_NCOLORS) as usize * XWD_COLOR;
+        let fits = be32(b, XWD_FILE_VERSION) == XWD_VERSION
+            && w >= width
+            && h >= height
+            && bpp == 32
+            && bpl >= (w * 4) as usize
+            && offset + bpl * h as usize <= size;
+        fits.then_some((buf, offset, bpl))
+    })
 }

@@ -15,7 +15,9 @@ use x11rb::protocol::randr::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 
-/// Smallest desktop a client may ask for.
+/// Smallest desktop a client may ask for: VGA, the least screen desktop toolkits lay their
+/// dialogs out for. A choice, not measured; what would measure it is the smallest size at
+/// which XFCE's settings dialogs still fit.
 pub const MIN: (u32, u32) = (640, 480);
 
 /// A size the screen can take: within [MIN, max], width a multiple of 8 and height
@@ -46,8 +48,8 @@ fn err(e: impl std::fmt::Display) -> String {
 }
 
 impl Screen {
-    pub fn open(display: Option<&str>) -> Result<Self, String> {
-        let (conn, n) = RustConnection::connect(display).map_err(err)?;
+    pub fn open(display: &str) -> Result<Self, String> {
+        let (conn, n) = RustConnection::connect(Some(display)).map_err(err)?;
         let s = &conn.setup().roots[n];
         let (root, w, h) = (s.root, s.width_in_pixels as u32, s.height_in_pixels as u32);
         let mm_per_px = (
@@ -210,19 +212,31 @@ impl Screen {
 mod tests {
     use super::*;
 
+    /// A size asked is fitted to one the screen takes: each side the largest it can be
+    /// that is no more than the ask held between `MIN` (or the maximum, if smaller) and
+    /// the maximum, the width a multiple of 8 and the height even. Over generated asks and
+    /// maxima, small and large, of either side of `MIN`.
     #[test]
-    fn fit_stays_within_min_and_max() {
-        let max = (2560, 1600);
-        assert_eq!(fit(1921, 1081, max), (1920, 1080));
-        assert_eq!(fit(100, 100, max), MIN);
-        assert_eq!(fit(9999, 9999, max), max);
-    }
-
-    #[test]
-    fn fit_handles_a_screen_smaller_than_min() {
-        assert_eq!(fit(1920, 1080, (800, 450)), (800, 450));
-        assert_eq!(fit(100, 100, (800, 450)), (640, 450));
-        assert_eq!(fit(1920, 1080, (600, 400)), (600, 400));
+    fn a_size_is_fitted_to_one_the_screen_takes() {
+        let mut rng = crate::xorshift::Xorshift::new(0x3c6e_f372_a54f_f53a);
+        let mut draw = |n: u64| rng.below(n) as u32;
+        for _ in 0..100_000 {
+            let max = (8 + draw(4000), 2 + draw(3000));
+            let (w, h) = (draw(5000), draw(4000));
+            let (fw, fh) = fit(w, h, max);
+            let side = |ask: u32, min: u32, most: u32, step: u32, got: u32| {
+                let held = ask.clamp(min.min(most), most);
+                got.is_multiple_of(step) && got <= held && held - got < step
+            };
+            assert!(
+                side(w, MIN.0, max.0, 8, fw),
+                "{w}x{h} in {max:?}: {fw}x{fh}"
+            );
+            assert!(
+                side(h, MIN.1, max.1, 2, fh),
+                "{w}x{h} in {max:?}: {fw}x{fh}"
+            );
+        }
     }
 
     /// An Xvfb of the test's own, on a display it picks itself, kept as the desktop's is
@@ -371,7 +385,7 @@ mod tests {
         foreign_mode(&x.display, foreign[0], "other-1200x800", true);
         foreign_mode(&x.display, foreign[1], "other-1024x640", false);
         let mut rng = crate::xorshift::Xorshift::new(0x2545_F491_4F6C_DD1D);
-        let mut screen = Screen::open(Some(&x.display)).unwrap();
+        let mut screen = Screen::open(&x.display).unwrap();
         // Sizes a connection before this one took the screen to, and the asks counted by
         // kind: another tool's mode on the output, one not on it, the start size, and a
         // size an earlier connection made, asked after a restart.
@@ -380,7 +394,7 @@ mod tests {
         for _ in 0..200 {
             if rng.below(4) == 0 {
                 drop(screen);
-                screen = Screen::open(Some(&x.display)).unwrap();
+                screen = Screen::open(&x.display).unwrap();
                 earlier.append(&mut made_here);
             }
             let want = sizes[rng.below(sizes.len() as u64) as usize];

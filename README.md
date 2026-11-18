@@ -1,21 +1,86 @@
 # voxl
 
-[![crates.io](https://img.shields.io/crates/v/voxl-server.svg)](https://crates.io/crates/voxl-server)
+A fork of [tembo/voxl](https://github.com/tembo/voxl) that went its own way: it carries the desktop over lanes through a proxy, with a code that repairs loss by each frame's deadline, so that it stays usable on a lossy, bursty path where one TCP stream stalls.
 
 Low-latency desktop streaming for the browser, written in Rust. voxl streams an X11
-display, a Mac's screen or a Windows desktop as H.264 over a WebSocket to a small web
-client that decodes with WebCodecs, with input, clipboard, audio, microphone, file and
-folder transfer and dynamic resolution.
+display as H.264 to a small web client that decodes
+with WebCodecs, with input, clipboard, audio, microphone, file and folder transfer and
+dynamic resolution. It is built for links that lose packets: video and audio cross as a
+code that repairs losses without waiting for a resend, and ssh is the only way in.
 
 ## Quick start
 
+On the machine with the desktop, run the daemon (it listens on unix sockets only):
+
 ```sh
-cargo install voxl-server   # needs x264, libyuv, Opus, PulseAudio and esbuild (see Usage)
-DISPLAY=:1 voxl             # streams display :1 and prints a link that signs you in
+cargo install --git https://github.com/bjornpagen/voxl   # needs x264, libyuv, Opus, PulseAudio and esbuild (see Usage)
+DISPLAY=:1 voxl             # streams display :1 to the sessions that attach to it
 ```
 
-Open the link it prints. On a Mac or a Windows PC, `voxl` streams that machine's own
-screen instead; see [macOS](#macos) and [Windows](#windows).
+On the machine you watch from, describe the lanes your proxy gives (see
+[Lanes](#lanes)) and run the relay:
+
+```sh
+echo 'datagram 127.0.0.1:1080' > ~/.config/voxl-lanes
+voxl relay --lanes ~/.config/voxl-lanes --ssh desktop --port 6901
+```
+
+Open `http://127.0.0.1:6901/`. The daemon runs on Linux; the relay runs on Linux and
+macOS.
+
+## How it works
+
+```
+browser page --WebSocket, 127.0.0.1--> voxl relay (the viewer's machine)
+   voxl relay --ssh--> voxl attach --unix socket--> voxl daemon   (the control stream)
+   voxl relay --lanes, through a proxy--> the server's proxy --unix sockets--> voxl daemon
+```
+
+- **The relay** (`voxl relay`) runs where you watch. It serves the page on 127.0.0.1 and,
+  for each page that connects, runs a session.
+- **The control stream** is `ssh <host> voxl attach`: whatever ssh's own configuration
+  makes of the host (its keys, its master connection) is the door. It carries everything
+  that must arrive whole: the hello, input, clipboard, cursor images, the microphone,
+  a report of every frame. `voxl attach` only joins ssh's stdio to the daemon's control
+  socket, which takes connections from the daemon's own user and no one else.
+- **The lanes** carry video and audio, one way, from the daemon to the relay, through a
+  proxy (a SOCKS5 proxy with UDP, or an HTTP CONNECT proxy) whose server end reaches the
+  daemon's lane sockets at `localhost:6901`. Each session's daemon makes a 256-bit
+  capability and sends it first on the control stream; each lane presents it once, as its
+  first message, and the daemon acts on nothing else a lane sends. The capability dies
+  with the control stream, and every lane attached with it is dropped. voxl itself
+  encrypts nothing: the tunnel encrypts the wire, and every other hop is on one machine.
+- **The code.** A frame (one update of the screen, or one Opus packet) is cut into pieces and
+  sent with as many repairs (combinations of its pieces over GF(256)) as make the best use
+  of the link, given the losses the reports show. A piece that has not arrived by the
+  frame's deadline is erased, lost or stuck behind a resend alike; the relay rebuilds the
+  frame from any large enough set of pieces and repairs. A frame that misses is never
+  sent again: the next update refers past it. The relay's report of each
+  frame is the only feedback; a still desktop sends nothing and gets nothing back.
+
+### Lanes
+
+The relay reads a one-line lanes description (`--lanes`) at every session start, so the
+transport may change between sessions. Fields are one space apart and the line ends in a
+newline:
+
+```
+datagram <socks5 host:port>
+streams <proxy host:port> <cap>
+connections <proxy host:port> <count>
+```
+
+- **`datagram`**: one lane of datagrams through the proxy's UDP ASSOCIATE (a UDP tunnel
+  such as Hysteria2). A loss costs only the piece.
+- **`streams`**: CONNECT streams over one connection that keeps each stream in order on
+  its own (HTTP/3), as many as the daemon asks for, up to `cap`.
+- **`connections`**: CONNECT streams through a proxy that gives each new stream a TCP
+  connection of its own (`count` of them, opened together, in order). A loss holds its
+  connection until TCP resends it, so interactive sessions lag under loss on this
+  transport; the page says so, and Hysteria2 or HTTP/3 is recommended.
+
+A description that cannot be read or is malformed ends the session with the reason on
+the page; nothing is assumed.
 
 ## Benchmarks
 
@@ -81,6 +146,8 @@ frame being decoded. voxl's column is its best run of each test. To reproduce, s
 - **Links:** a bottleneck with a deep queue: a TCP proxy for the WebSocket servers, and
   `tc netem` for Neko's WebRTC media and Sunshine's video (UDP). None of them drop
   packets, where UDP with error correction would have the edge.
+- These runs predate the lanes: voxl's video then crossed one WebSocket, as the other
+  WebSocket servers' did.
 
 ## Usage
 
@@ -95,271 +162,142 @@ cargo build --release
 On Linux, `--no-default-features` leaves out PulseAudio, and with it desktop audio: a
 voxl that can be linked statically (musl) and runs without PulseAudio's libraries.
 
-Or install it from [crates.io](https://crates.io/crates/voxl-server) with the same
-libraries on your system (the crate is `voxl-server`, the binary is `voxl`):
+Or install it from this repository with the same libraries on your system (the crate is
+`voxl-server`, the binary is `voxl`; crates.io's `voxl-server` is the original, not this fork):
 
 ```sh
-cargo install voxl-server
+cargo install --git https://github.com/bjornpagen/voxl
 ```
 
-Run it against an X display, then open the link it prints (`?stats` adds an FPS
-overlay):
+One binary does it all: `voxl` runs the daemon and `voxl relay` the relay; `voxl attach`
+and `voxl files` are what the relay runs over ssh, and `voxl screenshot`, `voxl record`
+and `voxl stats` are for agents and scripts.
+
+### The daemon
+
+Run it against an X display:
 
 ```sh
-DISPLAY=:1 ./target/release/voxl --port=6901
-# prints: open http://localhost:6901/?token=4f1c… to sign in
+DISPLAY=:1 ./target/release/voxl
 ```
 
-Start Xvfb with `-shmem` for zero-copy capture, and use the patched Xvfb
+It listens on three unix sockets and no network port, all in its runtime folder
+(`--runtime`), with the microphone's FIFO and its scratch keymap: `control`,
+`lane-stream`, `lane-datagram`, `mic` and `keymap`. The folder must be the daemon user's,
+with no write bit for others, or the daemon does not start; make it at boot (a tmpfiles.d
+rule) with the group the proxy's user is in. The server's proxy maps `localhost:6901` to
+the lane sockets: TCP to `lane-stream`, UDP to `lane-datagram`. PulseAudio's
+`module-pipe-source` reads the microphone from `mic`. Start Xvfb with `-shmem` for zero-copy
+capture, and use the patched Xvfb
 (`nix-build -E 'with import <nixpkgs> {}; callPackage ./xvfb.nix {}'`) for smooth
 scrolling. A held key repeats as the viewer's keyboard repeats it, so while voxl runs no
 keyboard on its X server autorepeats, and if voxl crashes that stays so until the X server
-restarts. voxl accepts selkies' command-line flags; other selkies flags are ignored.
-`voxl --help` lists every flag with its default, and `voxl --version` prints the version.
+restarts. A flag the daemon does not read stops it at startup. `voxl --help` lists every
+flag with its default, and `voxl --version` prints the version.
 
-| Flag                                                        | Default                            |                                                                                                                   |
-| ----------------------------------------------------------- | ---------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `--addr`, `--port`                                          | `0.0.0.0`, `6901`                  | listen address                                                                                                    |
-| `--title`                                                   | `Voxl Computer Stream`             | the page's title: the browser tab, and the app's name if a viewer installs it                                     |
-| `--favicon`                                                 | voxl's icon                        | the tab's icon: an `.ico`, `.png`, `.gif`, `.webp` or `.svg` file                                                 |
-| `--enable-basic-auth`                                       | `true`                             | ask for a password (see [Login](#login)); `false` serves without one                                              |
-| `--basic-auth-password`                                     | `VOXL_PASSWORD`, else made up      | the password                                                                                                      |
-| `--basic-auth-user`                                         | any                                | the user name a browser's sign-in has to give                                                                     |
-| `--framerate`                                               | `60`                               | max frames per second (`60-60` style ranges accepted)                                                             |
-| `--preset`                                                  | `ultrafast`                        | x264 preset                                                                                                       |
-| `--encoder-threads`                                         | `min(4, ncpu/4)`                   | x264 sliced threads                                                                                               |
-| `--crf`                                                     | `24`                               | base quality                                                                                                      |
-| `--max-kbps` / `--video-bitrate`                            | `30000`                            | adaptive bitrate ceiling; `0` for none, which caps nothing, even for a slow viewer                                |
-| `--min-kbps`                                                | `0`                                | adaptive bitrate floor (`0`: one packet in 60 ms); a ceiling under it wins                                        |
-| `--paintover-crf`, `--paintover-delay-ms`                   | `16`, `150`                        | sharpening when the screen goes still                                                                             |
-| `--enable-clipboard`                                        | `true`                             | `true`, `in`, `out` or `false`                                                                                    |
-| `--audio-enabled`, `--audio-device-name`, `--audio-bitrate` | `true`, `output.monitor`, `128000` | desktop audio                                                                                                     |
-| `--enable-resize`, `--resize-scale`                         | `false`, `1.5`                     | desktop follows the viewer's window; desktop pixels per CSS pixel                                                 |
-| `--microphone-enabled`, `--microphone-fifo`                 | `false`, `/tmp/voxl-mic.fifo`      | browser microphone into the FIFO a PulseAudio pipe source reads                                                   |
-| `--round-corners`                                           | `0` (off)                          | corner radius in pixels for top-level windows                                                                     |
-| `--round-windows`                                           | none                               | `title:radius,...` rounds windows with that title, docks included                                                 |
-| `--stripes`                                                 | `1`                                | encode the screen as N independent horizontal streams (experimental)                                              |
-| `--scroll-px-per-notch`                                     | `180`                              | desktop pixels one wheel notch scrolls (calibrates smooth scrolling)                                              |
-| `--file-transfers`                                          | `upload,download`                  | `upload`, `download`, both, or `none`                                                                             |
-| `--read-only`                                               | `false`                            | viewers only watch: input, clipboard writes, the microphone, uploads and resizing (`--enable-resize`) are refused |
-| `--allowed-hosts`                                           | none                               | host names to answer for besides IP addresses and `localhost` (`.example.com` covers subdomains, `*` any)         |
-| `--allowed-origins`                                         | none                               | other sites whose pages may connect, such as a page that embeds voxl's client (`*` any site)                      |
-| `--tls`                                                     | `false`                            | serve HTTPS with a self-signed certificate, made on first start and reused (see [HTTPS](#https))                  |
-| `--tls-cert`, `--tls-key`                                   | none                               | serve HTTPS with this PEM certificate chain and key                                                               |
-| `--files-root`                                              | `$HOME`                            | folder the Files panel can see; nothing outside it is reachable                                                   |
-| `--upload-dir`                                              | `Downloads`                        | folder (under the root) the panel opens and uploads into; created on first upload                                 |
-| `--max-upload-mb`                                           | `0` (no limit)                     | largest accepted upload                                                                                           |
-| `--max-record-seconds`                                      | `300`                              | longest recording (`/record`)                                                                                     |
-| `--convert-threads`, `--coalesce-us`                        | `4`, `0`                           | tuning                                                                                                            |
+| Flag              | Default     |                                                     |
+| ----------------- | ----------- | --------------------------------------------------- |
+| `--runtime`       | `/run/voxl` | the folder of the sockets and the microphone FIFO   |
+| `--resize-scale`  | `1.5`       | desktop pixels per CSS pixel of the viewer's window |
+| `--audio-enabled` | `true`      | desktop audio                                       |
 
-### Login
+It needs `DISPLAY` (the X display it streams) and `HOME` (the folder the Files panel
+reaches, opening and uploading into `Downloads`), and starts nothing without them. The clipboard, the Files panel, the microphone and dynamic resolution (the
+desktop follows the viewer's window) are always on.
 
-voxl asks for a password before it shows the desktop or takes input, files or API
-calls. Give it one with `--basic-auth-password` or `VOXL_PASSWORD`; otherwise it makes
-one up when it starts and prints a link that signs you in. There are three ways in:
+### The relay
 
-- **The link**: `http://host:6901/?token=<password>`. The page passes the password on to
-  its own connections, so the link also works as an iframe's `src`.
-- **The browser's sign-in prompt**, which voxl's page brings up: any user name (unless
-  `--basic-auth-user` names one) and the password. Password managers offer to save it.
-- **For programs**: `Authorization: Bearer <password>`, or `curl -u :<password>`.
+```sh
+voxl relay --lanes FILE --ssh DESTINATION --port PORT
+```
 
-The page's scripts and `/healthz` load without it. If voxl sits behind a proxy that signs
-people in itself, `--enable-basic-auth=false` turns voxl's login off.
+| Flag      |                                                                                   |
+| --------- | --------------------------------------------------------------------------------- |
+| `--lanes` | the lanes description, read at every session start (see [Lanes](#lanes))          |
+| `--ssh`   | where `voxl attach` and `voxl files` run: anything `ssh` takes as its destination |
+| `--port`  | the page's port on `127.0.0.1`                                                    |
 
-### Hosts and origins
+Each flag is required. The relay listens on `127.0.0.1` only, and answers only requests
+for an IP address or `localhost`, from its own page. That keeps out other web pages,
+which browsers let connect to any address, including pages whose domain is pointed at
+127.0.0.1 (DNS rebinding). Programs that aren't browsers send no `Origin` and get
+through.
 
-voxl only answers requests for an IP address or `localhost`, and only from its own page.
-That keeps out other web pages, which browsers let connect to any address, including
-pages whose domain is pointed at voxl's address (DNS rebinding). To reach voxl under a
-host name, such as through a proxy or as `my-pc.local`, name it with `--allowed-hosts`.
-To let a page on another site connect, name that site with `--allowed-origins`.
-Programs that aren't browsers (curl, scripts, agents) send no `Origin` and connect as
-usual. A refused request gets a 403 that names the flag to add.
+A session's WebSocket, its ssh and its lanes start together and end together; the page
+shows why a session ended, and clicking it starts a new one. Nothing reconnects by
+itself.
+
+### `voxl attach` and `voxl files`
+
+The relay runs these over ssh; you don't run them yourself. `voxl attach [--runtime
+DIR]` joins its stdin and stdout to the daemon's control socket for one session. `voxl
+files list|get|put` serves one request of the Files panel, confined to the folder the
+daemon's hello names, so a transfer never queues behind the stream or in front of it.
 
 ### For agents and scripts
 
-Screenshots and recordings (start voxl with `VOXL_PASSWORD` set, and send it along):
+Screenshots, recordings and the daemon's numbers come over ssh too, through the daemon's
+control socket, each command one run:
 
 ```sh
 # the screen as a PNG
-curl -u ":$VOXL_PASSWORD" -o shot.png localhost:6901/screenshot
+ssh desktop voxl screenshot > shot.png
 # an MP4 of the next 10 s
-curl -u ":$VOXL_PASSWORD" -o clip.mp4 "localhost:6901/record?seconds=10"
-# or start...
-id=$(curl -u ":$VOXL_PASSWORD" -s -X POST localhost:6901/record/start | jq .id)
-# ...and stop when done
-curl -u ":$VOXL_PASSWORD" -o clip.mp4 -X POST "localhost:6901/record/stop?id=$id"
+ssh desktop voxl record --seconds 10 > clip.mp4
+# or until its stdin ends (Ctrl-D in a terminal, or the end of a script's input)
+ssh desktop voxl record > clip.mp4
+# what the daemon is doing, as JSON
+ssh desktop voxl stats
 ```
 
-A recording is the H.264 voxl already sends to viewers, saved as MP4 without encoding
-it again, so it costs no extra CPU. It doesn't include the cursor (viewers draw it), and
-a resize ends it.
-
-`/wait` returns when the screen settles or changes, so an agent doesn't have to sleep
-after every action and hope it was long enough:
-
-```sh
-# once nothing changed for 300 ms
-curl -u ":$VOXL_PASSWORD" localhost:6901/wait
-# still for 1 s, giving up after 30 s
-curl -u ":$VOXL_PASSWORD" "localhost:6901/wait?idle=1000&timeout=30000"
-# the first change in that rectangle
-curl -u ":$VOXL_PASSWORD" "localhost:6901/wait?change&region=0,0,800,600"
-# {"changed":true,"timed_out":false,"seq":812,"waited_ms":340}
-```
-
-`idle` (ms, default 300) is how long the screen has to stay still, counted from the
-request at the earliest so an action just taken has time to show; `change` returns at
-the first change instead. `region=x,y,w,h` only watches that rectangle (to the 16-pixel
-block) and `timeout` (ms, default 10000) gives up. `changed` says whether anything
-changed while waiting. A change can land before the request does, so to wait for what an
-action caused, pass `since` the `seq` of an earlier `/wait` or the `X-Voxl-Seq` header of
-a screenshot: `/wait?change&since=812` returns at once if anything changed after it. A
-blinking text caret redraws about twice a second, so keep `idle` under 500 ms or leave
-the caret out of `region`. voxl already knows which parts of the screen change (XDamage,
-ScreenCaptureKit and DXGI report them), so waiting needs no screenshots or polling.
-
-### macOS
-
-voxl also streams a Mac's own screen, with every feature of the Linux version
-(ScreenCaptureKit capture, CGEvent input, NSPasteboard clipboard, system audio).
-
-With multiple displays, the toolbar's Display picker changes the captured monitor.
-All viewers follow the selection and reconnect automatically; read-only viewers
-cannot change it. `--display` still selects the initial monitor. The list refreshes
-when capture rebuilds; restart voxl to discover newly attached displays.
-
-```sh
-brew install x264 opus pkgconf esbuild
-cargo build --release
-./target/release/voxl --port=6901
-```
-
-Open the link it prints. On a Mac voxl listens on `127.0.0.1` unless `--addr` says
-otherwise, since the stream is your whole screen. macOS asks voxl (or the terminal that
-starts it) for Screen Recording and Accessibility permissions. For the microphone,
-install a loopback device (`brew install blackhole-2ch`) and pick it as the input in the
-apps that should hear you.
-
-| macOS flag             | Default                             |                                                                                        |
-| ---------------------- | ----------------------------------- | -------------------------------------------------------------------------------------- |
-| `--display`            | main display                        | display to stream: an index (0 is the main display) or a display ID; logged at startup |
-| `--capture-scale`      | native, within the budget           | streamed pixels per point                                                              |
-| `--max-capture-pixels` | `4096000` (2560x1600)               | pixel budget for the automatic scale: x264's cost grows with area                      |
-| `--microphone-device`  | first loopback device found         | output device (name or prefix) to play the browser microphone into                     |
-| `--resize-scale`       | the capture scale                   | so a viewer's window maps to the same number of points on the Mac                      |
-| `--show-cursor`        | `false` (`true` with `--read-only`) | include the host cursor in the video stream (for viewers/observers)                    |
-
-The other flags work as on Linux; `--audio-device-name`, `--microphone-fifo` and the
-rounded-corner flags don't apply.
-
-### Windows
-
-voxl also streams a Windows desktop (Windows 10 or later), with every feature of the
-Linux version (DXGI Desktop Duplication capture, SendInput, clipboard text and images,
-WASAPI system audio). Build it with Rust, [vcpkg](https://vcpkg.io), LLVM (for bindgen)
-and esbuild:
-
-```powershell
-vcpkg install x264 libyuv opus --triplet x64-windows-static-md
-$env:VCPKGRS_TRIPLET = 'x64-windows-static-md'
-npm install -g esbuild
-cargo build --release
-.\target\release\voxl.exe --port=6901
-```
-
-Open the link it prints. As on a Mac, voxl listens on `127.0.0.1` unless `--addr` says
-otherwise. It streams the desktop of the session it runs in, so start it in the user's
-session (not as a service); Windows hides the lock screen and UAC prompts from it unless
-it runs as SYSTEM. For the microphone, install a virtual audio cable
-([VB-CABLE](https://vb-audio.com/Cable/)): voxl plays into "CABLE Input" and apps record
-from "CABLE Output".
-
-| Windows flag          | Default                   |                                                                    |
-| --------------------- | ------------------------- | ------------------------------------------------------------------ |
-| `--display`           | primary display           | display to stream, by index (0 is the primary); logged at startup  |
-| `--audio-device-name` | default output device     | output device (name or prefix) whose sound to stream               |
-| `--microphone-device` | first virtual cable found | output device (name or prefix) to play the browser microphone into |
-| `--resize-scale`      | the display's scaling     | so a viewer's window maps to the same size on the desktop          |
-
-The other flags work as on Linux; `--microphone-fifo` and the rounded-corner flags don't
-apply. Dynamic resolution picks the largest display mode that fits the viewer's window,
-and Windows restores the original mode when voxl exits.
-
-### HTTPS
-
-`--tls-cert` and `--tls-key` serve HTTPS with a PEM certificate chain and key you
-provide. `--tls` on its own makes a self-signed certificate on first start and reuses it
-after that, so each browser asks to trust it only once. It's kept in `VOXL_TLS_DIR` if
-set, otherwise `%LOCALAPPDATA%\voxl` on Windows or `~/.config/voxl` elsewhere, and names
-`localhost`, the machine's host name, the `--addr` address and the `--allowed-hosts`
-names; delete it to make a new one. Over HTTPS, open `https://`: a browser that asks for
-`http://` on the same port gets an invalid response.
-
-```sh
-voxl --addr=0.0.0.0 --tls
-```
+A recording is the H.264 voxl already encodes, saved as MP4 without encoding it again,
+so it costs almost no CPU. It doesn't include the cursor (viewers draw it), and a restart
+of the stream (a resize) or five minutes ends it. Each command
+takes `--runtime DIR`, as `voxl attach` does, for a daemon whose runtime folder is not
+`/run/voxl`.
 
 ## FAQ
 
-**Why a WebSocket and not WebRTC?** One WebSocket goes wherever a web page does: through
-reverse proxies, tunnels and sandbox preview URLs, with no TURN servers or UDP ports to
-open. The browser decodes each frame the moment it arrives with WebCodecs, without
-WebRTC's jitter buffer, and voxl runs its own rate control, which keeps latency low on a
-clean link. The trade-off is TCP: on a link that drops packets (bad Wi-Fi, a weak mobile
-signal) a lost packet holds up the frames behind it, where WebRTC can skip ahead.
+**Why lanes and a code, and not one TCP connection?** On a link that loses packets, a
+lost packet holds up everything behind it on a TCP connection until it is resent, a
+round trip or more later. voxl sends each frame with repairs sized to the losses the
+reports show, so a frame is rebuilt from what arrived by its deadline, and a frame that
+misses is replaced by the next instead of waited for. The page still talks to one
+WebSocket, on 127.0.0.1, and the browser decodes each update the moment it arrives with
+WebCodecs.
 
 **How is it different from Moonlight and Sunshine?** They're for playing games on your
 own GPU machine through the Moonlight app, and for that they're the better fit. voxl was
 built for things like software factories that use headless VMs and sandboxes (CI,
-computer-use agents), usually on Xvfb with no GPU. It streams them to a plain browser tab
-over one WebSocket and has APIs for agents.
+computer-use agents), usually on Xvfb with no GPU, reached over ssh. It streams them to
+a plain browser tab, across links that lose packets.
 
 **How is it different from RustDesk?** RustDesk is an open-source alternative to
 TeamViewer and AnyDesk, for reaching your own computers or helping someone with theirs:
 you install its app on both ends, desktop or phone, and the two find each other through
 an ID server, then connect directly or through a relay. For that it's the better fit,
 and it also shares Wayland desktops (experimentally) and Android phones, which voxl
-doesn't. voxl is for desktops on servers, VMs and sandboxes: it's one process that
-serves its own page, so there's nothing to install on the viewing side and no ID or
-relay server to run. The stream goes wherever a URL does, can be embedded in another
-page and comes with the APIs agents use. RustDesk has a web client too, but it still
-goes through the ID and relay servers, and the self-hosted one comes with RustDesk
-Server Pro.
+doesn't. voxl is for desktops on servers and VMs reached over ssh: there is no ID server,
+and the viewer's side is one binary that serves its own page.
 
-**Why doesn't the stream load at `http://<ip>:6901`?** Browsers only allow WebCodecs on
-HTTPS pages and on localhost. To watch from another machine, start voxl with `--tls`
-(see [HTTPS](#https)), put it behind a TLS proxy (Caddy, Cloudflare Tunnel,
-`tailscale serve`) and name its host with `--allowed-hosts`, or forward the port over
-SSH and open `localhost`.
-
-**Is it safe to expose?** voxl asks for a password by default but serves plain HTTP
-unless `--tls` or `--tls-cert` is given, so serve it over HTTPS away from localhost. See
+**Is it safe to expose?** The daemon listens on no network port: its sockets are unix
+sockets, the control socket takes only the daemon's own user, and a lane counts only
+with the session's capability, which only that session's ssh channel ever carried. ssh is
+the door, so whoever can ssh in as that user gets the desktop. See
 [SECURITY.md](SECURITY.md).
 
-**Which browsers and devices work?** Any browser with WebCodecs, on an HTTPS page or
-localhost:
-
-| Browser                                                                | Works |
-| ---------------------------------------------------------------------- | ----- |
-| Chrome, Edge and other Chromium browsers 94+, desktop and Android      | Yes   |
-| Firefox 130+, desktop                                                  | Yes   |
-| Safari 16.4+ and any browser on iPhone or iPad (sound needs Safari 26) | Yes   |
-| Firefox for Android                                                    | No    |
-
-Phones and tablets get touch input (tap to click, drag, long press to right click, pinch
-to zoom, two fingers to move around a zoomed-in view and scroll) and an on-screen
-keyboard.
+**Which browsers and devices work?** A current Chrome or Edge on a desktop, with a mouse
+or trackpad. The page needs WebCodecs video and audio, MediaStreamTrackGenerator,
+ClipboardItem and the Keyboard Lock API, and a browser without one of them is told which
+it lacks, rather than run without it. Firefox, Safari and phones are not supported.
 
 **Wayland?** Not yet; on Linux voxl streams X11 displays, Xvfb included. The virtual
 desktops voxl is built for run on Xvfb (E2B's and Daytona's do too), and X11 lets voxl
 capture them without a permission prompt, with damage events that keep a still screen at
-no CPU and power `/wait`. Wayland support is being worked on.
+no CPU. Wayland support is being worked on.
 
 **Does it use the GPU?** Not yet. voxl encodes H.264 on the CPU with x264: 1.3–1.7 cores
-for a busy 2560x1600 desktop, X server included (see the CPU table above). Hardware
-encoding on macOS is in progress.
+for a busy 2560x1600 desktop, X server included (see the CPU table above).
 
 **What's the license?** voxl's code is MIT. It links x264, which is GPL-2.0, so a voxl
 binary, and anything that bundles one, is distributed under the GPL.

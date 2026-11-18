@@ -4,12 +4,12 @@
 	"extends": "./tsconfig.base.json",
 	"compilerOptions": {
 		"lib": ["ES2022", "WebWorker"],
-		"allowImportingTsExtensions": true,
-		"resolveJsonModule": true
+		"allowImportingTsExtensions": true
 	},
 	"include": [
 		"src/worker.ts",
 		"src/protocol.ts",
+		"src/wire.json",
 		"src/video-header.test.ts",
 		"src/frames.test.ts"
 	]

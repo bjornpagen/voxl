@@ -1,170 +1,332 @@
-//! voxl: low-latency desktop streaming (H.264 over WebSocket) for the browser, from an
-//! X11 display on Linux or the screen of a Mac or a Windows machine.
+//! voxl: low-latency desktop streaming for the browser, from an X11 display on Linux. The
+//! daemon codes the desktop as H.264 and sends it, with its audio, over a session's lanes;
+//! `voxl attach` (run over ssh) is a session's control stream; `voxl relay` on the viewer's
+//! machine serves the page and joins the two. The daemon runs on Linux alone; elsewhere
+//! `voxl` is the relay, and the daemon's platform-free core is built there for its tests.
 //!
 //! The `voxl` binary calls [`run`] with its command line; other programs (the Tembo CLI's
-//! `tembo voxl`) embed the server the same way.
+//! `tembo voxl`) embed it the same way.
 
-mod access;
-#[cfg(all(target_os = "linux", feature = "pulseaudio"))]
+#[cfg(target_os = "linux")]
 mod audio;
 #[cfg(target_os = "linux")]
 mod capture;
-mod clipboard;
+#[cfg(any(target_os = "linux", test))]
 mod convert;
 #[cfg(target_os = "linux")]
-mod corners;
-#[cfg(target_os = "linux")]
 mod desktop;
+#[cfg(any(target_os = "linux", test))]
 mod encoder;
 mod env;
+#[cfg(any(target_os = "linux", test))]
 mod event;
 mod files;
+#[cfg(any(target_os = "linux", test))]
 mod help;
+#[cfg(any(target_os = "linux", test))]
 mod hub;
 #[cfg(target_os = "linux")]
 mod input;
+pub mod lanes;
 mod logging;
-mod login;
-#[cfg(target_os = "macos")]
-mod mac;
+#[cfg(target_os = "linux")]
 mod mic;
+#[cfg(any(target_os = "linux", test))]
 mod mp4;
-#[cfg(test)]
-mod oracle;
+#[cfg(any(target_os = "linux", test))]
 mod path;
-mod rate;
+#[cfg(any(target_os = "linux", test))]
 mod record;
+mod relay;
 #[cfg(target_os = "linux")]
 mod screen;
-mod server;
-mod timeline;
-mod tls;
+#[cfg(any(target_os = "linux", test))]
+mod session;
+#[cfg(any(target_os = "linux", test))]
+mod sound;
+#[cfg(any(target_os = "linux", test))]
 mod video;
-mod wait;
-#[cfg(windows)]
-mod win;
-mod window;
 #[cfg(test)]
 mod xorshift;
 
-// The macOS and Windows backends provide the same modules with the same interfaces.
-#[cfg(target_os = "macos")]
-use mac::{audio, capture, desktop, input, screen};
-#[cfg(windows)]
-use win::{audio, capture, desktop, input, screen};
-
+#[cfg(any(target_os = "linux", test))]
 use std::collections::HashMap;
 
-/// Parses `--key=value` / `--key value` / `--flag`; unknown options are accepted so the
-/// binary can take the same argument list as the Python selkies service it replaces.
-fn parse_args(args: impl IntoIterator<Item = String>) -> HashMap<String, String> {
+/// A daemon flag: its name, the value it has when it is not given (parsed as a given one
+/// is), and what it is, as `voxl --help` says.
+#[cfg(any(target_os = "linux", test))]
+struct Flag {
+    name: &'static str,
+    default: &'static str,
+    says: &'static str,
+}
+
+/// The daemon's flags, every one it reads: anything else on its command line is a typed
+/// error at startup, not a flag quietly ignored. Production sets the runtime folder and
+/// the scale; the bench turns the desktop's audio off where no sound server runs.
+#[cfg(any(target_os = "linux", test))]
+const FLAGS: [Flag; 3] = [RUNTIME, RESIZE_SCALE, AUDIO_ENABLED];
+
+/// The folder of the daemon's sockets and its microphone FIFO, which `voxl attach` and
+/// the queries take too: the one the host makes at boot.
+#[cfg(any(target_os = "linux", test))]
+const RUNTIME: Flag = Flag {
+    name: "runtime",
+    default: "/run/voxl",
+    says: "the folder of the sockets and the microphone FIFO",
+};
+
+/// A 144 DPI desktop, apps drawn at 1.5x, shows windows as big as the viewer's: a
+/// choice, set to 2 for a retina viewer.
+#[cfg(any(target_os = "linux", test))]
+const RESIZE_SCALE: Flag = Flag {
+    name: "resize-scale",
+    default: "1.5",
+    says: "desktop pixels per CSS pixel of the viewer's window",
+};
+
+#[cfg(any(target_os = "linux", test))]
+const AUDIO_ENABLED: Flag = Flag {
+    name: "audio-enabled",
+    default: "true",
+    says: "desktop audio, true or false",
+};
+
+/// A command line the daemon or a subcommand does not take.
+#[derive(Debug, PartialEq)]
+#[cfg(any(target_os = "linux", test))]
+enum FlagError {
+    /// A word that is no `--flag`.
+    NotAFlag(String),
+    /// A flag no one reads.
+    Unknown(String),
+    /// A flag given a value it cannot take.
+    Malformed {
+        flag: &'static str,
+        value: String,
+        takes: &'static str,
+    },
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl std::fmt::Display for FlagError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FlagError::NotAFlag(w) => write!(f, "{w:?}: not a flag"),
+            FlagError::Unknown(k) => write!(f, "--{k}: no such flag (voxl --help lists them)"),
+            FlagError::Malformed { flag, value, takes } => {
+                write!(f, "--{flag} {value:?}: takes {takes}")
+            }
+        }
+    }
+}
+
+/// Parses `--key=value` / `--key value` / `--flag` (a flag alone is `true`), each key one
+/// of `known`; a key that is not, or a word that is no flag, is the error.
+#[cfg(any(target_os = "linux", test))]
+fn parse_args(
+    args: impl IntoIterator<Item = String>,
+    known: &[&'static str],
+) -> Result<HashMap<&'static str, String>, FlagError> {
     let mut m = HashMap::new();
     let args: Vec<String> = args.into_iter().collect();
     let mut i = 0;
     while i < args.len() {
-        let a = &args[i];
-        if let Some(k) = a.strip_prefix("--") {
-            if let Some((k, v)) = k.split_once('=') {
-                m.insert(k.replace('_', "-"), v.to_string());
-            } else if i + 1 < args.len() && !args[i + 1].starts_with("--") {
-                m.insert(k.replace('_', "-"), args[i + 1].clone());
+        let Some(k) = args[i].strip_prefix("--") else {
+            return Err(FlagError::NotAFlag(args[i].clone()));
+        };
+        let (k, v) = match k.split_once('=') {
+            Some((k, v)) => (k, v.to_string()),
+            None if i + 1 < args.len() && !args[i + 1].starts_with("--") => {
                 i += 1;
-            } else {
-                m.insert(k.replace('_', "-"), "true".into());
+                (k, args[i].clone())
             }
-        }
+            None => (k, "true".into()),
+        };
+        let Some(&known) = known.iter().find(|&&n| n == k) else {
+            return Err(FlagError::Unknown(k.to_string()));
+        };
+        m.insert(known, v);
         i += 1;
     }
-    m
+    Ok(m)
 }
 
-/// Selkies ranges look like "60-60"; take the upper bound.
-fn range_max(v: Option<&String>, default: f64) -> f64 {
-    v.and_then(|s| s.rsplit('-').next()?.trim().parse().ok())
-        .unwrap_or(default)
+/// What the daemon's flags say, each parsed, given or by its default.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, PartialEq)]
+struct Flags {
+    /// The runtime folder, as given: judged when the daemon starts.
+    runtime: std::path::PathBuf,
+    /// Desktop pixels per CSS pixel of the viewer's window: finite, over 0.
+    resize_scale: f64,
+    audio: session::control::Audio,
 }
 
-/// A rate flag's value in whole kbit/s: a number, or a Selkies range of two numbers from
-/// low to high, whose upper bound is the rate. Anything else is no rate.
-fn whole_kbps(v: &str) -> Option<u32> {
-    let whole = |s: &str| s.trim().parse::<u32>().ok();
-    match v.split_once('-') {
-        None => whole(v),
-        Some((low, high)) => whole(low)
-            .zip(whole(high))
-            .and_then(|(low, high)| (low <= high).then_some(high)),
+#[cfg(any(target_os = "linux", test))]
+impl Flags {
+    fn parse(args: impl IntoIterator<Item = String>) -> Result<Flags, FlagError> {
+        let names = FLAGS.map(|f| f.name);
+        let given = parse_args(args, &names)?;
+        let value = |flag: &Flag| -> (&'static str, &str) {
+            (
+                flag.name,
+                given.get(flag.name).map_or(flag.default, String::as_str),
+            )
+        };
+        Ok(Flags {
+            runtime: folder(value(&RUNTIME))?,
+            resize_scale: {
+                let (flag, v) = value(&RESIZE_SCALE);
+                v.parse::<f64>()
+                    .ok()
+                    .filter(|s| s.is_finite() && *s > 0.0)
+                    .ok_or_else(|| FlagError::Malformed {
+                        flag,
+                        value: v.into(),
+                        takes: "a number of pixels over 0",
+                    })?
+            },
+            audio: {
+                use session::control::Audio;
+                match value(&AUDIO_ENABLED) {
+                    (_, "true") => Audio::Sent,
+                    (_, "false") => Audio::Off,
+                    (flag, v) => {
+                        return Err(FlagError::Malformed {
+                            flag,
+                            value: v.into(),
+                            takes: "true or false",
+                        })
+                    }
+                }
+            },
+        })
     }
 }
 
-/// A rate flag in whole kbit/s; `default` when it is not given.
-fn rate_flag(flag: &str, v: Option<&String>, default: u32) -> Result<u32, String> {
-    let Some(v) = v else {
-        return Ok(default);
-    };
-    whole_kbps(v).ok_or_else(|| {
-        format!("--{flag} {v:?}: not a whole number of kbit/s, or a range of two from low to high")
+/// A folder's path: any but none.
+#[cfg(any(target_os = "linux", test))]
+fn folder((flag, v): (&'static str, &str)) -> Result<std::path::PathBuf, FlagError> {
+    match v {
+        "" => Err(FlagError::Malformed {
+            flag,
+            value: v.into(),
+            takes: "a folder's path",
+        }),
+        path => Ok(path.into()),
+    }
+}
+
+/// The runtime folder at `dir`, if it is one this user may trust; else the daemon or its
+/// subcommand ends with status 2, saying why.
+#[cfg(target_os = "linux")]
+fn runtime(dir: std::path::PathBuf) -> session::Runtime {
+    session::Runtime::open(dir.clone()).unwrap_or_else(|e| {
+        eprintln!("voxl: --runtime {}: {e}", dir.display());
+        std::process::exit(2)
     })
 }
 
-/// `--preset`: a preset x264 has, `ultrafast` when not given. x264 is asked here, where
-/// the flag is read, so a name it does not have starts nothing.
-fn preset(flag: Option<&String>) -> Result<encoder::Preset, String> {
-    let name = flag.map_or("ultrafast", String::as_str);
-    encoder::Preset::parse(name).ok_or_else(|| format!("--preset {name}: x264 has no such preset"))
-}
-
-/// The most frames a second when `--framerate` is not given, or is not a number:
-/// upstream's default.
-const FRAMERATE: encoder::Fps = encoder::Fps::new(60).unwrap();
-
-/// `--framerate` (or a Selkies range, whose upper bound is the rate): the most frames a
-/// second, 1 to `Fps::MAX`. Under one (0, or a fraction of one) the capture loop would
-/// space its frames an endless time apart; from 2^30 up, four frames' worth of the rate
-/// no longer fits the VBV buffer's arithmetic. Both stopped the server; now neither
-/// starts it.
-fn framerate(v: Option<&String>) -> Result<encoder::Fps, String> {
-    let Some(v) = v else {
-        return Ok(FRAMERATE);
-    };
-    encoder::Fps::new(range_max(Some(v), FRAMERATE.get() as f64) as u32).ok_or_else(|| {
-        format!(
-            "--framerate {v:?}: not 1 to {} frames a second",
-            encoder::Fps::MAX
-        )
-    })
-}
-
-/// `--min-kbps` and `--max-kbps` (or Selkies' `--video-bitrate`), read together: what a
-/// viewer's path is taken to carry, at least and at most; 0 and 30000 kbit/s when not
-/// given. A floor of 0 is a packet in the window's `LATENESS`: 2000 kbit/s, the floor
-/// before, is 15 KB in it, three times what a slow link was measured to carry. A ceiling
-/// of 0 is none: a path is taken to carry as much as its frames show, and encoders open
-/// without a rate cap.
-fn bounds(min: Option<&String>, max: Option<&String>) -> Result<rate::Bounds, String> {
-    let floor = rate_flag("min-kbps", min, 0)?;
-    let ceiling = rate_flag("max-kbps", max, 30000)?;
-    let kbps = |kbps: u32| path::Kbps::new(kbps as f64);
-    Ok(rate::Bounds::new(
-        kbps(floor),
-        (ceiling > 0).then(|| kbps(ceiling)),
-    ))
-}
-
-pub(crate) fn truthy(v: Option<&String>, default: bool) -> bool {
-    v.map(|s| matches!(s.as_str(), "true" | "1" | "yes" | "on"))
-        .unwrap_or(default)
-}
-
-/// Runs the server with these command-line flags (without the program name) until it's
-/// told to stop. Takes over the calling thread, which on macOS has to be the main thread.
+/// Runs voxl with these command-line arguments (without the program name) until it is
+/// told to stop: on Linux the daemon or one of its subcommands, elsewhere the relay alone.
 pub fn run(args: impl IntoIterator<Item = String>) {
     let args: Vec<String> = args.into_iter().collect();
+    no_core_dumps();
+    #[cfg(target_os = "linux")]
+    match args.first().map(String::as_str) {
+        Some("attach") => session::attach::run(&control(&args[1..], &["runtime"]).0),
+        Some("stats") => {
+            let (control, _) = control(&args[1..], &["runtime"]);
+            session::query::run(session::query::Query::Stats, &control)
+        }
+        Some("screenshot") => {
+            let (control, _) = control(&args[1..], &["runtime"]);
+            session::query::run(session::query::Query::Screenshot, &control)
+        }
+        Some("record") => {
+            use session::query::{Query, Recording};
+            let (control, a) = control(&args[1..], &["runtime", "seconds"]);
+            let until = match a.get("seconds").map(|s| s.parse::<std::num::NonZeroU32>()) {
+                None => Recording::UntilClosed,
+                Some(Ok(s)) => Recording::Seconds(s),
+                Some(Err(_)) => {
+                    eprintln!("voxl record: --seconds: a whole number of seconds over 0");
+                    std::process::exit(2)
+                }
+            };
+            session::query::run(Query::Record(until), &control)
+        }
+        Some("files") => files::run(&args[1..]),
+        Some("relay") => relay::run(&args[1..]),
+        _ => daemon(args),
+    }
+    #[cfg(not(target_os = "linux"))]
+    match args.first().map(String::as_str) {
+        Some("relay") => relay::run(&args[1..]),
+        _ => {
+            eprintln!("voxl: here only `voxl relay ...`: the daemon runs on Linux");
+            std::process::exit(2)
+        }
+    }
+}
+
+/// A subcommand's flags, of `known`, and the daemon's control socket in the runtime
+/// folder they name (`--runtime`, the daemon's default when not given): a flag it does not
+/// know, an empty path, or a folder it may not trust ends it with status 2.
+#[cfg(target_os = "linux")]
+fn control(
+    args: &[String],
+    known: &[&'static str],
+) -> (std::path::PathBuf, HashMap<&'static str, String>) {
+    let parsed = parse_args(args.iter().cloned(), known).and_then(|a| {
+        let dir = folder((
+            RUNTIME.name,
+            a.get(RUNTIME.name).map_or(RUNTIME.default, String::as_str),
+        ))?;
+        Ok((dir, a))
+    });
+    let (dir, a) = parsed.unwrap_or_else(|e| {
+        eprintln!("voxl: {e}");
+        std::process::exit(2)
+    });
+    (runtime(dir).control(), a)
+}
+
+/// No core dump is written of this process, of any of its subcommands: a dump of the
+/// daemon or of `voxl attach` would hold a session's capability.
+fn no_core_dumps() {
+    let none = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: setrlimit reads the struct it is given and nothing else.
+    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &none) } != 0 {
+        eprintln!(
+            "voxl: core dumps cannot be turned off ({}): a dump could hold a capability",
+            std::io::Error::last_os_error()
+        );
+        std::process::exit(1)
+    }
+}
+
+/// Runs the daemon with these flags until it is told to stop.
+#[cfg(target_os = "linux")]
+fn daemon(args: Vec<String>) {
     // --help and --version print and return instead of starting the server.
     if help::print_if_asked(&args) {
         return;
     }
-    let a = parse_args(args);
+    let flags = Flags::parse(args).unwrap_or_else(|e| {
+        eprintln!("voxl: {e}");
+        std::process::exit(2)
+    });
+    let runtime = runtime(flags.runtime.clone());
     let env = env::Env::read(|name| std::env::var_os(name));
+    let desktop = env::Desktop::read(|name| std::env::var_os(name)).unwrap_or_else(|e| {
+        eprintln!("voxl: {e}");
+        std::process::exit(2)
+    });
     // What env_logger::Builder::from_env does with RUST_LOG and RUST_LOG_STYLE, from Env.
     let mut log = env_logger::Builder::new();
     log.parse_filters(&env.log.filter);
@@ -174,9 +336,6 @@ pub fn run(args: impl IntoIterator<Item = String>) {
     // x264 says what VOXL_X264_INFO asks of it (its own level), and all of that is written.
     log.filter_module("x264", log::LevelFilter::Debug);
     logging::init(log.build());
-    if let Some(refused) = &env.refused {
-        log::error!("{refused}");
-    }
     // A panic on any thread ends the process, as in voxl's own release build (panic = "abort"),
     // rather than leaving the server up without that thread when the embedder unwinds.
     #[cfg(panic = "unwind")]
@@ -191,603 +350,241 @@ pub fn run(args: impl IntoIterator<Item = String>) {
         .worker_threads(2)
         .enable_all()
         .build()
-        .expect("tokio runtime");
-    // AppKit and the keyboard layout APIs want the main thread, so on macOS it runs the
-    // main dispatch queue and the server runs beside it.
-    #[cfg(target_os = "macos")]
-    {
-        std::thread::spawn(move || rt.block_on(serve(a, env)));
-        dispatch2::dispatch_main();
-    }
-    #[cfg(not(target_os = "macos"))]
-    rt.block_on(serve(a, env));
+        .unwrap_or_else(|e| {
+            log::error!("the daemon's runtime: {e}");
+            logging::exit(1)
+        });
+    rt.block_on(serve(flags, runtime, desktop));
 }
 
-async fn serve(a: HashMap<String, String>, env: env::Env) {
-    // macOS: --display picks a screen (index or display ID); DISPLAY there belongs to XQuartz.
-    #[cfg(target_os = "linux")]
-    let display = env.display.or_else(|| a.get("display").cloned());
-    #[cfg(not(target_os = "linux"))]
-    let display = a.get("display").cloned();
-    #[cfg(target_os = "macos")]
-    mac::init(&a);
-    #[cfg(windows)]
-    win::init(&a);
-    // A Mac's or a PC's own screen is only served locally unless --addr says otherwise;
-    // a VM's X11 display sits behind the platform's proxy.
-    let default_addr = if cfg!(not(target_os = "linux")) {
-        "127.0.0.1"
-    } else {
-        "0.0.0.0"
-    };
-    let addr = a
-        .get("addr")
-        .cloned()
-        .unwrap_or_else(|| default_addr.into());
-    let port: u16 = a.get("port").and_then(|p| p.parse().ok()).unwrap_or(6901);
-    let ncpu = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4) as u32;
-    let max = a.get("max-kbps").or(a.get("video-bitrate"));
-    let bounds = bounds(a.get("min-kbps"), max).unwrap_or_else(|e| {
-        log::error!("{e}");
-        logging::exit(1);
-    });
-    let preset = preset(a.get("preset")).unwrap_or_else(|e| {
-        log::error!("{e}");
-        logging::exit(1);
-    });
-    let fps = framerate(a.get("framerate")).unwrap_or_else(|e| {
-        log::error!("{e}");
-        logging::exit(1);
-    });
-    let vcfg = video::VideoConfig {
-        display: display.clone(),
-        #[cfg(target_os = "macos")]
-        enable_resize: truthy(a.get("enable-resize"), false) && !truthy(a.get("read-only"), false),
-        fps,
-        preset,
-        // Four sliced threads: lower latency than one, and x264's slicing overhead grows
-        // with thread count, so more threads only add CPU (measured on 2560x1600).
-        threads: a
-            .get("encoder-threads")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or((ncpu / 4).clamp(1, 4)),
-        convert_threads: a
-            .get("convert-threads")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(4),
-        crf: range_max(a.get("crf"), 24.0) as f32,
-        bounds,
-        paintover_crf: range_max(a.get("paintover-crf"), 16.0) as f32,
-        paintover_delay_ms: range_max(a.get("paintover-delay-ms"), 150.0) as u64,
-        stripes: range_max(a.get("stripes"), 1.0) as u32,
-        coalesce: std::time::Duration::from_micros(range_max(a.get("coalesce-us"), 0.0) as u64),
-        debug: env.debug,
-    };
-    let clip = a
-        .get("enable-clipboard")
-        .map(|s| s.as_str())
-        .unwrap_or("true");
-    let clip_mode = desktop::ClipboardMode {
-        to_server: matches!(clip, "true" | "in"),
-        to_client: matches!(clip, "true" | "out"),
-    };
-    let audio_on = truthy(a.get("audio-enabled"), true);
-    #[cfg(all(target_os = "linux", not(feature = "pulseaudio")))]
-    let audio_on = audio_on && {
-        log::info!("desktop audio off: this voxl was built without PulseAudio");
-        false
-    };
+/// Where the shared folder's panel opens and uploads go, under the root: made on the
+/// first upload.
+#[cfg(target_os = "linux")]
+const UPLOAD_DIR: &str = "Downloads";
 
-    let hub = hub::Hub::new(bounds.paths());
-    // --read-only: the viewer watches the desktop, it does not drive it. Only the
-    // commands watching needs are accepted (see server::READ_ONLY_COMMANDS), uploads
-    // are refused, and the page hides the controls that would send anything else.
-    let read_only = truthy(a.get("read-only"), false);
-    // --enable-resize (as in selkies): clients resize the desktop to their window. Not
-    // for read-only viewers: a new size changes the desktop for everyone.
-    let enable_resize = truthy(a.get("enable-resize"), false);
-    if enable_resize && read_only {
-        log::warn!("--enable-resize is ignored with --read-only: viewers can't resize the desktop");
-    }
-    let screen = (enable_resize && !read_only)
-        .then(|| match screen::Screen::open(display.as_deref()) {
-            Ok(s) => {
-                log::info!("dynamic resolution on, up to {}x{}", s.max().0, s.max().1);
-                Some(s)
-            }
-            Err(e) => {
-                log::warn!("dynamic resolution unavailable: {e}");
-                None
-            }
-        })
-        .flatten();
-    let resize_on = screen.is_some();
-    // Desktop pixels per CSS pixel of the viewer's window. The default matches a
-    // 144 DPI desktop (apps drawn at 1.5x), so windows look as big as in the viewer;
-    // on a Mac, the capture's pixels per point.
-    #[cfg(target_os = "linux")]
-    let default_scale = 1.5;
-    #[cfg(target_os = "macos")]
-    let default_scale = mac::capture_scale();
-    // On Windows, the display's scaling (150% -> 1.5).
-    #[cfg(windows)]
-    let default_scale = win::dpi_scale();
-    let resize_scale = range_max(a.get("resize-scale"), default_scale);
+/// The longest recording `voxl record` makes. Provisional: five minutes of a screen's
+/// H.264, upstream's bound since recordings came, unmeasured; what would measure it is
+/// the memory a recording of the busiest screen holds at its end.
+#[cfg(target_os = "linux")]
+const MAX_RECORD: std::time::Duration = std::time::Duration::from_secs(300);
+
+#[cfg(target_os = "linux")]
+async fn serve(flags: Flags, runtime: session::Runtime, env: env::Desktop) {
+    let display = env.display.clone();
+    let hub = hub::Hub::new().unwrap_or_else(|e| {
+        log::error!("the hub's waker: {e}");
+        logging::exit(1)
+    });
+    // The desktop follows the viewer's window where the X server can change its size;
+    // where it cannot, the desktop keeps its size, and the viewer is told so.
+    let screen = match screen::Screen::open(&display) {
+        Ok(s) => {
+            log::info!("dynamic resolution on, up to {}x{}", s.max().0, s.max().1);
+            Some(s)
+        }
+        Err(e) => {
+            log::warn!("dynamic resolution unavailable, the desktop keeps its size: {e}");
+            None
+        }
+    };
+    let resize = match screen {
+        Some(_) => session::control::Resizing::Follows,
+        None => session::control::Resizing::Fixed,
+    };
+    // The cores this process may run on; one if the kernel will not say.
+    let cores = std::thread::available_parallelism().unwrap_or_else(|e| {
+        log::error!("the cores this daemon may use: {e}");
+        logging::exit(1)
+    });
+    let vcfg = video::VideoConfig::new(display.clone(), env.debug, cores);
     if let Err(e) = video::spawn(vcfg, hub.clone(), screen) {
         log::error!("video init failed: {e}");
         logging::exit(1);
     }
-    let radius = range_max(a.get("round-corners"), 0.0) as u16;
-    // --round-windows=title:radius,...: round specific windows (docks included) by title.
-    let named: Vec<(String, u16)> = a
-        .get("round-windows")
-        .map(|v| {
-            v.split(',')
-                .filter_map(|e| {
-                    e.rsplit_once(':')
-                        .and_then(|(n, r)| Some((n.to_string(), r.parse().ok()?)))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    if radius > 0 || !named.is_empty() {
-        #[cfg(target_os = "linux")]
-        if let Err(e) = corners::spawn(display.clone(), radius, named, env.debug) {
-            log::warn!("rounded corners unavailable: {e}");
-        }
-        #[cfg(not(target_os = "linux"))]
-        log::info!("--round-corners/--round-windows only apply to X11 desktops");
-    }
-    let clipboard = match desktop::spawn(display.clone(), hub.clone(), clip_mode) {
-        Ok(h) => Some(h),
-        Err(e) => {
-            log::error!("cursor/clipboard init failed: {e}");
-            None
-        }
-    };
-    let px_per_notch = range_max(a.get("scroll-px-per-notch"), 180.0);
-    match input::spawn(display.clone(), clipboard, px_per_notch, env.runtime_dir) {
-        Ok(tx) => *hub.input.lock() = Some(tx),
-        Err(e) => log::error!("input init failed: {e}"),
-    }
-    #[cfg(any(not(target_os = "linux"), feature = "pulseaudio"))]
-    if audio_on {
-        let dev = a
-            .get("audio-device-name")
-            .cloned()
-            .unwrap_or_else(|| "output.monitor".into());
-        let br = range_max(a.get("audio-bitrate"), 128000.0) as i32;
-        audio::spawn(dev, br, hub.clone());
-    }
-
-    // --file-transfers=upload,download (as in selkies); "none" turns both off.
-    let transfers = a
-        .get("file-transfers")
-        .cloned()
-        .unwrap_or_else(|| "upload,download".into());
-    let root = a
-        .get("files-root")
-        .cloned()
-        .or(env.home)
-        .unwrap_or_else(|| "/".into());
-    let root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.into());
-    let files = std::sync::Arc::new(files::Files {
-        root,
-        // Uploading writes to the desktop, so a read-only viewer does not get it.
-        upload: !read_only && transfers.split(',').any(|t| t.trim() == "upload"),
-        download: transfers.split(',').any(|t| t.trim() == "download"),
-        default_dir: a
-            .get("upload-dir")
-            .cloned()
-            .unwrap_or_else(|| "Downloads".into())
-            .trim_matches('/')
-            .to_string(),
-        max_upload_bytes: (range_max(a.get("max-upload-mb"), 0.0) * 1048576.0) as u64,
+    let clipboard = desktop::spawn(display.clone(), hub.clone()).unwrap_or_else(|e| {
+        log::error!("cursor and clipboard: {e}");
+        logging::exit(1)
     });
-    log::info!("file transfer: {transfers} under {}", files.root.display());
-    // --microphone-enabled (as in selkies): browser microphone -> a FIFO that a
-    // PulseAudio module-pipe-source reads as the VM's microphone, or on macOS an
-    // output device that loops back to an input (BlackHole and the like).
-    #[cfg(target_os = "linux")]
-    let mic_sink = Some(
-        a.get("microphone-fifo")
-            .cloned()
-            .unwrap_or_else(|| "/tmp/voxl-mic.fifo".into()),
-    );
-    #[cfg(target_os = "macos")]
-    let mic_sink = truthy(a.get("microphone-enabled"), false)
-        .then(|| mac::mic::find_device(a.get("microphone-device").map(|s| s.as_str())))
-        .flatten();
-    // Windows: a virtual audio cable's playback side (VB-CABLE and the like).
-    #[cfg(windows)]
-    let mic_sink = truthy(a.get("microphone-enabled"), false)
-        .then(|| win::mic::find_device(a.get("microphone-device").map(|s| s.as_str())))
-        .flatten();
-    let mic = truthy(a.get("microphone-enabled"), false)
-        .then_some(())
-        .and(mic_sink)
-        .map(|sink| mic::spawn(sink, hub.clone()));
+    match input::spawn(&display, clipboard, runtime.keymap()) {
+        Ok(tx) => *hub.input.lock() = Some(tx),
+        Err(e) => {
+            log::error!("input: {e}");
+            logging::exit(1)
+        }
+    }
+    let audio = flags.audio;
+    if audio == session::control::Audio::Sent {
+        audio::spawn(hub.clone());
+    }
+    // Canonical, and text: the hello names it to the page, and the relay hands it back.
+    let root = std::fs::canonicalize(&env.home)
+        .map_err(|e| e.to_string())
+        .and_then(|p| {
+            p.into_os_string()
+                .into_string()
+                .map_err(|p| format!("{p:?} is not text"))
+        });
+    let root = root.unwrap_or_else(|e| {
+        log::error!("the shared folder, $HOME {}: {e}", env.home.display());
+        logging::exit(1);
+    });
+    let files = hub::FilesConfig {
+        root,
+        dir: UPLOAD_DIR.into(),
+    };
+    log::info!("file transfer under {}", files.root);
+    let mic = mic::spawn(hub.clone(), runtime.mic());
     hub.settings.lock().start(
         hub::Startup {
-            audio: audio_on,
-            files: hub::FilesConfig {
-                dir: files.default_dir.clone(),
-                download: files.download,
-                upload: files.upload,
-            },
-            mic: mic.is_some(),
-            os: std::env::consts::OS,
-            read_only,
+            audio: audio == session::control::Audio::Sent,
+            files,
         },
-        resize_on.then_some(hub::Resize {
-            scale: resize_scale,
+        (resize == session::control::Resizing::Follows).then_some(hub::Resize {
+            scale: flags.resize_scale,
         }),
     );
-    // --favicon: the tab's icon (default: voxl's own).
-    let (favicon, favicon_type) = server::favicon(a.get("favicon").map(|s| s.as_str()))
-        .unwrap_or_else(|e| {
-            log::error!("{e}");
-            logging::exit(1);
-        });
-    let state = server::AppState {
+    let daemon = std::sync::Arc::new(session::control::Daemon {
         hub: hub.clone(),
-        audio: audio_on,
-        files,
+        audio,
         mic,
-        resize: enable_resize && !read_only,
-        read_only,
-        // GET /screenshot, /record; --max-record-seconds caps a recording's length.
-        recorder: record::Recorder::new(
-            hub.clone(),
-            std::time::Duration::from_secs_f64(range_max(a.get("max-record-seconds"), 300.0)),
-        ),
-        // --title: the browser tab's title.
-        index: server::index_html(
-            a.get("title")
-                .map_or("Voxl Computer Stream", |t| t.as_str()),
-        ),
-        favicon,
-        favicon_type,
-        debug: env.debug,
-    };
-    // --allowed-hosts and --allowed-origins: the host names and other sites voxl answers
-    // besides IP addresses, localhost and its own page (see access.rs).
-    let access = std::sync::Arc::new(access::Access::new(
-        a.get("allowed-hosts").map(|s| s.as_str()),
-        a.get("allowed-origins").map(|s| s.as_str()),
-    ));
-    // The login (see login.rs): a password, given or made up at startup, unless
-    // --enable-basic-auth=false.
-    let login = login::Login::from_args(&a, env.password)
-        .map(|(l, generated)| (std::sync::Arc::new(l), generated));
-    let mut app = server::router(state);
-    if let Some((l, _)) = &login {
-        app = app.layer(axum::middleware::from_fn_with_state(
-            l.clone(),
-            login::check,
-        ));
-    }
-    // Added last, so it runs first: a request for the wrong host or from another site's
-    // page is turned away before the login is asked for.
-    let app = app.layer(axum::middleware::from_fn_with_state(access, access::check));
-    // HTTPS (see tls.rs). A self-signed certificate names this machine, the bound address
-    // and the --allowed-hosts names.
-    let tls = {
-        let mut names = vec!["localhost".to_string(), "127.0.0.1".into(), "::1".into()];
-        names.extend(env.host_names);
-        if !matches!(
-            addr.as_str(),
-            "0.0.0.0" | "::" | "127.0.0.1" | "::1" | "localhost"
-        ) {
-            names.push(addr.clone());
-        }
-        for h in a.get("allowed-hosts").map_or("", |s| s.as_str()).split(',') {
-            let h = h.trim();
-            if !h.is_empty() && h != "*" {
-                names.push(
-                    h.strip_prefix('.')
-                        .map_or(h.to_string(), |d| format!("*.{d}")),
-                );
-            }
-        }
-        names.sort();
-        names.dedup();
-        tls::from_args(&a, names, &env.tls_dir)
-    };
-    let scheme = if tls.is_some() { "https" } else { "http" };
-    let listener = tokio::net::TcpListener::bind((addr.as_str(), port))
-        .await
-        .expect("bind");
-    log::info!("listening on {scheme}://{addr}:{port}");
-    // Where to point a browser on this machine.
-    let page = match addr.as_str() {
-        "0.0.0.0" | "::" => format!("{scheme}://localhost:{port}/"),
-        a if a.contains(':') => format!("{scheme}://[{a}]:{port}/"),
-        a => format!("{scheme}://{a}:{port}/"),
-    };
-    match &login {
-        Some((l, true)) => log::info!(
-            "open {page}?token={} to sign in (the password is {0}; choose one with --basic-auth-password or VOXL_PASSWORD)",
-            l.password()
-        ),
-        Some((_, false)) => log::info!(
-            "login on: sign in at {page} with the password, or open {page}?token=<password>"
-        ),
-        None => log::info!("login off (--enable-basic-auth=false): anyone who reaches {page} can use this desktop"),
-    }
-    let shutdown_hub = hub.clone();
-    tokio::spawn(async move {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut term = signal(SignalKind::terminate()).unwrap();
-            let mut int = signal(SignalKind::interrupt()).unwrap();
-            tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
-        }
-        #[cfg(windows)]
-        let _ = tokio::signal::ctrl_c().await;
-        log::info!("shutting down");
-        if let Some(tx) = shutdown_hub.input.lock().as_ref() {
-            let _ = tx.send(event::InputEvent::Shutdown);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        logging::exit(0);
+        resize,
+        max_record: MAX_RECORD,
     });
-    if let Some(config) = tls {
-        return tls::serve(listener, app, config).await;
+    tokio::spawn(stop_on_signal(hub.clone()));
+    if let Err(e) = session::serve(&runtime.sockets(), daemon).await {
+        log::error!("{e}");
+        logging::exit(1);
     }
-    use axum::serve::ListenerExt;
-    let listener = listener.tap_io(|tcp| {
-        let _ = tcp.set_nodelay(true);
+}
+
+/// Ends the daemon on SIGTERM or SIGINT, once the input thread has let go of every key
+/// and button it holds down (`InputEvent::Shutdown`, answered when done).
+#[cfg(target_os = "linux")]
+async fn stop_on_signal(hub: std::sync::Arc<hub::Hub>) {
+    use tokio::signal::unix::{signal, SignalKind};
+    let (term, int) = (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+    );
+    let (mut term, mut int) = match (term, int) {
+        (Ok(term), Ok(int)) => (term, int),
+        (Err(e), _) | (_, Err(e)) => {
+            log::error!("the daemon's stop signals: {e}");
+            logging::exit(1)
+        }
+    };
+    tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
+    log::info!("shutting down");
+    let released = hub.input.lock().as_ref().map(|tx| {
+        let (done, released) = tokio::sync::oneshot::channel();
+        (tx.send(event::InputEvent::Shutdown(done)).is_ok()).then_some(released)
     });
-    axum::serve(listener, app).await.unwrap();
+    if let Some(Some(released)) = released {
+        // The input thread answers once every key is up; gone, it holds none.
+        if released.await.is_err() {
+            log::info!("the input thread had ended, holding no key");
+        }
+    }
+    logging::exit(0);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use path::Kbps;
-    use rate::Bounds;
+    use crate::xorshift::Xorshift;
 
-    /// A preset is one x264 has, asked where the flag is read. Each of x264's presets
-    /// (x264.h's `x264_preset_names`), by its name, in capitals and by its number, starts
-    /// voxl and opens an encoder; each name with a letter added or its first taken away
-    /// starts nothing; and no flag is `ultrafast`.
+    /// A command line is flags the daemon reads and nothing else: each known flag, in each
+    /// of its three spellings, parses to its value; any other flag (generated names, the
+    /// known ones changed by a character) and any word that is no flag are refused.
     #[test]
-    fn a_preset_is_one_x264_has() {
-        const X264: [&str; 10] = [
-            "ultrafast",
-            "superfast",
-            "veryfast",
-            "faster",
-            "fast",
-            "medium",
-            "slow",
-            "slower",
-            "veryslow",
-            "placebo",
-        ];
-        for (i, name) in X264.iter().enumerate() {
-            for given in [name.to_string(), name.to_uppercase(), i.to_string()] {
-                let preset = preset(Some(&given)).unwrap_or_else(|e| panic!("{e}"));
-                let cfg = encoder::EncoderConfig {
-                    pictures: encoder::Pictures {
-                        width: 64,
-                        height: 64,
-                        fps: encoder::Fps::new(60).unwrap(),
-                        preset,
-                        threads: 1,
-                        debug: env::Debugging::read(|_| None).0,
-                    },
-                    crf: 24.0,
-                    max_kbps: None,
-                };
-                assert!(encoder::Encoder::new(&cfg).is_ok(), "{given}");
-            }
-            for not in [format!("{name}x"), name[1..].to_string()] {
-                assert!(preset(Some(&not)).is_err(), "{not}");
+    fn a_flag_is_one_the_daemon_reads() {
+        let names = FLAGS.map(|f| f.name);
+        for f in names {
+            for (args, want) in [
+                (vec![format!("--{f}=v")], "v"),
+                (vec![format!("--{f}"), "v".into()], "v"),
+                (vec![format!("--{f}")], "true"),
+            ] {
+                let got = parse_args(args.clone(), &names);
+                assert_eq!(got.map(|m| m[f].clone()), Ok(want.to_string()), "{args:?}");
             }
         }
-        assert_eq!(
-            preset(None),
-            Ok(encoder::Preset::parse("ultrafast").unwrap())
-        );
-    }
-
-    fn read(min: Option<&str>, max: Option<&str>) -> Result<Bounds, String> {
-        bounds(
-            min.map(String::from).as_ref(),
-            max.map(String::from).as_ref(),
-        )
-    }
-
-    /// `--max-kbps` is a ceiling or none, decided where the flags are read: 0 is none, and
-    /// what is not a whole number of kbit/s starts nothing.
-    #[test]
-    fn the_ceiling_is_a_rate_or_none() {
-        let at = |kbps: f64| Ok(Some(Kbps::new(kbps)));
-        for (flag, want) in [
-            (None, at(30000.0)),
-            (Some("0"), Ok(None)),
-            (Some("12000"), at(12000.0)),
-            (Some(" 12000 "), at(12000.0)),
-            (Some("8000-12000"), at(12000.0)),
-            (Some("0-0"), Ok(None)),
-        ] {
-            assert_eq!(read(None, flag).map(Bounds::ceiling), want, "{flag:?}");
-        }
-        for flag in [
-            "",
-            "fast",
-            "12k",
-            "1.5",
-            "NaN",
-            "inf",
-            "8000-",
-            "99999999999",
-            "true",
-        ] {
-            assert!(read(None, Some(flag)).is_err(), "{flag:?} parsed");
-        }
-    }
-
-    /// A range is two whole numbers from low to high. A leading `-` is no range with
-    /// nothing before it (`--max-kbps -5` reaches the parse: it does not start with `--`),
-    /// a lower bound is read, and a range has two ends. (RED's finding 19.)
-    #[test]
-    fn a_ceiling_that_is_not_a_rate_starts_nothing() {
-        for flag in ["-5", "-0", "fast-12000", "1-2-3", "12000-8000"] {
-            assert!(
-                read(None, Some(flag)).is_err(),
-                "{flag:?} parsed as {:?}",
-                read(None, Some(flag))
-            );
-        }
-    }
-
-    /// `--min-kbps` is read the same way, 0 when not given, and with the ceiling into
-    /// one value: a ceiling under the floor brings the floor down to it.
-    #[test]
-    fn the_floor_is_read_with_the_ceiling() {
-        let kbps = Kbps::new;
-        let default = Some(kbps(30000.0));
-        for (min, max, want) in [
-            (None, None, Bounds::new(kbps(0.0), default)),
-            (Some("0"), None, Bounds::new(kbps(0.0), default)),
-            (Some("1000-3000"), None, Bounds::new(kbps(3000.0), default)),
-            (Some("5000"), Some("0"), Bounds::new(kbps(5000.0), None)),
-            (
-                None,
-                Some("1000"),
-                Bounds::new(kbps(0.0), Some(kbps(1000.0))),
-            ),
-            (
-                Some("9000"),
-                Some("4000"),
-                Bounds::new(kbps(4000.0), Some(kbps(4000.0))),
-            ),
-        ] {
-            assert_eq!(
-                read(min, max),
-                Ok(want),
-                "--min-kbps {min:?} --max-kbps {max:?}"
-            );
-        }
-        for min in ["", "fast", "1.5", "-5", "3000-1000"] {
-            assert!(read(Some(min), None).is_err(), "--min-kbps {min:?} parsed");
-        }
-    }
-
-    /// A viewer's path is taken to carry, in the window's `LATENESS` (60 ms), what the
-    /// flags carry in it: 7.5 bytes a kbit/s, whole bytes, rounded down; and with no
-    /// ceiling, as much as there is. The floor is never over the ceiling. Over whole rates
-    /// from 0 to past what a 32-bit kbit/s holds, either way round.
-    #[test]
-    fn a_path_is_taken_to_carry_what_the_flags_carry_in_the_lateness() {
-        let mut x = 0x9E37_79B9_7F4A_7C15u64;
-        let mut draw = |n: u64| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x % n
-        };
-        let bytes = |kbps: u64| (kbps * 15 / 2) as usize;
-        for _ in 0..10_000 {
-            let (floor, ceiling) = (draw(1 << 33), draw(1 << 33));
-            let none = draw(4) == 0;
-            let bounds = Bounds::new(
-                Kbps::new(floor as f64),
-                (!none).then(|| Kbps::new(ceiling as f64)),
-            );
-            let want = match none {
-                true => crate::hub::Paths {
-                    least: bytes(floor),
-                    most: usize::MAX,
-                },
-                false => crate::hub::Paths {
-                    least: bytes(floor.min(ceiling)),
-                    most: bytes(ceiling),
-                },
-            };
-            assert_eq!(bounds.paths(), want, "{bounds:?}");
-        }
-    }
-
-    /// `--framerate` reads as it did wherever that was 1 to 240 frames a second, and starts
-    /// nothing anywhere else: over whole and fractional numbers, ranges, a leading `-`,
-    /// words, and numbers of every size a u32 holds and past it.
-    #[test]
-    fn a_framerate_outside_1_to_240_starts_nothing() {
-        let mut rng = crate::xorshift::Xorshift::new(0x2545F4914F6CDD1D);
-        let mut draw = |n: u64| rng.below(n);
+        let mut rng = Xorshift::new(0x428a_2f98_d728_ae22);
+        let letters = b"abcdefghijklmnopqrstuvwxyz-=";
         for _ in 0..20_000 {
-            let v = match draw(6) {
-                0 => format!("{}", draw(300)),
-                1 => format!("{}.{}", draw(3), draw(100)),
-                2 => format!("{}-{}", draw(200), draw(300)),
-                3 => format!("-{}.{}", draw(3), draw(10)),
-                4 => {
-                    let bits = draw(40);
-                    format!("{}", draw(1 << bits))
-                }
-                _ => ["", "fast", "NaN", "inf", "-0", "0-0", " 0 ", "0.0"][draw(8) as usize].into(),
+            let mut name: Vec<u8> = match rng.below(2) {
+                0 => names[rng.below(names.len() as u64) as usize]
+                    .as_bytes()
+                    .to_vec(),
+                _ => Vec::new(),
             };
-            let before = range_max(Some(&v), 60.0) as u32;
-            assert_eq!(
-                framerate(Some(&v)).map(encoder::Fps::get),
-                match before {
-                    1..=240 => Ok(before),
-                    _ => Err(format!("--framerate {v:?}: not 1 to 240 frames a second")),
-                },
-                "{v:?}"
-            );
+            let at = rng.below(name.len() as u64 + 1) as usize;
+            name.insert(at, letters[rng.below(letters.len() as u64) as usize]);
+            let name = String::from_utf8(name).unwrap();
+            let key = name.split('=').next().unwrap_or_default();
+            let flag = format!("--{name}");
+            match names.contains(&key) {
+                true => assert!(parse_args([flag.clone()], &names).is_ok(), "{flag}"),
+                false => assert!(parse_args([flag.clone()], &names).is_err(), "{flag}"),
+            }
+            assert!(parse_args([name.clone()], &names).is_err(), "{name}");
         }
-        assert_eq!(framerate(None).map(encoder::Fps::get), Ok(60));
     }
 
-    /// Every frame rate `--framerate` lets through is one an encoder opens at under a cap,
-    /// and sets a new cap at: over the edges (240 and 241; 2^30 - 1 and 2^30, where four
-    /// frames' worth of the rate leaves a u32; u32::MAX and past it) and over rates drawn
-    /// across every magnitude a u32 holds.
+    /// With no flag, each takes its default, which is parsed as a given value is; and a
+    /// flag given its default reads the same.
     #[test]
-    fn every_framerate_read_opens_an_encoder() {
-        let mut rng = crate::xorshift::Xorshift::new(0x9E3779B97F4A7C15);
-        let mut draw = |n: u64| rng.below(n);
-        let edges = [
-            "240",
-            "241",
-            "1073741823",
-            "1073741824",
-            "4294967295",
-            "4294967296",
-            "1e12",
+    fn absent_flags_take_their_defaults() {
+        let none = Flags::parse([]).expect("the defaults parse");
+        assert_eq!(
+            none,
+            Flags {
+                runtime: "/run/voxl".into(),
+                resize_scale: 1.5,
+                audio: session::control::Audio::Sent,
+            }
+        );
+        let given = FLAGS.map(|f| format!("--{}={}", f.name, f.default));
+        assert_eq!(Flags::parse(given), Ok(none));
+    }
+
+    /// Every flag given a value it cannot take stops the daemon with the error naming the
+    /// flag and the value, and one it can take is read as it says: over generated values
+    /// for each flag (words, numbers whole and not, of either sign, the empty value and
+    /// the flag alone), against each flag's own rule written apart.
+    #[test]
+    fn a_malformed_flag_is_refused_naming_it() {
+        let mut rng = Xorshift::new(0x1f83_d9ab_fb41_bd6b);
+        let pieces = [
+            "", "-", "0", "1", "2.5", ".", "e3", "inf", "NaN", "true", "false", "x", " ",
         ];
-        let drawn: Vec<String> = (0..200)
-            .map(|_| {
-                let bits = draw(33);
-                draw(1 << bits).to_string()
-            })
-            .collect();
-        for v in edges.into_iter().map(String::from).chain(drawn) {
-            let Ok(fps) = framerate(Some(&v)) else {
-                continue;
-            };
-            let mut enc = encoder::Encoder::new(&encoder::EncoderConfig {
-                pictures: encoder::Pictures {
-                    width: 64,
-                    height: 64,
-                    fps,
-                    preset: encoder::Preset::parse("ultrafast").unwrap(),
-                    threads: 1,
-                    debug: env::Debugging::read(|_| None).0,
-                },
-                crf: 24.0,
-                max_kbps: Some(Kbps::new(2000.0)),
-            })
-            .unwrap_or_else(|e| panic!("--framerate {v:?}: {e}"));
-            enc.set_rate(24.0, 3000);
+        for _ in 0..20_000 {
+            let v: String = (0..rng.below(4))
+                .map(|_| pieces[rng.below(pieces.len() as u64) as usize])
+                .collect();
+            for f in &FLAGS {
+                let got = Flags::parse([format!("--{}={v}", f.name)]);
+                let takes = match f.name {
+                    "runtime" => !v.is_empty(),
+                    "resize-scale" => v.parse::<f64>().is_ok_and(|s| s.is_finite() && s > 0.0),
+                    "audio-enabled" => v == "true" || v == "false",
+                    other => panic!("--{other}: no rule written for it"),
+                };
+                match (got, takes) {
+                    (Ok(flags), true) => {
+                        let read = match f.name {
+                            "runtime" => flags.runtime.to_str() == Some(&v),
+                            "resize-scale" => Some(flags.resize_scale) == v.parse().ok(),
+                            _ => (flags.audio == session::control::Audio::Sent) == (v == "true"),
+                        };
+                        assert!(read, "--{}={v:?}", f.name);
+                    }
+                    (Err(FlagError::Malformed { flag, value, .. }), false) => {
+                        assert_eq!((flag, value.as_str()), (f.name, v.as_str()))
+                    }
+                    (got, _) => panic!("--{}={v:?}: {got:?}", f.name),
+                }
+            }
         }
     }
 }

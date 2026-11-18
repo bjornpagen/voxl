@@ -11,9 +11,6 @@ impl Kbps {
     pub fn get(self) -> f64 {
         self.0
     }
-    pub fn min(self, other: Self) -> Self {
-        Kbps(self.0.min(other.0))
-    }
 }
 
 /// An amount of data, in bits.

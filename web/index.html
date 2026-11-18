@@ -5,9 +5,8 @@
 		<meta
 			name="viewport"
 			content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
-		<!-- The server fills in the title (index_html in src/server.rs). -->
-		<meta name="application-name" content="{{title}}" />
-		<meta name="apple-mobile-web-app-title" content="{{title}}" />
+		<meta name="application-name" content="Voxl Computer Stream" />
+		<meta name="apple-mobile-web-app-title" content="Voxl Computer Stream" />
 		<link rel="icon" href="favicon.ico" />
 		<link
 			rel="preload"
@@ -15,7 +14,7 @@
 			as="font"
 			type="font/woff2"
 			crossorigin />
-		<title>{{title}}</title>
+		<title>Voxl Computer Stream</title>
 		<style>
 			/* Inter (latin subset of the variable font), as used by the Tembo app. */
 			@font-face {
@@ -80,27 +79,19 @@
 			#surface {
 				position: relative;
 				outline: none;
-				touch-action: none;
 				/* Pinch zoom (zoom.ts) scales from the top left corner. */
 				transform-origin: 0 0;
 			}
-			#screen {
+			.stream {
 				position: absolute;
 				inset: 0;
 				width: 100%;
 				height: 100%;
 				display: block;
 				pointer-events: none;
-			}
-			.stripe {
-				position: absolute;
-				left: 0;
-				width: 100%;
-				display: block;
-				pointer-events: none;
 				object-fit: fill;
 			}
-			/* On-screen so mobile browsers will open the soft keyboard for it. */
+			/* The keyboard's target: it takes keys, IME composition and pastes. */
 			#kbd {
 				position: fixed;
 				left: 0;
@@ -152,155 +143,9 @@
 				backdrop-filter: blur(30px);
 				-webkit-backdrop-filter: blur(30px);
 			}
-			#tools.show,
-			#tools.menu-open {
+			#tools.show {
 				opacity: 1;
 				pointer-events: auto;
-			}
-			#tools.touch {
-				top: auto;
-				bottom: 12px;
-			}
-
-			/* Display picker: the app's Select, with a ghost trigger like the composer's pickers. */
-			#display-picker {
-				position: relative;
-				display: flex;
-			}
-			#display-picker[hidden],
-			#display-menu[hidden] {
-				display: none;
-			}
-			#display-btn {
-				height: 28px;
-				max-width: 180px;
-				border: 0;
-				padding: 0 4px;
-				border-radius: 8px;
-				background: transparent;
-				display: inline-flex;
-				align-items: center;
-				gap: 2px;
-				cursor: pointer;
-				color: var(--text-default);
-				font: 520 13px/16px var(--font);
-				letter-spacing: -0.2px;
-				white-space: nowrap;
-				transition: background-color 0.15s ease-out;
-			}
-			#display-btn span {
-				min-width: 0;
-				padding: 0 2px;
-				overflow: hidden;
-				text-overflow: ellipsis;
-			}
-			#display-btn .chev {
-				color: var(--icon-weak);
-			}
-			#display-btn:hover,
-			#display-btn[aria-expanded='true'] {
-				background: var(--state-hover);
-			}
-			#display-btn:active {
-				background: var(--state-pressed);
-			}
-			#display-btn:hover svg.i:not(.chev),
-			#display-btn[aria-expanded='true'] svg.i:not(.chev) {
-				color: var(--icon-title);
-			}
-			#display-btn:disabled {
-				cursor: default;
-				background: transparent;
-				color: var(--text-muted);
-			}
-			#display-btn:disabled svg.i {
-				color: var(--text-muted);
-			}
-			#tools.touch #display-btn {
-				height: 40px;
-				padding: 0 8px;
-			}
-			#display-menu {
-				position: absolute;
-				top: calc(100% + 8px);
-				left: 0;
-				min-width: max(100%, 128px);
-				box-sizing: border-box;
-				padding: 4px;
-				display: flex;
-				flex-direction: column;
-				gap: 2px;
-				background: var(--surface-secondary);
-				border: 1px solid var(--border-default);
-				border-radius: 12px;
-				box-shadow: 0 16px 40px 0 rgba(0, 0, 0, 0.08);
-				outline: none;
-				transform-origin: top left;
-				animation: menu-in 0.15s cubic-bezier(0.23, 1, 0.32, 1);
-			}
-			#tools.touch #display-menu {
-				top: auto;
-				bottom: calc(100% + 8px);
-				transform-origin: bottom left;
-				animation-name: menu-in-up;
-			}
-			@keyframes menu-in {
-				from {
-					opacity: 0;
-					transform: translateY(-8px) scale(0.95);
-				}
-			}
-			@keyframes menu-in-up {
-				from {
-					opacity: 0;
-					transform: translateY(8px) scale(0.95);
-				}
-			}
-			@media (prefers-reduced-motion: reduce) {
-				#display-menu {
-					animation: none !important;
-				}
-			}
-			.option {
-				position: relative;
-				height: 32px;
-				flex: none;
-				display: flex;
-				align-items: center;
-				padding: 0 28px 0 8px;
-				border-radius: 8px;
-				color: var(--text-default);
-				font: 520 13px/16px var(--font);
-				letter-spacing: -0.2px;
-				white-space: nowrap;
-				cursor: pointer;
-				outline: none;
-				user-select: none;
-				-webkit-user-select: none;
-			}
-			.option:focus {
-				background: var(--state-hover);
-				color: var(--text-strong);
-			}
-			#tools.touch .option {
-				height: 40px;
-			}
-			/* The app's filled checkmark (central-icons IconCheckmark1) on the selected display. */
-			.option[aria-selected='true']::after {
-				--checkmark: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill-rule='evenodd' d='M19.3209 4.24472C20.0142 4.69807 20.2088 5.62768 19.7555 6.32105L11.2555 19.321C10.9972 19.7161 10.5681 19.9665 10.0971 19.997C9.62613 20.0276 9.16825 19.8347 8.86111 19.4764L4.36111 14.2264C3.82198 13.5974 3.89482 12.6504 4.52381 12.1113C5.1528 11.5722 6.09975 11.645 6.63888 12.274L9.83825 16.0066L17.2445 4.6793C17.6979 3.98593 18.6275 3.79136 19.3209 4.24472Z'/%3E%3C/svg%3E");
-				content: '';
-				position: absolute;
-				right: 10px;
-				top: 50%;
-				width: 16px;
-				height: 16px;
-				margin-top: -8px;
-				background: var(--icon-default);
-				-webkit-mask: var(--checkmark) center / 16px no-repeat;
-				mask: var(--checkmark) center / 16px no-repeat;
-			}
-			.option[aria-selected='true']:focus::after {
-				background: var(--icon-strong);
 			}
 			.ib {
 				width: 28px;
@@ -331,27 +176,13 @@
 				width: 24px;
 				height: 24px;
 			}
-			#tools.touch .ib {
-				width: 40px;
-				height: 40px;
-			}
-			#tools.touch .ib svg.i {
-				width: 20px;
-				height: 20px;
-			}
-			#kb-btn,
 			#files-btn,
 			#mic-btn {
 				display: none !important;
 			}
-			#tools.touch #kb-btn,
 			#tools.files #files-btn,
 			#tools.mic #mic-btn {
 				display: inline-grid !important;
-			}
-			/* Read-only: nothing on the desktop accepts what the keyboard would send. */
-			#tools.read-only #kb-btn {
-				display: none !important;
 			}
 			/* While the microphone is live the toolbar stays up as a recording indicator. */
 			#tools.mic-on {
@@ -390,24 +221,21 @@
 				letter-spacing: -0.1px;
 				pointer-events: none;
 			}
-			#stats {
-				position: fixed;
-				top: 6px;
-				left: 6px;
-				padding: 6px 8px;
-				background: rgba(0, 0, 0, 0.7);
-				color: #b8f7c4;
-				font:
-					12px/1.35 ui-monospace,
-					Menlo,
-					monospace;
-				white-space: pre;
-				border-radius: 4px;
-				pointer-events: none;
-				display: none;
-				z-index: 2;
+			#status.ended {
+				pointer-events: auto;
+				cursor: pointer;
 			}
-
+			#notice {
+				position: fixed;
+				left: 0;
+				right: 0;
+				bottom: 8px;
+				padding: 0 24px;
+				text-align: center;
+				color: var(--text-weak);
+				font: 520 12px/16px var(--font);
+				pointer-events: none;
+			}
 			/* Files panel: the app's dialog frame (secondary surface, 16px radius, 4px inset) around a raised body. */
 			#files {
 				position: fixed;
@@ -737,7 +565,7 @@
 		</style>
 	</head>
 	<body>
-		<div id="surface" tabindex="0"><canvas id="screen"></canvas></div>
+		<div id="surface" tabindex="0"></div>
 		<textarea
 			id="kbd"
 			autocomplete="off"
@@ -747,65 +575,6 @@
 			tabindex="-1"
 			aria-hidden="true"></textarea>
 		<div id="tools">
-			<div id="display-picker" hidden>
-				<button
-					id="display-btn"
-					type="button"
-					title="Switch display for all viewers"
-					aria-haspopup="listbox"
-					aria-expanded="false"
-					aria-controls="display-menu">
-					<svg class="i" viewBox="0 0 24 24" fill="none">
-						<path
-							d="M19 4H5C3.89543 4 3 4.89543 3 6V13C3 14.1046 3.89543 15 5 15H19C20.1046 15 21 14.1046 21 13V6C21 4.89543 20.1046 4 19 4Z"
-							stroke="currentColor"
-							stroke-width="2"
-							stroke-linejoin="round" />
-						<path
-							d="M9.5 16V20H14.5V16"
-							stroke="currentColor"
-							stroke-width="2"
-							stroke-linecap="round"
-							stroke-linejoin="round" />
-					</svg>
-					<span id="display-label"></span>
-					<svg class="i chev" viewBox="0 0 24 24" fill="none">
-						<path
-							d="M8 10L11.2929 13.2929C11.6834 13.6834 12.3166 13.6834 12.7071 13.2929L16 10"
-							stroke="currentColor"
-							stroke-width="2"
-							stroke-linecap="round"
-							stroke-linejoin="round" />
-					</svg>
-				</button>
-				<div
-					id="display-menu"
-					role="listbox"
-					aria-label="Displays"
-					tabindex="-1"
-					hidden></div>
-			</div>
-			<button
-				id="kb-btn"
-				class="ib"
-				type="button"
-				title="Keyboard"
-				aria-label="Show keyboard">
-				<svg class="i" viewBox="0 0 24 24" fill="none">
-					<path
-						d="M6 16.125C6.48325 16.125 6.875 16.5168 6.875 17C6.875 17.4832 6.48325 17.875 6 17.875C5.51675 17.875 5.125 17.4832 5.125 17C5.125 16.5168 5.51675 16.125 6 16.125ZM18 16.125C18.4832 16.125 18.875 16.5168 18.875 17C18.875 17.4832 18.4832 17.875 18 17.875C17.5168 17.875 17.125 17.4832 17.125 17C17.125 16.5168 17.5168 16.125 18 16.125ZM6 12.125C6.48325 12.125 6.875 12.5168 6.875 13C6.875 13.4832 6.48325 13.875 6 13.875C5.51675 13.875 5.125 13.4832 5.125 13C5.125 12.5168 5.51675 12.125 6 12.125ZM10 12.125C10.4832 12.125 10.875 12.5168 10.875 13C10.875 13.4832 10.4832 13.875 10 13.875C9.51675 13.875 9.125 13.4832 9.125 13C9.125 12.5168 9.51675 12.125 10 12.125ZM14 12.125C14.4832 12.125 14.875 12.5168 14.875 13C14.875 13.4832 14.4832 13.875 14 13.875C13.5168 13.875 13.125 13.4832 13.125 13C13.125 12.5168 13.5168 12.125 14 12.125ZM18 12.125C18.4832 12.125 18.875 12.5168 18.875 13C18.875 13.4832 18.4832 13.875 18 13.875C17.5168 13.875 17.125 13.4832 17.125 13C17.125 12.5168 17.5168 12.125 18 12.125Z"
-						fill="currentColor"
-						stroke="currentColor"
-						stroke-width="0.75"
-						stroke-linecap="square" />
-					<path
-						d="M10 17H14M14 5L12 3L10 5M4 9H20C21.1046 9 22 9.89543 22 11V19C22 20.1046 21.1046 21 20 21H4C2.89543 21 2 20.1046 2 19V11C2 9.89543 2.89543 9 4 9Z"
-						stroke="currentColor"
-						stroke-width="2"
-						stroke-linecap="round"
-						stroke-linejoin="round" />
-				</svg>
-			</button>
 			<button
 				id="mic-btn"
 				class="ib"
@@ -951,7 +720,10 @@
 				<div id="files-list"></div>
 				<div id="files-uploads"></div>
 			</div>
-			<footer></footer>
+			<footer>
+				Drop files or folders anywhere on the screen to upload them here. Click
+				a file to download it; folders download as zips.
+			</footer>
 			<input id="files-input" type="file" multiple hidden />
 			<input id="files-input-dir" type="file" webkitdirectory multiple hidden />
 		</div>
@@ -982,7 +754,7 @@
 			</div>
 		</div>
 		<div id="status">Connecting…</div>
-		<div id="stats"></div>
+		<div id="notice" style="display: none"></div>
 		<script src="client.js"></script>
 	</body>
 </html>

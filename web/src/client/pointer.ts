@@ -1,28 +1,35 @@
-// Mouse, wheel/trackpad and touch input on the desktop surface.
+// Mouse and wheel/trackpad input on the desktop surface.
 import { cmd } from '../protocol';
 import type { App } from './app';
-import { createTouch } from './touch';
-import type { Zoom } from './zoom';
 
 /** DOM button -> X button (left, middle, right, back, forward). */
 const BUTTONS = [1, 2, 3, 8, 9];
 
-export function setupPointer(app: App, zoom: Zoom, onInteract: () => void) {
+export function setupPointer(app: App, onInteract: () => void) {
 	const { surface, send } = app;
 
-	function toDesk(p: { clientX: number; clientY: number }): [number, number] {
+	function toDesk(
+		p: { clientX: number; clientY: number },
+		w: number,
+		h: number
+	): [number, number] {
 		const r = surface.getBoundingClientRect();
-		const x = Math.round(((p.clientX - r.left) * app.desk.w) / r.width);
-		const y = Math.round(((p.clientY - r.top) * app.desk.h) / r.height);
-		return [
-			Math.max(0, Math.min(app.desk.w - 1, x)),
-			Math.max(0, Math.min(app.desk.h - 1, y)),
-		];
+		const x = Math.round(((p.clientX - r.left) * w) / r.width);
+		const y = Math.round(((p.clientY - r.top) * h) / r.height);
+		return [Math.max(0, Math.min(w - 1, x)), Math.max(0, Math.min(h - 1, y))];
+	}
+	/** A DOM button pressed or released, as the desktop's; a button the desktop has no
+	 * number for (a pen's eraser) presses nothing. */
+	function button(dom: number, down: boolean) {
+		const x = BUTTONS[dom];
+		if (x !== undefined) send(cmd.button(x, down));
 	}
 	let lastMove = '';
 	function move(p: { clientX: number; clientY: number }, force = false) {
-		if (!app.desk.w) return;
-		const s = cmd.move(...toDesk(p));
+		const desk = app.desk;
+		// No desktop, no place on it to move to.
+		if (desk.s === 'none') return;
+		const s = cmd.move(...toDesk(p, desk.w, desk.h));
 		if (s !== lastMove || force) {
 			lastMove = s;
 			send(s);
@@ -47,55 +54,37 @@ export function setupPointer(app: App, zoom: Zoom, onInteract: () => void) {
 			sy = 0;
 		});
 	}
-	/** Desktop pixels per on-screen pixel. */
-	const deskPerPx = () => app.desk.w / surface.getBoundingClientRect().width;
+	/** Desktop pixels per on-screen pixel; none without a desktop. */
+	const deskPerPx = () =>
+		app.desk.s === 'shown'
+			? app.desk.w / surface.getBoundingClientRect().width
+			: null;
 
-	const touch = createTouch(app, {
-		moveTo: (x, y) => move({ clientX: x, clientY: y }, true),
-		queueScroll,
-		deskPerPx,
-		zoom,
-	});
-
-	surface.addEventListener('pointermove', (e) => {
-		if (e.pointerType === 'touch') touch.move(e);
-		else move(e);
-	});
+	surface.addEventListener('pointermove', (e) => move(e));
 	surface.addEventListener('pointerdown', (e) => {
 		e.preventDefault();
 		onInteract();
-		if (e.pointerType === 'touch') {
-			touch.down(e);
-			return;
-		}
 		app.kbd.focus({ preventScroll: true });
 		move(e);
-		try {
-			surface.setPointerCapture(e.pointerId);
-		} catch {}
-		send(cmd.button(BUTTONS[e.button] || 1, true));
+		surface.setPointerCapture(e.pointerId);
+		button(e.button, true);
 	});
 	surface.addEventListener('pointerup', (e) => {
 		e.preventDefault();
-		if (e.pointerType === 'touch') {
-			touch.up(e);
-			return;
-		}
 		move(e);
-		send(cmd.button(BUTTONS[e.button] || 1, false));
+		button(e.button, false);
 	});
-	surface.addEventListener('pointercancel', (e) => {
-		if (e.pointerType === 'touch') touch.cancel(e);
-		else send(cmd.releaseAll);
-	});
+	surface.addEventListener('pointercancel', () => send(cmd.releaseAll));
 	surface.addEventListener('contextmenu', (e) => e.preventDefault());
 	surface.addEventListener(
 		'wheel',
 		(e) => {
 			e.preventDefault();
 			move(e);
-			const k =
-				(e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? 800 : 1) * deskPerPx();
+			const perPx = deskPerPx();
+			// Without a desktop there is nothing to scroll.
+			if (perPx === null) return;
+			const k = (e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? 800 : 1) * perPx;
 			queueScroll(e.deltaX * k, e.deltaY * k);
 		},
 		{ passive: false }

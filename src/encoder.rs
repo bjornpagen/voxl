@@ -12,36 +12,18 @@ mod ffi {
 
 use crate::env::{Debugging, X264Log};
 use crate::path::Kbps;
-use std::ffi::{c_char, c_int, CStr, CString};
+use std::ffi::{c_char, c_int, CStr};
 use std::num::NonZeroU32;
 use std::ptr;
 
 /// What every encoder is tuned for: no frame held back to look ahead.
 const TUNE: &CStr = c"zerolatency";
 
-/// An x264 preset (`--preset`): a name x264 has, asked of x264 when voxl starts, so no
-/// encoder refuses it later, at a viewer's join.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Preset(CString);
-
-impl Preset {
-    /// The preset named `name`, if x264 has one by that name.
-    pub fn parse(name: &str) -> Option<Preset> {
-        let name = CString::new(name).ok()?;
-        // x264 fills in the parameters itself before it applies the preset.
-        let mut param: ffi::x264_param_t = unsafe { std::mem::zeroed() };
-        let known =
-            unsafe { ffi::x264_param_default_preset(&mut param, name.as_ptr(), TUNE.as_ptr()) }
-                >= 0;
-        known.then_some(Preset(name))
-    }
-}
-
-impl std::fmt::Display for Preset {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}", self.0.to_string_lossy())
-    }
-}
+/// x264's fastest preset (x264.h's `x264_preset_names`, the first): the least time a
+/// frame spends coding, which is latency it adds. Provisional: upstream's choice,
+/// unmeasured here; what would measure it is the bench's encode time and bytes per frame
+/// at each preset.
+const PRESET: &CStr = c"ultrafast";
 
 /// A frame rate: 1 to `Fps::MAX` frames a second, so that every use of it holds it: a
 /// frame's time, x264's rate, and the four frames' worth of it under a VBV buffer
@@ -71,14 +53,13 @@ impl Fps {
 }
 
 /// What every encoder is opened with, whatever decides its bits: the pictures' size and
-/// rate, the preset and threads that code them, and the debugging variables voxl was
+/// rate, the threads that code them, and the debugging variables voxl was
 /// started with (x264's log and hints, and a line per picture).
 #[derive(Clone)]
 pub struct Pictures {
     pub width: u32,
     pub height: u32,
     pub fps: Fps,
-    pub preset: Preset,
     pub threads: u32,
     pub debug: Debugging,
 }
@@ -98,6 +79,26 @@ pub struct EncoderConfig {
 /// frame, so the vectors the search starts from are tens of pixels off. At 64 the frames
 /// that moved more than 32 px came out 19-57% bigger than at 128, for the same picture.
 const ME_RANGE: u32 = 128;
+
+/// The pictures an encoder keeps to refer back to: 16, the most H.264 has room for
+/// (published: ITU-T H.264, A.3.1 h, MaxDpbFrames = Min(MaxDpbMbs / (PicWidthInMbs *
+/// FrameHeightInMbs), 16); x264 clamps `i_dpb_size` to the same 16, its `X264_REF_MAX`,
+/// and picks a level whose MaxDpbMbs holds it where one does). Derived from what a miss
+/// needs: when the report of an update missed comes back, every update coded since it left
+/// is forgotten with it (`invalidate`), and the next refers to the newest picture older than
+/// all of them, so the encoder must still hold that one. Those are the updates within a
+/// deadline and the report's way back: at 60 a second and the 0.2 s round trip of the lossy
+/// link that made this, 12 and more, and more on a longer trip; the most there is covers the
+/// most trips. Past it x264 has nothing left to refer to and codes a keyframe, which is what
+/// it did on every miss before. It costs memory (16 pictures), not time: x264 searches
+/// `i_frame_reference` pictures, not the whole buffer (x264.h,
+/// `x264_encoder_invalidate_reference`).
+pub const DPB: usize = 16;
+
+/// When a picture was handed to x264, as x264 knows it: its pts, the name
+/// `invalidate` forgets it and everything after it by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Pts(i64);
 
 pub struct Encoder {
     h: *mut ffi::x264_t,
@@ -174,13 +175,9 @@ impl Encoder {
     fn open(pictures: &Pictures, crf: f32, vbv: Option<Vbv>) -> Result<Self, String> {
         unsafe {
             let mut param: ffi::x264_param_t = std::mem::zeroed();
-            let preset = &pictures.preset;
-            let accepted =
-                ffi::x264_param_default_preset(&mut param, preset.0.as_ptr(), TUNE.as_ptr()) >= 0;
-            assert!(
-                accepted,
-                "x264 refused the preset {preset} it had when voxl started"
-            );
+            if ffi::x264_param_default_preset(&mut param, PRESET.as_ptr(), TUNE.as_ptr()) < 0 {
+                return Err(format!("x264 has no preset {PRESET:?} with tune {TUNE:?}"));
+            }
             param.i_width = pictures.width as i32;
             param.i_height = pictures.height as i32;
             param.i_csp = ffi::X264_CSP_I420 as i32;
@@ -198,6 +195,9 @@ impl Encoder {
             param.i_scenecut_threshold = 0;
             param.b_intra_refresh = 0;
             param.i_bframe = 0;
+            // Reference invalidation (`invalidate`) wants no B-frames and no intra
+            // refresh (x264.h), and room for older pictures to fall back on.
+            param.i_dpb_size = DPB as i32;
             param.b_annexb = 1;
             param.b_repeat_headers = 1;
             param.b_aud = 0;
@@ -307,6 +307,24 @@ impl Encoder {
         }
     }
 
+    /// Forgets the picture handed to x264 at `pts` and every picture after it: the next
+    /// refers only to older ones, or is a keyframe if none is left (x264.h,
+    /// `x264_encoder_invalidate_reference`). Not during an `encode`: the encoder is this
+    /// one value, borrowed mutably by either.
+    pub fn invalidate(&mut self, pts: Pts) -> Result<(), String> {
+        match unsafe { ffi::x264_encoder_invalidate_reference(self.h, pts.0) } {
+            0.. => Ok(()),
+            _ => Err(format!(
+                "x264 refused to forget the pictures from {pts:?} on"
+            )),
+        }
+    }
+
+    /// The pts of the last picture handed to x264, which `invalidate` names it by.
+    pub fn last_pts(&self) -> Pts {
+        Pts(self.pts)
+    }
+
     /// Change the CRF alone; the cap stays what it was.
     #[cfg(test)]
     pub fn set_crf(&mut self, crf: f32) {
@@ -414,7 +432,7 @@ pub enum Quality {
     Coarser,
 }
 
-/// Where a stripe's last frame left x264's QP, for judging the next one.
+/// Where the last frame left x264's QP, for judging the next one.
 ///
 /// x264 starts a predicted frame at the CRF plus a term from the picture's complexity,
 /// which it blurs over the frames before, halving their weight each frame. After a
@@ -556,9 +574,8 @@ mod tests {
                     width: w as u32,
                     height: h as u32,
                     fps: Fps::new(60).unwrap(),
-                    preset: Preset::parse("ultrafast").unwrap(),
                     threads: 1,
-                    debug: Debugging::read(|_| None).0,
+                    debug: Debugging::read(|_| None).unwrap(),
                 },
                 crf: 24.0,
                 max_kbps: None,
@@ -597,6 +614,96 @@ mod tests {
         );
     }
 
+    /// After a miss, the encoder refers back past it: with frames `k..=n` forgotten
+    /// (`invalidate` at frame `k`'s pts), frame `k - 1`'s picture coded again is a predicted
+    /// frame that costs no page: the picture it refers to is that very one, and it costs
+    /// the skipped blocks and the slice header's commands that drop the forgotten frames
+    /// from the decoder's buffer. Each frame is another page of text, so had frame `n`
+    /// stayed the reference it would cost a page (a quarter of one is the bound); with
+    /// frame 0 forgotten too, nothing is left and it is a keyframe. Over every `n` the
+    /// buffer holds and every `k` up to it.
+    #[test]
+    fn a_forgotten_frame_is_not_referred_to() {
+        let (w, h) = (640usize, 384usize);
+        let page = text_page(w, (DPB + 1) * h);
+        let (u, v) = (vec![128u8; w * h / 4], vec![128u8; w * h / 4]);
+        let planes = |f: usize| Planes {
+            y: &page[f * h * w..(f + 1) * h * w],
+            u: &u,
+            v: &v,
+            stride_y: w,
+            stride_uv: w / 2,
+        };
+        let open = || {
+            Encoder::new(&EncoderConfig {
+                pictures: Pictures {
+                    width: w as u32,
+                    height: h as u32,
+                    fps: Fps::new(60).unwrap(),
+                    threads: 1,
+                    debug: Debugging::read(|_| None).unwrap(),
+                },
+                crf: 24.0,
+                max_kbps: None,
+            })
+            .unwrap()
+        };
+        let mut out = Vec::new();
+        // What frame `f`'s picture costs right after itself: the floor a reference to
+        // the very same picture gives.
+        let mut enc = open();
+        enc.encode(&planes(0), 0, true, None, None, &mut out)
+            .unwrap();
+        out.clear();
+        enc.encode(&planes(0), 16, false, None, None, &mut out)
+            .unwrap();
+        let same = out.len();
+        // And what it costs referring to another page: the control, so `same` tells.
+        out.clear();
+        enc.encode(&planes(1), 32, false, None, None, &mut out)
+            .unwrap();
+        out.clear();
+        enc.encode(&planes(0), 48, false, None, None, &mut out)
+            .unwrap();
+        let page = out.len();
+        assert!(page > same * 20, "{page} against {same}");
+        for n in 1..DPB {
+            for k in 0..=n {
+                let mut enc = open();
+                let mut pts = Vec::new();
+                for f in 0..=n {
+                    out.clear();
+                    enc.encode(&planes(f), f as i64 * 16, f == 0, None, None, &mut out)
+                        .unwrap();
+                    pts.push(enc.last_pts());
+                }
+                enc.invalidate(pts[k]).unwrap();
+                out.clear();
+                let again = enc
+                    .encode(
+                        &planes(k.saturating_sub(1)),
+                        (n as i64 + 1) * 16,
+                        false,
+                        None,
+                        None,
+                        &mut out,
+                    )
+                    .unwrap();
+                match k {
+                    0 => assert!(again.keyframe(), "n {n}: nothing left, yet no keyframe"),
+                    _ => {
+                        assert!(!again.keyframe(), "n {n} k {k}: a keyframe");
+                        assert!(
+                            out.len() * 4 < page,
+                            "n {n} k {k}: {} bytes, against {page} for a page",
+                            out.len()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// x264 sets a VBV buffer's fill only when it opens an encoder (`for_keyframe`). So a
     /// cap and buffer raised by `set_rate` give the next frame, a keyframe too, no more
     /// than the last frame left in the old buffer; an encoder opened at the raised cap
@@ -613,9 +720,8 @@ mod tests {
                     width: w as u32,
                     height: h as u32,
                     fps: Fps::new(60).unwrap(),
-                    preset: Preset::parse("ultrafast").unwrap(),
                     threads: 1,
-                    debug: Debugging::read(|_| None).0,
+                    debug: Debugging::read(|_| None).unwrap(),
                 },
                 crf: 24.0,
                 max_kbps: Some(Kbps::new(kbps as f64)),
@@ -669,9 +775,8 @@ mod tests {
                     width: w as u32,
                     height: h as u32,
                     fps: Fps::new(60).unwrap(),
-                    preset: Preset::parse("ultrafast").unwrap(),
                     threads: 1,
-                    debug: Debugging::read(|_| None).0,
+                    debug: Debugging::read(|_| None).unwrap(),
                 },
                 crf: 24.0,
                 max_kbps,
@@ -739,9 +844,8 @@ mod tests {
                 width: w,
                 height: h,
                 fps: Fps::new(60).unwrap(),
-                preset: Preset::parse("ultrafast").unwrap(),
                 threads: 1,
-                debug: Debugging::read(|_| None).0,
+                debug: Debugging::read(|_| None).unwrap(),
             },
             crf: 24.0,
             max_kbps: None,
@@ -819,9 +923,8 @@ mod tests {
                     width: w as u32,
                     height: h as u32,
                     fps: Fps::new(60).unwrap(),
-                    preset: Preset::parse("ultrafast").unwrap(),
                     threads: 1,
-                    debug: Debugging::read(|_| None).0,
+                    debug: Debugging::read(|_| None).unwrap(),
                 },
                 crf: key_crf,
                 max_kbps: None,
@@ -901,7 +1004,8 @@ mod bench {
     /// finds, plus `STEP` rows of new text every frame.
     /// cargo test --release scroll_cost -- --ignored --nocapture
     #[test]
-    #[ignore]
+    #[ignore = "a benchmark (bits and time of a scrolled page, behind ME_RANGE and the \
+                CABAC and 4x4 choices): run by name with --release --ignored --nocapture"]
     fn scroll_cost() {
         /// Three of the page's 44 px lines a frame, near the fastest a trackpad flick moves
         /// a terminal (see `ME_RANGE`). The bench's default since it was written; it was
@@ -915,9 +1019,8 @@ mod bench {
                 width: w as u32,
                 height: h as u32,
                 fps: Fps::new(60).unwrap(),
-                preset: Preset::parse("ultrafast").unwrap(),
                 threads: 4,
-                debug: Debugging::read(|_| None).0,
+                debug: Debugging::read(|_| None).unwrap(),
             },
             crf: 24.0,
             max_kbps: None,
@@ -973,7 +1076,8 @@ mod bench {
 
     /// cargo test --release encode_cost -- --ignored --nocapture
     #[test]
-    #[ignore]
+    #[ignore = "a benchmark (a frame's time by how much of it changed, behind the \
+                macroblock hints): run by name with --release --ignored --nocapture"]
     fn encode_cost() {
         /// One thread, the bench's default since it was written; it was also run at four,
         /// the default.
@@ -981,25 +1085,20 @@ mod bench {
         let (w, h) = (2560usize, 1600usize);
         let mbs = (w / 16) * (h / 16);
         let threads = THREADS;
-        #[cfg(unix)]
         let cpu = || unsafe {
             let mut r: libc::rusage = std::mem::zeroed();
             libc::getrusage(libc::RUSAGE_SELF, &mut r);
             (r.ru_utime.tv_sec + r.ru_stime.tv_sec) as f64 * 1e3
                 + (r.ru_utime.tv_usec + r.ru_stime.tv_usec) as f64 / 1e3
         };
-        // Process CPU time isn't wired up on Windows; wall times still print.
-        #[cfg(windows)]
-        let cpu = || 0.0;
         for (label, hint) in [("no hints", false), ("hints", true)] {
             let mut enc = Encoder::new(&EncoderConfig {
                 pictures: Pictures {
                     width: w as u32,
                     height: h as u32,
                     fps: Fps::new(60).unwrap(),
-                    preset: Preset::parse("ultrafast").unwrap(),
                     threads,
-                    debug: Debugging::read(|_| None).0,
+                    debug: Debugging::read(|_| None).unwrap(),
                 },
                 crf: 24.0,
                 max_kbps: Some(Kbps::new(30000.0)),

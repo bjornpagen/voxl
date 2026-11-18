@@ -9,6 +9,8 @@ pub struct Frame {
     pub data: bytes::Bytes,
 }
 
+/// The movie's time unit, in ticks a second: milliseconds, the unit each frame's time is
+/// kept in (`Frame::ms`).
 const TIMESCALE: u32 = 1000;
 
 /// NAL units of an Annex-B stream (start codes removed).
@@ -94,10 +96,11 @@ pub fn write(frames: &[Frame], width: u32, height: u32, end_ms: u64) -> Result<V
             .collect();
         sizes.push(units.iter().map(|n| n.len() as u32 + 4).sum::<u32>());
         samples.push(units);
-        let next = frames
-            .get(i + 1)
-            .map(|n| n.ms)
-            .unwrap_or(end_ms.max(f.ms + 17));
+        // A frame lasts until the next, and the last until the recording's end.
+        let next = match frames.get(i + 1) {
+            Some(n) => n.ms,
+            None => end_ms,
+        };
         durations.push(next.saturating_sub(f.ms).max(1) as u32);
         if f.key {
             sync.push(i as u32 + 1);
@@ -214,47 +217,121 @@ pub fn write(frames: &[Frame], width: u32, height: u32, end_ms: u64) -> Result<V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::xorshift::Xorshift;
 
-    #[test]
-    fn splits_annex_b() {
-        let d = [
-            0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 0, 0, 0, 1, 0x65, 4, 5,
-        ];
-        let n = nals(&d);
-        assert_eq!(
-            n,
-            vec![&[0x67, 1, 2][..], &[0x68, 3][..], &[0x65, 4, 5][..]]
-        );
+    /// A NAL unit of `kind` (its header's low five bits), its payload as H.264 keeps it:
+    /// no two zero bytes in a row (emulation prevention keeps three from meeting) and a
+    /// last byte that is not zero (the RBSP's stop bit).
+    fn nal(rng: &mut Xorshift, kind: u8) -> Vec<u8> {
+        let mut n = vec![0x60 | kind];
+        for _ in 0..rng.below(40) {
+            let b = match (n.last(), rng.below(8)) {
+                (Some(0), _) | (_, 1..) => 1 + rng.below(255) as u8,
+                (_, 0) => 0,
+            };
+            n.push(b);
+        }
+        if n.last() == Some(&0) {
+            n.push(1);
+        }
+        n
     }
 
+    /// Units joined as Annex B, each after a start code of three or four bytes.
+    fn annex_b(rng: &mut Xorshift, units: &[Vec<u8>]) -> Vec<u8> {
+        units
+            .iter()
+            .flat_map(|u| {
+                let code: &[u8] = match rng.below(2) {
+                    0 => &[0, 0, 1],
+                    _ => &[0, 0, 0, 1],
+                };
+                code.iter().chain(u).copied().collect::<Vec<u8>>()
+            })
+            .collect()
+    }
+
+    /// An Annex B stream splits into exactly the units it was made of, whichever start
+    /// codes joined them: over generated streams of 0 to 12 units.
     #[test]
-    fn moov_first_and_chunk_offset_points_at_the_samples() {
-        let key = bytes::Bytes::from_static(&[
-            0, 0, 0, 1, 0x67, 100, 0, 40, 0xac, 0, 0, 0, 1, 0x68, 0xee, 0, 0, 0, 1, 0x65, 0xaa,
-        ]);
-        let delta = bytes::Bytes::from_static(&[0, 0, 0, 1, 0x41, 0xbb, 0xcc]);
-        let frames = [
-            Frame {
-                ms: 0,
-                key: true,
-                data: key,
-            },
-            Frame {
-                ms: 40,
-                key: false,
-                data: delta,
-            },
-        ];
-        let out = write(&frames, 64, 32, 100).unwrap();
-        let pos = |t: &[u8]| out.windows(4).position(|w| w == t).unwrap();
-        assert!(pos(b"moov") < pos(b"mdat"));
-        let stco = pos(b"stco");
-        let off = u32::from_be_bytes(out[stco + 12..stco + 16].try_into().unwrap()) as usize;
-        assert_eq!(off, pos(b"mdat") + 4);
-        // Both samples, length-prefixed, parameter sets left out.
-        assert_eq!(
-            &out[off..],
-            &[0, 0, 0, 2, 0x65, 0xaa, 0, 0, 0, 3, 0x41, 0xbb, 0xcc]
-        );
+    fn annex_b_splits_into_its_units() {
+        let mut rng = Xorshift::new(0x1f83_d9ab_5be0_cd19);
+        for _ in 0..5_000 {
+            let units: Vec<Vec<u8>> = (0..rng.below(13))
+                .map(|_| {
+                    let kind = 1 + rng.below(23) as u8;
+                    nal(&mut rng, kind)
+                })
+                .collect();
+            let stream = annex_b(&mut rng, &units);
+            let want: Vec<&[u8]> = units.iter().map(Vec::as_slice).collect();
+            assert_eq!(nals(&stream), want);
+        }
+    }
+
+    /// The box `name` at its first place in `mp4`, and its payload after its 8-byte header.
+    fn find<'a>(mp4: &'a [u8], name: &[u8; 4]) -> (usize, &'a [u8]) {
+        let at = mp4.windows(4).position(|w| w == name).expect("the box") - 4;
+        let len = u32::from_be_bytes(mp4[at..at + 4].try_into().unwrap()) as usize;
+        (at, &mp4[at + 8..at + len])
+    }
+
+    /// A recording is its frames as MP4 samples: the movie's header before its data,
+    /// the chunk offset pointing at the first sample, and the data each frame's units
+    /// length-prefixed in order with its parameter sets and delimiters left out, one
+    /// sample size each; each sample lasts until the next frame, the last until the end.
+    /// Over generated recordings of a keyframe (with SPS and PPS) and 0 to 20 frames more.
+    #[test]
+    fn a_recording_is_its_frames_as_samples() {
+        let mut rng = Xorshift::new(0x9b05_688c_2b3e_6c1f);
+        for _ in 0..1_000 {
+            let mut ms = 0;
+            let mut frames = Vec::new();
+            let mut want_data = Vec::new();
+            let mut want_sizes = Vec::new();
+            for i in 0..1 + rng.below(21) {
+                let mut units = Vec::new();
+                if i == 0 {
+                    let mut sps = nal(&mut rng, 7);
+                    sps.extend([100, 0, 40]);
+                    units.extend([sps, nal(&mut rng, 8)]);
+                }
+                if rng.below(4) == 0 {
+                    units.push(nal(&mut rng, 9));
+                }
+                let kind = if i == 0 { 5 } else { 1 };
+                units.extend((0..1 + rng.below(3)).map(|_| nal(&mut rng, kind)));
+                let sample: Vec<u8> = units
+                    .iter()
+                    .filter(|u| !matches!(u[0] & 0x1f, 7..=9))
+                    .flat_map(|u| (u.len() as u32).to_be_bytes().into_iter().chain(u.clone()))
+                    .collect();
+                want_sizes.push(sample.len() as u32);
+                want_data.extend(sample);
+                frames.push(Frame {
+                    ms,
+                    key: i == 0,
+                    data: annex_b(&mut rng, &units).into(),
+                });
+                ms += 1 + rng.below(100);
+            }
+            let end = ms + rng.below(100);
+            let out = write(&frames, 64, 32, end).unwrap();
+            let (moov, _) = find(&out, b"moov");
+            let (mdat, data) = find(&out, b"mdat");
+            assert!(moov < mdat);
+            assert_eq!(data, &want_data[..]);
+            let (_, stco) = find(&out, b"stco");
+            let first = u32::from_be_bytes(stco[8..12].try_into().unwrap()) as usize;
+            assert_eq!(first, mdat + 8);
+            let (_, stsz) = find(&out, b"stsz");
+            let sizes: Vec<u32> = stsz[12..]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_be_bytes(*c))
+                .collect();
+            assert_eq!(sizes, want_sizes);
+        }
     }
 }

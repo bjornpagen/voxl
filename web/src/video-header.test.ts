@@ -1,5 +1,6 @@
-// Checks the worker's header reader against web/src/video-header.json, the messages
-// src/video.rs's tests and bench/linkviewer.py check theirs against too:
+// Checks the worker's header reader against web/src/video-header.json: messages as the
+// page gets them, the relay's type byte first, then the bytes src/video.rs's `Header`
+// writes and its tests check against the same file:
 //   node web/src/video-header.test.ts
 import fixture from './video-header.json' with { type: 'json' };
 import {

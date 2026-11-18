@@ -7,7 +7,7 @@
 //! typed characters the viewer never sent. While voxl runs, no keyboard on its X server
 //! autorepeats (see `repeat_off`).
 
-use crate::event::{InputEvent, KeyAct};
+use crate::event::{InputEvent, KeyAct, Press};
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -179,12 +179,6 @@ fn set_repeat(
     Ok(())
 }
 
-fn scratch_file(display: Option<&str>, runtime_dir: Option<String>) -> std::path::PathBuf {
-    let dir = runtime_dir.unwrap_or_else(|| "/tmp".into());
-    let d = display.unwrap_or(":0").replace([':', '/'], "_");
-    std::path::Path::new(&dir).join(format!("voxl-keymap{d}"))
-}
-
 /// X keycodes (evdev + 8) with no entry in Chromium's DOM code table.
 const SAFE_SCRATCH: &[u8] = &[
     92, 109, 120, 126, 138, 147, 149, 153, 154, 155, 156, 157, 159, 161, 162, 165, 168, 170, 178,
@@ -194,8 +188,23 @@ const SAFE_SCRATCH: &[u8] = &[
 
 const SHIFT_L: u32 = 0xffe1;
 
-/// Scroll units per wheel notch (the X server's scroll increment, as for hi-res wheels).
+/// Scroll units per wheel notch: the increment patches/xorg-server-xtest-scroll.patch
+/// gives the XTEST pointer's scroll axes (`SetScrollValuator(..., 120.0, ...)`), which is
+/// the unit of a detent hi-res wheels report in (libinput's `v120`: 120 a detent).
 const NOTCH: f64 = 120.0;
+
+/// How long a scratch keycode's new mapping is left to reach the desktop's clients before
+/// its key is pressed: they must have read X's MappingNotify and fetched the new map, and
+/// the protocol says to nobody when they have, so no event can end this wait. Provisional:
+/// upstream's value, unmeasured; what would measure it is the bench's key test typing
+/// unmapped keysyms into each app with shorter waits until one lands wrong.
+const MAPPING_SETTLE: Duration = Duration::from_millis(8);
+
+/// Desktop pixels one wheel notch scrolls: what turns a viewer's pixel scroll into
+/// notches. Provisional: upstream's calibration of smooth scrolling against a browser
+/// on the desktop, unmeasured here; what would measure it is a page scrolled by a known
+/// number of pixels on the viewer, against the pixels it moves on the desktop.
+const PX_PER_NOTCH: f64 = 180.0;
 
 /// The most notches one pixel scroll turns, either way, on an X server without smooth
 /// scrolling; the rest of a longer scroll is dropped.
@@ -223,21 +232,29 @@ struct SmoothScroll {
 }
 
 impl SmoothScroll {
-    fn detect(conn: &RustConnection) -> Option<Self> {
+    /// The XTEST pointer's scroll axes, if the X server gives it some (an Xvfb with
+    /// patches/xorg-server-xtest-scroll.patch does, a stock server does not): none is a
+    /// server that scrolls by wheel clicks; a failed request is the error.
+    fn detect(conn: &RustConnection) -> Result<Option<Self>, String> {
         use x11rb::connection::RequestConnection;
         use x11rb::protocol::xinput::{self, ConnectionExt as _, DeviceClassData, ScrollType};
-        let xtest = conn
-            .extension_information(x11rb::protocol::xtest::X11_EXTENSION_NAME)
-            .ok()??;
-        let xi = conn
-            .extension_information(xinput::X11_EXTENSION_NAME)
-            .ok()??;
-        conn.xinput_xi_query_version(2, 2).ok()?.reply().ok()?;
+        let e = |e: &dyn std::fmt::Display| format!("smooth scrolling: {e}");
+        let extension = |name| conn.extension_information(name).map_err(|x| e(&x));
+        let (Some(xtest), Some(xi)) = (
+            extension(x11rb::protocol::xtest::X11_EXTENSION_NAME)?,
+            extension(xinput::X11_EXTENSION_NAME)?,
+        ) else {
+            return Ok(None);
+        };
+        conn.xinput_xi_query_version(2, 2)
+            .map_err(|x| e(&x))?
+            .reply()
+            .map_err(|x| e(&x))?;
         let reply = conn
             .xinput_xi_query_device(xinput::Device::ALL)
-            .ok()?
+            .map_err(|x| e(&x))?
             .reply()
-            .ok()?;
+            .map_err(|x| e(&x))?;
         for dev in reply.infos {
             if !String::from_utf8_lossy(&dev.name).contains("XTEST pointer") {
                 continue;
@@ -253,16 +270,16 @@ impl SmoothScroll {
                 }
             }
             if let (Some(vaxis), Some(haxis)) = (v.filter(|&a| a < 6), h.filter(|&a| a < 6)) {
-                return Some(SmoothScroll {
+                return Ok(Some(SmoothScroll {
                     device: dev.deviceid,
                     vaxis,
                     haxis,
                     xtest_opcode: xtest.major_opcode,
                     xi_first_event: xi.first_event,
-                });
+                }));
             }
         }
-        None
+        Ok(None)
     }
 
     /// XTestFakeInput with an XI DeviceMotionNotify (relative) followed by a
@@ -293,7 +310,7 @@ impl SmoothScroll {
             dv[8 + i * 4..12 + i * 4].copy_from_slice(&v.to_ne_bytes());
         }
         req.extend_from_slice(&dv);
-        let _ = conn.send_request_without_reply(&[std::io::IoSlice::new(&req)], vec![]);
+        sent(conn.send_request_without_reply(&[std::io::IoSlice::new(&req)], vec![]));
     }
 }
 const SHIFT_R: u32 = 0xffe2;
@@ -314,20 +331,23 @@ struct Injector {
     repeat: [u8; 32],
     /// keysym -> the key a viewer holds for it.
     pressed: HashMap<u32, Held>,
-    buttons: [bool; 16],
-    clipboard: Option<crate::desktop::ClipboardHandle>,
+    buttons: [Press; 16],
+    clipboard: crate::desktop::ClipboardHandle,
     smooth: Option<SmoothScroll>,
     /// Scroll units (120 per notch) not yet sent: fractions, or partial notches
     /// when falling back to wheel clicks.
     scroll_acc: (f64, f64),
-    px_per_notch: f64,
     shift_kc: u8,
     scratch_path: std::path::PathBuf,
 }
 
 impl Injector {
-    fn new(display: Option<&str>, runtime_dir: Option<String>) -> Result<Self, String> {
-        let (conn, n) = RustConnection::connect(display).map_err(|e| e.to_string())?;
+    fn new(
+        display: &str,
+        keymap: std::path::PathBuf,
+        clipboard: crate::desktop::ClipboardHandle,
+    ) -> Result<Self, String> {
+        let (conn, n) = RustConnection::connect(Some(display)).map_err(|e| e.to_string())?;
         let root = conn.setup().roots[n].root;
         let min_kc = conn.setup().min_keycode;
         let max_kc = conn.setup().max_keycode;
@@ -344,30 +364,44 @@ impl Injector {
             modifiers: vec![],
             repeat,
             pressed: HashMap::new(),
-            buttons: [false; 16],
-            clipboard: None,
+            buttons: [Press::Up; 16],
+            clipboard,
             smooth: None,
             scroll_acc: (0.0, 0.0),
-            px_per_notch: 180.0,
             shift_kc: 0,
-            scratch_path: scratch_file(display, runtime_dir),
+            scratch_path: keymap,
         };
         // Undo remaps left behind by a previous run that didn't exit cleanly.
-        if let Ok(old) = std::fs::read_to_string(&me.scratch_path) {
-            me.load_keymap(max_kc)?;
-            for kc in old.split_whitespace().filter_map(|k| k.parse::<u8>().ok()) {
-                if kc >= min_kc && kc <= max_kc {
-                    let _ = me
-                        .conn
-                        .change_keyboard_mapping(1, kc, me.per as u8, &vec![0; me.per]);
+        // A missing file is a clean exit before: nothing to undo. Keycodes in it are the
+        // ones a voxl wrote; one that is not a keycode of this server is passed over.
+        match std::fs::read_to_string(&me.scratch_path) {
+            Ok(old) => {
+                me.load_keymap(max_kc)?;
+                for kc in old.split_whitespace().filter_map(|k| k.parse::<u8>().ok()) {
+                    if kc >= min_kc && kc <= max_kc {
+                        sent(me.conn.change_keyboard_mapping(
+                            1,
+                            kc,
+                            me.per as u8,
+                            &vec![0; me.per],
+                        ));
+                    }
                 }
+                me.conn
+                    .sync()
+                    .map_err(|e| format!("the keymap left behind: {e}"))?;
+                std::fs::remove_file(&me.scratch_path)
+                    .map_err(|e| format!("{}: {e}", me.scratch_path.display()))?;
             }
-            let _ = me.conn.sync();
-            let _ = std::fs::remove_file(&me.scratch_path);
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("{}: {e}", me.scratch_path.display())),
         }
         me.load_keymap(max_kc)?;
-        me.shift_kc = me.lookup.get(&SHIFT_L).map(|&(k, _)| k).unwrap_or(50);
-        me.smooth = SmoothScroll::detect(&me.conn);
+        me.shift_kc = match me.lookup.get(&SHIFT_L) {
+            Some(&(k, _)) => k,
+            None => return Err("the keymap has no Shift_L".into()),
+        };
+        me.smooth = SmoothScroll::detect(&me.conn)?;
         match &me.smooth {
             Some(s) => log::info!(
                 "smooth scrolling via XTEST device {} (axes {}/{})",
@@ -436,9 +470,10 @@ impl Injector {
     }
 
     fn fake(&self, ty: u8, detail: u8, x: i16, y: i16) {
-        let _ = self
-            .conn
-            .xtest_fake_input(ty, detail, x11rb::CURRENT_TIME, self.root, x, y, 0);
+        sent(
+            self.conn
+                .xtest_fake_input(ty, detail, x11rb::CURRENT_TIME, self.root, x, y, 0),
+        );
     }
 
     /// The keycode that types `keysym` and the level it is on, if X has one or a spare
@@ -463,24 +498,29 @@ impl Injector {
         if self.scratch.is_empty() {
             return None;
         }
-        // Map the keysym onto a spare keycode at every level.
-        let kc = if self.scratch_map.len() < self.scratch.len() {
-            self.scratch[self.scratch_map.len()]
-        } else {
-            let (&old, _) = self
-                .scratch_map
-                .iter()
-                .min_by_key(|(_, (_, t))| *t)
-                .unwrap();
-            self.scratch_map.remove(&old).unwrap().0
+        // Map the keysym onto a spare keycode at every level: a free one, else the one
+        // used longest ago.
+        let kc = match self.scratch.get(self.scratch_map.len()) {
+            Some(&free) => free,
+            None => {
+                let oldest = self.scratch_map.iter().min_by_key(|(_, (_, t))| *t);
+                let (&old, &(kc, _)) = oldest?;
+                self.scratch_map.remove(&old);
+                kc
+            }
         };
         let row = vec![keysym; self.per];
-        let _ = self
+        let mapped = self
             .conn
-            .change_keyboard_mapping(1, kc, self.per as u8, &row);
-        let _ = self.conn.sync();
+            .change_keyboard_mapping(1, kc, self.per as u8, &row)
+            .map_err(x11rb::errors::ReplyError::from)
+            .and_then(|_| self.conn.sync());
+        if let Err(e) = mapped {
+            log::error!("keysym {keysym:#x} not mapped: {e}");
+            return None;
+        }
         // Clients must process MappingNotify before they see the key.
-        std::thread::sleep(Duration::from_millis(8));
+        std::thread::sleep(MAPPING_SETTLE);
         let i = (kc - self.min_kc) as usize;
         let per = self.per;
         self.syms[i * per..(i + 1) * per].copy_from_slice(&row);
@@ -490,7 +530,11 @@ impl Injector {
             .values()
             .map(|(k, _)| k.to_string())
             .collect();
-        let _ = std::fs::write(&self.scratch_path, used.join(" "));
+        // Without it, a crash leaves this mapping for the next voxl not to undo: said.
+        if let Err(e) = crate::session::private_file(&self.scratch_path, used.join(" ").as_bytes())
+        {
+            log::warn!("{}: {e}", self.scratch_path.display());
+        }
         Some((kc, Level::Either))
     }
 
@@ -535,12 +579,19 @@ impl Injector {
 
     fn restore_keymap(&mut self) {
         for (_, (kc, _)) in std::mem::take(&mut self.scratch_map) {
-            let _ = self
-                .conn
-                .change_keyboard_mapping(1, kc, self.per as u8, &vec![0; self.per]);
+            sent(
+                self.conn
+                    .change_keyboard_mapping(1, kc, self.per as u8, &vec![0; self.per]),
+            );
         }
-        let _ = self.conn.sync();
-        let _ = std::fs::remove_file(&self.scratch_path);
+        if let Err(e) = self.conn.sync() {
+            log::error!("the keymap not put back: {e}");
+        }
+        match std::fs::remove_file(&self.scratch_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::error!("{}: {e}", self.scratch_path.display()),
+        }
     }
 
     /// Turns the wheel by `notches`, a press and a release of one of X's wheel buttons
@@ -557,17 +608,16 @@ impl Injector {
     fn handle(&mut self, ev: InputEvent) {
         match ev {
             InputEvent::Move { x, y } => self.fake(xproto::MOTION_NOTIFY_EVENT, 0, x, y),
-            InputEvent::Button { button, down } => {
+            InputEvent::Button { button, press } => {
                 let held = &mut self.buttons[usize::from(button.number())];
-                if *held == down {
+                if *held == press {
                     return;
                 }
-                *held = down;
+                *held = press;
                 self.fake(
-                    if down {
-                        xproto::BUTTON_PRESS_EVENT
-                    } else {
-                        xproto::BUTTON_RELEASE_EVENT
+                    match press {
+                        Press::Down => xproto::BUTTON_PRESS_EVENT,
+                        Press::Up => xproto::BUTTON_RELEASE_EVENT,
                     },
                     button.number(),
                     0,
@@ -575,7 +625,7 @@ impl Injector {
                 )
             }
             InputEvent::ScrollPx { dx, dy } => {
-                let k = NOTCH / self.px_per_notch;
+                let k = NOTCH / PX_PER_NOTCH;
                 self.scroll_acc.0 += dx.get() * k;
                 self.scroll_acc.1 += dy.get() * k;
                 if let Some(sm) = &self.smooth {
@@ -602,23 +652,29 @@ impl Injector {
             }
             InputEvent::Key { keysym, act } => self.key(keysym, act),
             InputEvent::Clipboard(text) => {
-                if let Some(c) = &self.clipboard {
-                    c.set_blocking(text);
-                }
+                self.clipboard.set_blocking(text);
             }
-            InputEvent::Shutdown => {
+            InputEvent::Shutdown(done) => {
                 self.handle(InputEvent::ReleaseAll);
                 self.restore_keymap();
-                let _ = set_repeat(&self.conn, &self.repeat);
-                let _ = self.conn.sync();
+                if let Err(e) = set_repeat(&self.conn, &self.repeat) {
+                    log::error!("key repeat not put back: {e}");
+                }
+                if let Err(e) = self.conn.sync() {
+                    log::error!("the X server took no last input: {e}");
+                }
+                // The daemon's stop waits on this; gone, it waits for nothing.
+                if done.send(()).is_err() {
+                    log::info!("the daemon stopped before the input was let go");
+                }
             }
             InputEvent::ReleaseAll => {
                 for (_, held) in std::mem::take(&mut self.pressed) {
                     self.stroke(Stroke::Release(held.keycode()));
                 }
                 for b in 1..self.buttons.len() {
-                    if self.buttons[b] {
-                        self.buttons[b] = false;
+                    if self.buttons[b] == Press::Down {
+                        self.buttons[b] = Press::Up;
                         self.fake(xproto::BUTTON_RELEASE_EVENT, b as u8, 0, 0);
                     }
                 }
@@ -634,20 +690,31 @@ impl crate::event::Inject for Injector {
 
     /// X keeps requests in the connection's buffer until it is flushed.
     fn flush(&mut self) {
-        let _ = self.conn.flush();
+        sent(self.conn.flush());
     }
 }
 
+/// A request handed to the X server: a connection that fails is the X server gone, and
+/// the daemon ends with it (its service manager starts it again with the desktop).
+fn sent<T, E: std::fmt::Display>(r: Result<T, E>) -> T {
+    match r {
+        Ok(t) => t,
+        Err(e) => {
+            log::error!("input's X connection: {e}");
+            crate::logging::exit(1)
+        }
+    }
+}
+
+/// `keymap` is the file of the scratch keycodes voxl has remapped, in the runtime folder:
+/// what a voxl that did not exit cleanly left there is undone at the next start.
 pub fn spawn(
-    display: Option<String>,
-    clipboard: Option<crate::desktop::ClipboardHandle>,
-    px_per_notch: f64,
-    runtime_dir: Option<String>,
+    display: &str,
+    clipboard: crate::desktop::ClipboardHandle,
+    keymap: std::path::PathBuf,
 ) -> Result<mpsc::Sender<InputEvent>, String> {
-    let mut inj = Injector::new(display.as_deref(), runtime_dir)?;
-    inj.clipboard = clipboard;
-    inj.px_per_notch = px_per_notch.max(1.0);
-    Ok(crate::event::spawn(move || inj))
+    let inj = Injector::new(display, keymap, clipboard)?;
+    crate::event::spawn(move || inj)
 }
 
 #[cfg(test)]

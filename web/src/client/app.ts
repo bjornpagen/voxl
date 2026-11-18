@@ -13,16 +13,22 @@ export interface App {
 	kbd: HTMLTextAreaElement;
 	tools: HTMLElement;
 	isMac: boolean;
-	/** The desktop is a Mac (from the server's hello). */
-	remoteMac: boolean;
-	/** The server only shows the desktop (--read-only), from the server's hello. */
-	readOnly: boolean;
 	inIframe: boolean;
-	/** Desktop size in pixels; 0 until the server says hello. */
-	desk: { w: number; h: number };
-	/** On-screen CSS pixels per desktop pixel, before any pinch zoom (zoom.ts). */
+	/** The desktop as the session's hello describes it. */
+	desk: Desk;
+	/** On-screen CSS pixels per desktop pixel. */
 	view: { scale: number };
 }
+
+/** The desktop: none before a session's hello and after the session ends; otherwise its
+ * size in pixels. */
+export type Desk =
+	| { readonly s: 'none' }
+	| {
+			readonly s: 'shown';
+			readonly w: number;
+			readonly h: number;
+	  };
 
 export function el<T extends HTMLElement = HTMLElement>(id: string): T {
 	const e = document.getElementById(id);

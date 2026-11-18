@@ -20,6 +20,7 @@ export function createCursor(app: App) {
 			h = v.getUint16(4),
 			hx = v.getUint16(6),
 			hy = v.getUint16(8);
+		// A cursor of no size is the desktop hiding it.
 		if (!w || !h) {
 			app.surface.style.cursor = 'none';
 			return;
@@ -36,7 +37,7 @@ export function createCursor(app: App) {
 			);
 		// Cursor images are in desktop pixels; show them at the on-screen scale, but
 		// never smaller than a normal pointer.
-		const dpr = window.devicePixelRatio || 1;
+		const dpr = window.devicePixelRatio;
 		const size = Math.max(w, h);
 		const s = Math.min(
 			Math.max(app.view.scale, MIN_CURSOR_PX / size),
