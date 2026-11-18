@@ -38,6 +38,10 @@ pub struct Config {
     /// The lanes description, read at every session start.
     pub lanes: PathBuf,
     pub ssh: ssh::Destination,
+    /// The folder of the daemon `voxl attach` reaches; none for the daemon's default.
+    pub runtime: Option<ssh::Runtime>,
+    /// Where the lanes go, as the server's proxy is asked for it: that daemon's lanes.
+    pub place: proxy::Place,
     /// Where the files routes learn the shared folder from a session's hello.
     pub files: Arc<files::Files>,
 }
@@ -366,7 +370,7 @@ async fn session(
         Err(m) => return End::Lanes(m),
     };
     let opened = Instant::now();
-    let mut child: Child = match ssh::attach(&cfg.ssh) {
+    let mut child: Child = match ssh::attach(&cfg.ssh, cfg.runtime.as_ref()) {
         Ok(c) => c,
         Err(e) => return End::Ssh(e),
     };
@@ -581,7 +585,7 @@ impl Session<'_> {
         let lane = match &self.description {
             Description::Datagram { proxy } => {
                 let a = Arc::new(
-                    proxy::Association::open(proxy, buffer)
+                    proxy::Association::open(proxy, &self.cfg.place, buffer)
                         .await
                         .map_err(End::Proxy)?,
                 );
@@ -603,7 +607,9 @@ impl Session<'_> {
                 }
             }
             Description::Stream { proxy } => {
-                let reader = proxy::connect(proxy, buffer).await.map_err(End::Proxy)?;
+                let reader = proxy::connect(proxy, &self.cfg.place, buffer)
+                    .await
+                    .map_err(End::Proxy)?;
                 // What the proxy sent past its answer's head: the lane's first bytes.
                 let first = reader.buffer().to_vec();
                 let tcp = Arc::new(reader.into_inner());

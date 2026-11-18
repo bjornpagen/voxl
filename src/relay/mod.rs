@@ -1,6 +1,7 @@
 //! `voxl relay`: the viewer's side of a session, run on the viewer's machine. It serves the
 //! page on 127.0.0.1 and, for each page that connects, runs a session: `ssh <host> voxl
-//! attach` for the control stream, and one lane, through a proxy, for video and audio. It
+//! attach` for the control stream (to the daemon of `--runtime`'s folder, when it is given),
+//! and its lanes to `--place` on the server (the protocol's `localhost:6901` by default), and one lane, through a proxy, for video and audio. It
 //! hands the page every frame the lane completes, in order.
 //!
 //! **The lane.** One per session, of the kind the lanes description names. A datagram lane
@@ -36,7 +37,8 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// What `voxl relay` is told, each flag required and given once.
+/// What `voxl relay` is told: each flag given once, every one but `--runtime` and `--place`
+/// required.
 #[derive(Debug, PartialEq)]
 struct Flags {
     /// `--lanes`: the lanes description, read at every session start.
@@ -45,14 +47,21 @@ struct Flags {
     ssh: ssh::Destination,
     /// `--port`: the page's port on 127.0.0.1.
     port: u16,
+    /// `--runtime`: the folder of the daemon `voxl attach` reaches, on the server; when
+    /// not given, the daemon's default one.
+    runtime: Option<ssh::Runtime>,
+    /// `--place`: where the lanes go, as the server's proxy is asked for it; when not
+    /// given, the protocol's.
+    place: proxy::Place,
 }
 
-const USAGE: &str = "usage: voxl relay --lanes FILE --ssh DESTINATION --port PORT";
+const USAGE: &str = "usage: voxl relay --lanes FILE --ssh DESTINATION --port PORT [--runtime DIR] [--place localhost:PORT]";
 
 impl Flags {
-    /// `--name value` or `--name=value`, each of the three exactly once, and nothing else.
+    /// `--name value` or `--name=value`, each at most once, the three required ones
+    /// exactly once, and nothing else.
     fn parse(args: &[String]) -> Result<Flags, String> {
-        let (mut lanes, mut ssh, mut port) = (None, None, None);
+        let (mut lanes, mut ssh, mut port, mut runtime, mut place) = (None, None, None, None, None);
         let mut it = args.iter();
         while let Some(a) = it.next() {
             let (name, value) = match a.split_once('=') {
@@ -68,6 +77,8 @@ impl Flags {
                 "--lanes" => &mut lanes,
                 "--ssh" => &mut ssh,
                 "--port" => &mut port,
+                "--runtime" => &mut runtime,
+                "--place" => &mut place,
                 _ => return Err(format!("{name}: not a flag of voxl relay")),
             };
             if slot.replace(value).is_some() {
@@ -84,6 +95,11 @@ impl Flags {
                 .ok()
                 .filter(|&p| p != 0)
                 .ok_or_else(|| format!("--port {port}: not a port from 1 to 65535"))?,
+            runtime: runtime.as_deref().map(ssh::Runtime::parse).transpose()?,
+            place: match place {
+                Some(p) => proxy::Place::parse(&p)?,
+                None => proxy::Place::protocol(),
+            },
         })
     }
 }
@@ -128,6 +144,8 @@ async fn serve(flags: Flags) -> std::io::Result<()> {
     let sessions = Arc::new(session::Config {
         lanes: flags.lanes,
         ssh: flags.ssh,
+        runtime: flags.runtime,
+        place: flags.place,
         files: files.clone(),
     });
     let app = router(sessions, files);
@@ -222,27 +240,43 @@ mod tests {
     use super::*;
     use crate::xorshift::Xorshift;
 
-    /// Over drawn command lines (each of the three flags given zero, one or two times, in
+    /// Over drawn command lines (each of the five flags given zero, one or two times, in
     /// either spelling, with a value or without one at the end, ports good and bad,
-    /// destinations good and bad, an unknown flag now and then, in any order): a line is
-    /// read exactly when each flag is given once with a value it takes and nothing else is,
-    /// and it is read as the values given. The oracle is the drawing's record of what it
-    /// put in the line.
+    /// destinations, runtime folders and places good and bad, an unknown flag now and then,
+    /// in any order): a line is read exactly when each required flag is given once,
+    /// `--runtime` and `--place` at most once, each with a value it takes, and nothing else
+    /// is; and it is read as the values given, a runtime folder not given read as none and a
+    /// place not given as the protocol's. The oracle is the drawing's
+    /// record of what it put in the line.
     #[test]
-    fn the_relay_takes_exactly_its_three_flags() {
+    fn the_relay_takes_exactly_its_flags() {
         let mut rng = Xorshift::new(0xC6A4A7935BD1E995);
         let ports = ["6901", "1", "65535", "0", "65536", "-1", "x", ""];
         let dests = ["desk", "a.example", "-oProxyCommand=x", "a b", ""];
+        let runtimes = ["/run/voxl", "/run/voxl-bench/3", "a b", "--x", "x=y", ""];
+        let places = [
+            "localhost:6901",
+            "localhost:6913",
+            "localhost:22",
+            "localhost:69130",
+            "127.0.0.1:6901",
+            "",
+        ];
         let mut read = 0;
         for _ in 0..20_000 {
             // Per flag: the values given, in order.
-            let mut given: [Vec<String>; 3] = Default::default();
+            let mut given: [Vec<String>; 5] = Default::default();
             let mut words: Vec<Vec<String>> = Vec::new();
-            for (f, name) in ["--lanes", "--ssh", "--port"].into_iter().enumerate() {
+            for (f, name) in ["--lanes", "--ssh", "--port", "--runtime", "--place"]
+                .into_iter()
+                .enumerate()
+            {
                 for _ in 0..[0, 1, 1, 1, 2][rng.below(5) as usize] {
                     let v = match f {
                         0 => format!("/lanes/{}", rng.below(9)),
                         1 => dests[rng.below(dests.len() as u64) as usize].to_string(),
+                        3 => runtimes[rng.below(runtimes.len() as u64) as usize].to_string(),
+                        4 => places[rng.below(places.len() as u64) as usize].to_string(),
                         _ => ports[rng.below(ports.len() as u64) as usize].to_string(),
                     };
                     given[f].push(v.clone());
@@ -266,23 +300,37 @@ mod tests {
             if cut {
                 args.pop();
             }
-            let once = given.iter().all(|g| g.len() == 1);
+            let once =
+                given[..3].iter().all(|g| g.len() == 1) && given[3..].iter().all(|g| g.len() <= 1);
             let valid = once
                 && !unknown
                 && !cut
                 && ssh::Destination::parse(&given[1][0]).is_ok()
-                && given[2][0].parse::<u16>().is_ok_and(|p| p != 0);
+                && given[2][0].parse::<u16>().is_ok_and(|p| p != 0)
+                && given[3].iter().all(|r| !r.is_empty())
+                && given[4].iter().all(|p| proxy::Place::parse(p).is_ok());
             match Flags::parse(&args) {
                 Ok(flags) => {
                     assert!(valid, "{args:?} read");
                     assert_eq!(flags.lanes, PathBuf::from(&given[0][0]));
                     assert_eq!(flags.ssh, ssh::Destination::parse(&given[1][0]).unwrap());
                     assert_eq!(flags.port.to_string(), given[2][0]);
+                    assert_eq!(
+                        flags.runtime,
+                        given[3].first().map(|r| ssh::Runtime::parse(r).unwrap())
+                    );
+                    assert_eq!(
+                        flags.place,
+                        given[4]
+                            .first()
+                            .map_or_else(proxy::Place::protocol, |p| proxy::Place::parse(p)
+                                .unwrap())
+                    );
                     read += 1;
                 }
                 Err(_) => assert!(!valid, "{args:?} refused"),
             }
         }
-        assert!(read > 500, "{read}");
+        assert!(read > 100, "{read}");
     }
 }

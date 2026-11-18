@@ -207,16 +207,21 @@ desktop follows the viewer's window) are always on.
 ### The relay
 
 ```sh
-voxl relay --lanes FILE --ssh DESTINATION --port PORT
+voxl relay --lanes FILE --ssh DESTINATION --port PORT [--runtime DIR] [--place localhost:PORT]
 ```
 
-| Flag      |                                                                                   |
-| --------- | --------------------------------------------------------------------------------- |
-| `--lanes` | the lanes description, read at every session start (see [Lanes](#lanes))          |
-| `--ssh`   | where `voxl attach` and `voxl files` run: anything `ssh` takes as its destination |
-| `--port`  | the page's port on `127.0.0.1`                                                    |
+| Flag        |                                                                                                   |
+| ----------- | ------------------------------------------------------------------------------------------------- |
+| `--lanes`   | the lanes description, read at every session start (see [Lanes](#lanes))                          |
+| `--ssh`     | where `voxl attach` and `voxl files` run: anything `ssh` takes as its destination                 |
+| `--port`    | the page's port on `127.0.0.1`                                                                    |
+| `--runtime` | the runtime folder of the daemon `voxl attach` reaches, on the server; else the daemon's default  |
+| `--place`   | where the lanes go, as the server's proxy is asked for it; else the protocol's `localhost:6901`   |
 
-Each flag is required. The relay listens on `127.0.0.1` only, and answers only requests
+`--lanes`, `--ssh` and `--port` are required; `--runtime` and `--place` are for a server
+that runs more than one daemon, each in a folder of its own with its lanes at a port of its
+own on the server's loopback (`localhost:PORT`, no longer than `localhost:6901`: the daemon
+sizes its datagrams for that). The relay listens on `127.0.0.1` only, and answers only requests
 for an IP address or `localhost`, from its own page. That keeps out other web pages,
 which browsers let connect to any address, including pages whose domain is pointed at
 127.0.0.1 (DNS rebinding). Programs that aren't browsers send no `Origin` and get

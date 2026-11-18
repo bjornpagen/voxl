@@ -119,14 +119,66 @@ async fn reach(proxy: &Endpoint, lane: Option<Buffer>) -> Result<TcpStream, Prox
     Ok(tcp)
 }
 
-/// A stream to [`DESTINATION`] through `proxy`'s HTTP CONNECT. What the proxy sent past
-/// its answer's head stays in the reader, as the stream's first bytes.
-pub async fn connect(proxy: &Endpoint, buffer: Buffer) -> Result<BufReader<TcpStream>, ProxyError> {
+/// Where a session's lanes go, as the server's proxy is asked for it (`--place`):
+/// `localhost:<port>`, the server's own loopback at the port its proxy maps to one daemon's
+/// lane sockets. The protocol's is [`DESTINATION`]; a server that runs more than one daemon
+/// maps a port to each. Its text is never longer than `DESTINATION`'s: the daemon sizes a
+/// lane datagram for a Hysteria 2 message that names `DESTINATION` (`wire::DATAGRAM`), so a
+/// longer place would carry a full datagram past what one QUIC datagram holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Place {
+    port: std::num::NonZeroU16,
+}
+
+impl Place {
+    /// The protocol's place, [`DESTINATION`].
+    pub fn protocol() -> Place {
+        Place::parse(DESTINATION).expect("the lanes' destination is a place")
+    }
+
+    /// `localhost:<port>`, the port a decimal number from 1 without sign or leading zero,
+    /// the whole no longer than [`DESTINATION`].
+    pub fn parse(v: &str) -> Result<Place, String> {
+        let port = v
+            .strip_prefix("localhost:")
+            .filter(|p| !p.starts_with('0') && p.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|p| p.parse::<std::num::NonZeroU16>().ok())
+            .filter(|_| v.len() <= DESTINATION.len())
+            .ok_or_else(|| {
+                format!(
+                    "--place {v:?}: not localhost:<port> of at most {} characters, as {DESTINATION}",
+                    DESTINATION.len()
+                )
+            })?;
+        Ok(Place { port })
+    }
+
+    /// The SOCKS5 header a datagram to the place carries: RSV, FRAG 0, ATYP 3 (a domain
+    /// name), its length, the name, the port.
+    fn header(&self) -> Vec<u8> {
+        let mut h = vec![0, 0, 0, 3, b"localhost".len() as u8];
+        h.extend_from_slice(b"localhost");
+        h.extend_from_slice(&self.port.get().to_be_bytes());
+        h
+    }
+}
+
+impl std::fmt::Display for Place {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "localhost:{}", self.port)
+    }
+}
+
+/// A stream to `place` through `proxy`'s HTTP CONNECT. What the proxy sent past its
+/// answer's head stays in the reader, as the stream's first bytes.
+pub async fn connect(
+    proxy: &Endpoint,
+    place: &Place,
+    buffer: Buffer,
+) -> Result<BufReader<TcpStream>, ProxyError> {
     let mut tcp = reach(proxy, Some(buffer)).await?;
-    tcp.write_all(
-        format!("CONNECT {DESTINATION} HTTP/1.1\r\nHost: {DESTINATION}\r\n\r\n").as_bytes(),
-    )
-    .await?;
+    tcp.write_all(format!("CONNECT {place} HTTP/1.1\r\nHost: {place}\r\n\r\n").as_bytes())
+        .await?;
     let mut reader = BufReader::new(tcp);
     let mut head = (&mut reader).take(CONNECT_ANSWER_MOST);
     let mut line = Vec::new();
@@ -151,7 +203,7 @@ pub async fn connect(proxy: &Endpoint, buffer: Buffer) -> Result<BufReader<TcpSt
     }
 }
 
-/// A SOCKS5 UDP association: datagrams to and from [`DESTINATION`]. It lasts as long as
+/// A SOCKS5 UDP association: datagrams to and from a [`Place`]. It lasts as long as
 /// the TCP connection that asked for it (RFC 1928 §7), which `control` holds; a read of
 /// `control` ending is the association ending.
 pub struct Association {
@@ -159,21 +211,8 @@ pub struct Association {
     /// Connected to the proxy's relay address, so the kernel drops datagrams from anyone
     /// else.
     pub socket: UdpSocket,
-}
-
-/// The SOCKS5 header a datagram to [`DESTINATION`] carries: RSV, FRAG 0, ATYP 3 (a domain
-/// name), its length, the name, the port.
-fn header() -> Vec<u8> {
-    let (name, port) = DESTINATION
-        .rsplit_once(':')
-        .expect("the lanes' destination is host:port");
-    let port: u16 = port
-        .parse()
-        .expect("the lanes' destination's port is a port");
-    let mut h = vec![0, 0, 0, 3, name.len() as u8];
-    h.extend_from_slice(name.as_bytes());
-    h.extend_from_slice(&port.to_be_bytes());
-    h
+    /// The SOCKS5 header of every datagram it sends: to its place.
+    header: Vec<u8>,
 }
 
 /// The longest SOCKS5 UDP header: RSV, FRAG, ATYP, a 255-byte name with its length, the
@@ -197,8 +236,12 @@ pub fn payload(d: &[u8]) -> Option<&[u8]> {
 }
 
 impl Association {
-    /// Asks `proxy` for an association.
-    pub async fn open(proxy: &Endpoint, buffer: Buffer) -> Result<Association, ProxyError> {
+    /// Asks `proxy` for an association whose datagrams go to `place`.
+    pub async fn open(
+        proxy: &Endpoint,
+        place: &Place,
+        buffer: Buffer,
+    ) -> Result<Association, ProxyError> {
         let mut control = reach(proxy, None).await?;
         // No authentication: the proxy is the user's own, on their machine.
         control.write_all(&[5, 1, 0]).await?;
@@ -257,7 +300,11 @@ impl Association {
         socket
             .connect(SocketAddr::new(ip, u16::from_be_bytes(port)))
             .await?;
-        Ok(Association { control, socket })
+        Ok(Association {
+            control,
+            socket,
+            header: place.header(),
+        })
     }
 
     /// Waits on the association's TCP connection, on which the proxy says nothing: its end
@@ -272,9 +319,9 @@ impl Association {
         }
     }
 
-    /// Sends `payload` to [`DESTINATION`].
+    /// Sends `payload` to the association's place.
     pub async fn send(&self, payload: &[u8]) -> std::io::Result<()> {
-        let mut d = header();
+        let mut d = self.header.clone();
         d.extend_from_slice(payload);
         self.socket.send(&d).await.map(drop)
     }
@@ -285,7 +332,109 @@ mod tests {
     use super::*;
     use crate::xorshift::Xorshift;
 
-    /// A CONNECT asks the proxy for the lanes' destination, takes a `200` answer with any
+    /// A place drawn as `--place` takes it: a port of 1 to 9999 drawn, the place the protocol's
+    /// own way of writing a lane's port to its proxy.
+    fn drawn_place(rng: &mut Xorshift) -> Place {
+        Place::parse(&format!("localhost:{}", rng.range(1, 10_000))).unwrap()
+    }
+
+    /// A place is read exactly when it is `localhost:` and a port from 1 written without sign
+    /// or leading zero, the whole no longer than the protocol's destination, and it is read
+    /// as itself: over drawn strings of that form and near misses of it (other hosts, ports 0
+    /// and past 65535, leading zeros, signs, spaces, nothing). The protocol's own is one.
+    #[test]
+    fn a_place_is_localhost_and_a_port_no_longer_than_the_protocols() {
+        let mut rng = Xorshift::new(0x2545F4914F6CDD1D);
+        let mut read = 0;
+        for _ in 0..50_000 {
+            let host = [
+                "localhost",
+                "localhost",
+                "localhost",
+                "127.0.0.1",
+                "LOCALHOST",
+                "",
+            ][rng.below(6) as usize];
+            let port = match rng.below(8) {
+                0 => format!("0{}", rng.below(1000)),
+                1 => format!("+{}", rng.below(1000)),
+                2 => format!("{} ", rng.below(1000)),
+                3 => String::new(),
+                4 => rng.below(100_000).to_string(),
+                _ => rng.below(12_000).to_string(),
+            };
+            let v = format!("{host}:{port}");
+            let canonical = host == "localhost"
+                && port
+                    .parse::<u32>()
+                    .is_ok_and(|p| (1..=65_535).contains(&p) && p.to_string() == port)
+                && v.len() <= DESTINATION.len();
+            match Place::parse(&v) {
+                Ok(p) => {
+                    assert!(canonical, "{v:?} read");
+                    assert_eq!(p.to_string(), v);
+                    read += 1;
+                }
+                Err(_) => assert!(!canonical, "{v:?} refused"),
+            }
+        }
+        assert!(read > 5_000, "{read}");
+        assert_eq!(Place::protocol().to_string(), DESTINATION);
+    }
+
+    /// Every lane message goes to the place named: through a SOCKS5 proxy on 127.0.0.1 (its
+    /// greeting, UDP ASSOCIATE and relay socket, as RFC 1928 has them), each datagram an
+    /// association sends arrives at the proxy's relay whole, its header naming the place's
+    /// host and port (ATYP 3) and its payload what was sent, over drawn places and payloads.
+    /// The stream lane's CONNECT naming its place is the test below's.
+    #[tokio::test]
+    async fn every_lane_datagram_goes_to_the_place_named() {
+        let mut rng = Xorshift::new(0x94D049BB133111EB);
+        for _ in 0..40 {
+            let place = drawn_place(&mut rng);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_port = listener.local_addr().unwrap().port();
+            let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let relay_port = relay.local_addr().unwrap().port();
+            let control = tokio::spawn(async move {
+                let (mut tcp, _) = listener.accept().await.unwrap();
+                let mut greeting = [0u8; 3];
+                tcp.read_exact(&mut greeting).await.unwrap();
+                assert_eq!(greeting, [5, 1, 0]);
+                tcp.write_all(&[5, 0]).await.unwrap();
+                let mut ask = [0u8; 10];
+                tcp.read_exact(&mut ask).await.unwrap();
+                assert_eq!(ask[..2], [5, 3]);
+                let mut reply = vec![5, 0, 0, 1, 127, 0, 0, 1];
+                reply.extend_from_slice(&relay_port.to_be_bytes());
+                tcp.write_all(&reply).await.unwrap();
+                tcp
+            });
+            let endpoint = Endpoint {
+                host: Host::V4(Ipv4Addr::LOCALHOST),
+                port: std::num::NonZeroU16::new(proxy_port).unwrap(),
+            };
+            let a = Association::open(&endpoint, &place, Buffer::named(64 << 10))
+                .await
+                .unwrap();
+            let _held = control.await.unwrap();
+            for _ in 0..1 + rng.below(8) {
+                let sent: Vec<u8> = (0..rng.below(1200)).map(|_| rng.next() as u8).collect();
+                a.send(&sent).await.unwrap();
+                let mut got = vec![0u8; UDP_HEADER_MOST + 1200];
+                let n = relay.recv(&mut got).await.unwrap();
+                let got = &got[..n];
+                let name = b"localhost";
+                assert_eq!(got[..5], [0, 0, 0, 3, name.len() as u8], "{place}");
+                assert_eq!(&got[5..5 + name.len()], name);
+                let port = u16::from_be_bytes([got[5 + name.len()], got[6 + name.len()]]);
+                assert_eq!(format!("localhost:{port}"), place.to_string());
+                assert_eq!(payload(got), Some(sent.as_slice()));
+            }
+        }
+    }
+
+    /// A CONNECT asks the proxy for the lane's place, takes a `200` answer with any
     /// headers as the stream, and keeps what the proxy sent past the answer's head as the
     /// stream's first bytes; any other status is the proxy's refusal, and an answer cut
     /// before its head ends is no answer. Against a proxy on 127.0.0.1 that answers as drawn.
@@ -327,11 +476,12 @@ mod tests {
                 host: Host::V4(Ipv4Addr::LOCALHOST),
                 port: std::num::NonZeroU16::new(port).unwrap(),
             };
-            let got = connect(&endpoint, Buffer::named(64 << 10)).await;
+            let place = drawn_place(&mut rng);
+            let got = connect(&endpoint, &place, Buffer::named(64 << 10)).await;
             let asked = proxy.await.unwrap();
             assert_eq!(
                 asked,
-                format!("CONNECT {DESTINATION} HTTP/1.1\r\nHost: {DESTINATION}\r\n\r\n").as_bytes()
+                format!("CONNECT {place} HTTP/1.1\r\nHost: {place}\r\n\r\n").as_bytes()
             );
             match (got, status.starts_with("200"), cut) {
                 (Ok(mut stream), true, false) => {
@@ -419,7 +569,7 @@ mod tests {
             assert_eq!(payload(&atyp), None);
         }
         assert_eq!(
-            payload(&[header(), b"x".to_vec()].concat()),
+            payload(&[Place::protocol().header(), b"x".to_vec()].concat()),
             Some(&b"x"[..])
         );
     }
