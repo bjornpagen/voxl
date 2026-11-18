@@ -10,7 +10,7 @@ import {
 	parseVideoHeader,
 	VIDEO_HEADER_BYTES,
 } from './protocol';
-import { Count } from './protocol';
+import { Count } from './stats';
 import type { FromWorker, PcmChunk, ServerMessage, ToWorker } from './protocol';
 
 declare const self: DedicatedWorkerGlobalScope;

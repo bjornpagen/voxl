@@ -107,39 +107,6 @@ export const VIDEO_HEADER_BYTES = 14;
 
 // ---- page <-> worker ----
 
-/** The counters the worker keeps and the page reads when asked (`window.voxlStats`),
- * shared between them: each a running total, wrapping at 2^32, so the reader takes the
- * difference since its last read. */
-export const Count = {
-	/** Updates shown. */
-	Frames: 0,
-	/** Updates arrived. */
-	Updates: 1,
-	/** Bytes of updates arrived. */
-	Bytes: 2,
-	/** Arrival to shown of the updates shown, in µs. */
-	DecodeUs: 3,
-	/** The server's capture to send of the updates arrived, in tenths of a ms. */
-	PipeTenths: 4,
-	/** Deltas passed undecoded while a datagram lane's stream waited for its keyframe. */
-	Passed: 5,
-} as const;
-export const COUNTS = 6;
-
-/** What `window.voxlStats` reads. */
-export interface Stats {
-	fps: number;
-	kbps: number;
-	/** Mean arrival to shown, and the server's capture to send, since the last read; null
-	 * when none came since. */
-	decodeMs: number | null;
-	pipeMs: number | null;
-	/** What the decoder decodes; null while there is none (before a keyframe). */
-	codec: string | null;
-	/** Deltas passed undecoded, waiting for a keyframe, since the last read. */
-	passed: number;
-}
-
 /** Worker -> page. Relay messages other than close are forwarded as is; the session's
  * end is the status `closed`, with its cause. */
 export type FromWorker =
@@ -156,6 +123,7 @@ export type FromWorker =
 
 /** Page -> worker. */
 export type ToWorker =
+	/** `counts` is the page's meter's (stats.ts), which the worker adds to. */
 	| { t: 'init'; url: string; counts: Uint32Array }
 	/** Open a new session after the last one ended (the viewer asked). */
 	| { t: 'connect' }

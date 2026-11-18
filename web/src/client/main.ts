@@ -1,8 +1,8 @@
 // Main thread: layout, input capture, cursor, clipboard, files, microphone and audio.
 // Video decode/paint and the socket live in the worker (worker.ts).
 import { cmd } from '../protocol';
-import { Count, COUNTS } from '../protocol';
-import type { FromWorker, Stats, ToWorker } from '../protocol';
+import type { FromWorker, ToWorker } from '../protocol';
+import { Meter, type Stats } from '../stats';
 import type { App } from './app';
 import { el } from './app';
 import { createAudio } from './audio';
@@ -95,30 +95,14 @@ function main() {
 	const mic = createMic(app);
 	const resize = createResize(app);
 
-	const counts = new Uint32Array(new SharedArrayBuffer(COUNTS * 4));
-	post({ t: 'init', url: wsUrl.href, counts });
+	const meter = new Meter(performance.now());
+	post({ t: 'init', url: wsUrl.href, counts: meter.counts });
 	/** What the decoder decodes, as the worker last said. */
 	let codec: string | null = null;
 	// Read by the bench tools (measure.mjs) and handy in the console: the worker's counters
 	// since the last read, as rates and means, computed when read.
-	let last = { at: performance.now(), counts: counts.slice() };
 	Object.defineProperty(window, 'voxlStats', {
-		get(): Stats {
-			const now = { at: performance.now(), counts: counts.slice() };
-			const d = (i: number) => (now.counts[i] - last.counts[i]) >>> 0;
-			const dt = (now.at - last.at) / 1000;
-			last = now;
-			const frames = d(Count.Frames);
-			const updates = d(Count.Updates);
-			return {
-				fps: frames / dt,
-				kbps: (d(Count.Bytes) * 8) / 1000 / dt,
-				decodeMs: frames ? d(Count.DecodeUs) / 1000 / frames : null,
-				pipeMs: updates ? d(Count.PipeTenths) / 10 / updates : null,
-				codec,
-				passed: d(Count.Passed),
-			};
-		},
+		get: (): Stats => ({ ...meter.read(performance.now()), codec }),
 	});
 
 	// Stop video when nobody can see it.

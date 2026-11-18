@@ -20,5 +20,5 @@ interface Navigator {
 
 // Read by the bench tools (measure.mjs) and handy in the console: computed when read.
 interface Window {
-	readonly voxlStats: import('../protocol').Stats;
+	readonly voxlStats: import('../stats').Stats;
 }
