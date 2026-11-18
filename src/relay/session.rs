@@ -431,6 +431,20 @@ async fn session(
     let mut lane = Lanes::Closed;
     let mut out = Vec::new();
     loop {
+        // Every message already read is handled before the session waits for more. The
+        // daemon sends its first messages at once (the capability, the buffer, the hello) and
+        // then nothing until the lane attaches, so one read often holds them all: a message left
+        // in the framer would wait on a read that never comes, and the lane would never open.
+        loop {
+            let m = match framer.frame() {
+                Ok(Some(m)) => m,
+                Ok(None) => break,
+                Err(e) => return End::Control(e),
+            };
+            if let Err(end) = down(&mut s, &mut lane, page, m).await {
+                return end;
+            }
+        }
         let decide = s.receiver.lock().wake();
         let resend = resend(&lane, s.round_trip);
         tokio::select! {
@@ -443,56 +457,10 @@ async fn session(
                 };
                 up.encode(&mut out);
             }
-            r = read(&mut from_daemon, &mut buf, &mut child) => {
-                match r {
-                    Ok(n) => framer.push(&buf[..n]),
-                    Err(end) => return end,
-                }
-                while let Some(m) = match framer.frame() {
-                    Ok(m) => m,
-                    Err(e) => return End::Control(e),
-                } {
-                    match Down::decode(m) {
-                        Err(e) => return End::Control(e),
-                        Ok(Down::Capability(_)) => return End::Capability,
-                        Ok(Down::Attached { generation }) => {
-                            if let Lanes::Open(open) = &mut lane {
-                                s.attached(open, generation);
-                            }
-                        }
-                        Ok(Down::Buffer { bytes }) => {
-                            let buffer = proxy::Buffer::named(bytes);
-                            match &lane {
-                                // The lane opens once the daemon has named its size.
-                                Lanes::Closed => match s.open(Generation::first(), buffer).await {
-                                    Ok(open) => lane = Lanes::Open(open),
-                                    Err(end) => return end,
-                                },
-                                Lanes::Open(open) => {
-                                    if let Err(e) = buffer.hold(open.socket.fd()) {
-                                        return End::Proxy(e);
-                                    }
-                                    open.buffer.set(buffer);
-                                }
-                            }
-                        }
-                        Ok(Down::Text(t)) => {
-                            if let Ok(Said::Hello { files }) = serde_json::from_str::<Said>(t) {
-                                *s.cfg.files.grant.lock() =
-                                    Some(files::Grant { root: files.root });
-                            }
-                            if let Err(end) = page.text(t.to_string()) {
-                                return end;
-                            }
-                        }
-                        Ok(Down::Binary(b)) => {
-                            if let Err(end) = page.send(Message::Binary(Bytes::copy_from_slice(b))) {
-                                return end;
-                            }
-                        }
-                    }
-                }
-            }
+            r = read(&mut from_daemon, &mut buf, &mut child) => match r {
+                Ok(n) => framer.push(&buf[..n]),
+                Err(end) => return end,
+            },
             Some(e) = ended.recv() => {
                 let Lanes::Open(open) = &lane else { continue };
                 // The end of a lane opened before this one changes nothing.
@@ -534,6 +502,37 @@ async fn session(
             out.clear();
         }
     }
+}
+
+/// Handles one message from the daemon's control stream.
+async fn down(s: &mut Session<'_>, lane: &mut Lanes, page: &Page, m: &[u8]) -> Result<(), End> {
+    match Down::decode(m).map_err(End::Control)? {
+        Down::Capability(_) => return Err(End::Capability),
+        Down::Attached { generation } => {
+            if let Lanes::Open(open) = lane {
+                s.attached(open, generation);
+            }
+        }
+        Down::Buffer { bytes } => {
+            let buffer = proxy::Buffer::named(bytes);
+            match lane {
+                // The lane opens once the daemon has named its size.
+                Lanes::Closed => *lane = Lanes::Open(s.open(Generation::first(), buffer).await?),
+                Lanes::Open(open) => {
+                    buffer.hold(open.socket.fd()).map_err(End::Proxy)?;
+                    open.buffer.set(buffer);
+                }
+            }
+        }
+        Down::Text(t) => {
+            if let Ok(Said::Hello { files }) = serde_json::from_str::<Said>(t) {
+                *s.cfg.files.grant.lock() = Some(files::Grant { root: files.root });
+            }
+            page.text(t.to_string())?;
+        }
+        Down::Binary(b) => page.send(Message::Binary(Bytes::copy_from_slice(b)))?,
+    }
+    Ok(())
 }
 
 /// Reads what ssh's stdout has, or why the control stream ended.
