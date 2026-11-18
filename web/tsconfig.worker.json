@@ -11,6 +11,8 @@
 		"src/protocol.ts",
 		"src/wire.json",
 		"src/video-header.test.ts",
-		"src/frames.test.ts"
+		"src/frames.test.ts",
+		"src/keys.ts",
+		"src/keyboard.test.ts"
 	]
 }
