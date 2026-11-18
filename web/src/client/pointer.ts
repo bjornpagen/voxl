@@ -1,11 +1,19 @@
-// Mouse and wheel/trackpad input on the desktop surface.
+// Mouse, wheel/trackpad and touch input on the desktop surface.
 import { cmd } from '../protocol';
 import type { App } from './app';
+import type { Cursor } from './cursor';
+import { createTouch } from './touch';
+import type { Zoom } from './zoom';
 
 /** DOM button -> X button (left, middle, right, back, forward). */
 const BUTTONS = [1, 2, 3, 8, 9];
 
-export function setupPointer(app: App, onInteract: () => void) {
+export function setupPointer(
+	app: App,
+	cursor: Cursor,
+	zoom: Zoom,
+	onInteract: () => void
+) {
 	const { surface, send } = app;
 
 	function toDesk(
@@ -60,10 +68,31 @@ export function setupPointer(app: App, onInteract: () => void) {
 			? app.desk.w / surface.getBoundingClientRect().width
 			: null;
 
-	surface.addEventListener('pointermove', (e) => move(e));
+	const touch = createTouch(app, {
+		moveTo: (x, y) => move({ clientX: x, clientY: y }, true),
+		moveToDesk(x, y) {
+			lastMove = cmd.move(Math.round(x), Math.round(y));
+			send(lastMove);
+		},
+		queueScroll,
+		deskPerPx,
+		cursor,
+		zoom,
+	});
+
+	surface.addEventListener('pointermove', (e) => {
+		if (e.pointerType === 'touch') touch.move(e);
+		else move(e);
+	});
 	surface.addEventListener('pointerdown', (e) => {
 		e.preventDefault();
 		onInteract();
+		// A finger is the touch machine's: it never focuses the keyboard (only the
+		// toolbar's keyboard button raises the on-screen one).
+		if (e.pointerType === 'touch') {
+			touch.down(e);
+			return;
+		}
 		app.kbd.focus({ preventScroll: true });
 		move(e);
 		surface.setPointerCapture(e.pointerId);
@@ -71,10 +100,17 @@ export function setupPointer(app: App, onInteract: () => void) {
 	});
 	surface.addEventListener('pointerup', (e) => {
 		e.preventDefault();
+		if (e.pointerType === 'touch') {
+			touch.up(e);
+			return;
+		}
 		move(e);
 		button(e.button, false);
 	});
-	surface.addEventListener('pointercancel', () => send(cmd.releaseAll));
+	surface.addEventListener('pointercancel', (e) => {
+		if (e.pointerType === 'touch') touch.cancel(e);
+		else send(cmd.releaseAll);
+	});
 	surface.addEventListener('contextmenu', (e) => e.preventDefault());
 	surface.addEventListener(
 		'wheel',

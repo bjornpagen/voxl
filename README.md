@@ -291,6 +291,13 @@ or trackpad. The page needs WebCodecs video and audio, MediaStreamTrackGenerator
 ClipboardItem and the Keyboard Lock API, and a browser without one of them is told which
 it lacks, rather than run without it. Firefox, Safari and phones are not supported.
 
+**Touchscreens?** A touchscreen works: tap to click, drag, long press to right click, two
+fingers to scroll, pinch to zoom the view (the desktop is unchanged), and an on-screen
+keyboard that only the toolbar's keyboard button raises. The toolbar's trackpad button
+switches the touchscreen to a laptop trackpad: slide to move the pointer, tap to click
+where it is, hold still to grab and slide to drag, two fingers lifted together to right
+click.
+
 **Wayland?** Not yet; on Linux voxl streams X11 displays, Xvfb included. The virtual
 desktops voxl is built for run on Xvfb (E2B's and Daytona's do too), and X11 lets voxl
 capture them without a permission prompt, with damage events that keep a still screen at

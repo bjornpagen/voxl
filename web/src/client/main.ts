@@ -15,6 +15,7 @@ import { setupPointer } from './pointer';
 import { createResize } from './resize';
 import { setupToolbar } from './toolbar';
 import { createVideo } from './video';
+import { createZoom } from './zoom';
 
 /** What the page says when video and audio come over separate connections, one a lane:
  * a lost packet holds its whole connection until TCP resends it. */
@@ -80,7 +81,10 @@ function main() {
 	};
 
 	const cursor = createCursor(app);
+	const zoom = createZoom(app);
 	const video = createVideo(app, () => {
+		// The zoom is fitted first: the trackpad pointer is drawn at it (touch.ts).
+		zoom.fit();
 		cursor.apply();
 	});
 	const clipboard = createClipboard(app);
@@ -90,7 +94,7 @@ function main() {
 		audio.start();
 		clipboard.flush();
 	};
-	setupPointer(app, onInteract);
+	setupPointer(app, cursor, zoom, onInteract);
 	setupKeyboard(app, clipboard, onInteract);
 	setupToolbar(app, video.layout);
 	const files = createFiles(app);

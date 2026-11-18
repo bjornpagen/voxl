@@ -1,6 +1,7 @@
 {
-	// The decode/socket worker, and the checks of its header reader and its record of
-	// the screen (run by node, which wants the .ts extension and reads the fixture as JSON).
+	// The decode/socket worker, and the checks of its header reader, its record of the
+	// screen, the keys and the touch gestures (run by node, which wants the .ts extension
+	// and reads the fixture as JSON).
 	"extends": "./tsconfig.base.json",
 	"compilerOptions": {
 		"lib": ["ES2022", "WebWorker"],
@@ -13,6 +14,7 @@
 		"src/video-header.test.ts",
 		"src/frames.test.ts",
 		"src/keys.ts",
-		"src/keyboard.test.ts"
+		"src/keyboard.test.ts",
+		"src/touch.test.ts"
 	]
 }
