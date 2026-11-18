@@ -701,6 +701,9 @@ pub enum Down<'a> {
     /// deadline holds at the drain rate. The relay gives its lane socket's receive buffer the
     /// same.
     Buffer { bytes: u32 },
+    /// The lane of this generation broke under the daemon (its socket refused a message for
+    /// good: its peer is gone). What it held waits for the lane that attaches next.
+    Lost { generation: Generation },
     /// A text message for the page (its hello, a clipboard, ...), as the page reads it.
     Text(&'a str),
     /// A binary message for the page (a cursor's image, ...).
@@ -712,6 +715,7 @@ const D_ATTACHED: u8 = 2;
 const D_TEXT: u8 = 3;
 const D_BINARY: u8 = 4;
 const D_BUFFER: u8 = 5;
+const D_LOST: u8 = 6;
 
 impl<'a> Down<'a> {
     /// Appends the message to `out`, after its length.
@@ -729,6 +733,10 @@ impl<'a> Down<'a> {
             Down::Buffer { bytes } => {
                 out.push(D_BUFFER);
                 out.extend_from_slice(&bytes.to_be_bytes());
+            }
+            Down::Lost { generation } => {
+                out.push(D_LOST);
+                out.extend_from_slice(&generation.0.to_be_bytes());
             }
             Down::Text(t) => {
                 out.push(D_TEXT);
@@ -755,6 +763,9 @@ impl<'a> Down<'a> {
                 generation: Generation(r.u32()?),
             },
             D_BUFFER => Down::Buffer { bytes: r.u32()? },
+            D_LOST => Down::Lost {
+                generation: Generation(r.u32()?),
+            },
             D_TEXT => return text(r.rest()).map(Down::Text),
             D_BINARY => return Ok(Down::Binary(r.rest())),
             t => return Err(Malformed::Tag(t)),
@@ -1435,8 +1446,12 @@ mod tests {
             bytes(rng, n)
         };
         let cap = Capability(bytes(rng, CAPABILITY).try_into().unwrap());
-        match rng.below(5) {
+        match rng.below(6) {
             0 => Down::Capability(cap.lend()).encode(&mut out),
+            4 => Down::Lost {
+                generation: Generation(rng.next() as u32),
+            }
+            .encode(&mut out),
             1 => Down::Attached {
                 generation: Generation(rng.next() as u32),
             }

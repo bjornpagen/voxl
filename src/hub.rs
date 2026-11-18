@@ -22,6 +22,10 @@ pub enum Out {
     },
     /// The send buffer the session's lane socket was given, for the relay's receive buffer.
     Buffer(u32),
+    /// The session's lane of this generation broke under the daemon.
+    Lost {
+        generation: Generation,
+    },
     /// An Opus packet of desktop audio, to a recording alone (a session's audio goes on
     /// its lanes): the packet, and the frames of silence the encoder left out since the
     /// one before.

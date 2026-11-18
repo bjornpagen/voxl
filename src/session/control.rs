@@ -150,6 +150,10 @@ async fn control_writer(
             }
             .encode(&mut out),
             Out::Buffer(bytes) => Down::Buffer { bytes: *bytes }.encode(&mut out),
+            Out::Lost { generation } => Down::Lost {
+                generation: *generation,
+            }
+            .encode(&mut out),
             // A recording's alone: a session's audio goes on its lanes.
             Out::Audio { .. } => continue,
         }

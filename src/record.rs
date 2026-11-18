@@ -163,7 +163,7 @@ async fn collect(
             }
             // A restart of the stream ends this recording.
             Out::Text(ServerMessage::Hello(_)) if !tracks.frames.is_empty() => Taken::End,
-            Out::Text(_) | Out::Attached { .. } | Out::Buffer(_) => Taken::On,
+            Out::Text(_) | Out::Attached { .. } | Out::Buffer(_) | Out::Lost { .. } => Taken::On,
         }
     };
     let asked_to_end = loop {

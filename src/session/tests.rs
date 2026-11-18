@@ -36,6 +36,7 @@ enum Said {
     Capability(Vec<u8>),
     Attached,
     Buffer,
+    Lost(Generation),
     Text(String),
     Binary(Vec<u8>),
 }
@@ -55,15 +56,8 @@ impl Relay {
     /// The next control message, waiting for it; with a capability, the capability too.
     async fn next(&mut self) -> (Said, Option<Capability>) {
         loop {
-            if let Some(m) = self.framer.frame().unwrap() {
-                let raw = m.to_vec();
-                return match Down::decode(&raw).unwrap() {
-                    Down::Capability(c) => (Said::Capability(raw[1..].to_vec()), Some(c.keep())),
-                    Down::Attached { .. } => (Said::Attached, None),
-                    Down::Buffer { .. } => (Said::Buffer, None),
-                    Down::Text(t) => (Said::Text(t.into()), None),
-                    Down::Binary(b) => (Said::Binary(b.into()), None),
-                };
+            if let Some(said) = self.read() {
+                return said;
             }
             let mut buf = [0u8; 4096];
             let n = self.socket.read(&mut buf).await.unwrap();
@@ -93,6 +87,29 @@ impl Relay {
         let mut out = Vec::new();
         up.encode(&mut out);
         self.socket.write_all(&out).await.unwrap();
+    }
+
+    /// The next control message, if one has come with every task run as far as it goes.
+    async fn said(&mut self) -> Option<Said> {
+        settle().await;
+        let mut buf = [0u8; 4096];
+        while let Ok(n @ 1..) = self.socket.try_read(&mut buf) {
+            self.framer.push(&buf[..n]);
+        }
+        self.read().map(|(said, _)| said)
+    }
+
+    /// The next whole control message read, if any.
+    fn read(&mut self) -> Option<(Said, Option<Capability>)> {
+        let raw = self.framer.frame().unwrap()?.to_vec();
+        Some(match Down::decode(&raw).unwrap() {
+            Down::Capability(c) => (Said::Capability(raw[1..].to_vec()), Some(c.keep())),
+            Down::Attached { .. } => (Said::Attached, None),
+            Down::Buffer { .. } => (Said::Buffer, None),
+            Down::Lost { generation } => (Said::Lost(generation), None),
+            Down::Text(t) => (Said::Text(t.into()), None),
+            Down::Binary(b) => (Said::Binary(b.into()), None),
+        })
     }
 
     /// Whether the daemon has sent nothing more, with every task run as far as it goes.
@@ -958,4 +975,173 @@ fn no_frame_is_released_before_an_earlier_one_is_decided() {
             }
         }
     }
+}
+
+/// The capture gate is open while no lane is live and closed only by a live lane's backlog.
+/// Over generated sequences on a sender (lanes of one kind attaching, generation after
+/// generation; video updates of generated sizes; the socket taking some of what waits; the
+/// socket breaking), after every step: the room is unbounded exactly when no lane is live or
+/// the live lane's queue is empty, the sender counts as attached exactly while a lane is live,
+/// and each live lane that breaks is told exactly once, with its generation. A gate that read
+/// a lost lane's backlog froze its session until a reload.
+#[test]
+fn only_a_live_lanes_backlog_gates_the_capture() {
+    use crate::hub::Out;
+    use crate::lanes::wire::Number;
+    use crate::session::sender::{Kind, Queue, Room, Sender};
+    let mut rng = crate::xorshift::Xorshift::new(0x9b05_688c_2b3e_6c1f);
+    for case in 0..200 {
+        let now = Instant::now();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut s = Sender::new(Capability::mint().unwrap(), tx, now).unwrap();
+        let kind = match case % 2 {
+            0 => Kind::Datagram,
+            _ => Kind::Stream,
+        };
+        let (mut queue, mut live): (Option<(Arc<Queue>, Generation)>, bool) = (None, false);
+        let (mut generation, mut number) = (Generation::first(), Number::first());
+        let mut lost = Vec::new();
+        for _ in 0..rng.range(1, 60) {
+            match rng.below(4) {
+                0 => {
+                    let q = Queue::new(kind, now, Arc::new(|| {}));
+                    let rtt = Duration::from_millis(100);
+                    assert!(s.attach(generation, q.clone(), Stamp::since(now, now), rtt, now));
+                    (queue, live) = (Some((q, generation)), true);
+                    generation = generation.next();
+                }
+                1 => {
+                    let frame = bytes::Bytes::from(vec![3u8; rng.range(1, 30_000) as usize]);
+                    s.video(number, &frame, now);
+                    number = number.next();
+                }
+                2 if live => {
+                    if let Some((q, _)) = &queue {
+                        for _ in 0..rng.below(20) {
+                            q.take(now);
+                        }
+                    }
+                }
+                _ => {
+                    if let Some((q, g)) = &queue {
+                        q.lose();
+                        if live {
+                            lost.push(*g);
+                        }
+                        live = false;
+                    }
+                }
+            }
+            let waits = queue.as_ref().map_or(0, |(q, _)| q.backlog_bytes());
+            assert_eq!(
+                s.room() == Room::Unbounded,
+                !live || waits == 0,
+                "live {live}, {waits} B waiting: {:?}",
+                s.room()
+            );
+            assert_eq!(s.attached(), live);
+        }
+        let mut told = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let Out::Lost { generation } = m {
+                told.push(generation);
+            }
+        }
+        assert_eq!(told, lost, "each lost lane told once");
+    }
+}
+
+/// A lost lane is told, and the next carries what waited. Over generated sequences on a
+/// session with stream lanes (video updates of generated sizes; the relay reading what has
+/// come; the relay's end of the lane vanishing at any point: idle, mid-frame, or just after
+/// its attach): the daemon says `Lost` exactly once for each lane whose socket broke, with
+/// its generation; the relay attaches the next generation; and the frames read whole across
+/// the lanes are every frame sent, each once, in order. The relay reads all that has come
+/// before its end vanishes, so what the lost socket held is read; a frame it held only part
+/// of goes again whole on the next lane.
+#[tokio::test]
+async fn a_lost_lane_is_told_and_the_next_carries_what_waited() {
+    use crate::lanes::wire::{Lane, Number};
+    let mut rng = crate::xorshift::Xorshift::new(0x1f83_d9ab_5be0_cd19);
+    // Lanes lost with nothing waiting, with frames waiting, and with a frame read in part.
+    let (mut idle, mut waiting, mut partial) = (0, 0, 0);
+    for _ in 0..30 {
+        let hub = Hub::new().unwrap();
+        let d = daemon(&hub);
+        let mut relay = Relay::open(&d).await;
+        let (c, _) = relay.greeted().await;
+        let mut generation = Generation::first();
+        let mut lane = stream(&hub, &attach_framed(&c, generation)).await;
+        assert_eq!(relay.next().await.0, Said::Attached);
+        let client = hub.clients.lock()[0].clone();
+        let mut framer = Framer::stream();
+        let (mut sent, mut got) = (0u64, Vec::new());
+        // The current lane's bytes read, and those of the frames read whole.
+        let mut counts = (0usize, 0usize);
+        // Everything that has come on the lane, read without waiting.
+        let read = |lane: &mut UnixStream,
+                    framer: &mut Framer,
+                    got: &mut Vec<u64>,
+                    counts: &mut (usize, usize)| {
+            let mut buf = [0u8; 8192];
+            while let Ok(n @ 1..) = lane.try_read(&mut buf) {
+                framer.push(&buf[..n]);
+                counts.0 += n;
+            }
+            while let Some(m) = framer.frame().unwrap() {
+                counts.1 += wire::STREAM_PREFIX + m.len();
+                let Ok(Lane::Frame { frame, .. }) = Lane::decode(m) else {
+                    panic!("a stream lane carries frames");
+                };
+                got.push(frame.get());
+            }
+        };
+        let send = |sent: &mut u64, rng: &mut crate::xorshift::Xorshift| {
+            let frame = bytes::Bytes::from(vec![5u8; rng.range(1, 6000) as usize]);
+            client.lanes(|s| s.video(Number::first(), &frame, Instant::now()));
+            *sent += 1;
+        };
+        for _ in 0..rng.range(1, 30) {
+            match rng.below(4) {
+                0 | 1 => send(&mut sent, &mut rng),
+                2 => {
+                    settle().await;
+                    read(&mut lane, &mut framer, &mut got, &mut counts);
+                }
+                _ => {
+                    settle().await;
+                    read(&mut lane, &mut framer, &mut got, &mut counts);
+                    match client.lanes(|s| s.stats()) {
+                        crate::session::sender::Way::Stream {
+                            backlog_bytes: 0, ..
+                        } => idle += 1,
+                        _ => waiting += 1,
+                    }
+                    partial += usize::from(counts.0 > counts.1);
+                    drop(lane);
+                    // The next frame finds the socket broken, if what waited did not.
+                    send(&mut sent, &mut rng);
+                    assert_eq!(relay.said().await, Some(Said::Lost(generation)));
+                    generation = generation.next();
+                    lane = stream(&hub, &attach_framed(&c, generation)).await;
+                    assert_eq!(relay.next().await.0, Said::Attached);
+                    (framer, counts) = (Framer::stream(), (0, 0));
+                }
+            }
+        }
+        while got.len() < sent as usize {
+            settle().await;
+            read(&mut lane, &mut framer, &mut got, &mut counts);
+        }
+        assert_eq!(
+            got,
+            (0..sent).collect::<Vec<_>>(),
+            "every frame, once, in order"
+        );
+        assert!(relay.silent().await, "a lane told lost twice");
+    }
+    assert!(
+        idle > 0 && waiting > 0 && partial > 0,
+        "lost idle {idle}, waiting {waiting}, mid-frame {partial}"
+    );
 }

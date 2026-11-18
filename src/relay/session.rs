@@ -473,14 +473,9 @@ async fn session(
                 if open.attaching != Attaching::Attached {
                     return e.end;
                 }
-                let (generation, buffer) = (open.generation.next(), open.buffer.get());
-                log::info!("the lane ended ({}): it opens again as {generation:?}", e.end);
-                // The old lane's reader stops before the new lane opens.
-                drop(std::mem::replace(&mut lane, Lanes::Closed));
-                lane = match s.open(generation, buffer).await {
-                    Ok(open) => Lanes::Open(open),
-                    Err(end) => return end,
-                };
+                if let Err(end) = s.reopen(&mut lane, &e.end).await {
+                    return end;
+                }
             }
             () = sleep_until(decide) => {
                 if let Err(end) = s.receiver.lock().decide(&mut out) {
@@ -524,6 +519,13 @@ async fn down(s: &mut Session<'_>, lane: &mut Lanes, page: &Page, m: &[u8]) -> R
                 }
             }
         }
+        // The daemon's side of the open lane broke: it opens again, as when its transport ends
+        // it. A loss of a generation before it changes nothing.
+        Down::Lost { generation } => {
+            if matches!(lane, Lanes::Open(open) if open.generation == generation) {
+                s.reopen(lane, &"the daemon lost it").await?;
+            }
+        }
         Down::Text(t) => {
             if let Ok(Said::Hello { files }) = serde_json::from_str::<Said>(t) {
                 *s.cfg.files.grant.lock() = Some(files::Grant { root: files.root });
@@ -556,6 +558,24 @@ async fn sleep_until(at: Option<Instant>) {
 }
 
 impl Session<'_> {
+    /// Opens the lane's next generation in place of the open one, which `why` ended, its
+    /// socket holding what the daemon last named.
+    async fn reopen(
+        &self,
+        lane: &mut Lanes,
+        why: &(dyn std::fmt::Display + Sync),
+    ) -> Result<(), End> {
+        let Lanes::Open(open) = lane else {
+            return Ok(());
+        };
+        let (generation, buffer) = (open.generation.next(), open.buffer.get());
+        log::info!("the lane ended ({why}): it opens again as {generation:?}");
+        // The old lane's reader stops before the new lane opens.
+        drop(std::mem::replace(lane, Lanes::Closed));
+        *lane = Lanes::Open(self.open(generation, buffer).await?);
+        Ok(())
+    }
+
     /// Opens the lane as `generation`, its socket holding `buffer`, attached as it opens.
     async fn open(&self, generation: Generation, buffer: proxy::Buffer) -> Result<Open, End> {
         let lane = match &self.description {

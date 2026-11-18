@@ -5,8 +5,11 @@
 //! lane. A message leaves when the lane's socket takes it, waits in the lane's one queue until
 //! then, and is never discarded. What the daemon reads of the rate is its own socket: the
 //! drain, the bytes the socket accepted a second while it was full ([`Drain`]).
-//! The capture is gated by the backlog (at most one update interval of the drain waits), and
-//! the encoder aims at the drain times the frames' share of what the lane carries.
+//! The capture is gated by a live lane's backlog (at most one update interval of the drain
+//! waits), and the encoder aims at the drain times the frames' share of what the lane carries.
+//! A lane whose socket breaks is lost: the relay is told ([`Out::Lost`]), its queue keeps what
+//! it held for the lane that attaches next, and it gates nothing, since nothing waits on a
+//! socket that will never take another message.
 //!
 //! - **Datagram lane**: frames go coded, in blocks ([`crate::lanes::code`]): one capture's
 //!   update with the Opus packet waiting for it, or an Opus packet alone, with the repairs the
@@ -38,8 +41,8 @@ pub enum Room {
     Open(usize),
     /// Nothing: an update interval's drain already waits.
     Full,
-    /// No bound: nothing waits for the socket, or a recording, which takes each frame as it
-    /// is coded.
+    /// No bound: nothing waits for a live lane's socket (no lane is live, or its queue is
+    /// empty), or a recording, which takes each frame as it is coded.
     Unbounded,
 }
 
@@ -194,6 +197,9 @@ pub struct Queue {
 
 pub(super) struct Waiting {
     pub(super) phase: Phase,
+    /// Who to tell, once, that the lane broke: its session's control stream and its
+    /// generation, given when it attaches.
+    tell: Option<Tell>,
     pub(super) messages: VecDeque<Message>,
     /// Bytes of the front message the socket has taken (a stream lane's, part by part).
     pub(super) written: usize,
@@ -218,6 +224,12 @@ pub(super) struct Waiting {
     #[allow(clippy::vec_box)]
     spare_datagrams: Vec<Box<[u8; DATAGRAM]>>,
     spare_frames: Vec<Vec<u8>>,
+}
+
+/// Where a lane's loss is told: its session's control stream, and the lane's generation.
+struct Tell {
+    control: tokio::sync::mpsc::UnboundedSender<Out>,
+    generation: Generation,
 }
 
 /// A message waiting: when it was queued, and its bytes.
@@ -314,6 +326,7 @@ impl Queue {
             kind,
             state: Mutex::new(Waiting {
                 phase: Phase::Open,
+                tell: None,
                 messages: VecDeque::new(),
                 written: 0,
                 backlog: 0,
@@ -373,7 +386,8 @@ impl Queue {
         self.wake();
     }
 
-    /// Queues a datagram of `block` that `encode` writes; a closed lane takes nothing.
+    /// Queues a datagram of `block` that `encode` writes; a closed lane takes nothing, a lost
+    /// one keeps it for the next.
     fn push_datagram(
         &self,
         block: Seq,
@@ -398,7 +412,8 @@ impl Queue {
         self.wake();
     }
 
-    /// Queues a stream lane's frame message; a closed lane takes nothing.
+    /// Queues a stream lane's frame message; a closed lane takes nothing, a lost one keeps it
+    /// for the next.
     fn push_frame(&self, frame: Seq, track: Track, bytes: &[u8], now: Instant) {
         let mut w = self.state.lock();
         if w.phase == Phase::Closed {
@@ -416,18 +431,27 @@ impl Queue {
         self.wake();
     }
 
-    /// What waits, and the drain.
-    fn backlog(&self) -> (usize, Option<f64>) {
+    /// What waits, and the drain, whether the lane is live or not.
+    fn held(&self) -> (usize, Option<f64>) {
         let w = self.state.lock();
         (w.backlog, w.drain.rate())
     }
+
+    /// What waits for a live lane's socket, and its drain: none for a lane lost or closed,
+    /// whose socket takes nothing more, so that what it holds gates nothing.
+    fn live(&self) -> Option<(usize, Option<f64>)> {
+        let w = self.state.lock();
+        (w.phase == Phase::Open).then(|| (w.backlog, w.drain.rate()))
+    }
 }
 
-/// Whether a lane takes messages: open until its session closes, a newer lane replaces it, or
-/// its socket breaks.
+/// Whether a lane takes messages: open until its session closes or a newer lane replaces it
+/// (closed), or its socket breaks (lost: it keeps what it holds, and what comes, for the lane
+/// that attaches next).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum Phase {
     Open,
+    Lost,
     Closed,
 }
 
@@ -508,9 +532,25 @@ impl Waiting {
         }
     }
 
-    /// The lane's socket broke: it takes nothing more.
-    pub(super) fn broken(&mut self) {
-        self.phase = Phase::Closed;
+    /// The lane's socket broke for good: it sends nothing more, the relay is told once, and
+    /// the capture loop is woken, since the lane gates nothing now. What it holds stays for
+    /// the lane that attaches next ([`Queue::take_over`]). A lane already closed is left so.
+    pub(super) fn lost(&mut self) {
+        if self.phase != Phase::Open {
+            return;
+        }
+        self.phase = Phase::Lost;
+        if let Some(Tell {
+            control,
+            generation,
+        }) = self.tell.take()
+        {
+            // A session whose control writer has ended is closing: there is no one to tell.
+            if control.send(Out::Lost { generation }).is_err() {
+                log::debug!("a lost lane not told: the session is closing");
+            }
+        }
+        (self.wake)();
     }
 }
 
@@ -620,10 +660,10 @@ impl Sender {
         }
     }
 
-    /// Whether it has a way to be sent frames on: a lane, or a recording.
+    /// Whether it has a way to be sent frames on: a live lane, or a recording.
     pub fn attached(&self) -> bool {
         match &self.state {
-            State::Open(o) => !matches!(o.lane, Attached::None),
+            State::Open(o) => o.lane.queue().and_then(|q| q.live()).is_some(),
             State::Recording(_) => true,
             State::Closed => false,
         }
@@ -645,7 +685,14 @@ impl Sender {
         let State::Open(o) = &mut self.state else {
             return false;
         };
-        queue.state.lock().origin = o.origin;
+        {
+            let mut w = queue.state.lock();
+            w.origin = o.origin;
+            w.tell = Some(Tell {
+                control: o.control.clone(),
+                generation,
+            });
+        }
         if let Some((old, g)) = o.lane.queue().zip(o.lane.generation()) {
             if generation <= g || queue.kind() != old.kind() {
                 return false;
@@ -684,18 +731,19 @@ impl Sender {
         true
     }
 
-    /// What a frame may take now: nothing waiting, any; else what one update interval of the
-    /// drain leaves past what waits.
+    /// What a frame may take now: with no live lane, or nothing waiting for its socket, any;
+    /// else what one update interval of the drain leaves past what waits. Only a live lane's
+    /// backlog gates: a lost lane's waits on no socket.
     pub fn room(&self) -> Room {
         let o = match &self.state {
             State::Open(o) => o,
             State::Recording(_) => return Room::Unbounded,
             State::Closed => return Room::Full,
         };
-        let Some(queue) = o.lane.queue() else {
-            return Room::Full;
+        let Some((queue, live)) = o.lane.queue().and_then(|q| Some((q, q.live()?))) else {
+            return Room::Unbounded;
         };
-        match queue.backlog() {
+        match live {
             (0, _) => Room::Unbounded,
             (backlog, drain) => {
                 let budget = drain
@@ -730,14 +778,14 @@ impl Sender {
         let State::Open(o) = &self.state else {
             return Rate::Unlimited;
         };
-        let Some(queue) = o.lane.queue() else {
+        let Some(live) = o.lane.queue().and_then(|q| q.live()) else {
             return Rate::Unlimited;
         };
         let share = match &o.lane {
             Attached::Datagram(d) => d.link.share(),
             Attached::Stream(_) | Attached::None => 1.0,
         };
-        match queue.backlog() {
+        match live {
             (0, _) | (_, None) => Rate::Unlimited,
             (_, Some(drain)) => Rate::Drain(drain * share),
         }
@@ -754,7 +802,7 @@ impl Sender {
         match &o.lane {
             Attached::None => Way::Unattached,
             Attached::Datagram(d) => {
-                let (backlog, drain) = d.queue.backlog();
+                let (backlog, drain) = d.queue.held();
                 let st = d.link.stats();
                 Way::Datagram {
                     backlog_bytes: backlog,
@@ -771,7 +819,7 @@ impl Sender {
                 }
             }
             Attached::Stream(s) => {
-                let (backlog, drain) = s.queue.backlog();
+                let (backlog, drain) = s.queue.held();
                 Way::Stream {
                     backlog_bytes: backlog,
                     drain_bytes_per_s: drain,
@@ -846,7 +894,7 @@ impl Sender {
                 buf.clear();
                 buf.extend_from_slice(packet);
                 d.capture.audio.push(buf);
-                let waits = d.queue.backlog().0 > 0;
+                let waits = d.queue.held().0 > 0;
                 let n = d.capture.audio.len();
                 // The packets before this one, whose play time passed with no capture, go
                 // together, unless the socket has a backlog and there is room in a block.
@@ -952,7 +1000,7 @@ fn received(
     was: u32,
     round_trip: Option<Duration>,
 ) -> u32 {
-    let (_, drain) = queue.backlog();
+    let (_, drain) = queue.held();
     let Some((rate, wait)) = drain.zip(round_trip) else {
         return was;
     };
@@ -1042,6 +1090,11 @@ impl Queue {
     /// The bytes waiting.
     pub(crate) fn backlog_bytes(&self) -> usize {
         self.lock().backlog
+    }
+
+    /// Its socket broke, as a writer finds it.
+    pub(crate) fn lose(&self) {
+        self.lock().lost();
     }
 }
 

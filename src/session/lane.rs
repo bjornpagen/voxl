@@ -107,15 +107,16 @@ fn give_buffer(w: &mut Waiting, socket: impl AsFd) {
 /// Writes a stream lane's queue, each framed message after the one before, as fast as the
 /// socket takes them, until the lane closes. Bytes are written only under the queue's lock and
 /// only while the lane is open, so after `Queue::close` returns no byte more is written; a
-/// write that fails closes the lane. A message the socket took only part of stays at the front,
-/// and is written on before any other.
+/// write that fails loses the lane, which tells the relay ([`Waiting::lost`]) and keeps what it
+/// holds for the next. A message the socket took only part of stays at the front, and is
+/// written on before any other (on the next lane, whole).
 async fn stream_writer(queue: Arc<Queue>, socket: OwnedWriteHalf) {
     loop {
         let next = {
             let mut w = queue.lock();
             give_buffer(&mut w, socket.as_ref());
             match (w.phase, w.messages.front()) {
-                (Phase::Closed, _) => Next::End,
+                (Phase::Closed | Phase::Lost, _) => Next::End,
                 (Phase::Open, None) => Next::Idle,
                 (Phase::Open, Some(m)) => match socket.try_write(m.from(w.written)) {
                     Ok(n) if w.written + n == m.len() => {
@@ -131,7 +132,7 @@ async fn stream_writer(queue: Arc<Queue>, socket: OwnedWriteHalf) {
                         Next::Writable
                     }
                     Err(_) => {
-                        w.broken();
+                        w.lost();
                         Next::End
                     }
                 },
@@ -141,7 +142,7 @@ async fn stream_writer(queue: Arc<Queue>, socket: OwnedWriteHalf) {
             Next::Write => {}
             Next::Writable => {
                 if socket.writable().await.is_err() {
-                    queue.close();
+                    queue.lock().lost();
                     return;
                 }
             }
@@ -250,7 +251,8 @@ pub async fn datagrams(socket: UnixDatagram, hub: Arc<Hub>) {
 }
 
 /// Sends a datagram lane's queue to its peer as fast as the socket takes it, until the lane
-/// closes. A datagram the socket cannot take now waits for the socket: none is ever dropped.
+/// closes or is lost (its peer gone: the relay is told, and the queue kept for the next lane).
+/// A datagram the socket cannot take now waits for the socket: none is ever dropped.
 /// Each is stamped as it goes, with when it left and its block's deadline
 /// (`Waiting::stamp`). Sent only under the queue's lock and only while the lane is open.
 ///
@@ -269,7 +271,7 @@ async fn datagram_writer(
             let mut w = queue.lock();
             give_buffer(&mut w, socket.as_ref());
             match w.phase {
-                Phase::Closed => Next::End,
+                Phase::Closed | Phase::Lost => Next::End,
                 Phase::Open if w.messages.is_empty() => Next::Idle,
                 Phase::Open => {
                     let now = Instant::now();
@@ -289,9 +291,10 @@ async fn datagram_writer(
                             w.refused();
                             Next::Writable
                         }
-                        // The peer is gone (its proxy session ended): the lane is.
+                        // The peer is gone (its proxy session ended): the lane is lost, and the
+                        // relay told.
                         Err(_) => {
-                            w.broken();
+                            w.lost();
                             Next::End
                         }
                     }
@@ -303,7 +306,7 @@ async fn datagram_writer(
             Next::Writable => {
                 tokio::select! {
                     r = ready.writable() => if r.is_err() {
-                        queue.close();
+                        queue.lock().lost();
                         return;
                     },
                     _ = queue.woken() => {}
