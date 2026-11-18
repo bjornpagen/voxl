@@ -1,5 +1,5 @@
 //! voxl: low-latency desktop streaming for the browser, from an X11 display on Linux. The
-//! daemon codes the desktop as H.264 and sends it, with its audio, over a session's lanes;
+//! daemon codes the desktop as VP9 and sends it, with its audio, over a session's lanes;
 //! `voxl attach` (run over ssh) is a session's control stream; `voxl relay` on the viewer's
 //! machine serves the page and joins the two. The daemon runs on Linux alone; elsewhere
 //! `voxl` is the relay, and the daemon's platform-free core is built there for its tests.
@@ -15,8 +15,6 @@ mod capture;
 mod convert;
 #[cfg(target_os = "linux")]
 mod desktop;
-#[cfg(any(target_os = "linux", test))]
-mod encoder;
 mod env;
 #[cfg(any(target_os = "linux", test))]
 mod event;
@@ -34,8 +32,6 @@ mod mic;
 #[cfg(any(target_os = "linux", test))]
 mod mp4;
 #[cfg(any(target_os = "linux", test))]
-mod path;
-#[cfg(any(target_os = "linux", test))]
 mod record;
 mod relay;
 #[cfg(target_os = "linux")]
@@ -46,6 +42,8 @@ mod session;
 mod sound;
 #[cfg(any(target_os = "linux", test))]
 mod video;
+#[cfg(any(target_os = "linux", test))]
+mod vp9;
 #[cfg(test)]
 mod xorshift;
 
@@ -333,8 +331,6 @@ fn daemon(args: Vec<String>) {
     if let Some(style) = &env.log.style {
         log.parse_write_style(style);
     }
-    // x264 says what VOXL_X264_INFO asks of it (its own level), and all of that is written.
-    log.filter_module("x264", log::LevelFilter::Debug);
     logging::init(log.build());
     // A panic on any thread ends the process, as in voxl's own release build (panic = "abort"),
     // rather than leaving the server up without that thread when the embedder unwinds.
@@ -363,7 +359,7 @@ fn daemon(args: Vec<String>) {
 const UPLOAD_DIR: &str = "Downloads";
 
 /// The longest recording `voxl record` makes. Provisional: five minutes of a screen's
-/// H.264, upstream's bound since recordings came, unmeasured; what would measure it is
+/// video, upstream's bound since recordings came, unmeasured; what would measure it is
 /// the memory a recording of the busiest screen holds at its end.
 #[cfg(target_os = "linux")]
 const MAX_RECORD: std::time::Duration = std::time::Duration::from_secs(300);

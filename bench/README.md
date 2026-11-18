@@ -49,12 +49,12 @@ is its log. CBR from 30 Mbps, with congestion control down to 2 Mbps.
 - `nkclient.py host:port secs [x y]`: native Neko client. Logs in and signals over
   Neko's WebSocket API like its web client, receives the WebRTC video with aiortc and
   reads the marker from every decoded frame. Needs aiortc (`pip install aiortc`). Same JSON.
-- `suite2.sh`: noVNC, Neko and tuned Neko through the same workloads and links as
+- `suite2.sh`: noVNC and Neko through the same workloads and links as
   `suite.sh`; `cpusuite2.sh`: their server CPU. Start the servers with
   `env/novnc.sh` (x11vnc + websockify + noVNC, as E2B ships them; `X11VNC`, `NOVNC`,
   `WEBSOCKIFY`), `env/neko.sh` (Neko's official image against the benchmark display;
   `NEKO_SHAPE=mbps/rtt` shapes its UDP media with `tc netem` in its own container
-  network) or `env/neko-tuned.sh` (60 FPS x264).
+  network).
 - `mlclient.py host secs [x y]`: native Moonlight client for Sunshine. Streams with
   moonlight-embedded built by `moonlight/` (`nix-build moonlight`; its patch makes
   `-platform fake` hand each frame over as it arrives), decodes with FFmpeg and reads the

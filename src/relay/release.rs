@@ -1,41 +1,44 @@
-//! What the page is given of the frames the decoder makes whole, and when.
+//! What the page is given of the frames the lanes complete, and when.
 //!
-//! The screen is one H.264 stream, whose updates refer to earlier ones. When an update
-//! misses its deadline the daemon is told (its report), and invalidates it in its encoder
-//! (`x264_encoder_invalidate_reference`, which takes it and every later picture out of the
-//! references); every update carries its epoch, the newest missed update the encoder had
-//! invalidated when it coded it. So updates go to the page in their order, each once every
-//! earlier one is decided: decoded and given to the page, or missed. One of an epoch older
-//! than the newest miss before it may refer to that miss, or to an update dropped after
-//! it, and is dropped too.
+//! The screen is one video stream whose updates refer only to pictures the page has
+//! reported decoded, so every update the relay completes is decodable: updates go to the
+//! page in their order, each as soon as every earlier one is decided, and every completed
+//! update goes. One that missed its deadline (datagram lanes only) is passed over: the relay
+//! knows it missed once every frame before the next update it holds is decided, and that
+//! update's number is past it. On a stream lane frames arrive whole and in order, and each
+//! goes at once.
 //!
-//! A block that misses is reported by its frame numbers alone: the relay knows an update in
-//! it missed once every frame before the next update it holds is decided, and that update's
-//! number is past it.
-//!
-//! An Opus packet refers to nothing. It goes to the page at its deadline, in order: the
-//! daemon's deadline is the moment by which the path's measured spread has delivered it,
-//! so packets reach the page as evenly as they were sent, and the page's player needs no
-//! jitter allowance of its own. The cost is that spread, on every packet: a packet waits
-//! from its arrival to its deadline. One whole only after a later one went is dropped.
+//! An Opus packet refers to nothing. On a datagram lane it goes to the page at its deadline,
+//! in order: the daemon's deadline is the moment by which the path's measured spread has
+//! delivered it, so packets reach the page as evenly as they were sent, and the page's
+//! player needs no jitter allowance of its own; the cost is that spread, on every packet. On
+//! a stream lane it goes as it arrives: the stream paces it. One whole only after a later
+//! one went is dropped (audio plays in order).
 
-use crate::lanes::wire::{Epoch, Member, Number, Seq, Stamp, Track};
+use crate::lanes::wire::{Member, Number, Seq, Stamp, Track};
 use std::collections::VecDeque;
 
 /// What goes to the page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Give<'a> {
-    /// An update: its 9-byte header and Annex-B.
+    /// An update: its 9-byte header and the picture.
     Video(&'a [u8]),
     /// An Opus packet.
     Audio(&'a [u8]),
+}
+
+/// When an Opus packet may go to the page: at once (a stream lane's), or at its block's
+/// deadline (a datagram lane's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum When {
+    Now,
+    At(Stamp),
 }
 
 /// A whole update held until every earlier one is decided.
 struct Held {
     number: Number,
     frame: Seq,
-    epoch: Epoch,
     bytes: Vec<u8>,
 }
 
@@ -50,9 +53,6 @@ struct Sound {
 pub struct Release {
     /// The number of the next update the page may be given; every earlier one was decided.
     next: Number,
-    /// The update just after the newest missed one: an update coded once its encoder had
-    /// invalidated that miss has an epoch of at least the one before it. None: no miss yet.
-    clean: Option<Number>,
     /// Whole updates at `next` or past it, by number.
     held: VecDeque<Held>,
     /// The oldest frame not yet decided, by its number.
@@ -67,7 +67,6 @@ impl Release {
     pub fn new() -> Release {
         Release {
             next: Number::first(),
-            clean: None,
             held: VecDeque::new(),
             undecided: 0,
             audio: None,
@@ -75,67 +74,54 @@ impl Release {
         }
     }
 
-    /// Whether an update coded in `epoch` refers to no missed update.
-    fn passes(&self, epoch: Epoch) -> bool {
-        match (self.clean, epoch) {
-            (None, _) => true,
-            (Some(_), Epoch::Start) => false,
-            (Some(clean), Epoch::After(x)) => x.next() >= clean,
-        }
-    }
-
     /// Gives the page what is due, in order, while every frame before the next held update
     /// is decided.
     fn pump(&mut self, give: &mut impl FnMut(Give<'_>)) {
         while let Some(h) = self.held.front() {
-            if h.number > self.next {
-                // The updates between were not made whole: once every frame before this one
-                // is decided, they are missed, the one just before it the newest.
-                if self.undecided < h.frame.get() {
-                    return;
-                }
-                self.clean = Some(h.number);
-                self.next = h.number;
+            // The updates before it were not completed: once every frame before this one is
+            // decided, they missed.
+            if h.number > self.next && self.undecided < h.frame.get() {
+                return;
             }
             let h = self.held.pop_front().expect("the front, just read");
-            if self.passes(h.epoch) {
-                give(Give::Video(&h.bytes));
-            }
+            give(Give::Video(&h.bytes));
             self.next = h.number.next();
         }
     }
 
-    /// A frame the decoder made whole (a member of a whole block due at `due`): given now,
-    /// held, or dropped.
-    pub fn whole(&mut self, member: &Member<'_>, due: Stamp, give: &mut impl FnMut(Give<'_>)) {
+    /// A frame the lanes completed: given now, or held.
+    pub fn whole(&mut self, member: &Member<'_>, when: When, give: &mut impl FnMut(Give<'_>)) {
         let bytes = member.bytes;
         match member.track {
             Track::Audio => {
                 if self.audio.is_some_and(|a| a >= member.frame) {
                     return;
                 }
-                let at = self.sounds.partition_point(|s| s.frame < member.frame);
-                self.sounds.insert(
-                    at,
-                    Sound {
-                        frame: member.frame,
-                        due,
-                        bytes: bytes.to_vec(),
-                    },
-                );
-            }
-            Track::Video { number, epoch } => {
-                // One already decided missed comes too late for the page.
-                if number < self.next {
-                    return;
+                match when {
+                    When::Now => {
+                        self.audio = Some(member.frame);
+                        give(Give::Audio(bytes));
+                    }
+                    When::At(due) => {
+                        let at = self.sounds.partition_point(|s| s.frame < member.frame);
+                        self.sounds.insert(
+                            at,
+                            Sound {
+                                frame: member.frame,
+                                due,
+                                bytes: bytes.to_vec(),
+                            },
+                        );
+                    }
                 }
+            }
+            Track::Video { number } => {
                 let at = self.held.partition_point(|h| h.number < number);
                 self.held.insert(
                     at,
                     Held {
                         number,
                         frame: member.frame,
-                        epoch,
                         bytes: bytes.to_vec(),
                     },
                 );
@@ -158,8 +144,9 @@ impl Release {
         self.sounds.front().map(|s| s.due)
     }
 
-    /// The decoder decided every frame up to `last` (a block, whole or missed): an update
-    /// among them that was not made whole is known missed once a later update is held.
+    /// Every frame up to `last` is decided (a datagram lane's block, completed or missed; a
+    /// stream lane's frame, completed): an update among them that was not completed is
+    /// passed over once a later update is held.
     pub fn decided(&mut self, last: Seq, give: &mut impl FnMut(Give<'_>)) {
         self.undecided = last.get() + 1;
         self.pump(give);
@@ -172,111 +159,52 @@ mod tests {
     use crate::lanes::code::Encoder;
     use crate::lanes::wire::Stamp;
     use crate::xorshift::Xorshift;
-    use std::collections::BTreeSet;
     use std::time::Instant;
 
     /// A frame as the fake daemon coded it (a block of one): its number and track as the
-    /// encoder made them, and what an update refers to, which is the oracle's.
+    /// encoder made them.
     struct Coded {
         frame: Seq,
         track: Track,
-        refers: Vec<Number>,
         /// Its bytes: its frame number, so what the page is given names it.
         bytes: [u8; 8],
     }
 
-    /// Over random sessions, a fake daemon codes updates and Opus packets, each update
-    /// referring to some of the updates its encoder still holds (none for a keyframe), and
-    /// invalidates a missed update (that update and every later one it holds) when the
-    /// report of its miss reaches it, some frames after the miss, reports arriving in order.
-    /// Each frame is made whole at a random time before it is decided, or never (missed);
-    /// frames are decided in order.
-    ///
-    /// The page is never given an update that refers to one it was not given, gets updates
-    /// in order and each at most once, and gets Opus packets in order, each at its deadline. And nothing is held
-    /// back for nothing: every whole update whose epoch is at or past each miss before it
-    /// is given.
+    /// Over random sessions of updates and Opus packets, each completed at a random time
+    /// before it is decided, or never (missed), frames decided in order: the page gets every
+    /// completed update, each once, in number order, and each only once every frame before
+    /// it is decided or the update before it went; no completed update is held back once
+    /// that is so.
     #[test]
-    fn the_page_never_gets_an_update_referring_to_one_it_did_not_get() {
+    fn every_completed_update_goes_to_the_page_in_order() {
         let mut rng = Xorshift::new(0x853C49E6748FEA9B);
         let due = {
             let now = Instant::now();
             Stamp::since(now, now)
         };
-        let mut gave_after_miss = 0;
+        let mut missed_then_given = 0;
         for _ in 0..3_000 {
             let frames = rng.range(1, 200) as usize;
             let loss = rng.below(5);
             let mut encoder = Encoder::new();
-            // The encoder: the updates it may refer to, its epoch, its next number.
-            let mut refs: Vec<Number> = Vec::new();
-            let mut epoch = Epoch::Start;
             let mut next = Number::first();
-            // Reports of misses on their way to the daemon, in order: the frame they reach
-            // it before, and the update.
-            let mut reports: Vec<(usize, Number)> = Vec::new();
             let mut coded: Vec<Coded> = Vec::new();
-            // Per frame: the step it is made whole at, or never.
+            // Per frame: the step it is completed at, or never.
             let mut whole_at: Vec<Option<usize>> = Vec::new();
-            let mut missed: Vec<Number> = Vec::new();
             let mut release = Release::new();
-            // What the page was given, and in what order.
-            let mut page: BTreeSet<Number> = BTreeSet::new();
-            let mut last: Option<Number> = None;
-            let mut audio: Option<u64> = None;
+            let mut given: Vec<Number> = Vec::new();
             let mut decided = 0usize;
             let mut step = 0usize;
-            let check = |g: Give<'_>,
-                         coded: &[Coded],
-                         page: &mut BTreeSet<Number>,
-                         last: &mut Option<Number>,
-                         audio: &mut Option<u64>| {
-                let b = match g {
-                    Give::Video(b) | Give::Audio(b) => b,
-                };
-                let f = u64::from_be_bytes(b.try_into().unwrap());
-                let c = &coded[f as usize];
-                match (g, c.track) {
-                    (Give::Audio(_), Track::Audio) => {
-                        assert!(audio.is_none_or(|a| a < f), "an Opus packet out of order");
-                        *audio = Some(f);
-                    }
-                    (Give::Video(_), Track::Video { number, .. }) => {
-                        for r in &c.refers {
-                            assert!(page.contains(r), "{number:?} refers to {r:?}, not given");
-                        }
-                        assert!(last.is_none_or(|n| n < number), "updates out of order");
-                        *last = Some(number);
-                        page.insert(number);
-                    }
-                    _ => panic!("a frame given as another track"),
-                }
-            };
             while decided < frames {
                 step += 1;
                 if coded.len() < frames {
                     let f = coded.len();
-                    // Reports that have reached the daemon invalidate their update and every
-                    // later one.
-                    reports.retain(|&(by, x)| {
-                        if by > f {
-                            return true;
-                        }
-                        refs.retain(|&r| r < x);
-                        epoch = epoch.max(Epoch::After(x));
-                        false
-                    });
-                    let (track, refers) = match rng.below(4) {
-                        0 => (Track::Audio, vec![]),
+                    let track = match rng.below(4) {
+                        0 => Track::Audio,
                         _ => {
                             let number = next;
                             next = number.next();
-                            let refers: Vec<Number> = match rng.below(10) {
-                                0 => vec![],
-                                _ => refs.iter().copied().filter(|_| rng.below(2) == 0).collect(),
-                            };
-                            refs.push(number);
-                            (Track::Video { number, epoch }, refers)
+                            Track::Video { number }
                         }
                     };
                     let bytes = (f as u64).to_be_bytes();
@@ -290,60 +218,71 @@ mod tests {
                     coded.push(Coded {
                         frame: head.first,
                         track,
-                        refers,
                         bytes,
                     });
                     let lost = rng.below(10) < loss;
                     whole_at.push((!lost).then(|| step + rng.below(6) as usize));
                 }
+                let give = |g: Give<'_>, decided: usize, given: &mut Vec<Number>| {
+                    let Give::Video(b) = g else { return };
+                    let f = u64::from_be_bytes(b.try_into().unwrap()) as usize;
+                    let Track::Video { number } = coded[f].track else {
+                        panic!("an Opus packet given as video")
+                    };
+                    assert!(given.last().is_none_or(|&l| l < number), "out of order");
+                    // Every frame before it is decided, or it is the next number.
+                    let next_number = given.last().map_or(Number::first(), |l| l.next());
+                    assert!(
+                        decided >= f || number == next_number,
+                        "update {number:?} given before the frames before it were decided"
+                    );
+                    given.push(number);
+                };
                 for f in decided..coded.len() {
                     if whole_at[f] == Some(step) {
                         let c = &coded[f];
-                        let mut give =
-                            |g: Give<'_>| check(g, &coded, &mut page, &mut last, &mut audio);
                         let member = Member {
                             frame: c.frame,
                             track: c.track,
                             bytes: &c.bytes,
                         };
-                        release.whole(&member, due, &mut give);
-                        release.due(due, &mut give);
+                        release.whole(&member, When::At(due), &mut |g| {
+                            give(g, decided, &mut given)
+                        });
                     }
                 }
-                // The oldest frames are decided, now and then, once made whole if they are.
                 while decided < coded.len()
                     && rng.below(3) == 0
                     && whole_at[decided].is_none_or(|w| w <= step)
                 {
                     let c = &coded[decided];
-                    if let (None, Track::Video { number, .. }) = (whole_at[decided], c.track) {
-                        missed.push(number);
-                        // The control stream keeps reports in order.
-                        let after = reports.last().map_or(0, |r| r.0);
-                        let by = after.max(coded.len() + rng.below(5) as usize);
-                        reports.push((by, number));
-                    }
-                    let mut give = |g: Give<'_>| check(g, &coded, &mut page, &mut last, &mut audio);
-                    release.decided(c.frame, &mut give);
+                    let d = decided + 1;
+                    release.decided(c.frame, &mut |g| give(g, d, &mut given));
                     decided += 1;
                 }
             }
-            // Nothing held back for nothing.
-            for c in &coded {
-                let Track::Video { number, epoch } = c.track else {
-                    continue;
-                };
-                let before = missed.iter().copied().filter(|&x| x < number).max();
-                let whole = whole_at[c.frame.get() as usize].is_some();
-                let due = whole && before.is_none_or(|x| epoch >= Epoch::After(x));
-                assert_eq!(page.contains(&number), due, "update {number:?}");
-                if due && before.is_some() {
-                    gave_after_miss += 1;
-                }
+            // Every completed update went, and nothing else.
+            let want: Vec<Number> = coded
+                .iter()
+                .filter_map(|c| match c.track {
+                    Track::Video { number } if whole_at[c.frame.get() as usize].is_some() => {
+                        Some(number)
+                    }
+                    _ => None,
+                })
+                .collect();
+            if want.len()
+                < coded
+                    .iter()
+                    .filter(|c| matches!(c.track, Track::Video { .. }))
+                    .count()
+                && !want.is_empty()
+            {
+                missed_then_given += 1;
             }
+            assert_eq!(given, want);
         }
-        // The oracle above is not met only by giving nothing after a miss.
-        assert!(gave_after_miss > 1000, "{gave_after_miss}");
+        assert!(missed_then_given > 500, "{missed_then_given}");
     }
 
     /// Over random runs of Opus packets, each due a random while after the one before and
@@ -420,7 +359,7 @@ mod tests {
                         track: Track::Audio,
                         bytes: &c.3,
                     };
-                    release.whole(&member, at(c.1), &mut give);
+                    release.whole(&member, When::At(at(c.1)), &mut give);
                 }
                 release.due(at(now), &mut give);
             }

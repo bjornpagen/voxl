@@ -3,18 +3,18 @@
 //! reconnects by itself.
 //!
 //! The control stream carries the page's messages up as they are, the daemon's down as they
-//! are, each lane's confirmation, and a report of every frame. The lanes carry the frames'
-//! pieces and repairs to the decoder, which makes frames whole; [`Release`] decides what of
-//! them the page is given.
+//! are, the lane's confirmation, the size the lane's socket buffers, and on a datagram lane
+//! a report of every block. The session's one lane carries its frames: on a datagram lane
+//! the pieces and repairs of coded blocks, which the decoder makes whole; on a stream lane
+//! the frames as they are, in order. [`Release`] decides when the page is given them.
 
 use super::description::{Description, Malformed as Undescribed};
 use super::proxy::{self, ProxyError};
-use super::release::{Give, Release};
-use super::set::{self, Attaching, Ended, Wanted};
+use super::release::{Give, Release, When};
 use super::{files, ssh};
 use crate::lanes::code::{self, Decided, Decoder, Took};
 use crate::lanes::wire::{
-    self, Attach, Capability, Down, Framer, Generation, Lane, LaneIndex, Stamp, Up,
+    self, Attach, Capability, Down, Framer, Generation, Lane, Member, Stamp, Up,
 };
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -23,10 +23,11 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use std::fmt;
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::process::{Child, ChildStdout};
 use tokio::sync::{mpsc, Notify};
@@ -45,9 +46,10 @@ pub struct Config {
 /// Derived: `wire::MAX_CONTROL` less the one byte of `Up`'s tag.
 const PAGE_MESSAGE_MOST: usize = wire::MAX_CONTROL - 1;
 
-/// The bytes read from ssh's stdout at a time: a pipe's capacity, 65,536 bytes on Linux
-/// (pipe(7): "the pipe capacity is 16 pages") and on macOS, the most one read gives.
-/// Published.
+/// The bytes read from ssh's stdout, or from a stream lane, at a time: a pipe's capacity,
+/// 65,536 bytes on Linux (pipe(7): "the pipe capacity is 16 pages") and on macOS, the most
+/// one read of ssh's stdout gives; a stream lane's frame larger than it is gathered by its
+/// framer over several reads. Published.
 const CONTROL_READ: usize = 64 << 10;
 
 pub async fn upgrade(ws: WebSocketUpgrade, State(cfg): State<Arc<Config>>) -> Response {
@@ -73,14 +75,14 @@ pub enum End {
     Control(wire::Malformed),
     /// The control stream's first message was not the capability, or a second one came.
     Capability,
-    /// A lane could not be opened through the proxy.
-    Proxy { lane: usize, error: ProxyError },
-    /// A lane ended before its set was attached: its transport refuses lanes.
-    LaneEnded { lane: usize, why: String },
-    /// A lane carried something that is not a lane message.
-    Lane { lane: usize, error: wire::Malformed },
+    /// The lane could not be opened through the proxy.
+    Proxy(ProxyError),
+    /// The lane ended before it was attached: its transport refuses lanes.
+    LaneEnded(String),
+    /// The lane carried something that is not a lane message.
+    Lane(wire::Malformed),
     /// The decoder refused a piece or repair.
-    Refused { lane: usize, why: code::Refused },
+    Refused(code::Refused),
 }
 
 impl fmt::Display for End {
@@ -96,12 +98,10 @@ impl fmt::Display for End {
             End::ControlEnded(how) => write!(f, "the ssh session ended ({how})"),
             End::Control(e) => write!(f, "the control stream is broken: {e}"),
             End::Capability => write!(f, "the server's voxl did not open the session as expected"),
-            End::Proxy { lane, error } => write!(f, "lane {lane}: {error}"),
-            End::LaneEnded { lane, why } => {
-                write!(f, "lane {lane} ended before the lanes were attached: {why}")
-            }
-            End::Lane { lane, error } => write!(f, "lane {lane} is broken: {error}"),
-            End::Refused { lane, why } => write!(f, "lane {lane}: the decoder refused {why:?}"),
+            End::Proxy(error) => write!(f, "the lane: {error}"),
+            End::LaneEnded(why) => write!(f, "the lane ended before it was attached: {why}"),
+            End::Lane(error) => write!(f, "the lane is broken: {error}"),
+            End::Refused(why) => write!(f, "the lane's decoder refused {why:?}"),
         }
     }
 }
@@ -166,15 +166,6 @@ async fn run(socket: WebSocket, cfg: Arc<Config>) {
     }
 }
 
-/// The kind the page is told, as `LanesKind` in web/src/protocol.ts names it.
-fn kind(d: &Description) -> &'static str {
-    match d {
-        Description::Datagram { .. } => "datagram",
-        Description::Streams { .. } => "streams",
-        Description::Connections { .. } => "connections",
-    }
-}
-
 /// What the lane tasks and the session share: the decoder and the release, the page, and
 /// the session's clock.
 struct Receiver {
@@ -190,9 +181,10 @@ impl Receiver {
         Stamp::since(self.origin, Instant::now())
     }
 
-    /// One message from lane `lane`, arrived now.
-    fn take(&mut self, lane: usize, b: &[u8]) -> Result<(), End> {
-        let msg = Lane::decode(b).map_err(|error| End::Lane { lane, error })?;
+    /// One message from the lane, arrived now: a piece or repair of a datagram lane's block,
+    /// or a stream lane's whole frame.
+    fn take(&mut self, b: &[u8]) -> Result<(), End> {
+        let msg = Lane::decode(b).map_err(End::Lane)?;
         let at = self.now();
         let Receiver {
             decoder,
@@ -200,24 +192,40 @@ impl Receiver {
             page,
             ..
         } = self;
-        match decoder.take(msg, at) {
-            Ok(Took::Whole(head, bytes)) => {
-                let members = head
-                    .members(bytes)
-                    .map_err(|error| End::Lane { lane, error })?;
-                let mut given = Ok(());
-                for member in members {
-                    release.whole(&member, head.due, &mut |g| {
-                        if given.is_ok() {
-                            given = page.give(g);
-                        }
-                    });
-                }
-                given
+        let mut given = Ok(());
+        let mut give = |g: Give<'_>| {
+            if given.is_ok() {
+                given = page.give(g);
             }
-            Ok(Took::Held | Took::Spare | Took::Late) => Ok(()),
-            Err(why) => Err(End::Refused { lane, why }),
+        };
+        match msg {
+            // On a stream lane a frame arrives whole and in order: every frame before it has
+            // arrived, so it is decided as it comes.
+            Lane::Frame {
+                frame,
+                track,
+                bytes,
+            } => {
+                let member = Member {
+                    frame,
+                    track,
+                    bytes,
+                };
+                release.whole(&member, When::Now, &mut give);
+                release.decided(frame, &mut give);
+            }
+            Lane::Piece(_) | Lane::Repair(_) => match decoder.take(msg, at) {
+                Ok(Took::Whole(head, bytes)) => {
+                    let due = head.due;
+                    for member in head.members(bytes).map_err(End::Lane)? {
+                        release.whole(&member, When::At(due), &mut give);
+                    }
+                }
+                Ok(Took::Held | Took::Spare | Took::Late) => {}
+                Err(why) => return Err(End::Refused(why)),
+            },
         }
+        given
     }
 
     /// Decides every frame due by now, writing each report into `out` as a control message,
@@ -259,34 +267,68 @@ impl Receiver {
 
 /// What a lane task says when it ends.
 struct LaneEnd {
-    lane: LaneIndex,
     generation: Generation,
     end: End,
 }
 
-/// What carries a lane: its reading task, stopped when the lane is closed, and for the
-/// datagram lane its association, to send the attach again.
-struct Carrier {
+/// Where the lane is in attaching.
+#[derive(Clone, Copy, PartialEq)]
+enum Attaching {
+    /// Its attach went at this moment, unconfirmed.
+    Sent(Instant),
+    Attached,
+}
+
+/// The session's lane: its opening, its attach, its reading task (stopped when the lane is
+/// dropped), its socket (for the size the daemon names), and for a datagram lane its
+/// association (to send the attach again).
+struct Open {
+    generation: Generation,
+    attaching: Attaching,
     task: JoinHandle<()>,
+    socket: Socket,
+    /// What its socket holds, as the daemon last named it.
+    buffer: std::cell::Cell<proxy::Buffer>,
     association: Option<Arc<proxy::Association>>,
 }
 
-impl Drop for Carrier {
+/// The lane's socket, kept open by its reader.
+enum Socket {
+    Datagram(Arc<proxy::Association>),
+    Stream(Arc<TcpStream>),
+}
+
+impl Socket {
+    fn fd(&self) -> RawFd {
+        match self {
+            Socket::Datagram(a) => a.socket.as_raw_fd(),
+            Socket::Stream(s) => s.as_raw_fd(),
+        }
+    }
+}
+
+impl Drop for Open {
     fn drop(&mut self) {
         self.task.abort();
     }
 }
 
-type Set = set::Set<Instant, Carrier>;
+/// The session's lane: closed until the daemon names the size its socket holds (the first
+/// `Down::Buffer`, which the daemon sends before anything else), then open.
+enum Lanes {
+    Closed,
+    Open(Open),
+}
 
 /// When the datagram lane's attach, if unconfirmed, goes again: a round trip after it went,
 /// when no confirmation could still be on its way.
-fn resend(set: &Set, round_trip: Duration) -> Option<Instant> {
-    match set.slots().first() {
-        Some(slot) if slot.carrier.association.is_some() => match slot.attaching {
-            Attaching::Sent(at) => Some(at + round_trip),
-            Attaching::Attached => None,
-        },
+fn resend(lane: &Lanes, round_trip: Duration) -> Option<Instant> {
+    match lane {
+        Lanes::Open(Open {
+            association: Some(_),
+            attaching: Attaching::Sent(at),
+            ..
+        }) => Some(*at + round_trip),
         _ => None,
     }
 }
@@ -297,9 +339,14 @@ struct Session<'a> {
     description: Description,
     capability: Capability,
     receiver: Arc<Mutex<Receiver>>,
-    /// Rung by a lane task after a frame arrived, so the next decision is looked at again.
+    /// Rung by the lane task after a message arrived, so the next decision is looked at
+    /// again.
     arrived: Arc<Notify>,
     ends: mpsc::UnboundedSender<LaneEnd>,
+    /// From starting `ssh … voxl attach` to its capability: at least one round trip of the
+    /// path (see `round_trip`), which each attach tells the daemon, its first sample of the
+    /// path before any report.
+    door: Duration,
     /// The least round trip seen, after which an unconfirmed datagram attach goes again.
     /// Before any attach is confirmed it is the time from starting `ssh … voxl attach` to its
     /// capability: ssh's request to run `voxl attach` went to the server and the daemon's
@@ -354,11 +401,18 @@ async fn session(
             },
         }
     };
-    let text = serde_json::json!({ "t": "lanes", "kind": kind(&description) }).to_string();
-    if let Err(end) = page.text(text) {
+    // The page learns the lane's kind before the stream's hello: on a datagram lane a keyframe
+    // may miss, and the page waits through the deltas after it; on a stream lane every frame
+    // comes.
+    let kind = match &description {
+        Description::Datagram { .. } => "datagram",
+        Description::Stream { .. } => "stream",
+    };
+    if let Err(end) = page.text(serde_json::json!({ "t": "lane", "kind": kind }).to_string()) {
         return end;
     }
     let (ends, mut ended) = mpsc::unbounded_channel();
+    let door = opened.elapsed();
     let mut s = Session {
         cfg,
         description,
@@ -371,20 +425,14 @@ async fn session(
         })),
         arrived: Arc::new(Notify::new()),
         ends,
-        round_trip: opened.elapsed(),
+        door,
+        round_trip: door,
     };
-    let mut set = Set::new(match &s.description {
-        Description::Datagram { .. } => Wanted::One,
-        Description::Connections { lanes, .. } => Wanted::All(*lanes),
-        Description::Streams { cap, .. } => Wanted::UpTo(*cap),
-    });
-    if let Err(end) = s.fill(&mut set).await {
-        return end;
-    }
+    let mut lane = Lanes::Closed;
     let mut out = Vec::new();
     loop {
         let decide = s.receiver.lock().wake();
-        let resend = resend(&set, s.round_trip);
+        let resend = resend(&lane, s.round_trip);
         tokio::select! {
             m = from_page.next() => {
                 let up = match &m {
@@ -407,11 +455,25 @@ async fn session(
                     match Down::decode(m) {
                         Err(e) => return End::Control(e),
                         Ok(Down::Capability(_)) => return End::Capability,
-                        Ok(Down::Attached { lane, generation }) => s.attached(&mut set, lane, generation),
-                        Ok(Down::Lanes(lanes)) => {
-                            set.asked(lanes);
-                            if let Err(end) = s.fill(&mut set).await {
-                                return end;
+                        Ok(Down::Attached { generation }) => {
+                            if let Lanes::Open(open) = &mut lane {
+                                s.attached(open, generation);
+                            }
+                        }
+                        Ok(Down::Buffer { bytes }) => {
+                            let buffer = proxy::Buffer::named(bytes);
+                            match &lane {
+                                // The lane opens once the daemon has named its size.
+                                Lanes::Closed => match s.open(Generation::first(), buffer).await {
+                                    Ok(open) => lane = Lanes::Open(open),
+                                    Err(end) => return end,
+                                },
+                                Lanes::Open(open) => {
+                                    if let Err(e) = buffer.hold(open.socket.fd()) {
+                                        return End::Proxy(e);
+                                    }
+                                    open.buffer.set(buffer);
+                                }
                             }
                         }
                         Ok(Down::Text(t)) => {
@@ -431,27 +493,35 @@ async fn session(
                     }
                 }
             }
-            Some(e) = ended.recv() => match set.ended(e.lane, e.generation) {
-                Ended::Stale => continue,
-                Ended::End => return e.end,
-                Ended::Reopen(generation) => {
-                    log::info!(
-                        "lane {} ended ({}): the lanes open again as generation {generation:?}",
-                        e.lane.get(),
-                        e.end
-                    );
-                    if let Err(end) = s.fill(&mut set).await {
-                        return end;
-                    }
+            Some(e) = ended.recv() => {
+                let Lanes::Open(open) = &lane else { continue };
+                // The end of a lane opened before this one changes nothing.
+                if e.generation != open.generation {
+                    continue;
                 }
-            },
+                // A lane that attached and then ended was closed by its transport: it opens
+                // again, holding what the daemon last named. One that never attached is a
+                // transport refusing lanes.
+                if open.attaching != Attaching::Attached {
+                    return e.end;
+                }
+                let (generation, buffer) = (open.generation.next(), open.buffer.get());
+                log::info!("the lane ended ({}): it opens again as {generation:?}", e.end);
+                // The old lane's reader stops before the new lane opens.
+                drop(std::mem::replace(&mut lane, Lanes::Closed));
+                lane = match s.open(generation, buffer).await {
+                    Ok(open) => Lanes::Open(open),
+                    Err(end) => return end,
+                };
+            }
             () = sleep_until(decide) => {
                 if let Err(end) = s.receiver.lock().decide(&mut out) {
                     return end;
                 }
             }
             () = sleep_until(resend) => {
-                if let Err(end) = s.resend(&mut set).await {
+                let Lanes::Open(open) = &mut lane else { continue };
+                if let Err(end) = s.resend(open).await {
                     return end;
                 }
             }
@@ -487,73 +557,62 @@ async fn sleep_until(at: Option<Instant>) {
 }
 
 impl Session<'_> {
-    /// Opens the lanes the set lacks, in order, each attached as it opens.
-    async fn fill(&self, set: &mut Set) -> Result<(), End> {
-        let missing: Vec<LaneIndex> = set.missing().collect();
-        let generation = set.generation();
-        for lane in missing {
-            let (sent, carrier) = match &self.description {
-                Description::Datagram { proxy } => {
-                    let a = proxy::Association::open(proxy)
+    /// Opens the lane as `generation`, its socket holding `buffer`, attached as it opens.
+    async fn open(&self, generation: Generation, buffer: proxy::Buffer) -> Result<Open, End> {
+        let lane = match &self.description {
+            Description::Datagram { proxy } => {
+                let a = Arc::new(
+                    proxy::Association::open(proxy, buffer)
                         .await
-                        .map_err(|error| End::Proxy {
-                            lane: lane.get(),
-                            error,
-                        })?;
-                    let a = Arc::new(a);
-                    let sent = self.attach_datagram(&a, lane, generation).await?;
-                    let task = tokio::spawn(datagram_lane(
-                        a.clone(),
-                        lane,
-                        generation,
-                        self.receiver.clone(),
-                        self.arrived.clone(),
-                        self.ends.clone(),
-                    ));
-                    (
-                        sent,
-                        Carrier {
-                            task,
-                            association: Some(a),
-                        },
-                    )
+                        .map_err(End::Proxy)?,
+                );
+                let sent = self.attach_datagram(&a, generation).await?;
+                let task = tokio::spawn(datagram_lane(
+                    a.clone(),
+                    generation,
+                    self.receiver.clone(),
+                    self.arrived.clone(),
+                    self.ends.clone(),
+                ));
+                Open {
+                    generation,
+                    attaching: Attaching::Sent(sent),
+                    task,
+                    socket: Socket::Datagram(a.clone()),
+                    buffer: std::cell::Cell::new(buffer),
+                    association: Some(a),
                 }
-                Description::Streams { proxy, .. } | Description::Connections { proxy, .. } => {
-                    let failed = |e: std::io::Error| End::Proxy {
-                        lane: lane.get(),
-                        error: ProxyError::Io(e),
-                    };
-                    let mut stream = proxy::connect(proxy).await.map_err(|error| End::Proxy {
-                        lane: lane.get(),
-                        error,
-                    })?;
-                    let attach = Attach::encode(&self.capability, lane, generation, self.stamp());
-                    let tcp = stream.get_mut();
-                    tcp.write_all(&wire::lane_prefix(Attach::LEN))
-                        .await
-                        .map_err(failed)?;
-                    tcp.write_all(&attach).await.map_err(failed)?;
-                    let sent = Instant::now();
-                    let task = tokio::spawn(stream_lane(
-                        stream,
-                        lane,
-                        generation,
-                        self.receiver.clone(),
-                        self.arrived.clone(),
-                        self.ends.clone(),
-                    ));
-                    (
-                        sent,
-                        Carrier {
-                            task,
-                            association: None,
-                        },
-                    )
+            }
+            Description::Stream { proxy } => {
+                let reader = proxy::connect(proxy, buffer).await.map_err(End::Proxy)?;
+                // What the proxy sent past its answer's head: the lane's first bytes.
+                let first = reader.buffer().to_vec();
+                let tcp = Arc::new(reader.into_inner());
+                let framed =
+                    Attach::encode_stream(&self.capability, generation, self.stamp(), self.door);
+                write_all(&tcp, &framed)
+                    .await
+                    .map_err(|e| End::Proxy(ProxyError::Io(e)))?;
+                let sent = Instant::now();
+                let task = tokio::spawn(stream_lane(
+                    tcp.clone(),
+                    first,
+                    generation,
+                    self.receiver.clone(),
+                    self.arrived.clone(),
+                    self.ends.clone(),
+                ));
+                Open {
+                    generation,
+                    attaching: Attaching::Sent(sent),
+                    task,
+                    socket: Socket::Stream(tcp),
+                    buffer: std::cell::Cell::new(buffer),
+                    association: None,
                 }
-            };
-            set.opened(lane, sent, carrier);
-        }
-        Ok(())
+            }
+        };
+        Ok(lane)
     }
 
     /// Now on the relay's clock.
@@ -565,36 +624,47 @@ impl Session<'_> {
     async fn attach_datagram(
         &self,
         a: &proxy::Association,
-        lane: LaneIndex,
         generation: Generation,
     ) -> Result<Instant, End> {
-        let attach = Attach::encode(&self.capability, lane, generation, self.stamp());
-        a.send(&attach).await.map_err(|e| End::Proxy {
-            lane: lane.get(),
-            error: ProxyError::Io(e),
-        })?;
+        let attach = Attach::encode(&self.capability, generation, self.stamp(), self.door);
+        a.send(&attach)
+            .await
+            .map_err(|e| End::Proxy(ProxyError::Io(e)))?;
         Ok(Instant::now())
     }
 
     /// The datagram lane's attach went a round trip ago unconfirmed: it goes again.
-    async fn resend(&self, set: &mut Set) -> Result<(), End> {
-        let generation = set.generation();
-        let Some(slot) = set.slots_mut().first_mut() else {
+    async fn resend(&self, lane: &mut Open) -> Result<(), End> {
+        let Some(a) = lane.association.clone() else {
             return Ok(());
         };
-        let Some(a) = slot.carrier.association.clone() else {
-            return Ok(());
-        };
-        slot.attaching = Attaching::Sent(self.attach_datagram(&a, slot.lane, generation).await?);
+        lane.attaching = Attaching::Sent(self.attach_datagram(&a, lane.generation).await?);
         Ok(())
     }
 
-    /// The daemon confirmed lane `lane` of `generation`.
-    fn attached(&mut self, set: &mut Set, lane: LaneIndex, generation: Generation) {
-        if let Some(sent) = set.attached(lane, generation) {
-            self.round_trip = self.round_trip.min(sent.elapsed());
+    /// The daemon confirmed the lane of `generation`.
+    fn attached(&mut self, lane: &mut Open, generation: Generation) {
+        if generation != lane.generation {
+            return;
+        }
+        if let Attaching::Sent(at) = lane.attaching {
+            self.round_trip = self.round_trip.min(at.elapsed());
+        }
+        lane.attaching = Attaching::Attached;
+    }
+}
+
+/// Writes all of `b` to a stream shared with its reader.
+async fn write_all(tcp: &TcpStream, mut b: &[u8]) -> std::io::Result<()> {
+    while !b.is_empty() {
+        tcp.writable().await?;
+        match tcp.try_write(b) {
+            Ok(n) => b = &b[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e),
         }
     }
+    Ok(())
 }
 
 /// What the relay reads of the daemon's text for the page: a hello names the shared folder
@@ -616,63 +686,49 @@ struct Shared {
     root: String,
 }
 
-/// Reads a stream lane's messages into the decoder until it ends.
+/// Reads a stream lane's frames until it ends; `first` are its bytes that came with the
+/// proxy's answer.
 async fn stream_lane(
-    mut stream: BufReader<TcpStream>,
-    lane: LaneIndex,
+    tcp: Arc<TcpStream>,
+    first: Vec<u8>,
     generation: Generation,
     receiver: Arc<Mutex<Receiver>>,
     arrived: Arc<Notify>,
     ends: mpsc::UnboundedSender<LaneEnd>,
 ) {
-    let mut framer = Framer::lane();
-    let mut buf = [0u8; wire::LANE_PREFIX + wire::DATAGRAM];
+    let mut framer = Framer::stream();
+    framer.push(&first);
+    let mut buf = vec![0u8; CONTROL_READ];
     let end = 'read: loop {
-        match stream.read(&mut buf).await {
-            Ok(0) => {
-                break End::LaneEnded {
-                    lane: lane.get(),
-                    why: "the proxy closed it".into(),
-                }
-            }
-            Ok(n) => framer.push(&buf[..n]),
-            Err(e) => {
-                break End::LaneEnded {
-                    lane: lane.get(),
-                    why: e.to_string(),
-                }
-            }
-        }
         loop {
             match framer.frame() {
                 Ok(Some(m)) => {
-                    if let Err(end) = receiver.lock().take(lane.get(), m) {
+                    if let Err(end) = receiver.lock().take(m) {
                         break 'read end;
                     }
                 }
                 Ok(None) => break,
-                Err(error) => {
-                    break 'read End::Lane {
-                        lane: lane.get(),
-                        error,
-                    }
-                }
+                Err(error) => break 'read End::Lane(error),
             }
         }
         arrived.notify_one();
+        if let Err(e) = tcp.readable().await {
+            break End::LaneEnded(e.to_string());
+        }
+        match tcp.try_read(&mut buf) {
+            Ok(0) => break End::LaneEnded("the proxy closed it".into()),
+            Ok(n) => framer.push(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => break End::LaneEnded(e.to_string()),
+        }
     };
     // The session holds the other end while it runs; once it is gone, so is the lane.
-    let _ = ends.send(LaneEnd {
-        lane,
-        generation,
-        end,
-    });
+    let _ = ends.send(LaneEnd { generation, end });
 }
 
 /// Reads the datagram lane's messages into the decoder until its association ends.
 async fn datagram_lane(
     a: Arc<proxy::Association>,
-    lane: LaneIndex,
     generation: Generation,
     receiver: Arc<Mutex<Receiver>>,
     arrived: Arc<Notify>,
@@ -686,31 +742,24 @@ async fn datagram_lane(
                 // A datagram that is not one whole SOCKS5 datagram is no lane message.
                 Ok(n) => {
                     if let Some(m) = proxy::payload(&buf[..n]) {
-                        if let Err(end) = receiver.lock().take(lane.get(), m) {
+                        if let Err(end) = receiver.lock().take(m) {
                             break end;
                         }
                         arrived.notify_one();
                     }
                 }
-                Err(e) => break End::LaneEnded { lane: lane.get(), why: e.to_string() },
+                Err(e) => break End::LaneEnded(e.to_string()),
             },
             // The association lasts as long as its TCP connection, on which the proxy says
             // nothing.
-            r = a.control_read(&mut control) => break End::LaneEnded {
-                lane: lane.get(),
-                why: match r {
-                    Ok(_) => "the proxy ended the UDP association".into(),
-                    Err(e) => e.to_string(),
-                },
-            },
+            r = a.control_read(&mut control) => break End::LaneEnded(match r {
+                Ok(_) => "the proxy ended the UDP association".into(),
+                Err(e) => e.to_string(),
+            }),
         }
     };
     // The session holds the other end while it runs; once it is gone, so is the lane.
-    let _ = ends.send(LaneEnd {
-        lane,
-        generation,
-        end,
-    });
+    let _ = ends.send(LaneEnd { generation, end });
 }
 
 #[cfg(test)]
@@ -742,6 +791,7 @@ mod tests {
             let hello = ServerMessage::Hello(Hello {
                 w: rng.below(8000) as u32,
                 h: rng.below(8000) as u32,
+                codec: Some(format!("vp09.00.{}.08", 10 + rng.below(52))),
                 settings: Settings {
                     startup: Some(Startup {
                         audio: rng.below(2) == 0,

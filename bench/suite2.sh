@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # suite2.sh : noVNC and Neko through the README workloads and links, with native clients
 # (kclient.py for noVNC's x11vnc, nkclient.py for Neko's WebRTC). Bench display :2.
-# Configs: novnc (env/novnc.sh), neko (Neko's defaults), neko_tuned (env/neko-tuned.sh).
+# Configs: novnc (env/novnc.sh), neko (Neko's defaults).
 # Links: TCP through shaper.py for noVNC; for Neko (UDP media) tc netem on its own
 # container network, same rate, RTT and deep queue (see env/neko.sh).
 cd "$(dirname "$(readlink -f "$0")")"
@@ -27,7 +27,6 @@ run_one() { # config workload net
     neko*)
       # Restart Neko for each link: shaped runs get their own network with tc netem.
       local addr starter=env/neko.sh
-      [ $cfg = neko_tuned ] && starter=env/neko-tuned.sh
       if [ "$net" = lan ]; then addr=$(NEKO_SHAPE= $starter 2>/dev/null); else addr=$(NEKO_SHAPE=$net $starter 2>/dev/null); fi
       sleep 5
       res=$(timeout $((SECS+60)) /tmp/rtcpy.sh nkclient.py $addr $SECS $mx $my 2>/dev/null | tail -1) ;;
@@ -35,7 +34,7 @@ run_one() { # config workload net
   echo "{\"config\":\"$cfg\",\"workload\":\"$wl\",\"net\":\"$net\",\"r\":${res:-null}}" | tee -a $OUT
   sleep 12
 }
-for cfg in ${CONFIGS:-novnc neko neko_tuned}; do
+for cfg in ${CONFIGS:-novnc neko}; do
   for wl in ${WORKLOADS:-scroll anim1080 animfull}; do
     for net in ${NETS:-lan 10/40 5/60}; do
       [ $wl = animfull ] && [ $net != lan ] && continue

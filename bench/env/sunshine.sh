@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Sunshine (github.com/LizardByte/Sunshine) streaming the benchmark display with its
-# software (x264) encoder, the only one on a VM without a GPU; measured with mlclient.py.
+# software H.264 encoder, the only one on a VM without a GPU; measured with mlclient.py.
 # SUNSHINE: the sunshine binary (a Nix store path when SUNSHINE_SHAPE is set, since the
 # container mounts /nix/store). SUNSHINE_DIR (default /tmp/voxl-bench-sunshine) keeps
 # its config, certificates and pairings; SUNSHINE_OPTS adds name=value settings

@@ -16,7 +16,7 @@
 use super::gf;
 use super::wire::{
     symbols, write_entry, Arrivals, Fate, Head, Lane, Late, Malformed, OneWay, Outcome, Report,
-    Seq, Stamp, Symbol, Track, DELAY, LATE, SYMBOL, WINDOW,
+    Seq, Stamp, Symbol, Symbolic, Track, DATAGRAM, DELAY, LATE, SYMBOL, WINDOW,
 };
 use std::collections::VecDeque;
 use std::num::{NonZeroU32, NonZeroU8, NonZeroUsize};
@@ -158,23 +158,44 @@ impl<'a> Coded<'a> {
     }
 
     /// Its message `i` of n (sources first, then repairs), leaving at `sent`.
+    /// Writes message `i`, stamped `sent`, into `out`, returning its length.
+    pub fn encode(&self, i: usize, sent: Stamp, out: &mut [u8; DATAGRAM]) -> usize {
+        let (tag, s) = self.symbol(i, sent);
+        Lane::encode_symbol(tag, &s, out)
+    }
+
+    /// Message `i`: a piece below k, a repair from k.
     pub fn message(&self, i: usize, sent: Stamp) -> Lane<'a> {
+        match self.symbol(i, sent) {
+            (Symbolic::Piece, s) => Lane::Piece(s),
+            (Symbolic::Repair, s) => Lane::Repair(s),
+        }
+    }
+
+    /// Symbol `i`, stamped `sent`: a piece below k, a repair from k.
+    fn symbol(&self, i: usize, sent: Stamp) -> (Symbolic, Symbol<'a>) {
         let k = self.head.k();
         match i < k {
-            true => Lane::Piece(Symbol {
-                head: self.head,
-                sent,
-                index: i as u16,
-                data: &self.bytes[i * SYMBOL..(i * SYMBOL + self.head.source_len(i))],
-            }),
-            false => {
-                let (j, w) = (i - k, self.head.repair_len());
-                Lane::Repair(Symbol {
+            true => (
+                Symbolic::Piece,
+                Symbol {
                     head: self.head,
                     sent,
-                    index: j as u16,
-                    data: &self.repairs[j * w..(j + 1) * w],
-                })
+                    index: i as u16,
+                    data: &self.bytes[i * SYMBOL..(i * SYMBOL + self.head.source_len(i))],
+                },
+            ),
+            false => {
+                let (j, w) = (i - k, self.head.repair_len());
+                (
+                    Symbolic::Repair,
+                    Symbol {
+                        head: self.head,
+                        sent,
+                        index: j as u16,
+                        data: &self.repairs[j * w..(j + 1) * w],
+                    },
+                )
             }
         }
     }
@@ -202,6 +223,9 @@ pub enum Refused {
     Ahead,
     /// Holding its frame would hold more than [`WINDOW`] symbols.
     Full,
+    /// A whole frame, which a stream lane carries: a datagram lane carries only pieces and
+    /// repairs.
+    Frame,
 }
 
 /// A block decided: its report, and the newest frame decided with it (its own last member;
@@ -463,7 +487,15 @@ impl Decoder {
 
     /// A piece or repair, arrived at `arrived` on the relay's clock.
     pub fn take(&mut self, lane: Lane<'_>, arrived: Stamp) -> Result<Took<'_>, Refused> {
-        let s = *lane.symbol();
+        let (s, piece) = match lane {
+            Lane::Piece(s) => (s, true),
+            Lane::Repair(s) => (s, false),
+            Lane::Frame { .. } => return Err(Refused::Frame),
+        };
+        let position = match piece {
+            true => s.index as usize,
+            false => s.head.k() + s.index as usize,
+        };
         let delay = OneWay::of(s.sent, arrived);
         if s.head.block < self.base {
             return Ok(self.late(delay));
@@ -494,7 +526,6 @@ impl Decoder {
                 slot.insert(f)
             }
         };
-        let position = lane.position();
         if frame.arrivals[position].is_some() {
             return Ok(Took::Spare);
         }
@@ -503,10 +534,10 @@ impl Decoder {
             return Ok(Took::Spare);
         }
         let before = frame.unknown;
-        match lane {
-            Lane::Piece(p) if frame.known[p.index as usize] => return Ok(Took::Spare),
-            Lane::Piece(p) => frame.source(p.index as usize, p.data),
-            Lane::Repair(r) => frame.repair(r.index, r.data),
+        match piece {
+            true if frame.known[s.index as usize] => return Ok(Took::Spare),
+            true => frame.source(s.index as usize, s.data),
+            false => frame.repair(s.index, s.data),
         }
         frame.harvest();
         Ok(match () {
@@ -622,7 +653,7 @@ impl Default for Decoder {
 mod tests {
     use super::*;
     use crate::lanes::model::{Arrival, Runs, Table};
-    use crate::lanes::wire::{Epoch, Number, DATAGRAM};
+    use crate::lanes::wire::Number;
     use crate::xorshift::Xorshift;
     use std::num::NonZeroUsize;
 
@@ -668,7 +699,6 @@ mod tests {
             0 => Track::Audio,
             _ => Track::Video {
                 number: Number(rng.below(1000) + 10),
-                epoch: Epoch::After(Number(rng.below(10))),
             },
         }
     }
@@ -699,7 +729,7 @@ mod tests {
             let mut messages = Vec::new();
             let mut kept = Vec::new();
             let due = Stamp(1_000_000);
-            for (members, m) in &blocks {
+            for (b, (members, m)) in blocks.iter().enumerate() {
                 let coded = enc
                     .assemble(members.iter().map(|(t, b)| (*t, b.as_slice())))
                     .unwrap()
@@ -707,12 +737,15 @@ mod tests {
                     .unwrap();
                 let n = coded.head().n();
                 let mut arrived = vec![false; n];
+                // The round's last block has a piece arrive: a block nothing of which comes is
+                // decided only once something later shows its deadline passed.
+                let last = b + 1 == blocks.len();
                 for (i, a) in arrived.iter_mut().enumerate() {
-                    if rng.below(3) == 0 {
+                    if rng.below(3) == 0 && !(last && i == 0) {
                         continue;
                     }
                     *a = true;
-                    let len = coded.message(i, Stamp(i as u32)).encode(&mut buf);
+                    let len = coded.encode(i, Stamp(i as u32), &mut buf);
                     messages.push(buf[..len].to_vec());
                     if rng.below(5) == 0 {
                         messages.push(buf[..len].to_vec());
@@ -728,7 +761,10 @@ mod tests {
                 let lane = Lane::decode(msg).unwrap();
                 let which = kept
                     .iter()
-                    .position(|(h, _, _)| h.block == lane.symbol().head.block)
+                    .position(|(h, _, _)| match lane {
+                        Lane::Piece(s) | Lane::Repair(s) => h.block == s.head.block,
+                        Lane::Frame { .. } => false,
+                    })
                     .unwrap();
                 if let Took::Whole(head, bytes) = dec.take(lane, Stamp(500)).unwrap() {
                     assert_eq!(head, kept[which].0);
@@ -809,7 +845,7 @@ mod tests {
                         continue;
                     }
                     got += 1;
-                    let len = coded.message(i, Stamp(t)).encode(&mut buf);
+                    let len = coded.encode(i, Stamp(t), &mut buf);
                     messages.push(buf[..len].to_vec());
                 }
                 for msg in &messages {
@@ -882,7 +918,7 @@ mod tests {
                         if now == Arrival::Erased {
                             continue;
                         }
-                        let len = coded.message(i, Stamp(t as u32)).encode(&mut buf);
+                        let len = coded.encode(i, Stamp(t as u32), &mut buf);
                         if let Took::Whole(..) = dec
                             .take(Lane::decode(&buf[..len]).unwrap(), Stamp(t as u32))
                             .unwrap()

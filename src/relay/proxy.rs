@@ -5,8 +5,9 @@ use super::description::{Endpoint, Host};
 use crate::lanes::wire::DESTINATION;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::os::fd::{AsRawFd, RawFd};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 
 /// The longest answer to a CONNECT read: Chromium's bound on a response's head
 /// (`net/http/http_stream_parser.h`, `kMaxHeaderBufSize`, 256 KiB), what a browser takes
@@ -22,6 +23,8 @@ pub enum ProxyError {
     Refused(String),
     /// The proxy's answer to a CONNECT was not an HTTP head within `CONNECT_ANSWER_MOST`.
     Answer,
+    /// The kernel would not hold a lane's `bytes` (`SO_RCVBUF` above its ceiling).
+    Buffer { bytes: u32, error: std::io::Error },
     /// The SOCKS5 proxy refused: the step and its reply code.
     Socks { step: &'static str, code: u8 },
 }
@@ -32,6 +35,10 @@ impl fmt::Display for ProxyError {
             ProxyError::Io(e) => write!(f, "the proxy: {e}"),
             ProxyError::Refused(status) => write!(f, "the proxy refused the lane: {status}"),
             ProxyError::Answer => write!(f, "the proxy's answer to CONNECT is not HTTP"),
+            ProxyError::Buffer { bytes, error } => write!(
+                f,
+                "the kernel would not hold the lane's {bytes} bytes (raise its socket buffer ceiling): {error}"
+            ),
             ProxyError::Socks { step, code } => {
                 write!(f, "the SOCKS5 proxy refused the {step} (reply {code})")
             }
@@ -45,20 +52,77 @@ impl From<std::io::Error> for ProxyError {
     }
 }
 
-async fn reach(proxy: &Endpoint) -> std::io::Result<TcpStream> {
-    let tcp = match &proxy.host {
-        Host::V4(ip) => TcpStream::connect((*ip, proxy.port.get())).await?,
-        Host::V6(ip) => TcpStream::connect((*ip, proxy.port.get())).await?,
-        Host::Name(name) => TcpStream::connect((name.as_str(), proxy.port.get())).await?,
+/// What the kernel may hold of a lane the relay has not yet read (`SO_RCVBUF`), in bytes: the
+/// size the daemon names (`Down::Buffer`, one deadline at the drain rate). A lane socket is
+/// built only with one, set before it receives a byte (and, for a stream, before its
+/// connect, which fixes TCP's window scale), so no lane is ever read through a buffer of the
+/// kernel's guess.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Buffer(u32);
+
+impl Buffer {
+    /// The size the daemon named; only the session, reading `Down::Buffer`, makes one.
+    pub(in crate::relay) fn named(bytes: u32) -> Buffer {
+        Buffer(bytes)
+    }
+
+    /// Sets it on the socket `fd`.
+    pub fn hold(self, fd: RawFd) -> Result<(), ProxyError> {
+        let refused = |error| ProxyError::Buffer {
+            bytes: self.0,
+            error,
+        };
+        let bytes = libc::c_int::try_from(self.0).map_err(|e| refused(std::io::Error::other(e)))?;
+        // SAFETY: `fd` is a socket the caller holds open, and the option's value is a c_int
+        // that outlives the call.
+        let set = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                (&bytes as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        match set {
+            0 => Ok(()),
+            _ => Err(refused(std::io::Error::last_os_error())),
+        }
+    }
+}
+
+/// The proxy's address, resolved.
+async fn address(proxy: &Endpoint) -> std::io::Result<SocketAddr> {
+    let port = proxy.port.get();
+    match &proxy.host {
+        Host::V4(ip) => Ok(SocketAddr::new(IpAddr::V4(*ip), port)),
+        Host::V6(ip) => Ok(SocketAddr::new(IpAddr::V6(*ip), port)),
+        Host::Name(name) => tokio::net::lookup_host((name.as_str(), port))
+            .await?
+            .next()
+            .ok_or_else(|| std::io::Error::other(format!("{name} has no address"))),
+    }
+}
+
+/// A TCP connection to the proxy; for a lane, its receive buffer set before it connects.
+async fn reach(proxy: &Endpoint, lane: Option<Buffer>) -> Result<TcpStream, ProxyError> {
+    let addr = address(proxy).await?;
+    let socket = match addr {
+        SocketAddr::V4(_) => TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => TcpSocket::new_v6()?,
     };
+    if let Some(buffer) = lane {
+        buffer.hold(socket.as_raw_fd())?;
+    }
+    let tcp = socket.connect(addr).await?;
     tcp.set_nodelay(true)?;
     Ok(tcp)
 }
 
 /// A stream to [`DESTINATION`] through `proxy`'s HTTP CONNECT. What the proxy sent past
 /// its answer's head stays in the reader, as the stream's first bytes.
-pub async fn connect(proxy: &Endpoint) -> Result<BufReader<TcpStream>, ProxyError> {
-    let mut tcp = reach(proxy).await?;
+pub async fn connect(proxy: &Endpoint, buffer: Buffer) -> Result<BufReader<TcpStream>, ProxyError> {
+    let mut tcp = reach(proxy, Some(buffer)).await?;
     tcp.write_all(
         format!("CONNECT {DESTINATION} HTTP/1.1\r\nHost: {DESTINATION}\r\n\r\n").as_bytes(),
     )
@@ -134,8 +198,8 @@ pub fn payload(d: &[u8]) -> Option<&[u8]> {
 
 impl Association {
     /// Asks `proxy` for an association.
-    pub async fn open(proxy: &Endpoint) -> Result<Association, ProxyError> {
-        let mut control = reach(proxy).await?;
+    pub async fn open(proxy: &Endpoint, buffer: Buffer) -> Result<Association, ProxyError> {
+        let mut control = reach(proxy, None).await?;
         // No authentication: the proxy is the user's own, on their machine.
         control.write_all(&[5, 1, 0]).await?;
         let mut choice = [0u8; 2];
@@ -186,7 +250,10 @@ impl Association {
             true => peer.ip(),
             false => ip,
         };
-        let socket = UdpSocket::bind(SocketAddr::new(unspecified, 0)).await?;
+        let socket = std::net::UdpSocket::bind(SocketAddr::new(unspecified, 0))?;
+        buffer.hold(socket.as_raw_fd())?;
+        socket.set_nonblocking(true)?;
+        let socket = UdpSocket::from_std(socket)?;
         socket
             .connect(SocketAddr::new(ip, u16::from_be_bytes(port)))
             .await?;
@@ -260,7 +327,7 @@ mod tests {
                 host: Host::V4(Ipv4Addr::LOCALHOST),
                 port: std::num::NonZeroU16::new(port).unwrap(),
             };
-            let got = connect(&endpoint).await;
+            let got = connect(&endpoint, Buffer::named(64 << 10)).await;
             let asked = proxy.await.unwrap();
             assert_eq!(
                 asked,
@@ -284,6 +351,41 @@ mod tests {
                         .unwrap_or_else(|| format!("ok {ok}"))
                 ),
             }
+        }
+    }
+
+    /// What the kernel holds of a lane socket is at least what the daemon named: over named
+    /// sizes from a page to a megabyte, a UDP and a TCP socket built with one report, read
+    /// back from the kernel (`getsockopt`), no less (Linux doubles what it is given; macOS
+    /// keeps it). The oracle is the kernel.
+    #[test]
+    fn a_lane_socket_holds_what_the_daemon_named() {
+        let mut rng = Xorshift::new(0x510E527FADE682D1);
+        let held = |fd: RawFd| {
+            let mut v: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: `fd` is a socket this test holds open; `v` and `len` outlive the call.
+            let got = unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
+                    (&mut v as *mut libc::c_int).cast(),
+                    &mut len,
+                )
+            };
+            assert_eq!(got, 0);
+            v as u32
+        };
+        for _ in 0..200 {
+            let bytes = rng.range(4096, 1 << 20) as u32;
+            let b = Buffer::named(bytes);
+            let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            b.hold(udp.as_raw_fd()).unwrap();
+            assert!(held(udp.as_raw_fd()) >= bytes, "UDP {bytes}");
+            let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            b.hold(tcp.as_raw_fd()).unwrap();
+            assert!(held(tcp.as_raw_fd()) >= bytes, "TCP {bytes}");
         }
     }
 

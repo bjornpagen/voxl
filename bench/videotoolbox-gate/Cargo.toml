@@ -1,0 +1,12 @@
+# The VideoToolbox gate: run on the Mac that views, before a deploy (bench/videotoolbox-gate.sh).
+# It builds the daemon's VP9 encoder (src/vp9.rs) on its own, so it needs neither the daemon
+# nor its Linux libraries.
+[package]
+name = "voxl-videotoolbox-gate"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[build-dependencies]
+bindgen = "0.72"
+pkg-config = "0.3"

@@ -3,7 +3,7 @@
 A fork of [tembo/voxl](https://github.com/tembo/voxl) that went its own way: it carries the desktop over lanes through a proxy, with a code that repairs loss by each frame's deadline, so that it stays usable on a lossy, bursty path where one TCP stream stalls.
 
 Low-latency desktop streaming for the browser, written in Rust. voxl streams an X11
-display as H.264 to a small web client that decodes
+display as VP9 to a small web client that decodes
 with WebCodecs, with input, clipboard, audio, microphone, file and folder transfer and
 dynamic resolution. It is built for links that lose packets: video and audio cross as a
 code that repairs losses without waiting for a resend, and ssh is the only way in.
@@ -13,7 +13,7 @@ code that repairs losses without waiting for a resend, and ssh is the only way i
 On the machine with the desktop, run the daemon (it listens on unix sockets only):
 
 ```sh
-cargo install --git https://github.com/bjornpagen/voxl   # needs x264, libyuv, Opus, PulseAudio and esbuild (see Usage)
+cargo install --git https://github.com/bjornpagen/voxl   # needs libvpx, libyuv, Opus, PulseAudio and esbuild (see Usage)
 DISPLAY=:1 voxl             # streams display :1 to the sessions that attach to it
 ```
 
@@ -41,22 +41,28 @@ browser page --WebSocket, 127.0.0.1--> voxl relay (the viewer's machine)
 - **The control stream** is `ssh <host> voxl attach`: whatever ssh's own configuration
   makes of the host (its keys, its master connection) is the door. It carries everything
   that must arrive whole: the hello, input, clipboard, cursor images, the microphone,
-  a report of every frame. `voxl attach` only joins ssh's stdio to the daemon's control
+  and on a datagram lane a report of every block. `voxl attach` only joins ssh's stdio to the daemon's control
   socket, which takes connections from the daemon's own user and no one else.
-- **The lanes** carry video and audio, one way, from the daemon to the relay, through a
+- **The lane** carries video and audio, one way, from the daemon to the relay, through a
   proxy (a SOCKS5 proxy with UDP, or an HTTP CONNECT proxy) whose server end reaches the
   daemon's lane sockets at `localhost:6901`. Each session's daemon makes a 256-bit
-  capability and sends it first on the control stream; each lane presents it once, as its
+  capability and sends it first on the control stream; the lane presents it once, as its
   first message, and the daemon acts on nothing else a lane sends. The capability dies
-  with the control stream, and every lane attached with it is dropped. voxl itself
-  encrypts nothing: the tunnel encrypts the wire, and every other hop is on one machine.
-- **The code.** A frame (one update of the screen, or one Opus packet) is cut into pieces and
-  sent with as many repairs (combinations of its pieces over GF(256)) as make the best use
-  of the link, given the losses the reports show. A piece that has not arrived by the
-  frame's deadline is erased, lost or stuck behind a resend alike; the relay rebuilds the
-  frame from any large enough set of pieces and repairs. A frame that misses is never
-  sent again: the next update refers past it. The relay's report of each
-  frame is the only feedback; a still desktop sends nothing and gets nothing back.
+  with the control stream, and the lane attached with it is dropped. voxl itself encrypts
+  nothing: the tunnel encrypts the wire, and every other hop is on one machine.
+- **The rate is the transport's.** The daemon writes to the lane only what its socket
+  accepts, never drops what it decided to send, and sizes the encoder by the rate the
+  socket drains; it runs no congestion control of its own.
+- **References.** The VP9 encoder refers only to pictures the page is known to have, so
+  every frame the relay completes decodes, and the relay gives the page every one, in
+  order. Keyframes are sent only when a viewer starts.
+- **The code** (datagram lanes only). A frame (one update of the screen, or one Opus
+  packet) is cut into pieces and sent with as many repairs (combinations of its pieces over
+  GF(256)) as make the best use of the link, given the losses the reports show. A piece
+  that has not arrived by the frame's deadline is erased; the relay rebuilds the frame from
+  any large enough set of pieces and repairs. A frame that misses is never sent again: the
+  next update refers past it. On a stream lane TCP or QUIC delivers every frame, in order,
+  and nothing is coded.
 
 ### Lanes
 
@@ -66,18 +72,14 @@ newline:
 
 ```
 datagram <socks5 host:port>
-streams <proxy host:port> <cap>
-connections <proxy host:port> <count>
+stream <proxy host:port>
 ```
 
-- **`datagram`**: one lane of datagrams through the proxy's UDP ASSOCIATE (a UDP tunnel
-  such as Hysteria2). A loss costs only the piece.
-- **`streams`**: CONNECT streams over one connection that keeps each stream in order on
-  its own (HTTP/3), as many as the daemon asks for, up to `cap`.
-- **`connections`**: CONNECT streams through a proxy that gives each new stream a TCP
-  connection of its own (`count` of them, opened together, in order). A loss holds its
-  connection until TCP resends it, so interactive sessions lag under loss on this
-  transport; the page says so, and Hysteria2 or HTTP/3 is recommended.
+- **`datagram`**: the lane is datagrams through the proxy's UDP ASSOCIATE (Hysteria2's UDP
+  relay), coded with repair. A loss costs only the piece.
+- **`stream`**: the lane is one HTTP CONNECT stream through the proxy (naive over HTTP/2 or
+  HTTP/3): frames as they are, in order. A loss holds the stream until it is resent, so a
+  frame waits for it.
 
 A description that cannot be read or is malformed ends the session with the reason on
 the page; nothing is assumed.
@@ -95,15 +97,15 @@ Cells are FPS (worst second), then latency p50/p99 from the content being drawn 
 frame being decoded. voxl's column is its best run of each test. To reproduce, see
 [`bench/`](bench/README.md).
 
-| Test                           | voxl                       | [selkies](https://github.com/selkies-project/selkies) | [KasmVNC](https://github.com/kasmtech/KasmVNC) | [Neko](https://github.com/m1k1o/neko) | [Neko, tuned](https://github.com/m1k1o/neko) | [Sunshine](https://github.com/LizardByte/Sunshine) | [Sunshine, tuned](https://github.com/LizardByte/Sunshine) | [noVNC](https://github.com/novnc/noVNC) | [Daytona](https://www.daytona.io) |
-| ------------------------------ | -------------------------- | ----------------------------------------------------- | ---------------------------------------------- | ------------------------------------- | -------------------------------------------- | -------------------------------------------------- | --------------------------------------------------------- | --------------------------------------- | --------------------------------- |
-| Chromium scroll, LAN           | **60.1 (59.7), 55/60 ms**  | 56.8 (54.0), 85/106 ms                                | 51.7 (39.5), 99/135 ms                         | 25.0 (23.7), 156/217 ms               | 53.9 (49.9), 128/155 ms                      | 28.3 (23.5), 88/115 ms                             | 48.5 (44.0), 94/117 ms                                    | 6.7 (6.3), 198/301 ms                   | 5.2 (2.5), 306/713 ms             |
-| Scroll, 10 Mbps / 40 ms RTT    | **60.0 (59.4), 82/94 ms**  | 55.6 (47.7), 152/261 ms                               | 8.3 (7.4), 229/249 ms                          | 24.6 (14.9), 221/737 ms               | 46.3 (40.3), 606/831 ms                      | 27.9 (25.3), 160/179 ms                            | 51.3 (47.5), 147/162 ms                                   | 2.6 (2.4), 426/678 ms                   | 1.9 (1.6), 617/798 ms             |
-| Scroll, 5 Mbps / 60 ms RTT     | **60.1 (59.7), 99/109 ms** | 27.9 (19.6), 2.7/3.7 s                                | 4.9 (3.6), 306/415 ms                          | 21.7 (3.8), 1.2/3.6 s                 | stalls                                       | 29.6 (21.9), 178/207 ms                            | 44.5 (35.2), 164/191 ms                                   | 1.6 (1.4), 637/937 ms                   | 1.1 (0.9), 1.1/1.2 s              |
-| 1080p animation, LAN           | **60.1 (59.9), 12/16 ms**  | 58.7 (55.9), 31/48 ms                                 | 56.7 (51.6), 51/82 ms                          | 24.8 (23.6), 122/202 ms               | 55.6 (50.0), 54/82 ms                        | 27.1 (22.7), 69/91 ms                              | 45.6 (40.3), 42/57 ms                                     | 7.7 (7.2), 149/210 ms                   | 10.5 (8.8), 138/209 ms            |
-| Animation, 10 Mbps / 40 ms RTT | **60.1 (59.5), 46/71 ms**  | 39.3 (31.8), 2.3/3.1 s                                | 52.9 (49.2), 76/115 ms                         | 25.1 (9.1), 295/962 ms                | 33.3 (25.4), 4.0/7.1 s                       | 29.7 (26.0), 108/125 ms                            | 51.1 (44.6), 86/107 ms                                    | 5.8 (5.2), 160/226 ms                   | 7.4 (7.0), 154/213 ms             |
-| Animation, 5 Mbps / 60 ms RTT  | **60.0 (58.8), 66/92 ms**  | 18.4 (15.3), 2.2/4.3 s                                | 34.1 (26.4), 104/156 ms                        | 15.2 (8.6), 5.0/9.4 s                 | stalls                                       | 34.7 (25.4), 123/143 ms                            | 45.5 (40.9), 114/131 ms                                   | 5.1 (4.7), 174/240 ms                   | 5.8 (4.4), 189/252 ms             |
-| Full-screen animation, LAN     | **59.8 (54.0), 18/25 ms**  | 54.8 (49.8), 54/79 ms                                 | 34.2 (32.5), 83/102 ms                         | 22.7 (18.0), 2.9/3.3 s                | 54.6 (49.7), 54/79 ms                        | 24.9 (21.7), 73/98 ms                              | 47.4 (43.4), 46/65 ms                                     | 5.9 (5.2), 184/279 ms                   | 9.1 (7.2), 154/247 ms             |
+| Test                           | voxl                       | [selkies](https://github.com/selkies-project/selkies) | [KasmVNC](https://github.com/kasmtech/KasmVNC) | [Neko](https://github.com/m1k1o/neko) | [Sunshine](https://github.com/LizardByte/Sunshine) | [Sunshine, tuned](https://github.com/LizardByte/Sunshine) | [noVNC](https://github.com/novnc/noVNC) | [Daytona](https://www.daytona.io) |
+| ------------------------------ | -------------------------- | ----------------------------------------------------- | ---------------------------------------------- | ------------------------------------- | -------------------------------------------------- | --------------------------------------------------------- | --------------------------------------- | --------------------------------- |
+| Chromium scroll, LAN           | **60.1 (59.7), 55/60 ms**  | 56.8 (54.0), 85/106 ms                                | 51.7 (39.5), 99/135 ms                         | 25.0 (23.7), 156/217 ms               | 28.3 (23.5), 88/115 ms                             | 48.5 (44.0), 94/117 ms                                    | 6.7 (6.3), 198/301 ms                   | 5.2 (2.5), 306/713 ms             |
+| Scroll, 10 Mbps / 40 ms RTT    | **60.0 (59.4), 82/94 ms**  | 55.6 (47.7), 152/261 ms                               | 8.3 (7.4), 229/249 ms                          | 24.6 (14.9), 221/737 ms               | 27.9 (25.3), 160/179 ms                            | 51.3 (47.5), 147/162 ms                                   | 2.6 (2.4), 426/678 ms                   | 1.9 (1.6), 617/798 ms             |
+| Scroll, 5 Mbps / 60 ms RTT     | **60.1 (59.7), 99/109 ms** | 27.9 (19.6), 2.7/3.7 s                                | 4.9 (3.6), 306/415 ms                          | 21.7 (3.8), 1.2/3.6 s                 | 29.6 (21.9), 178/207 ms                            | 44.5 (35.2), 164/191 ms                                   | 1.6 (1.4), 637/937 ms                   | 1.1 (0.9), 1.1/1.2 s              |
+| 1080p animation, LAN           | **60.1 (59.9), 12/16 ms**  | 58.7 (55.9), 31/48 ms                                 | 56.7 (51.6), 51/82 ms                          | 24.8 (23.6), 122/202 ms               | 27.1 (22.7), 69/91 ms                              | 45.6 (40.3), 42/57 ms                                     | 7.7 (7.2), 149/210 ms                   | 10.5 (8.8), 138/209 ms            |
+| Animation, 10 Mbps / 40 ms RTT | **60.1 (59.5), 46/71 ms**  | 39.3 (31.8), 2.3/3.1 s                                | 52.9 (49.2), 76/115 ms                         | 25.1 (9.1), 295/962 ms                | 29.7 (26.0), 108/125 ms                            | 51.1 (44.6), 86/107 ms                                    | 5.8 (5.2), 160/226 ms                   | 7.4 (7.0), 154/213 ms             |
+| Animation, 5 Mbps / 60 ms RTT  | **60.0 (58.8), 66/92 ms**  | 18.4 (15.3), 2.2/4.3 s                                | 34.1 (26.4), 104/156 ms                        | 15.2 (8.6), 5.0/9.4 s                 | 34.7 (25.4), 123/143 ms                            | 45.5 (40.9), 114/131 ms                                   | 5.1 (4.7), 174/240 ms                   | 5.8 (4.4), 189/252 ms             |
+| Full-screen animation, LAN     | **59.8 (54.0), 18/25 ms**  | 54.8 (49.8), 54/79 ms                                 | 34.2 (32.5), 83/102 ms                         | 22.7 (18.0), 2.9/3.3 s                | 24.9 (21.7), 73/98 ms                              | 47.4 (43.4), 46/65 ms                                     | 5.9 (5.2), 184/279 ms                   | 9.1 (7.2), 154/247 ms             |
 
 | Server CPU, X server + streamer (cores)                   | idle | 1080p animation  | scroll           | full screen      |
 | --------------------------------------------------------- | ---- | ---------------- | ---------------- | ---------------- |
@@ -111,7 +113,6 @@ frame being decoded. voxl's column is its best run of each test. To reproduce, s
 | [selkies](https://github.com/selkies-project/selkies)     | 1.29 | not measured     | 1.54             | 1.80             |
 | [KasmVNC](https://github.com/kasmtech/KasmVNC)            | 0.00 | 1.97             | 2.07             | 1.82 (at 34 FPS) |
 | [Neko](https://github.com/m1k1o/neko)                     | 1.63 | 2.50 (at 25 FPS) | 2.20 (at 25 FPS) | 2.46 (at 23 FPS) |
-| [Neko](https://github.com/m1k1o/neko), tuned              | 1.90 | 2.28             | 2.30             | 2.52             |
 | [Sunshine](https://github.com/LizardByte/Sunshine)        | 2.10 | 2.34 (at 27 FPS) | 2.24 (at 28 FPS) | 2.35 (at 25 FPS) |
 | [Sunshine](https://github.com/LizardByte/Sunshine), tuned | 2.84 | 3.07 (at 46 FPS) | 3.14 (at 49 FPS) | 3.22 (at 47 FPS) |
 | [noVNC](https://github.com/novnc/noVNC)                   | 0.01 | 0.55 (at 8 FPS)  | 0.58 (at 7 FPS)  | 0.64 (at 6 FPS)  |
@@ -121,18 +122,16 @@ frame being decoded. voxl's column is its best run of each test. To reproduce, s
 - **KasmVNC:** 1.4.0 with a 60 FPS cap, JPEG/WebP quality 8–9 and video mode, no
   compositor.
 - **Neko:** [m1k1o/neko](https://github.com/m1k1o/neko) 3.2 with its defaults (VP8, 25
-  FPS). **Neko, tuned** captures at 60 FPS and encodes with x264 `ultrafast`/
-  `zerolatency` at up to 30 Mbps, like voxl. Neither adapts its bitrate (Neko's
-  estimator is off by default), so on slow links frames queue up; "stalls" means no
-  frame arrived in 20 s.
+  FPS). It doesn't adapt its bitrate (its estimator is off by default), so on slow links
+  frames queue up.
 - **Sunshine:** [Sunshine](https://github.com/LizardByte/Sunshine) 2025.628 streaming to
   Moonlight ([moonlight-embedded](https://github.com/moonlight-stream/moonlight-embedded)
   2.7, patched to hand frames to the benchmark client). Sunshine is built around GPU
-  capture and encoding; without a GPU it falls back to copying the X11 screen and x264,
+  capture and encoding; without a GPU it falls back to copying the X11 screen and a software H.264 encoder,
   so these numbers show it on a GPU-less VM like the other tests, not on the gaming PC
   it's made for. **Sunshine** runs its defaults (`superfast` on 2 threads) at Moonlight's
-  default 40 Mbps; **Sunshine, tuned** uses `ultrafast` on 4 threads at 30 Mbps, like
-  voxl (8 or 16 threads did no better). Neither reaches 60 FPS on this VM, and it keeps
+  default 40 Mbps; **Sunshine, tuned** uses `ultrafast` on 4 threads at 30 Mbps (8 or 16
+  threads did no better). Neither reaches 60 FPS on this VM, and it keeps
   working while the screen is still (its idle CPU). Moonlight doesn't adapt its bitrate,
   so on slow links it's set to 80% of the link. Its CPU was measured in a later session,
   where voxl used 1.74, 1.65 and 1.99 cores on the same workloads.
@@ -151,7 +150,7 @@ frame being decoded. voxl's column is its best run of each test. To reproduce, s
 
 ## Usage
 
-Build (needs Rust, pkg-config, clang, x264, libyuv, libopus, libpulse and esbuild;
+Build (needs Rust, pkg-config, clang, libvpx, libyuv, libopus, libpulse and esbuild;
 `nix-shell` provides them all):
 
 ```sh
@@ -250,7 +249,7 @@ ssh desktop voxl record > clip.mp4
 ssh desktop voxl stats
 ```
 
-A recording is the H.264 voxl already encodes, saved as MP4 without encoding it again,
+A recording is the VP9 voxl already encodes, saved without encoding it again,
 so it costs almost no CPU. With `--audio-enabled`, it carries the desktop's sound as an
 Opus track beside the video, with the silences kept as gaps. It doesn't include the cursor (viewers draw it), and a restart
 of the stream (a resize) or five minutes ends it. Each command
@@ -304,8 +303,8 @@ desktops voxl is built for run on Xvfb (E2B's and Daytona's do too), and X11 let
 capture them without a permission prompt, with damage events that keep a still screen at
 no CPU. Wayland support is being worked on.
 
-**Does it use the GPU?** Not yet. voxl encodes H.264 on the CPU with x264: 1.3–1.7 cores
-for a busy 2560x1600 desktop, X server included (see the CPU table above).
+**Does it use the GPU?** Not yet. voxl encodes VP9 on the CPU with libvpx. (The CPU table
+above was measured with the H.264 encoder voxl used before.)
 
-**What's the license?** voxl's code is MIT. It links x264, which is GPL-2.0, so a voxl
-binary, and anything that bundles one, is distributed under the GPL.
+**What's the license?** voxl's code is MIT. It links libvpx, libyuv and Opus, each under a
+BSD license.

@@ -86,9 +86,14 @@ async fn session(
         return;
     };
     let (tx, rx) = mpsc::unbounded_channel::<Out>();
-    let client = d
-        .hub
-        .add_client(tx.clone(), Sender::new(capability, tx, Instant::now()));
+    let sender = match Sender::new(capability, tx.clone(), Instant::now()) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("no session: no lane socket to size its buffer from: {e}");
+            return;
+        }
+    };
+    let client = d.hub.add_client(tx, sender);
     log::info!("session {} opened", client.id);
     greet(&d.hub, &client);
     let writer = tokio::spawn(control_writer(rx, write));
@@ -140,12 +145,11 @@ async fn control_writer(
         match &m {
             Out::Bin(b) => Down::Binary(b).encode(&mut out),
             Out::Text(t) => Down::Text(&t.json()).encode(&mut out),
-            Out::Attached { lane, generation } => Down::Attached {
-                lane: *lane,
+            Out::Attached { generation } => Down::Attached {
                 generation: *generation,
             }
             .encode(&mut out),
-            Out::Lanes(lanes) => Down::Lanes(*lanes).encode(&mut out),
+            Out::Buffer(bytes) => Down::Buffer { bytes: *bytes }.encode(&mut out),
             // A recording's alone: a session's audio goes on its lanes.
             Out::Audio { .. } => continue,
         }
@@ -232,17 +236,19 @@ fn handle(d: &Daemon, c: &Arc<Client>, up: Up<'_>) -> Result<(), Ended> {
     Ok(())
 }
 
-/// A report from the relay at `now`: the block leaves its lanes, a video update it says
-/// missed goes to the encoder to forget, and the capture loop looks again (there is room on
-/// the lanes, or an update to forget from).
+/// A report from the relay at `now`: the block leaves its lane, each video update it decided
+/// goes to the encoder (a picture decoded may be predicted from; one missed may not) and to
+/// the client (a keyframe it started on that missed starts it again), and the capture loop
+/// looks again.
 pub(crate) fn reported(
     hub: &Hub,
     c: &Client,
     report: &crate::lanes::wire::Report<'_>,
     now: Instant,
 ) -> Result<(), super::sender::Broken> {
-    for m in c.lanes(|s| s.reported(report, now))? {
-        hub.misses.missed(m.number);
+    for d in c.lanes(|s| s.reported(report, now))? {
+        hub.updates.decided(d.number, d.outcome);
+        c.decided(d.number, d.outcome);
     }
     hub.wake();
     Ok(())
@@ -293,8 +299,6 @@ enum Command {
     Mic(bool),
     /// `sz,<w>,<h>`: the desktop size the viewer's window wants.
     Resize { w: u32, h: u32 },
-    /// `kf`: the browser broke a decoder.
-    Keyframe,
 }
 
 impl Command {
@@ -345,7 +349,6 @@ impl Command {
                 w: num(w)?,
                 h: num(h)?,
             },
-            ("kf", []) => Command::Keyframe,
             _ => return None,
         })
     }
@@ -392,10 +395,6 @@ fn handle_text(d: &Daemon, c: &Arc<Client>, t: &str) {
                 *d.hub.resize_req.lock() = Some((w, h));
                 d.hub.wake();
             }
-        }
-        Command::Keyframe => {
-            c.ask_keyframe();
-            d.hub.wake();
         }
     }
 }

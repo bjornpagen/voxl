@@ -5,52 +5,13 @@
 //! runs, queues and stalls among them, have heavier tails, and in simulation the chain
 //! underestimated rare misses twelve-fold.
 //!
-//! The model is read in send order across every lane, not lane by lane. The path erases in
-//! the order packets cross it, so a burst of loss falls on symbols sent one after another,
-//! whichever lanes carry them; and on a stream lane a loss stalls every later symbol on that
-//! lane for a resend's round trip, so one burst stalls the few lanes it fell on together, and
-//! the frames after it lose their symbols on those lanes together. Lanes taken as independent
-//! chains miss that, and in simulation underestimated misses up to twenty-fold; the chain in
-//! send order sees both as runs of erasures. A frame's symbols are sent in a row, so its chance
-//! of a miss is the chain's over n symbols in a row, from the long-run state: the sender
-//! cannot know the state when a frame starts, since what it hears is a round trip old.
+//! The model is read in send order: the path erases in the order datagrams cross it, so a burst
+//! of loss falls on symbols sent one after another. A block's symbols are sent in a row, so its
+//! chance of a miss is the runs' over n symbols in a row, from the long-run state: the sender
+//! cannot know the state when a block starts, since what it hears is a round trip old.
 
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
-
-/// How many lanes a session deals its frames over: at least 1, at most what a 16-bit lane
-/// index numbers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Lanes(u16);
-
-impl Lanes {
-    /// One lane.
-    pub const ONE: Lanes = Lanes(1);
-
-    /// `n` lanes, if there is at least one.
-    pub fn new(n: u16) -> Option<Lanes> {
-        (n > 0).then_some(Lanes(n))
-    }
-
-    pub fn get(self) -> usize {
-        self.0 as usize
-    }
-
-    /// As many lanes as `n`, within what a lane index numbers.
-    pub fn at_most(n: NonZeroUsize) -> Lanes {
-        Lanes(n.get().min(u16::MAX as usize) as u16)
-    }
-
-    /// The lane piece `i` of a block goes on, its first on lane `first`. Pieces are dealt to
-    /// the lanes in turn, in the order they leave, block after block ([`super::link::Link`]
-    /// carries the turn from one block to the next and starts it over at the first lane when
-    /// the lanes become fewer than it reached): a lane's pieces are as far apart in send order as
-    /// there are lanes, so a stream lane stalled by a loss holds back none of the pieces that
-    /// leave during the stall when the lanes outnumber them ([`super::link::Link::wanted`]).
-    pub fn lane(self, first: usize, i: usize) -> usize {
-        (first + i) % self.0 as usize
-    }
-}
 
 /// What became of one symbol: the model's two states.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

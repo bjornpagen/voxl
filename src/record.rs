@@ -1,7 +1,7 @@
 //! Screenshots and recordings, for agents and scripts: asked over the daemon's control
 //! socket by `voxl screenshot` and `voxl record` (run over ssh, as `voxl attach` is).
 //!
-//! A recording is the H.264 stream voxl already encodes, rewrapped as MP4: the recorder
+//! A recording is the VP9 stream voxl already encodes, rewrapped as MP4: the recorder
 //! joins as one more viewer, whose way out is the recording itself (`Sender::recording`),
 //! so it costs almost no CPU and bounds no real viewer. Like the stream, it holds frames
 //! only when the screen changes, and it doesn't include the cursor (viewers draw it).
@@ -115,9 +115,9 @@ async fn collect(
         frames: Vec::new(),
         audio: Vec::new(),
     };
-    // The picture's size, read at the first frame: a restart (a new size) ends the
-    // recording before it could change.
-    let mut size = (0, 0);
+    // The picture's size and level, read at the first frame: a restart (a new size) ends
+    // the recording before either could change.
+    let mut size = (0, 0, mp4::Vp9 { level: 0 });
     // One message: taken into the recording, or the recording's end.
     let mut take = |m: Out| -> Taken {
         match m {
@@ -129,7 +129,16 @@ async fn collect(
                 };
                 if tracks.frames.is_empty() {
                     use std::sync::atomic::Ordering::Relaxed;
-                    size = (hub.width.load(Relaxed), hub.height.load(Relaxed));
+                    // A frame comes only from a built stream, which the hub holds.
+                    let Some(stream) = *hub.stream.lock() else {
+                        return Taken::On;
+                    };
+                    let level = stream.level();
+                    size = (
+                        hub.width.load(Relaxed),
+                        hub.height.load(Relaxed),
+                        mp4::Vp9 { level },
+                    );
                 }
                 // Time the frame was captured: now, less the pipeline time in its header.
                 let ms = (start.elapsed().as_millis() as u64).saturating_sub(h.pipe.millis());
@@ -154,7 +163,7 @@ async fn collect(
             }
             // A restart of the stream ends this recording.
             Out::Text(ServerMessage::Hello(_)) if !tracks.frames.is_empty() => Taken::End,
-            Out::Text(_) | Out::Attached { .. } | Out::Lanes(_) => Taken::On,
+            Out::Text(_) | Out::Attached { .. } | Out::Buffer(_) => Taken::On,
         }
     };
     let asked_to_end = loop {
@@ -177,7 +186,7 @@ async fn collect(
         }
     }
     let end = start.elapsed().as_millis() as u64;
-    tokio::task::spawn_blocking(move || mp4::write(&tracks, size.0, size.1, end))
+    tokio::task::spawn_blocking(move || mp4::write(&tracks, size.0, size.1, size.2, end))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -186,15 +195,26 @@ async fn collect(
 mod tests {
     use super::*;
 
-    /// Video frame `id`: a keyframe, its SPS and PPS as mp4.rs's own test writes them.
+    /// Video frame `id`: a keyframe's header, and bytes standing for its VP9.
     fn video(id: u32) -> Out {
         let mut m = vec![1];
         m.extend_from_slice(&id.to_be_bytes());
         m.extend_from_slice(&[0; 4]);
-        m.extend_from_slice(&[
-            0, 0, 0, 1, 0x67, 100, 0, 40, 0xac, 0, 0, 0, 1, 0x68, 0xee, 0, 0, 0, 1, 0x65, 0xaa,
-        ]);
+        m.extend_from_slice(&[0x82, 0x49, 0x83, 0x42, 0x00]);
         Out::Bin(bytes::Bytes::from(m))
+    }
+
+    /// A hub whose stream is built, as a recording's frames come only from one.
+    fn hub() -> Arc<Hub> {
+        let hub = Hub::new().unwrap();
+        let shape = crate::vp9::Shape {
+            width: 64,
+            height: 64,
+            fps: 60,
+        };
+        *hub.stream.lock() =
+            Some(crate::vp9::Stream::new(shape, std::num::NonZeroUsize::MIN).unwrap());
+        hub
     }
 
     /// The frames an MP4 holds: its sample count.
@@ -217,7 +237,7 @@ mod tests {
             "",
             "x",
         ];
-        let hub = Hub::new().unwrap();
+        let hub = hub();
         let mut rng = crate::xorshift::Xorshift::new(0x9e37_79b9_7f4a_7c15);
         for _ in 0..2_000 {
             let (tx, rx) = mpsc::unbounded_channel();
@@ -261,7 +281,7 @@ mod tests {
     #[tokio::test]
     async fn a_recording_carries_the_audio_on_the_clock_its_packets_say() {
         let mut rng = crate::xorshift::Xorshift::new(0x510e_527f_ade6_82d1);
-        let hub = Hub::new().unwrap();
+        let hub = hub();
         // Without audio; with audio and no silence; with silence.
         let mut reached = [0u32; 3];
         for _ in 0..1_000 {

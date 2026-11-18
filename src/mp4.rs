@@ -1,12 +1,14 @@
-//! Minimal MP4 writer for recordings: the H.264 voxl already sends, rewrapped without
-//! re-encoding, and the desktop's Opus packets as a second track. Frames arrive only when
+//! Minimal MP4 writer for recordings: the VP9 voxl already sends, rewrapped without
+//! re-encoding (VP9 in MP4 as the VP Codec ISO Media File Format Binding,
+//! https://www.webmproject.org/vp9/mp4/, places it: a `vp09` sample entry with a `vpcC`, each
+//! frame one sample), and the desktop's Opus packets as a second track. Frames arrive only when
 //! the screen changes, so each sample lasts until the next one (variable frame rate);
 //! packets are sent only for sound, so the audio track has gaps, which its sample
 //! durations hold.
 
 use crate::sound::{DESKTOP, RATE};
 
-/// One encoded frame: time since the recording started (ms), keyframe, Annex-B data.
+/// One encoded frame: time since the recording started (ms), keyframe, the VP9 frame.
 pub struct Frame {
     pub ms: u64,
     pub key: bool,
@@ -43,33 +45,6 @@ const PRE_SKIP: u16 = (RATE / 400) as u16;
 /// The movie's time unit, in ticks a second: milliseconds, the unit each frame's time is
 /// kept in (`Frame::ms`).
 const TIMESCALE: u32 = 1000;
-
-/// NAL units of an Annex-B stream (start codes removed).
-fn nals(data: &[u8]) -> Vec<&[u8]> {
-    let mut out = Vec::new();
-    let mut start = None;
-    let mut i = 0;
-    while i + 3 <= data.len() {
-        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-            if let Some(s) = start {
-                // A 4-byte start code leaves a zero at the end of the previous unit.
-                let mut end = i;
-                while end > s && data[end - 1] == 0 {
-                    end -= 1;
-                }
-                out.push(&data[s..end]);
-            }
-            i += 3;
-            start = Some(i);
-        } else {
-            i += 1;
-        }
-    }
-    if let Some(s) = start {
-        out.push(&data[s..]);
-    }
-    out.into_iter().filter(|n| !n.is_empty()).collect()
-}
 
 fn bx(name: &[u8; 4], body: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(body.len() + 8);
@@ -183,42 +158,45 @@ fn audio_trak(packets: &[&AudioPacket], lead_ms: u64, ms: u64, at: u32) -> Vec<u
     bx(b"trak", &[fbx(b"tkhd", 3, &tkhd), edts, mdia].concat())
 }
 
-/// Writes `tracks` (the first frame must be a keyframe) as an MP4 of `width`x`height`
-/// lasting until `end_ms`. The movie begins at its first frame: audio before it is left
-/// out, and the audio after it keeps its place, silences and all.
-pub fn write(tracks: &Tracks, width: u32, height: u32, end_ms: u64) -> Result<Vec<u8>, String> {
+/// What the `vpcC` of a VP9 stream says: the level it is coded at, times ten (profile 0 and
+/// 8 bits are voxl's one stream's).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Vp9 {
+    pub level: u8,
+}
+
+/// The VP Codec Configuration Box of a stream at `level` (the binding's §2.2.3): version 1;
+/// profile 0; the level; 8 bits, 4:2:0 with chroma between luma rows (code 0), studio range;
+/// BT.709 primaries (code 1) and the sRGB transfer (code 13), as X11 draws the screen, and
+/// BT.601's matrix (code 6), as libyuv's ARGBToI420 converts it (ISO/IEC 23091-2's codes);
+/// no initialisation data, as VP9 has none.
+fn vpcc(Vp9 { level }: Vp9) -> Vec<u8> {
+    let mut b = vec![1, 0, 0, 0]; // version 1, flags 0
+    b.extend_from_slice(&[0, level, 8 << 4, 1, 13, 6]);
+    b.extend_from_slice(&0u16.to_be_bytes());
+    bx(b"vpcC", &b)
+}
+
+/// Writes `tracks` (the first frame must be a keyframe) of a VP9 stream `codec` as an MP4 of
+/// `width`x`height` lasting until `end_ms`. The movie begins at its first frame: audio
+/// before it is left out, and the audio after it keeps its place, silences and all.
+pub fn write(
+    tracks: &Tracks,
+    width: u32,
+    height: u32,
+    codec: Vp9,
+    end_ms: u64,
+) -> Result<Vec<u8>, String> {
     let frames = &tracks.frames;
     let first = frames.first().ok_or("no frames were recorded")?;
     if !first.key {
         return Err("recording doesn't start with a keyframe".into());
     }
-    let (mut sps, mut pps) = (None, None);
-    for n in nals(&first.data) {
-        match n[0] & 0x1f {
-            7 if sps.is_none() => sps = Some(n.to_vec()),
-            8 if pps.is_none() => pps = Some(n.to_vec()),
-            _ => {}
-        }
-    }
-    let (sps, pps) = (
-        sps.ok_or("keyframe without SPS")?,
-        pps.ok_or("keyframe without PPS")?,
-    );
-    if sps.len() < 4 {
-        return Err("bad SPS".into());
-    }
 
-    // Samples: length-prefixed NAL units, parameter sets and delimiters left out. They
-    // are only sized here and copied once, straight into the output, at the end.
-    let mut samples: Vec<Vec<&[u8]>> = Vec::with_capacity(frames.len());
+    // Samples: each frame as it is, copied once, straight into the output, at the end.
     let (mut sizes, mut durations, mut sync) = (Vec::new(), Vec::new(), Vec::new());
     for (i, f) in frames.iter().enumerate() {
-        let units: Vec<&[u8]> = nals(&f.data)
-            .into_iter()
-            .filter(|n| !matches!(n[0] & 0x1f, 7..=9))
-            .collect();
-        sizes.push(units.iter().map(|n| n.len() as u32 + 4).sum::<u32>());
-        samples.push(units);
+        sizes.push(f.data.len() as u32);
         // A frame lasts until the next, and the last until the recording's end.
         let next = match frames.get(i + 1) {
             Some(n) => n.ms,
@@ -248,32 +226,23 @@ pub fn write(tracks: &Tracks, width: u32, height: u32, end_ms: u64) -> Result<Ve
     let movie = total.max(audio_span.map_or(0, |(lead, ms)| lead + ms));
     let mdat_len = video_len + audio_len;
 
-    let ftyp = bx(b"ftyp", b"isom\0\0\x02\0isomiso2avc1mp41");
+    let ftyp = bx(b"ftyp", b"isom\0\0\x02\0isomiso2mp41");
     if mdat_len + 8 > u32::MAX as u64 {
         return Err("recording too large".into());
     }
 
-    let mut avcc = vec![1, sps[1], sps[2], sps[3], 0xff, 0xe1];
-    avcc.extend_from_slice(&(sps.len() as u16).to_be_bytes());
-    avcc.extend_from_slice(&sps);
-    avcc.push(1);
-    avcc.extend_from_slice(&(pps.len() as u16).to_be_bytes());
-    avcc.extend_from_slice(&pps);
-    if matches!(sps[1], 100 | 110 | 122 | 144) {
-        // 4:2:0, 8-bit, no SPS extensions.
-        avcc.extend_from_slice(&[0xfd, 0xf8, 0xf8, 0]);
-    }
-    let mut avc1 = vec![0u8; 6];
-    avc1.extend_from_slice(&1u16.to_be_bytes()); // data reference index
-    avc1.extend_from_slice(&[0u8; 16]);
-    avc1.extend_from_slice(&(width as u16).to_be_bytes());
-    avc1.extend_from_slice(&(height as u16).to_be_bytes());
-    avc1.extend_from_slice(&u32s(&[0x48_0000, 0x48_0000, 0]));
-    avc1.extend_from_slice(&1u16.to_be_bytes()); // frame count
-    avc1.extend_from_slice(&[0u8; 32]); // compressor name
-    avc1.extend_from_slice(&[0, 0x18, 0xff, 0xff]); // depth, pre-defined
-    avc1.extend_from_slice(&bx(b"avcC", &avcc));
-    let stsd = fbx(b"stsd", 0, &[u32s(&[1]), bx(b"avc1", &avc1)].concat());
+    // The visual sample entry (ISO/IEC 14496-12 §12.1.3), then its `vpcC`.
+    let mut vp09 = vec![0u8; 6];
+    vp09.extend_from_slice(&1u16.to_be_bytes()); // data reference index
+    vp09.extend_from_slice(&[0u8; 16]);
+    vp09.extend_from_slice(&(width as u16).to_be_bytes());
+    vp09.extend_from_slice(&(height as u16).to_be_bytes());
+    vp09.extend_from_slice(&u32s(&[0x48_0000, 0x48_0000, 0]));
+    vp09.extend_from_slice(&1u16.to_be_bytes()); // frame count
+    vp09.extend_from_slice(&[0u8; 32]); // compressor name
+    vp09.extend_from_slice(&[0, 0x18, 0xff, 0xff]); // depth, pre-defined
+    vp09.extend_from_slice(&vpcc(codec));
+    let stsd = fbx(b"stsd", 0, &[u32s(&[1]), bx(b"vp09", &vp09)].concat());
 
     // Runs of equal durations.
     let mut stts: Vec<(u32, u32)> = Vec::new();
@@ -365,9 +334,8 @@ pub fn write(tracks: &Tracks, width: u32, height: u32, end_ms: u64) -> Result<Ve
     out.extend_from_slice(&moov);
     out.extend_from_slice(&(mdat_len as u32 + 8).to_be_bytes());
     out.extend_from_slice(b"mdat");
-    for n in samples.iter().flatten() {
-        out.extend_from_slice(&(n.len() as u32).to_be_bytes());
-        out.extend_from_slice(n);
+    for f in frames {
+        out.extend_from_slice(&f.data);
     }
     for p in &audio {
         out.extend_from_slice(&p.data);
@@ -380,54 +348,11 @@ pub(crate) mod tests {
     use super::*;
     use crate::xorshift::Xorshift;
 
-    /// A NAL unit of `kind` (its header's low five bits), its payload as H.264 keeps it:
-    /// no two zero bytes in a row (emulation prevention keeps three from meeting) and a
-    /// last byte that is not zero (the RBSP's stop bit).
-    fn nal(rng: &mut Xorshift, kind: u8) -> Vec<u8> {
-        let mut n = vec![0x60 | kind];
-        for _ in 0..rng.below(40) {
-            let b = match (n.last(), rng.below(8)) {
-                (Some(0), _) | (_, 1..) => 1 + rng.below(255) as u8,
-                (_, 0) => 0,
-            };
-            n.push(b);
-        }
-        if n.last() == Some(&0) {
-            n.push(1);
-        }
-        n
-    }
-
-    /// Units joined as Annex B, each after a start code of three or four bytes.
-    fn annex_b(rng: &mut Xorshift, units: &[Vec<u8>]) -> Vec<u8> {
-        units
-            .iter()
-            .flat_map(|u| {
-                let code: &[u8] = match rng.below(2) {
-                    0 => &[0, 0, 1],
-                    _ => &[0, 0, 0, 1],
-                };
-                code.iter().chain(u).copied().collect::<Vec<u8>>()
-            })
+    /// A frame's bytes: 1 to 200 of any value (the writer copies a frame as it is).
+    fn frame(rng: &mut Xorshift) -> Vec<u8> {
+        (0..1 + rng.below(200))
+            .map(|_| rng.below(256) as u8)
             .collect()
-    }
-
-    /// An Annex B stream splits into exactly the units it was made of, whichever start
-    /// codes joined them: over generated streams of 0 to 12 units.
-    #[test]
-    fn annex_b_splits_into_its_units() {
-        let mut rng = Xorshift::new(0x1f83_d9ab_5be0_cd19);
-        for _ in 0..5_000 {
-            let units: Vec<Vec<u8>> = (0..rng.below(13))
-                .map(|_| {
-                    let kind = 1 + rng.below(23) as u8;
-                    nal(&mut rng, kind)
-                })
-                .collect();
-            let stream = annex_b(&mut rng, &units);
-            let want: Vec<&[u8]> = units.iter().map(Vec::as_slice).collect();
-            assert_eq!(nals(&stream), want);
-        }
     }
 
     /// The box `name` at its first place in `mp4`, and its payload after its 8-byte header.
@@ -437,42 +362,31 @@ pub(crate) mod tests {
         (at, &mp4[at + 8..at + len])
     }
 
-    /// A recording is its frames as MP4 samples: the movie's header before its data,
-    /// the chunk offset pointing at the first sample, and the data each frame's units
-    /// length-prefixed in order with its parameter sets and delimiters left out, one
-    /// sample size each; each sample lasts until the next frame, the last until the end.
-    /// Over generated recordings of a keyframe (with SPS and PPS) and 0 to 20 frames more.
+    /// A recording is its frames as MP4 samples: the movie's header before its data, the
+    /// chunk offset pointing at the first sample, and the data each frame as it is, in
+    /// order, one sample size each; a `vp09` entry whose `vpcC` names the level; the
+    /// keyframes the sync samples. Over generated recordings of a keyframe and 0 to 20
+    /// frames more, keyframes among them.
     #[test]
     fn a_recording_is_its_frames_as_samples() {
         let mut rng = Xorshift::new(0x9b05_688c_2b3e_6c1f);
         for _ in 0..1_000 {
             let mut ms = 0;
             let mut frames = Vec::new();
-            let mut want_data = Vec::new();
-            let mut want_sizes = Vec::new();
+            let (mut want_data, mut want_sizes, mut want_sync) =
+                (Vec::new(), Vec::new(), Vec::new());
             for i in 0..1 + rng.below(21) {
-                let mut units = Vec::new();
-                if i == 0 {
-                    let mut sps = nal(&mut rng, 7);
-                    sps.extend([100, 0, 40]);
-                    units.extend([sps, nal(&mut rng, 8)]);
+                let data = frame(&mut rng);
+                let key = i == 0 || rng.below(8) == 0;
+                want_sizes.push(data.len() as u32);
+                want_data.extend_from_slice(&data);
+                if key {
+                    want_sync.push(i as u32 + 1);
                 }
-                if rng.below(4) == 0 {
-                    units.push(nal(&mut rng, 9));
-                }
-                let kind = if i == 0 { 5 } else { 1 };
-                units.extend((0..1 + rng.below(3)).map(|_| nal(&mut rng, kind)));
-                let sample: Vec<u8> = units
-                    .iter()
-                    .filter(|u| !matches!(u[0] & 0x1f, 7..=9))
-                    .flat_map(|u| (u.len() as u32).to_be_bytes().into_iter().chain(u.clone()))
-                    .collect();
-                want_sizes.push(sample.len() as u32);
-                want_data.extend(sample);
                 frames.push(Frame {
                     ms,
-                    key: i == 0,
-                    data: annex_b(&mut rng, &units).into(),
+                    key,
+                    data: data.into(),
                 });
                 ms += 1 + rng.below(100);
             }
@@ -481,7 +395,8 @@ pub(crate) mod tests {
                 frames,
                 audio: Vec::new(),
             };
-            let out = write(&tracks, 64, 32, end).unwrap();
+            let level = [10, 31, 41, 51, 62][rng.below(5) as usize];
+            let out = write(&tracks, 64, 32, Vp9 { level }, end).unwrap();
             let (moov, _) = find(&out, b"moov");
             let (mdat, data) = find(&out, b"mdat");
             assert!(moov < mdat);
@@ -489,14 +404,19 @@ pub(crate) mod tests {
             let (_, stco) = find(&out, b"stco");
             let first = u32::from_be_bytes(stco[8..12].try_into().unwrap()) as usize;
             assert_eq!(first, mdat + 8);
+            let words = |b: &[u8]| -> Vec<u32> {
+                b.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| u32::from_be_bytes(*c))
+                    .collect()
+            };
             let (_, stsz) = find(&out, b"stsz");
-            let sizes: Vec<u32> = stsz[12..]
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|c| u32::from_be_bytes(*c))
-                .collect();
-            assert_eq!(sizes, want_sizes);
+            assert_eq!(words(&stsz[12..]), want_sizes);
+            let (_, stss) = find(&out, b"stss");
+            assert_eq!(words(&stss[8..]), want_sync);
+            let (_, vpcc) = find(&out, b"vpcC");
+            assert_eq!(vpcc, &[1, 0, 0, 0, 0, level, 0x80, 1, 13, 6, 0, 0]);
         }
     }
 
@@ -618,24 +538,12 @@ pub(crate) mod tests {
             let mut frames = Vec::new();
             let mut want_video = Vec::new();
             for i in 0..1 + rng.below(20) {
-                let mut units = Vec::new();
-                if i == 0 {
-                    let mut sps = nal(&mut rng, 7);
-                    sps.extend([100, 0, 40]);
-                    units.extend([sps, nal(&mut rng, 8)]);
-                }
-                let kind = if i == 0 { 5 } else { 1 };
-                units.extend((0..1 + rng.below(3)).map(|_| nal(&mut rng, kind)));
-                let sample: Vec<u8> = units
-                    .iter()
-                    .filter(|u| !matches!(u[0] & 0x1f, 7..=9))
-                    .flat_map(|u| (u.len() as u32).to_be_bytes().into_iter().chain(u.clone()))
-                    .collect();
-                want_video.push((ms - first, sample));
+                let sample = frame(&mut rng);
+                want_video.push((ms - first, sample.clone()));
                 frames.push(Frame {
                     ms,
                     key: i == 0,
-                    data: annex_b(&mut rng, &units).into(),
+                    data: sample.into(),
                 });
                 ms += 1 + rng.below(100);
             }
@@ -664,7 +572,7 @@ pub(crate) mod tests {
                 _ => 4,
             }] += 1;
 
-            let out = write(&tracks, 64, 32, end).unwrap();
+            let out = write(&tracks, 64, 32, Vp9 { level: 10 }, end).unwrap();
             let (read, movie_ms) = read(&out);
             assert_eq!(read.len(), 1 + usize::from(!want_audio.is_empty()));
 

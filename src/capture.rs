@@ -90,9 +90,6 @@ pub struct Capturer {
     _damage: u32,
     /// Rows touched since the last take (raw damage rectangles, no server round trip).
     pub damage: Damage,
-    /// Macroblocks (16x16) touched since the last take, row-major.
-    mb_dirty: Vec<u8>,
-    pub mb_cols: usize,
     debug: Debugging,
     /// The threads that convert its captures.
     rows: crate::convert::Rows,
@@ -184,8 +181,6 @@ impl Capturer {
             direct,
             _damage: damage,
             damage: Damage::Unreported,
-            mb_dirty: vec![0; (width as usize).div_ceil(16) * (height as usize).div_ceil(16)],
-            mb_cols: (width as usize).div_ceil(16),
             debug,
             rows: crate::convert::Rows::new(convert_threads)?,
         })
@@ -224,15 +219,10 @@ impl Capturer {
                 let bot =
                     (e.area.y as i32 + e.area.height as i32).clamp(0, self.height as i32) as u32;
                 if bot > top {
-                    let left = (e.area.x as i32).clamp(0, self.width as i32) as u32;
-                    let right =
-                        (e.area.x as i32 + e.area.width as i32).clamp(0, self.width as i32) as u32;
+                    let left = (e.area.x as i32).clamp(0, self.width as i32);
+                    let right = (e.area.x as i32 + e.area.width as i32).clamp(0, self.width as i32);
                     if right <= left {
                         continue;
-                    }
-                    let (x0, x1) = (left as usize / 16, (right as usize).div_ceil(16));
-                    for row in (top as usize / 16)..(bot as usize).div_ceil(16) {
-                        self.mb_dirty[row * self.mb_cols + x0..row * self.mb_cols + x1].fill(1);
                     }
                     self.damage.add(top, bot, std::time::Instant::now());
                 }
@@ -245,13 +235,6 @@ impl Capturer {
     /// areas in the events themselves, so this never waits on the X server.
     pub fn take_damage(&mut self) -> Result<Option<Band>, String> {
         Ok(self.damage.take(self.height))
-    }
-
-    /// Take the dirty-macroblock map accumulated with the current damage.
-    /// The macroblocks damaged since the last take; `fresh`, a map of none of them as
-    /// long, takes its place.
-    pub fn take_mb_map(&mut self, fresh: Vec<u8>) -> Vec<u8> {
-        std::mem::replace(&mut self.mb_dirty, fresh)
     }
 
     pub fn full(&self) -> Band {

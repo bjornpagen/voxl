@@ -8,13 +8,15 @@
 //! first, drops anything from a peer already attached unread, and takes an `Attach` from
 //! any other peer or drops it, again with no reply.
 
-use super::sender::{Due, Message, Phase, Queue};
+use super::sender::{Kind, Phase, Queue, Waiting};
 use crate::hub::Hub;
 use crate::lanes::wire::Attach;
+use std::os::fd::AsFd;
 use std::os::unix::net::UnixDatagram;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::AsyncReadExt;
+use tokio::io::Interest;
 use tokio::net::unix::OwnedWriteHalf;
 #[cfg(target_os = "linux")]
 use tokio::net::UnixListener;
@@ -32,29 +34,36 @@ pub async fn streams(listener: UnixListener, hub: Arc<Hub>) {
     }
 }
 
-/// A stream lane: its first message, which must be an attach of exactly `Attach::LEN`
-/// bytes after its 2-byte length, read into a buffer of that size and nothing more; then,
+/// A stream lane: its first message, which must be an attach after its length
+/// ([`Attach::decode_stream`]), read into a buffer of that size and nothing more; then,
 /// attached, its writer.
 pub(super) async fn stream_lane(stream: tokio::net::UnixStream, hub: Arc<Hub>) {
     let (mut read, write) = stream.into_split();
-    let mut first = [0u8; 2 + Attach::LEN];
+    let mut first = [0u8; Attach::STREAM_LEN];
     if read.read_exact(&mut first).await.is_err() {
         return;
     }
-    let attach = match usize::from(u16::from_be_bytes([first[0], first[1]])) {
-        Attach::LEN => Attach::decode(&first[2..]),
-        _ => return,
-    };
+    let attach = Attach::decode_stream(&first);
     // The capability is read; the buffer that held it is zeroed.
     zero(&mut first);
     let Ok(attach) = attach else {
         return;
     };
-    let queue = Queue::new();
+    let queue = Queue::new(Kind::Stream, Instant::now(), waker(&hub));
     if hub.attach(attach, queue.clone(), Instant::now()) {
         drop(read);
         stream_writer(queue, write).await;
     }
+}
+
+/// What a lane's queue wakes when room opens on it: the hub's capture loop.
+fn waker(hub: &Arc<Hub>) -> super::sender::Wake {
+    let hub = Arc::downgrade(hub);
+    Arc::new(move || {
+        if let Some(hub) = hub.upgrade() {
+            hub.wake();
+        }
+    })
 }
 
 /// Zeroes bytes that held a capability.
@@ -68,52 +77,57 @@ fn zero(b: &mut [u8]) {
 
 /// What a writer does next.
 enum Next {
-    /// Write again: more is due, or the message in hand is not all written.
+    /// Write again: more waits, and the socket may take it.
     Write,
     /// Wait for the socket to take more bytes.
     Writable,
-    /// Wait until the front message is due, or something else comes.
-    Until(Instant),
     /// Wait for a message.
     Idle,
     /// Its lane closed: end.
     End,
 }
 
-/// Writes a stream lane's queue, each message after its length, as each falls due, until
-/// the lane closes. Bytes are written only under the queue's lock and only while the lane
-/// is open, so after `Queue::close` returns no byte more is written; a write that fails
-/// closes the lane. A message the socket took only part of stays in hand, and is written on
-/// before any other.
+/// Gives `socket` the send buffer the sender asked for, if it has not been given it. The
+/// kernel doubles what it is given, for its bookkeeping (socket(7)); the size asked for is the
+/// size of the messages it may hold.
+fn give_buffer(w: &mut Waiting, socket: impl AsFd) {
+    if let Some(bytes) = w.buffer.filter(|&b| w.given != Some(b)) {
+        let set = nix::sys::socket::setsockopt(
+            &socket,
+            nix::sys::socket::sockopt::SndBuf,
+            &(bytes as usize),
+        );
+        match set {
+            Ok(()) => w.given = Some(bytes),
+            Err(e) => log::warn!("lane socket's send buffer not set to {bytes}: {e}"),
+        }
+    }
+}
+
+/// Writes a stream lane's queue, each framed message after the one before, as fast as the
+/// socket takes them, until the lane closes. Bytes are written only under the queue's lock and
+/// only while the lane is open, so after `Queue::close` returns no byte more is written; a
+/// write that fails closes the lane. A message the socket took only part of stays at the front,
+/// and is written on before any other.
 async fn stream_writer(queue: Arc<Queue>, socket: OwnedWriteHalf) {
-    // The message being written, and how much of it is.
-    let mut partial: Option<(Message, usize)> = None;
     loop {
         let next = {
             let mut w = queue.lock();
-            let in_hand = match (w.phase, partial.take()) {
-                (Phase::Closed, _) => Err(Next::End),
-                (Phase::Open, Some(p)) => Ok(p),
-                (Phase::Open, None) => match w.due(Instant::now()) {
-                    Due::Closed => Err(Next::End),
-                    Due::Idle => Err(Next::Idle),
-                    Due::At(at) => Err(Next::Until(at)),
-                    Due::Now(m) => Ok((m, 0)),
-                },
-            };
-            match in_hand {
-                Err(next) => next,
-                Ok((m, written)) => match socket.try_write(m.framed_from(written)) {
-                    Ok(n) if written + n == m.framed_len() => {
-                        w.sent(m);
+            give_buffer(&mut w, socket.as_ref());
+            match (w.phase, w.messages.front()) {
+                (Phase::Closed, _) => Next::End,
+                (Phase::Open, None) => Next::Idle,
+                (Phase::Open, Some(m)) => match socket.try_write(m.from(w.written)) {
+                    Ok(n) if w.written + n == m.len() => {
+                        w.sent(Instant::now());
                         Next::Write
                     }
                     Ok(n) => {
-                        partial = Some((m, written + n));
+                        w.written += n;
                         Next::Write
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        partial = Some((m, written));
+                        w.refused();
                         Next::Writable
                     }
                     Err(_) => {
@@ -129,12 +143,6 @@ async fn stream_writer(queue: Arc<Queue>, socket: OwnedWriteHalf) {
                 if socket.writable().await.is_err() {
                     queue.close();
                     return;
-                }
-            }
-            Next::Until(at) => {
-                tokio::select! {
-                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(at)) => {}
-                    _ = queue.woken() => {}
                 }
             }
             Next::Idle => queue.woken().await,
@@ -191,12 +199,13 @@ impl Peer {
 
 /// Reads the datagram socket for `hub`'s sessions, until the daemon ends.
 pub async fn datagrams(socket: UnixDatagram, hub: Arc<Hub>) {
-    // Read through tokio, sent from the std socket (`Peer::send`): one socket, two handles.
+    // Read, and waited on for room, through tokio; sent from the std socket (`Peer::send`),
+    // which can address an abstract peer: one socket, two handles.
     let reader = match socket
         .try_clone()
         .and_then(tokio::net::UnixDatagram::from_std)
     {
-        Ok(r) => r,
+        Ok(r) => Arc::new(r),
         Err(e) => {
             log::error!("lane datagram socket: {e}");
             return;
@@ -232,47 +241,150 @@ pub async fn datagrams(socket: UnixDatagram, hub: Arc<Hub>) {
         let Ok(attach) = attach else {
             continue;
         };
-        let queue = Queue::new();
+        let queue = Queue::new(Kind::Datagram, Instant::now(), waker(&hub));
         if hub.attach(attach, queue.clone(), Instant::now()) {
             attached.push((peer.clone(), queue.clone()));
-            tokio::spawn(datagram_writer(queue, socket.clone(), peer));
+            tokio::spawn(datagram_writer(queue, socket.clone(), reader.clone(), peer));
         }
     }
 }
 
-/// Sends a datagram lane's queue to its peer as each message falls due, until the lane
-/// closes. A datagram the socket cannot take now is dropped, as a path drops one: the code
-/// is for that. Sent only under the queue's lock and only while the lane is open.
-async fn datagram_writer(queue: Arc<Queue>, socket: Arc<UnixDatagram>, peer: Peer) {
+/// Sends a datagram lane's queue to its peer as fast as the socket takes it, until the lane
+/// closes. A datagram the socket cannot take now waits for the socket: none is ever dropped.
+/// Each is stamped as it goes, with when it left and its block's deadline
+/// (`Waiting::stamp`). Sent only under the queue's lock and only while the lane is open.
+///
+/// The socket is shared and unconnected, so its writability is its own send buffer's, which the
+/// kernel charges with every datagram until the peer reads it and frees as it does; the buffer
+/// ([`super::sender`]) is far smaller than the peer's queue of datagrams, so the buffer is what
+/// fills first, and a wait on it ends when the peer reads.
+async fn datagram_writer(
+    queue: Arc<Queue>,
+    socket: Arc<UnixDatagram>,
+    ready: Arc<tokio::net::UnixDatagram>,
+    peer: Peer,
+) {
     loop {
         let next = {
             let mut w = queue.lock();
-            match w.due(Instant::now()) {
-                Due::Closed => Next::End,
-                Due::Idle => Next::Idle,
-                Due::At(at) => Next::Until(at),
-                Due::Now(m) => {
-                    match peer.send(&socket, m.datagram()) {
-                        Ok(_) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            give_buffer(&mut w, socket.as_ref());
+            match w.phase {
+                Phase::Closed => Next::End,
+                Phase::Open if w.messages.is_empty() => Next::Idle,
+                Phase::Open => {
+                    let now = Instant::now();
+                    w.stamp(now);
+                    let sent = match w.messages.front() {
+                        Some(m) => {
+                            ready.try_io(Interest::WRITABLE, || peer.send(&socket, m.from(0)))
+                        }
+                        None => Ok(0),
+                    };
+                    match sent {
+                        Ok(_) => {
+                            w.sent(now);
+                            Next::Write
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            w.refused();
+                            Next::Writable
+                        }
                         // The peer is gone (its proxy session ended): the lane is.
-                        Err(_) => w.broken(),
+                        Err(_) => {
+                            w.broken();
+                            Next::End
+                        }
                     }
-                    w.sent(m);
-                    Next::Write
                 }
             }
         };
         match next {
-            Next::Write | Next::Writable => {}
-            Next::Until(at) => {
+            Next::Write => {}
+            Next::Writable => {
                 tokio::select! {
-                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(at)) => {}
+                    r = ready.writable() => if r.is_err() {
+                        queue.close();
+                        return;
+                    },
                     _ = queue.woken() => {}
                 }
             }
             Next::Idle => queue.woken().await,
             Next::End => return,
         }
+    }
+}
+
+/// On Linux, where the daemon's lane sockets are.
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use crate::lanes::wire::{Lane, Number};
+    use crate::session::sender::Sender;
+    use std::time::Duration;
+
+    /// A datagram lane never drops a datagram: a peer that reads nothing while the writer sends
+    /// a queue far larger than the socket's buffer (so the socket refuses, and the writer waits
+    /// on it) then reads it all, and gets every byte queued, every datagram whole, in the order
+    /// queued. A writer that dropped what the socket refused fails this.
+    #[tokio::test]
+    async fn a_datagram_lane_never_drops_one() {
+        let dir = std::env::temp_dir().join(format!("voxl-writer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (ours, theirs) = (dir.join("ours"), dir.join("theirs"));
+        let _ = std::fs::remove_file(&ours);
+        let _ = std::fs::remove_file(&theirs);
+        let socket = UnixDatagram::bind(&ours).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let ready =
+            Arc::new(tokio::net::UnixDatagram::from_std(socket.try_clone().unwrap()).unwrap());
+        let peer = tokio::net::UnixDatagram::bind(&theirs).unwrap();
+        let now = Instant::now();
+        let (mut s, queue, _control) = Sender::with_lane(now);
+        let mut number = Number::first();
+        for _ in 0..60 {
+            s.video(number, &bytes::Bytes::from(vec![9u8; 20_000]), now);
+            number = number.next();
+        }
+        let total = queue.backlog_bytes();
+        tokio::spawn(datagram_writer(
+            queue.clone(),
+            Arc::new(socket),
+            ready,
+            Peer::Path(theirs.clone()),
+        ));
+        // The writer sends until the socket refuses, and waits on it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            queue.backlog_bytes() > 0,
+            "the socket took {total} bytes at once"
+        );
+        let (mut got, mut last) = (0usize, None);
+        let mut buf = vec![0u8; crate::lanes::wire::DATAGRAM + 1];
+        while got < total {
+            let n = tokio::time::timeout(Duration::from_secs(5), peer.recv(&mut buf))
+                .await
+                .expect("the writer goes on as the peer reads")
+                .unwrap();
+            let Ok(Lane::Piece(m) | Lane::Repair(m)) = Lane::decode(&buf[..n]) else {
+                panic!("a datagram, whole");
+            };
+            let at = (
+                m.head.block.get(),
+                Lane::decode(&buf[..n])
+                    .map(|l| match l {
+                        Lane::Piece(p) => p.index as usize,
+                        Lane::Repair(r) => r.head.k() + r.index as usize,
+                        Lane::Frame { .. } => usize::MAX,
+                    })
+                    .unwrap(),
+            );
+            assert!(last.is_none_or(|l| l < at), "{at:?} after {last:?}");
+            last = Some(at);
+            got += n;
+        }
+        assert_eq!(got, total, "every byte queued");
+        assert_eq!(queue.backlog_bytes(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

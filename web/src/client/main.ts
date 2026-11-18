@@ -17,11 +17,6 @@ import { setupToolbar } from './toolbar';
 import { createVideo } from './video';
 import { createZoom } from './zoom';
 
-/** What the page says when video and audio come over separate connections, one a lane:
- * a lost packet holds its whole connection until TCP resends it. */
-const CONNECTIONS_LAG =
-	'Interactive sessions lag under loss on this transport; Hysteria2 or HTTP/3 is recommended.';
-
 /** What the page cannot run without, each by the name the refusal gives it. WebCodecs and
  * a secure context (the relay's 127.0.0.1 is one) for the stream; MediaStreamTrackGenerator
  * to present it; ClipboardItem for clipboard images; Keyboard Lock for the desktop's
@@ -40,7 +35,6 @@ const REQUIRED: [string, () => boolean][] = [
 
 function main() {
 	const statusEl = el('status');
-	const noticeEl = el('notice');
 
 	// What the page needs, checked once: a browser without one of them is refused, by name,
 	// rather than run with that part missing.
@@ -122,7 +116,7 @@ function main() {
 				decodeMs: frames ? d(Count.DecodeUs) / 1000 / frames : null,
 				pipeMs: updates ? d(Count.PipeTenths) / 10 / updates : null,
 				codec,
-				dropped: now.counts[Count.Dropped],
+				passed: d(Count.Passed),
 			};
 		},
 	});
@@ -153,10 +147,6 @@ function main() {
 			case 'frame':
 				video.present(m.frame);
 				break;
-			case 'lanes':
-				noticeEl.textContent = m.kind === 'connections' ? CONNECTIONS_LAG : '';
-				noticeEl.style.display = m.kind === 'connections' ? '' : 'none';
-				break;
 			case 'hello': {
 				app.desk = { s: 'shown', w: m.w, h: m.h };
 				video.layout();
@@ -171,7 +161,6 @@ function main() {
 					app.desk = { s: 'none' };
 					mic.stop();
 					resize.closed();
-					noticeEl.style.display = 'none';
 					statusEl.style.display = '';
 					statusEl.classList.add('ended');
 					statusEl.textContent = `Ended: ${m.why}. Click to connect again.`;

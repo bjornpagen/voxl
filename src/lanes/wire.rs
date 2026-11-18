@@ -12,7 +12,6 @@
 //! length against the bytes in hand and against the message's fixed maximum first, and
 //! returns a [`Malformed`] for anything else.
 
-use super::model::Lanes;
 use std::num::{NonZeroU32, NonZeroU8, NonZeroUsize};
 use std::time::{Duration, Instant};
 
@@ -84,6 +83,14 @@ pub const fn symbols(bytes: NonZeroUsize) -> NonZeroUsize {
 pub struct Seq(pub(super) u64);
 
 impl Seq {
+    pub const fn first() -> Seq {
+        Seq(0)
+    }
+
+    pub fn next(self) -> Seq {
+        Seq(self.0 + 1)
+    }
+
     pub fn get(self) -> u64 {
         self.0
     }
@@ -103,7 +110,6 @@ impl Number {
         Number(self.0 + 1)
     }
 
-    #[cfg(test)]
     pub fn get(self) -> u64 {
         self.0
     }
@@ -169,24 +175,8 @@ impl OneWay {
     }
 }
 
-/// A lane's place in its set, from 0: the relay numbers its set with [`LaneIndex::all`], the
-/// daemon reads them from attaches.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct LaneIndex(u16);
-
-impl LaneIndex {
-    /// The places of a set of `lanes` lanes, in order.
-    pub fn all(lanes: Lanes) -> impl Iterator<Item = LaneIndex> {
-        (0..lanes.get()).map(|i| LaneIndex(i as u16))
-    }
-
-    pub fn get(self) -> usize {
-        self.0 as usize
-    }
-}
-
-/// Which opening of the relay's set of lanes a lane belongs to: a set reopened is a new
-/// generation, and the daemon drops the old one's lanes. The relay counts them with
+/// Which opening of the session's lane a lane is: a lane reopened after it attached is a new
+/// generation, and the daemon drops the old one. The relay counts them with
 /// [`Generation::first`] and [`Generation::next`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Generation(u32);
@@ -281,21 +271,8 @@ impl Drop for Capability {
 pub enum Track {
     /// One Opus packet.
     Audio,
-    /// One video update: its `number` among the updates, from 0, and its `epoch`, the newest
-    /// update whose miss the encoder had invalidated when it coded this one.
-    Video { number: Number, epoch: Epoch },
-}
-
-/// The newest miss of a video update that the encoder had invalidated (by its number) when it
-/// coded an update.
-///
-/// After the relay decides update `x` missed, it drops every later update whose epoch is
-/// older than `x`: it may refer to `x`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Epoch {
-    /// None yet.
-    Start,
-    After(Number),
+    /// One video update: its `number` among the updates, from 0.
+    Video { number: Number },
 }
 
 /// What every piece and repair of a block says about it, the same in each.
@@ -442,14 +419,9 @@ impl<'a> Iterator for Members<'a> {
 pub(super) fn write_entry(out: &mut Vec<u8>, track: Track, len: u32) {
     match track {
         Track::Audio => out.push(0),
-        Track::Video { number, epoch } => {
+        Track::Video { number } => {
             out.push(1);
             out.extend_from_slice(&number.0.to_be_bytes());
-            let e = match epoch {
-                Epoch::Start => 0,
-                Epoch::After(x) => x.0 + 1,
-            };
-            out.extend_from_slice(&e.to_be_bytes());
         }
     }
     out.extend_from_slice(&len.to_be_bytes());
@@ -458,15 +430,9 @@ pub(super) fn write_entry(out: &mut Vec<u8>, track: Track, len: u32) {
 fn read_track(r: &mut Reader<'_>) -> Result<Track, Malformed> {
     match r.u8()? {
         0 => Ok(Track::Audio),
-        1 => {
-            let number = Number(r.u64()?);
-            let epoch = match r.u64()? {
-                0 => Epoch::Start,
-                e if e - 1 < number.0 => Epoch::After(Number(e - 1)),
-                _ => return Err(Malformed::Epoch),
-            };
-            Ok(Track::Video { number, epoch })
-        }
+        1 => Ok(Track::Video {
+            number: Number(r.u64()?),
+        }),
         t => Err(Malformed::Track(t)),
     }
 }
@@ -483,7 +449,9 @@ pub struct Symbol<'a> {
     pub data: &'a [u8],
 }
 
-/// A message on a lane from the daemon to the relay.
+/// A message on a lane from the daemon to the relay: on a datagram lane a piece or a repair
+/// of a coded block, one a datagram; on a stream lane a frame as it is, one a framed message
+/// ([`Framer::stream`]), in order and whole, since the stream delivers every byte.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lane<'a> {
     /// A source symbol, as it is in the frame.
@@ -491,35 +459,35 @@ pub enum Lane<'a> {
     /// A repair: the sum over the frame's sources `i` of `c(frame, index, i)` times source `i`
     /// ([`super::code::coefficient`]).
     Repair(Symbol<'a>),
+    /// A whole frame: its number among the session's frames, what it is, its bytes.
+    Frame {
+        frame: Seq,
+        track: Track,
+        bytes: &'a [u8],
+    },
 }
 
 const ATTACH: u8 = 1;
 const PIECE: u8 = 2;
 const REPAIR: u8 = 3;
+const FRAME: u8 = 4;
+
+/// The most bytes a stream lane's frame carries: as many as a datagram lane's block may
+/// ([`WINDOW`] symbols), so that either lane takes every frame the encoder makes.
+pub const MAX_FRAME: usize = WINDOW * SYMBOL;
+
+/// A frame message's bytes before the frame's own: its tag, its number, and its track at the
+/// longest (a video update's tag and number).
+pub const FRAME_HEADER: usize = 1 + 8 + 1 + 8;
 
 impl<'a> Lane<'a> {
-    pub fn symbol(&self) -> &Symbol<'a> {
-        match self {
-            Lane::Piece(s) | Lane::Repair(s) => s,
-        }
-    }
-
-    /// The symbol's place among the frame's n: sources from 0, repairs after them.
-    pub fn position(&self) -> usize {
-        match self {
-            Lane::Piece(s) => s.index as usize,
-            Lane::Repair(s) => s.head.k() + s.index as usize,
-        }
-    }
-
-    /// Writes the message into `out`, returning its length.
-    pub fn encode(&self, out: &mut [u8; DATAGRAM]) -> usize {
-        let (tag, s) = match self {
-            Lane::Piece(s) => (PIECE, s),
-            Lane::Repair(s) => (REPAIR, s),
-        };
+    /// Writes a piece or repair into `out`, returning its length.
+    pub fn encode_symbol(tag: Symbolic, s: &Symbol<'_>, out: &mut [u8; DATAGRAM]) -> usize {
         let mut w = Writer::new(out);
-        w.u8(tag);
+        w.u8(match tag {
+            Symbolic::Piece => PIECE,
+            Symbolic::Repair => REPAIR,
+        });
         s.head.write(&mut w);
         w.u32(s.sent.0);
         w.u16(s.index);
@@ -527,13 +495,46 @@ impl<'a> Lane<'a> {
         w.at
     }
 
-    /// Reads one message from a lane: a datagram, or one framed message of a stream lane.
+    /// Appends a frame message to `out`, after its stream length ([`STREAM_PREFIX`]).
+    /// `bytes` is at most [`MAX_FRAME`].
+    pub fn encode_frame(frame: Seq, track: Track, bytes: &[u8], out: &mut Vec<u8>) {
+        debug_assert!(bytes.len() <= MAX_FRAME);
+        let start = out.len();
+        out.extend_from_slice(&[0; STREAM_PREFIX]);
+        out.push(FRAME);
+        out.extend_from_slice(&frame.0.to_be_bytes());
+        match track {
+            Track::Audio => out.push(0),
+            Track::Video { number } => {
+                out.push(1);
+                out.extend_from_slice(&number.0.to_be_bytes());
+            }
+        }
+        out.extend_from_slice(bytes);
+        let len = (out.len() - start - STREAM_PREFIX) as u32;
+        out[start..start + STREAM_PREFIX].copy_from_slice(&len.to_be_bytes());
+    }
+
+    /// Reads one message from a lane: a datagram (a piece or a repair), or one framed message
+    /// of a stream lane (a frame).
     pub fn decode(b: &'a [u8]) -> Result<Lane<'a>, Malformed> {
+        let mut r = Reader(b);
+        let tag = r.u8()?;
+        if tag == FRAME {
+            if b.len() > FRAME_HEADER + MAX_FRAME {
+                return Err(Malformed::Long(b.len()));
+            }
+            let frame = Seq(r.u64()?);
+            let track = read_track(&mut r)?;
+            return Ok(Lane::Frame {
+                frame,
+                track,
+                bytes: r.rest(),
+            });
+        }
         if b.len() > DATAGRAM {
             return Err(Malformed::Long(b.len()));
         }
-        let mut r = Reader(b);
-        let tag = r.u8()?;
         if tag != PIECE && tag != REPAIR {
             return Err(Malformed::Tag(tag));
         }
@@ -563,35 +564,101 @@ impl<'a> Lane<'a> {
     }
 }
 
-/// A lane's first message, from the relay: the session's capability, the lane's place in its
-/// set and the set's generation, and when it left on the relay's clock (the daemon's first
-/// sample of the delay toward it, before any report).
+/// Where a datagram's head holds its block's deadline, and where the datagram holds when it
+/// left: after the tag, the block (8), the first frame (8), the members (1), the bytes (4) and
+/// m (2); then the deadline (4) and the time it left (4). The daemon's lane writer stamps both
+/// as the socket accepts the datagram ([`stamp_datagram`]).
+const DUE_AT: usize = 1 + 8 + 8 + 1 + 4 + 2;
+const SENT_AT: usize = DUE_AT + 4;
+
+/// Stamps a piece's or repair's datagram, as [`Lane::encode_symbol`] wrote it, with its block's
+/// deadline `due` and the time it left, `sent`.
+pub fn stamp_datagram(datagram: &mut [u8], due: Stamp, sent: Stamp) {
+    datagram[DUE_AT..DUE_AT + 4].copy_from_slice(&due.0.to_be_bytes());
+    datagram[SENT_AT..SENT_AT + 4].copy_from_slice(&sent.0.to_be_bytes());
+}
+
+/// Which of a block's symbols a datagram carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Symbolic {
+    Piece,
+    Repair,
+}
+
+/// A lane's first message, from the relay: the session's capability, the lane's generation
+/// (a lane reopened after it attached is the next), when it left on the relay's clock (the
+/// daemon's first sample of the delay toward it, before any report), and the relay's measured
+/// round trip (from starting its control connection to receiving the capability: at least one
+/// round trip), which a deadline waits before any report gives the real figures.
 pub struct Attach {
     pub capability: Capability,
-    pub lane: LaneIndex,
     pub generation: Generation,
     pub sent: Stamp,
+    pub round_trip: Duration,
 }
 
 impl Attach {
     /// Its length, always.
-    pub const LEN: usize = 1 + CAPABILITY + 2 + 4 + 4;
+    pub const LEN: usize = 1 + CAPABILITY + 4 + 4 + 4;
 
-    /// Writes an attach of a lane with `capability`.
+    /// Its length as a stream lane's first message: after its own length ([`STREAM_PREFIX`]).
+    pub const STREAM_LEN: usize = STREAM_PREFIX + Attach::LEN;
+
+    /// Writes an attach of a lane with `capability`, as a datagram lane's first datagram. A
+    /// round trip past what a `u32` of tenths holds (119 hours) is written as that much.
     pub fn encode(
         capability: &Capability,
-        lane: LaneIndex,
         generation: Generation,
         sent: Stamp,
+        round_trip: Duration,
     ) -> [u8; Attach::LEN] {
         let mut out = [0; Attach::LEN];
+        Attach::write(
+            &mut Writer::new(&mut out),
+            capability,
+            generation,
+            sent,
+            round_trip,
+        );
+        out
+    }
+
+    /// Writes an attach as a stream lane's first message: its length, then the attach.
+    pub fn encode_stream(
+        capability: &Capability,
+        generation: Generation,
+        sent: Stamp,
+        round_trip: Duration,
+    ) -> [u8; Attach::STREAM_LEN] {
+        let mut out = [0; Attach::STREAM_LEN];
         let mut w = Writer::new(&mut out);
+        w.u32(Attach::LEN as u32);
+        Attach::write(&mut w, capability, generation, sent, round_trip);
+        out
+    }
+
+    fn write(
+        w: &mut Writer,
+        capability: &Capability,
+        generation: Generation,
+        sent: Stamp,
+        round_trip: Duration,
+    ) {
         w.u8(ATTACH);
         w.bytes(&capability.0);
-        w.u16(lane.0);
         w.u32(generation.0);
         w.u32(sent.0);
-        out
+        w.u32(tenths(round_trip).clamp(0, u32::MAX as i64) as u32);
+    }
+
+    /// Reads a stream lane's first message, read whole as [`Attach::STREAM_LEN`] bytes: a
+    /// length that is not an attach's is an error, as is anything but an attach after it.
+    pub fn decode_stream(b: &[u8; Attach::STREAM_LEN]) -> Result<Attach, Malformed> {
+        let (len, attach) = b.split_at(STREAM_PREFIX);
+        match Reader(len).u32()? as usize {
+            Attach::LEN => Attach::decode(attach),
+            _ => Err(Malformed::Length),
+        }
     }
 
     /// Reads a lane's first message; anything but an attach is an error.
@@ -603,9 +670,9 @@ impl Attach {
         }
         let a = Attach {
             capability: Capability::read(&mut r)?,
-            lane: LaneIndex(r.u16()?),
             generation: Generation(r.u32()?),
             sent: Stamp(r.u32()?),
+            round_trip: from_tenths(r.u32()? as i64),
         };
         r.end()?;
         Ok(a)
@@ -616,14 +683,12 @@ impl Attach {
 pub enum Down<'a> {
     /// The session's capability: the first message, and only then.
     Capability(CapabilityRef<'a>),
-    /// A lane of this generation has attached with it.
-    Attached {
-        lane: LaneIndex,
-        generation: Generation,
-    },
-    /// The lanes the daemon wants the set to have ([`super::link::Link::wanted`]): the relay
-    /// opens a stream set of the least of this and its transport's cap.
-    Lanes(Lanes),
+    /// The lane of this generation has attached with it.
+    Attached { generation: Generation },
+    /// The bytes the daemon gave its lane socket's send buffer, whenever it sizes it: what one
+    /// deadline holds at the drain rate. The relay gives its lane socket's receive buffer the
+    /// same.
+    Buffer { bytes: u32 },
     /// A text message for the page (its hello, a clipboard, ...), as the page reads it.
     Text(&'a str),
     /// A binary message for the page (a cursor's image, ...).
@@ -634,7 +699,7 @@ const D_CAPABILITY: u8 = 1;
 const D_ATTACHED: u8 = 2;
 const D_TEXT: u8 = 3;
 const D_BINARY: u8 = 4;
-const D_LANES: u8 = 5;
+const D_BUFFER: u8 = 5;
 
 impl<'a> Down<'a> {
     /// Appends the message to `out`, after its length.
@@ -645,14 +710,13 @@ impl<'a> Down<'a> {
                 out.push(D_CAPABILITY);
                 out.extend_from_slice(c.0);
             }
-            Down::Attached { lane, generation } => {
+            Down::Attached { generation } => {
                 out.push(D_ATTACHED);
-                out.extend_from_slice(&lane.0.to_be_bytes());
                 out.extend_from_slice(&generation.0.to_be_bytes());
             }
-            Down::Lanes(lanes) => {
-                out.push(D_LANES);
-                out.extend_from_slice(&(lanes.get() as u16).to_be_bytes());
+            Down::Buffer { bytes } => {
+                out.push(D_BUFFER);
+                out.extend_from_slice(&bytes.to_be_bytes());
             }
             Down::Text(t) => {
                 out.push(D_TEXT);
@@ -676,10 +740,9 @@ impl<'a> Down<'a> {
                 Down::Capability(CapabilityRef(bytes))
             }
             D_ATTACHED => Down::Attached {
-                lane: LaneIndex(r.u16()?),
                 generation: Generation(r.u32()?),
             },
-            D_LANES => Down::Lanes(Lanes::new(r.u16()?).ok_or(Malformed::NoLanes)?),
+            D_BUFFER => Down::Buffer { bytes: r.u32()? },
             D_TEXT => return text(r.rest()).map(Down::Text),
             D_BINARY => return Ok(Down::Binary(r.rest())),
             t => return Err(Malformed::Tag(t)),
@@ -696,7 +759,8 @@ pub enum Up<'a> {
     Text(&'a str),
     /// A binary message from the page (the microphone, a clipboard image).
     Binary(&'a [u8]),
-    /// A frame decided.
+    /// A datagram lane's block decided. A stream lane has no reports: it delivers every frame,
+    /// in order.
     Report(Report<'a>),
 }
 
@@ -924,8 +988,6 @@ pub enum Malformed {
     Track(u8),
     /// No outcome has this tag.
     Outcome(u8),
-    /// A video epoch at or after its own update's number.
-    Epoch,
     /// A frame of no bytes.
     Empty,
     /// A frame, or a report of one, of more than [`WINDOW`] symbols; or more than [`LATE`]
@@ -937,8 +999,6 @@ pub enum Malformed {
     Length,
     /// Text that is not UTF-8.
     Utf8,
-    /// A set of no lanes.
-    NoLanes,
     /// A framed length, or a datagram, over the longest message of its kind.
     Long(usize),
 }
@@ -951,13 +1011,11 @@ impl std::fmt::Display for Malformed {
             Malformed::Tag(t) => write!(f, "no message has tag {t}"),
             Malformed::Track(t) => write!(f, "no track has tag {t}"),
             Malformed::Outcome(t) => write!(f, "no outcome has tag {t}"),
-            Malformed::Epoch => write!(f, "an epoch at or after its own update"),
             Malformed::Empty => write!(f, "a frame of no bytes"),
             Malformed::TooLarge => write!(f, "a frame or report too large"),
             Malformed::Index => write!(f, "a symbol index out of its frame"),
             Malformed::Length => write!(f, "a part of the wrong length"),
             Malformed::Utf8 => write!(f, "text that is not UTF-8"),
-            Malformed::NoLanes => write!(f, "a set of no lanes"),
             Malformed::Long(n) => write!(f, "a message of {n} bytes, over the longest"),
         }
     }
@@ -985,20 +1043,16 @@ impl Control {
     }
 }
 
-/// The length a stream lane writes before each message: a `u16`, which holds [`DATAGRAM`].
-pub const LANE_PREFIX: usize = std::mem::size_of::<u16>();
+/// The length a stream lane writes before each frame message: a `u32`, which holds
+/// [`FRAME_HEADER`] + [`MAX_FRAME`].
+pub const STREAM_PREFIX: usize = std::mem::size_of::<u32>();
 
 /// The control stream's length before each message: a `u32`, which holds [`MAX_CONTROL`].
 pub const CONTROL_PREFIX: usize = std::mem::size_of::<u32>();
 
-/// A stream lane's framing: the length to write before a lane message of `len` bytes.
-pub fn lane_prefix(len: usize) -> [u8; LANE_PREFIX] {
-    debug_assert!(len <= DATAGRAM);
-    (len as u16).to_be_bytes()
-}
-
-/// Cuts a stream into its messages: a stream lane's (2-byte lengths, at most [`DATAGRAM`]) or
-/// the control stream's (4-byte lengths, at most [`MAX_CONTROL`]).
+/// Cuts a stream into its messages: a stream lane's (its attach and its frames, 4-byte lengths,
+/// at most [`FRAME_HEADER`] + [`MAX_FRAME`]) or the control stream's (4-byte lengths, at most
+/// [`MAX_CONTROL`]).
 ///
 /// It holds only bytes that arrived: a length is checked against the maximum as soon as it
 /// is whole, and room grows only as bytes come, never by a length read.
@@ -1011,12 +1065,12 @@ pub struct Framer {
 }
 
 impl Framer {
-    pub fn lane() -> Framer {
+    pub fn stream() -> Framer {
         Framer {
-            buf: Vec::with_capacity(LANE_PREFIX + DATAGRAM),
+            buf: Vec::new(),
             used: 0,
-            prefix: LANE_PREFIX,
-            max: DATAGRAM,
+            prefix: STREAM_PREFIX,
+            max: FRAME_HEADER + MAX_FRAME,
         }
     }
 
@@ -1152,17 +1206,9 @@ mod tests {
     fn track(rng: &mut Xorshift) -> Track {
         match rng.below(2) {
             0 => Track::Audio,
-            _ => {
-                let number = Number(rng.below(1 << 40));
-                Track::Video {
-                    number,
-                    epoch: match number.0 {
-                        0 => Epoch::Start,
-                        x if rng.below(2) == 0 => Epoch::After(Number(rng.below(x))),
-                        _ => Epoch::Start,
-                    },
-                }
-            }
+            _ => Track::Video {
+                number: Number(rng.below(1 << 40)),
+            },
         }
     }
 
@@ -1258,12 +1304,30 @@ mod tests {
             data: &data,
         };
         let mut out = [0; DATAGRAM];
-        let n = match piece {
-            true => Lane::Piece(s),
-            false => Lane::Repair(s),
-        }
-        .encode(&mut out);
+        let tag = match piece {
+            true => Symbolic::Piece,
+            false => Symbolic::Repair,
+        };
+        let n = Lane::encode_symbol(tag, &s, &mut out);
         out[..n].to_vec()
+    }
+
+    /// A valid stream lane frame message, its bytes without its length.
+    fn frame(rng: &mut Xorshift) -> Vec<u8> {
+        let t = track(rng);
+        let n = rng.below(3000) as usize;
+        let data = bytes(rng, n);
+        let mut out = Vec::new();
+        Lane::encode_frame(Seq(rng.below(1 << 60)), t, &data, &mut out);
+        out[STREAM_PREFIX..].to_vec()
+    }
+
+    /// A lane message: a datagram's or a stream's.
+    fn any_lane(rng: &mut Xorshift) -> Vec<u8> {
+        match rng.below(2) {
+            0 => lane(rng),
+            _ => frame(rng),
+        }
     }
 
     fn report(rng: &mut Xorshift) -> Vec<u8> {
@@ -1315,11 +1379,13 @@ mod tests {
         match rng.below(5) {
             0 => Down::Capability(cap.lend()).encode(&mut out),
             1 => Down::Attached {
-                lane: LaneIndex(rng.next() as u16),
                 generation: Generation(rng.next() as u32),
             }
             .encode(&mut out),
-            2 => Down::Lanes(Lanes::new(rng.range(1, 65536) as u16).unwrap()).encode(&mut out),
+            2 => Down::Buffer {
+                bytes: rng.next() as u32,
+            }
+            .encode(&mut out),
             3 => Down::Text(&text).encode(&mut out),
             _ => Down::Binary(&bin).encode(&mut out),
         }
@@ -1344,9 +1410,20 @@ mod tests {
         let cap = Capability(bytes(rng, CAPABILITY).try_into().unwrap());
         Attach::encode(
             &cap,
-            LaneIndex(rng.next() as u16),
             Generation(rng.next() as u32),
             Stamp(rng.next() as u32),
+            from_tenths(rng.next() as u32 as i64),
+        )
+        .to_vec()
+    }
+
+    fn stream_attach(rng: &mut Xorshift) -> Vec<u8> {
+        let cap = Capability(bytes(rng, CAPABILITY).try_into().unwrap());
+        Attach::encode_stream(
+            &cap,
+            Generation(rng.next() as u32),
+            Stamp(rng.next() as u32),
+            from_tenths(rng.next() as u32 as i64),
         )
         .to_vec()
     }
@@ -1357,17 +1434,41 @@ mod tests {
         match kind {
             0 => Lane::decode(b).ok().map(|l| {
                 let mut out = [0; DATAGRAM];
-                let n = l.encode(&mut out);
-                out[..n].to_vec()
+                match l {
+                    Lane::Piece(s) => {
+                        let n = Lane::encode_symbol(Symbolic::Piece, &s, &mut out);
+                        out[..n].to_vec()
+                    }
+                    Lane::Repair(s) => {
+                        let n = Lane::encode_symbol(Symbolic::Repair, &s, &mut out);
+                        out[..n].to_vec()
+                    }
+                    Lane::Frame {
+                        frame,
+                        track,
+                        bytes,
+                    } => {
+                        let mut out = Vec::new();
+                        Lane::encode_frame(frame, track, bytes, &mut out);
+                        out[STREAM_PREFIX..].to_vec()
+                    }
+                }
             }),
-            1 => Attach::decode(b)
-                .ok()
-                .map(|a| Attach::encode(&a.capability, a.lane, a.generation, a.sent).to_vec()),
+            1 => Attach::decode(b).ok().map(|a| {
+                Attach::encode(&a.capability, a.generation, a.sent, a.round_trip).to_vec()
+            }),
             2 => Down::decode(b).ok().map(|d| {
                 let mut out = Vec::new();
                 d.encode(&mut out);
                 out[CONTROL_PREFIX..].to_vec()
             }),
+            3 => <&[u8; Attach::STREAM_LEN]>::try_from(b)
+                .ok()
+                .and_then(|b| Attach::decode_stream(b).ok())
+                .map(|a| {
+                    Attach::encode_stream(&a.capability, a.generation, a.sent, a.round_trip)
+                        .to_vec()
+                }),
             _ => Up::decode(b).ok().map(|u| {
                 let mut out = Vec::new();
                 u.encode(&mut out);
@@ -1383,9 +1484,9 @@ mod tests {
     #[test]
     fn every_input_is_a_message_or_a_typed_error() {
         let mut rng = Xorshift::new(0x082E_FA98_EC4E_6C89);
-        let makers: [fn(&mut Xorshift) -> Vec<u8>; 4] = [lane, attach, down, up];
+        let makers: [fn(&mut Xorshift) -> Vec<u8>; 5] = [any_lane, attach, down, stream_attach, up];
         for _ in 0..20_000 {
-            let kind = rng.below(4) as usize;
+            let kind = rng.below(5) as usize;
             let valid = makers[kind](&mut rng);
             assert_eq!(
                 again(kind, &valid).as_deref(),
@@ -1415,7 +1516,7 @@ mod tests {
                     }
                 }
             }
-            for k in 0..4 {
+            for k in 0..5 {
                 if let Some(out) = again(k, &b) {
                     assert_eq!(out, b, "kind {k} decoded bytes it does not encode to");
                 }
@@ -1423,8 +1524,9 @@ mod tests {
         }
     }
 
-    /// Every strict prefix of a message whose fields fix its length (a lane message, an
-    /// attach, a report, and the daemon's capability, attached and lanes) is refused.
+    /// Every strict prefix of a message whose fields fix its length (a piece or repair, an
+    /// attach, a report, and the daemon's capability, attached and buffer) is refused. (A
+    /// frame's length is its stream's framing's, not its own fields'.)
     #[test]
     fn every_cut_message_is_refused() {
         let mut rng = Xorshift::new(0x4528_21E6_38D0_1377);
@@ -1459,21 +1561,21 @@ mod tests {
             let messages: Vec<Vec<u8>> = (0..rng.range(1, 20))
                 .map(|_| match control {
                     true => up(&mut rng),
-                    false => lane(&mut rng),
+                    false => frame(&mut rng),
                 })
                 .collect();
             let mut stream = Vec::new();
             for m in &messages {
                 match control {
                     true => stream.extend_from_slice(&(m.len() as u32).to_be_bytes()),
-                    false => stream.extend_from_slice(&lane_prefix(m.len())),
+                    false => stream.extend_from_slice(&(m.len() as u32).to_be_bytes()),
                 }
                 stream.extend_from_slice(m);
             }
             let mut f = if control {
                 Framer::control()
             } else {
-                Framer::lane()
+                Framer::stream()
             };
             let mut got = Vec::new();
             let mut at = 0;
@@ -1488,12 +1590,36 @@ mod tests {
             }
             assert_eq!(got, messages);
         }
-        let mut f = Framer::lane();
-        f.push(&((DATAGRAM + 1) as u16).to_be_bytes());
-        assert_eq!(f.frame(), Err(Malformed::Long(DATAGRAM + 1)));
+        let mut f = Framer::stream();
+        let long = FRAME_HEADER + MAX_FRAME + 1;
+        f.push(&(long as u32).to_be_bytes());
+        assert_eq!(f.frame(), Err(Malformed::Long(long)));
         let mut f = Framer::control();
         f.push(&((MAX_CONTROL + 1) as u32).to_be_bytes());
         assert_eq!(f.frame(), Err(Malformed::Long(MAX_CONTROL + 1)));
+    }
+
+    /// A datagram stamped as its socket takes it reads back with the deadline and the time it
+    /// left it was stamped with, and with everything else as it was written.
+    #[test]
+    fn a_stamped_datagram_says_its_stamps() {
+        let mut rng = Xorshift::new(0x9B05_688C_2B3E_6C1F);
+        for _ in 0..2000 {
+            let mut b = lane(&mut rng);
+            let (due, sent) = (Stamp(rng.next() as u32), Stamp(rng.next() as u32));
+            let before = match Lane::decode(&b) {
+                Ok(Lane::Piece(s) | Lane::Repair(s)) => (s.head, s.index, s.data.to_vec()),
+                other => panic!("a symbol: {other:?}"),
+            };
+            stamp_datagram(&mut b, due, sent);
+            match Lane::decode(&b) {
+                Ok(Lane::Piece(s) | Lane::Repair(s)) => {
+                    assert_eq!(s.head, Head { due, ..before.0 });
+                    assert_eq!((s.sent, s.index, s.data), (sent, before.1, &before.2[..]));
+                }
+                other => panic!("a symbol: {other:?}"),
+            }
+        }
     }
 
     /// Two capabilities match exactly when their bytes are equal, wherever they differ.

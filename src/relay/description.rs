@@ -4,15 +4,13 @@
 //!
 //! ```text
 //! datagram <socks5 host:port>
-//! streams <proxy host:port> <count>
-//! connections <proxy host:port> <count>
+//! stream <proxy host:port>
 //! ```
 //!
 //! A line means one thing and has one spelling: fields one space apart, the line ended by
 //! a newline, numbers without sign or leading zero, an IPv6 address in brackets and in its
 //! shortest form. Anything else is a [`Malformed`] the page shows; nothing is assumed.
 
-use crate::lanes::model::Lanes;
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroU16;
@@ -21,15 +19,11 @@ use std::path::Path;
 /// What a session's lanes are.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Description {
-    /// One lane of datagrams, through a SOCKS5 proxy's UDP ASSOCIATE.
+    /// One lane of datagrams, through a SOCKS5 proxy's UDP ASSOCIATE: coded blocks with
+    /// repair.
     Datagram { proxy: Endpoint },
-    /// CONNECT streams through one proxy endpoint, each in order on its own: as many as the
-    /// daemon asks for, up to `cap` (the streams the proxy's connection takes at once).
-    Streams { proxy: Endpoint, cap: Lanes },
-    /// CONNECT streams through a proxy endpoint that deals each new stream to its own
-    /// connection, in turn among `lanes`: all of them, opened and reopened as one set, in
-    /// order, so each lands on a connection of its own.
-    Connections { proxy: Endpoint, lanes: Lanes },
+    /// One HTTP CONNECT stream through the proxy: frames as they are, in order, whole.
+    Stream { proxy: Endpoint },
 }
 
 /// A proxy's address.
@@ -68,9 +62,6 @@ pub enum Malformed {
     },
     /// The proxy is not `host:port`.
     Endpoint(String),
-    /// The count is not a whole number from 1 to `u16::MAX` (a lane's index is two bytes on
-    /// the wire).
-    Count(String),
 }
 
 impl fmt::Display for Malformed {
@@ -88,7 +79,7 @@ impl fmt::Display for Malformed {
             }
             Malformed::Kind(kind) => write!(
                 f,
-                "the lanes description names no kind of lanes: {kind:?} is not datagram, streams or connections"
+                "the lanes description names no kind of lanes: {kind:?} is not datagram or stream"
             ),
             Malformed::Fields { kind, want, got } => write!(
                 f,
@@ -97,11 +88,6 @@ impl fmt::Display for Malformed {
             Malformed::Endpoint(v) => write!(
                 f,
                 "the lanes description's proxy {v:?} is not host:port (an IPv6 address in brackets, in its shortest form)"
-            ),
-            Malformed::Count(v) => write!(
-                f,
-                "the lanes description's count {v:?} is not a whole number from 1 to {}",
-                u16::MAX
             ),
         }
     }
@@ -144,18 +130,10 @@ impl Description {
                     proxy: Endpoint::parse(fields[1])?,
                 })
             }
-            "streams" => {
-                want("streams", 3)?;
-                Ok(Description::Streams {
+            "stream" => {
+                want("stream", 2)?;
+                Ok(Description::Stream {
                     proxy: Endpoint::parse(fields[1])?,
-                    cap: count(fields[2])?,
-                })
-            }
-            "connections" => {
-                want("connections", 3)?;
-                Ok(Description::Connections {
-                    proxy: Endpoint::parse(fields[1])?,
-                    lanes: count(fields[2])?,
                 })
             }
             kind => Err(Malformed::Kind(kind.to_string())),
@@ -168,10 +146,7 @@ impl fmt::Display for Description {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Description::Datagram { proxy } => writeln!(f, "datagram {proxy}"),
-            Description::Streams { proxy, cap } => writeln!(f, "streams {proxy} {}", cap.get()),
-            Description::Connections { proxy, lanes } => {
-                writeln!(f, "connections {proxy} {}", lanes.get())
-            }
+            Description::Stream { proxy } => writeln!(f, "stream {proxy}"),
         }
     }
 }
@@ -182,14 +157,6 @@ fn whole(v: &str) -> Option<u64> {
     let canonical = v == "0" || !v.starts_with('0');
     // `parse` refuses a number past u64.
     (digits && canonical).then(|| v.parse().ok())?
-}
-
-/// A count of lanes.
-fn count(v: &str) -> Result<Lanes, Malformed> {
-    whole(v)
-        .and_then(|n| u16::try_from(n).ok())
-        .and_then(Lanes::new)
-        .ok_or_else(|| Malformed::Count(v.to_string()))
 }
 
 impl Endpoint {
@@ -326,14 +293,9 @@ mod tests {
             host,
             port: NonZeroU16::new(rng.range(1, 65536) as u16).unwrap(),
         };
-        let count = Lanes::new(rng.range(1, u64::from(u16::MAX) + 1) as u16).unwrap();
-        match rng.below(3) {
+        match rng.below(2) {
             0 => Description::Datagram { proxy },
-            1 => Description::Streams { proxy, cap: count },
-            _ => Description::Connections {
-                proxy,
-                lanes: count,
-            },
+            _ => Description::Stream { proxy },
         }
     }
 
@@ -382,9 +344,8 @@ mod tests {
 
     /// Each way a line is not a description is its own error, naming what is wrong: over
     /// every drawn description's line broken in one way (not one line; a word that is no
-    /// kind; a field more or fewer; a proxy that is no `host:port` in its one spelling; a
-    /// count that is no whole number from 1 to 65535 in its one spelling), the error is the
-    /// one for the break the drawing made.
+    /// kind; a field more or fewer; a proxy that is no `host:port` in its one spelling), the
+    /// error is the one for the break the drawing made.
     #[test]
     fn a_malformed_line_says_what_is_wrong() {
         let mut rng = Xorshift::new(0xB5297A4D3F84D5B5);
@@ -398,7 +359,6 @@ mod tests {
             "a..example:1",
             "1.2.3.256:1",
         ];
-        let bad_counts = ["0", "06", "65536", "+1", "", "x", "-1"];
         for _ in 0..20_000 {
             let d = draw(&mut rng);
             let line = d.to_string();
@@ -409,14 +369,13 @@ mod tests {
                 .collect();
             let kind: &'static str = match d {
                 Description::Datagram { .. } => "datagram",
-                Description::Streams { .. } => "streams",
-                Description::Connections { .. } => "connections",
+                Description::Stream { .. } => "stream",
             };
             let want_fields = fields.len();
             let pick = |rng: &mut Xorshift, of: &[&str]| {
                 of[rng.below(of.len() as u64) as usize].to_string()
             };
-            let (text, want) = match rng.below(6) {
+            let (text, want) = match rng.below(4) {
                 0 => match rng.below(3) {
                     0 => (
                         line.trim_end_matches('\n').to_string(),
@@ -426,7 +385,10 @@ mod tests {
                     _ => (format!("{line}\n"), Malformed::NotOneLine),
                 },
                 1 => {
-                    let word = pick(&mut rng, &["tunnel", "Datagram", "stream", "", "lanes"]);
+                    let word = pick(
+                        &mut rng,
+                        &["tunnel", "Datagram", "streams", "", "connections"],
+                    );
                     fields[0] = word.clone();
                     (format!("{}\n", fields.join(" ")), Malformed::Kind(word))
                 }
@@ -443,7 +405,7 @@ mod tests {
                     };
                     (format!("{}\n", fields.join(" ")), want)
                 }
-                3 => {
+                _ => {
                     let proxy = pick(&mut rng, &bad_proxies);
                     fields[1] = proxy.clone();
                     (
@@ -451,14 +413,6 @@ mod tests {
                         Malformed::Endpoint(proxy),
                     )
                 }
-                _ => match d {
-                    Description::Datagram { .. } => continue,
-                    _ => {
-                        let count = pick(&mut rng, &bad_counts);
-                        fields[2] = count.clone();
-                        (format!("{}\n", fields.join(" ")), Malformed::Count(count))
-                    }
-                },
             };
             assert_eq!(Description::parse(&text), Err(want), "{text:?}");
         }

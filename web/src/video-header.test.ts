@@ -20,7 +20,9 @@ const bytes = (hex: string) => {
 // reads as undefined, one the fixture does not name is expected as undefined.
 for (const { header, picture, ...fields } of fixture) {
 	const message = new Uint8Array([...bytes(header), ...bytes(picture)]);
-	const got = parseVideoHeader(message);
+	const read = parseVideoHeader(message);
+	if (!read.ok) throw new Error(`${header}: refused, flags ${read.flags}`);
+	const got = read.header;
 	for (const name of new Set([...Object.keys(fields), ...Object.keys(got)])) {
 		const value = got[name as keyof VideoHeader];
 		const expected = fields[name as keyof typeof fields];
@@ -30,4 +32,16 @@ for (const { header, picture, ...fields } of fixture) {
 	const rest = message.subarray(VIDEO_HEADER_BYTES).join();
 	if (rest !== bytes(picture).join())
 		throw new Error(`${header}: the picture reads ${rest}`);
+}
+
+// Over every value of the flags byte: a header is read exactly when it sets no bit but the
+// keyframe's, and then `key` is that bit.
+for (let flags = 0; flags < 256; flags++) {
+	const message = new Uint8Array(VIDEO_HEADER_BYTES);
+	message[1] = flags;
+	const read = parseVideoHeader(message);
+	const valid = flags === 0 || flags === 1;
+	if (read.ok !== valid) throw new Error(`flags ${flags} read: ${read.ok}`);
+	if (read.ok && read.header.key !== (flags === 1))
+		throw new Error(`flags ${flags} read as key ${read.header.key}`);
 }

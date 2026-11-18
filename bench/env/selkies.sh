@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # (Re)start selkies (github.com/selkies-project/selkies) from its base image, port 6912, on
 # the image's XLibre Xvfb (display :3): selkies reads the screen in place only from its own
-# X server. Both run in containers sharing the host's network, IPC and X sockets. x264 at
-# 60 FPS, CBR from 30 Mbps with congestion control down to 2 Mbps, paint-over to CRF 16, like
-# voxl. Extra args are passed through. SELKIES_IMAGE: the image (a local addons/base build
+# X server. Both run in containers sharing the host's network, IPC and X sockets. Software
+# H.264 at 60 FPS, CBR from 30 Mbps with congestion control down to 2 Mbps, paint-over to
+# CRF 16. Extra args are passed through. SELKIES_IMAGE: the image (a local addons/base build
 # works too). SELKIES_DISPLAY: the display. Its log is `docker logs selkies-bench`.
 IMAGE=${SELKIES_IMAGE:-ghcr.io/selkies-project/selkies/base:main-debiantrixie}
 D=${SELKIES_DISPLAY:-:3}

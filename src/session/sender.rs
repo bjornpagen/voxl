@@ -1,20 +1,29 @@
-//! A session's lanes as the media producers use them: frames in, each cut by the code into
-//! pieces and repairs, dealt over the lanes and paced at the budget (`lanes::link`), and
-//! the reports that come back for them.
+//! A session's lane as the media producers use it: frames in, and on the lane's socket only as
+//! fast as the socket accepts them.
 //!
-//! Everything here is synchronous, under the session's lock in the hub: a frame is planned,
-//! coded and queued on its lanes in one step, so the room the capture loop reads next
-//! already counts it. Each lane has a writer task that releases its queue at the pace the
-//! plan set; with nothing queued it waits on nothing but the queue, so a still desktop
-//! sends nothing and wakes nothing.
+//! The rate is the transport's: Hysteria2 under a datagram lane, TCP or QUIC under a stream
+//! lane. A message leaves when the lane's socket takes it, waits in the lane's one queue until
+//! then, and is never discarded. What the daemon reads of the rate is its own socket: the
+//! drain, the bytes the socket accepted a second while it was full ([`Drain`]).
+//! The capture is gated by the backlog (at most one update interval of the drain waits), and
+//! the encoder aims at the drain times the frames' share of what the lane carries.
+//!
+//! - **Datagram lane**: frames go coded, in blocks ([`crate::lanes::code`]): one capture's
+//!   update with the Opus packet waiting for it, or an Opus packet alone, with the repairs the
+//!   link sizes ([`Link`]). The writer stamps each piece as the socket accepts it, and the
+//!   block's deadline as it accepts its first piece. The relay reports every block, in order.
+//! - **Stream lane**: frames go as they are, one framed message each, in order; the transport
+//!   delivers every byte, so a frame sent is a frame delivered. No report, no deadline.
+//!
+//! Everything here is synchronous, under the session's lock in the hub; each lane has a writer
+//! task (`lane.rs`) that empties the queue into the socket.
 
 use crate::hub::Out;
 use crate::lanes::code;
 use crate::lanes::link::{Flight, Link};
-use crate::lanes::model::Lanes;
+use crate::lanes::path::RATE_MEMORY;
 use crate::lanes::wire::{
-    self, Capability, Epoch, Fate, Generation, LaneIndex, Number, Outcome, Report, Seq, Stamp,
-    Track, DATAGRAM,
+    self, Capability, Fate, Generation, Lane, Number, Outcome, Report, Seq, Stamp, Track, DATAGRAM,
 };
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -24,20 +33,34 @@ use std::time::{Duration, Instant};
 /// What a viewer's way out lets a frame take.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Room {
-    /// This many bytes, what its lanes may still hold unreported.
+    /// This many bytes, what may still wait for the socket within one update interval of its
+    /// drain.
     Open(usize),
-    /// Nothing: its lanes hold all they may until reports come back.
+    /// Nothing: an update interval's drain already waits.
     Full,
-    /// No bound of its own: a recording, which takes each frame as it is coded.
+    /// No bound: nothing waits for the socket, or a recording, which takes each frame as it
+    /// is coded.
     Unbounded,
 }
 
-/// What a keyframe may take of a viewer's way out.
+/// What reaches the page of what a viewer's way out is given.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum KeyRoom {
-    Bytes(usize),
-    /// No bound of its own: a recording.
-    Unbounded,
+pub enum Delivery {
+    /// Everything sent arrives, in order: a stream lane, or a recording.
+    Whole,
+    /// Each frame is reported, decoded or missed: a datagram lane.
+    Reported,
+}
+
+/// The rate the encoder aims at.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Rate {
+    /// Nothing waits for the socket: the lane carries all the encoder makes, so it codes at its
+    /// quality target.
+    Unlimited,
+    /// The queue has backed up: the drain, bytes a second, times the frames' share of what the
+    /// lane carries.
+    Drain(f64),
 }
 
 /// A viewer's way out, as `voxl stats` says it.
@@ -46,38 +69,37 @@ pub enum KeyRoom {
 pub enum Way {
     /// A session no lane has attached to yet.
     Unattached,
-    /// A session's lanes: what each lane holds unreported and the most it may, the blocks
-    /// not yet reported, and the link's view (`lanes::link::Stats`): the long-run loss of
-    /// its erasure runs, the bottleneck rate and the round trip it measured, the spread of
-    /// arrivals, the time a miss takes to mend, the pacing rate and its share for the
-    /// frames themselves, the share of time the picture is expected stale, and the lanes it
-    /// wants.
-    Lanes {
-        held_bytes: Vec<usize>,
-        lane_bound_bytes: usize,
+    /// A datagram lane: its queue and socket, and the link's view (`lanes::link::Stats`).
+    Datagram {
+        backlog_bytes: usize,
+        drain_bytes_per_s: Option<f64>,
+        receive_buffer_bytes: u32,
         unreported_blocks: usize,
+        missed: u64,
+        expected_misses: f64,
         loss: f64,
-        btlbw_bytes_per_s: f64,
         rtprop_ms: Option<f64>,
         spread_ms: f64,
-        recovery_ms: f64,
-        pacing_bytes_per_s: f64,
-        data_bytes_per_s: f64,
-        stale: f64,
-        wanted_lanes: usize,
+        miss: f64,
+        share: f64,
+    },
+    /// A stream lane: its queue and socket.
+    Stream {
+        backlog_bytes: usize,
+        drain_bytes_per_s: Option<f64>,
     },
     Recording,
     /// A session whose control connection closed.
     Closed,
 }
 
-/// A viewer's way out: a session's lanes, or a recording in this process.
+/// A viewer's way out: a session's lane, or a recording in this process.
 pub struct Sender {
     state: State,
 }
 
 enum State {
-    /// Its control connection is open: the capability lanes attach with, and its lanes.
+    /// Its control connection is open: the capability its lane attaches with, and its lane.
     Open(Box<Open>),
     /// Its control connection closed: the capability is forgotten, and no lane is sent
     /// another byte.
@@ -89,69 +111,83 @@ enum State {
 
 struct Open {
     capability: Capability,
-    /// Its control stream's writer: the lanes the link wants are told on it.
+    /// Its control stream's writer: the buffer the lane's socket was given is told on it.
     control: tokio::sync::mpsc::UnboundedSender<Out>,
     /// The daemon's clock for this session's stamps.
     origin: Instant,
-    encoder: code::Encoder,
-    /// The capture's update going into its block, and the Opus packet waiting to go with
-    /// the next capture.
-    capture: Capture,
-    lanes: Attached,
+    /// When each video update started, for the update interval the backlog is held to.
+    updates: Updates,
+    /// The next frame's number among a stream lane's frames.
+    frame: Seq,
+    lane: Attached,
+    /// The receive buffer the relay was last told to give its lane socket.
+    buffer: u32,
 }
 
-/// A capture's update as it goes into its block, and the Opus packet waiting for a capture:
-/// it waits until the next packet, its own play time, and then goes alone.
-#[derive(Default)]
-struct Capture {
-    members: Vec<(Track, bytes::Bytes)>,
-    audio: Option<Vec<u8>>,
-    /// The Opus packet whose play time passed with no capture, going alone.
-    lone: Option<Vec<u8>>,
-    /// Track lists of blocks reported, to be used again: a block's are kept in its flight.
-    spare: Vec<Vec<Track>>,
-}
-
-/// The lanes attached so far. It is already on the heap with the rest of `Open`: boxing
-/// the set again would put every frame's step behind a second pointer.
+/// The lane attached, if any. It is already on the heap with the rest of `Open`.
 #[allow(clippy::large_enum_variant)]
 enum Attached {
     /// None yet: frames are sent nowhere, and the session is not looked at for them.
     None,
-    /// A set: the link (from the first lane's attach on, across sets), the set's
-    /// generation, its lanes by index, what each holds unreported, the frames sent and
-    /// not yet reported, when the last block's pacing ends, and the lanes the relay was
-    /// last told the link wants.
-    Set {
-        link: Link,
-        generation: Generation,
-        lanes: Vec<Lane>,
-        /// How many `lanes` there are, as the link counts them.
-        set: Lanes,
-        flights: VecDeque<Sent>,
-        paced_to: Instant,
-        told: Lanes,
-    },
+    Datagram(Datagram),
+    Stream(Stream),
 }
 
-/// A frame sent and not yet reported: what the link keeps of it, and the set it went on.
-struct Sent {
-    flight: Flight,
+/// A datagram lane: its generation and queue, the code and the link, the capture gathering
+/// into its block, and the blocks sent and not yet reported.
+struct Datagram {
     generation: Generation,
-}
-
-/// A lane as the sender holds it: its index in the set, its queue, and the bytes it holds
-/// unreported.
-struct Lane {
-    index: LaneIndex,
     queue: Arc<Queue>,
-    held: usize,
+    encoder: code::Encoder,
+    link: Link,
+    capture: Capture,
+    flights: VecDeque<Flight>,
+    /// The blocks missed, and the sum of the chances their plans gave them of a miss, over the
+    /// session: the model checked against what happened.
+    missed: u64,
+    expected: f64,
 }
 
-/// One lane's messages waiting to leave, released by its writer at their times. Its writer
-/// writes only under the queue's lock and only while it is open, so once the session closes
-/// it (`close`), not one byte more leaves on the lane.
+/// A stream lane: its generation and queue.
+struct Stream {
+    generation: Generation,
+    queue: Arc<Queue>,
+}
+
+/// A capture's update as it goes into its block, and the Opus packets waiting for a capture,
+/// oldest first. A packet waits for the next capture until the next packet, its own play time,
+/// and then goes, with every other waiting; while anything waits for the socket, packets wait
+/// on for the next block, which takes them all, so that a backlog never fills with blocks of
+/// one packet each (never more than a block's [`MEMBERS`] in all).
+#[derive(Default)]
+struct Capture {
+    members: Vec<(Track, bytes::Bytes)>,
+    audio: Vec<Vec<u8>>,
+    /// Packets' buffers that left, for the next ones.
+    spare_audio: Vec<Vec<u8>>,
+    /// Track lists of blocks reported, to be used again: a block's are kept in its flight.
+    spare: Vec<Vec<Track>>,
+}
+
+/// The most frames a block holds: its head counts them in a byte.
+const MEMBERS: usize = u8::MAX as usize;
+
+/// Which transport a lane is, as its socket says: the datagram socket or a stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Kind {
+    Datagram,
+    Stream,
+}
+
+/// What wakes the capture loop: called where a lane's backlog empties, or falls under the
+/// mark a capture has room under ([`Waiting::sent`]), the one place it falls.
+pub type Wake = Arc<dyn Fn() + Send + Sync>;
+
+/// One lane's messages waiting for its socket, written by its writer as the socket takes
+/// them. Its writer writes only under the queue's lock and only while it is open, so once the
+/// session closes it (`close`), not one byte more leaves on the lane.
 pub struct Queue {
+    kind: Kind,
     state: Mutex<Waiting>,
     wake: tokio::sync::Notify,
 }
@@ -159,57 +195,144 @@ pub struct Queue {
 pub(super) struct Waiting {
     pub(super) phase: Phase,
     pub(super) messages: VecDeque<Message>,
+    /// Bytes of the front message the socket has taken (a stream lane's, part by part).
+    pub(super) written: usize,
+    /// The bytes waiting.
+    pub(super) backlog: usize,
+    pub(super) drain: Drain,
+    /// The session's clock, for the writer's stamps.
+    pub(super) origin: Instant,
+    /// What a datagram block's deadline waits past the socket's acceptance, in tenths
+    /// ([`Link::after`]), and the block whose deadline is stamped, with it.
+    pub(super) after: i64,
+    pub(super) due: Option<(Seq, Stamp)>,
+    /// The send buffer the socket is to have, and the one it was given.
+    pub(super) buffer: Option<u32>,
+    pub(super) given: Option<u32>,
+    /// The backlog a capture has room under, as [`Sender::room`] last found it, and what to
+    /// wake when the backlog falls under it or empties.
+    room_at: usize,
+    wake: Wake,
     /// Buffers of messages that left, for the next ones: a steady stream allocates none.
-    /// Boxed, as a `Message` holds one: a buffer moves between them as a pointer, not as
-    /// its bytes.
     #[allow(clippy::vec_box)]
-    spare: Vec<Box<Framed>>,
+    spare_datagrams: Vec<Box<[u8; DATAGRAM]>>,
+    spare_frames: Vec<Vec<u8>>,
 }
 
-/// A lane message's buffer: the 2-byte length a stream lane writes before it, and room for
-/// the longest.
-pub(super) struct Framed {
-    prefix: [u8; 2],
-    body: [u8; DATAGRAM],
-}
-
-/// A message waiting: when it may leave, how long it is, and its buffer.
+/// A message waiting: when it was queued, and its bytes.
 pub struct Message {
-    pub(super) at: Instant,
-    len: usize,
-    buf: Box<Framed>,
+    pub(super) queued: Instant,
+    pub(super) body: Body,
+}
+
+/// A message's bytes: a datagram lane's piece or repair of `block`, or a stream lane's framed
+/// frame.
+pub(super) enum Body {
+    Datagram {
+        block: Seq,
+        len: usize,
+        buf: Box<[u8; DATAGRAM]>,
+    },
+    Frame(Vec<u8>),
 }
 
 impl Message {
-    /// How many bytes a stream lane writes of it: its length, then it.
-    pub(super) fn framed_len(&self) -> usize {
-        2 + self.len
-    }
-
-    /// What a stream lane has still to write of it, `written` bytes in.
-    pub(super) fn framed_from(&self, written: usize) -> &[u8] {
-        match written.checked_sub(2) {
-            None => &self.buf.prefix[written..],
-            Some(into) => &self.buf.body[into..self.len],
+    pub(super) fn len(&self) -> usize {
+        match &self.body {
+            Body::Datagram { len, .. } => *len,
+            Body::Frame(f) => f.len(),
         }
     }
 
-    /// As a datagram lane sends it.
-    pub(super) fn datagram(&self) -> &[u8] {
-        &self.buf.body[..self.len]
+    /// Its bytes from `written` on.
+    pub(super) fn from(&self, written: usize) -> &[u8] {
+        match &self.body {
+            Body::Datagram { len, buf, .. } => &buf[written..*len],
+            Body::Frame(f) => &f[written..],
+        }
+    }
+}
+
+/// The socket's drain: the bytes it accepted a second, over the last [`RATE_MEMORY`] messages
+/// it refused before it took them, each over the time from the later of the acceptance before
+/// it and its queueing. Only a refused message waited on the transport: one the socket took at
+/// once found room in the transport's own queue (a burst after a quiet spell fills it at no
+/// cost), which tells nothing of the rate it drains at, and is not counted.
+pub(super) struct Drain {
+    samples: VecDeque<(usize, Duration)>,
+    bytes: usize,
+    time: Duration,
+    last: Option<Instant>,
+    /// The socket refused the front message.
+    refused: bool,
+}
+
+impl Drain {
+    pub(super) fn new() -> Drain {
+        Drain {
+            samples: VecDeque::with_capacity(RATE_MEMORY + 1),
+            bytes: 0,
+            time: Duration::ZERO,
+            last: None,
+            refused: false,
+        }
+    }
+
+    /// The socket refused the front message: it is full.
+    pub(super) fn refused(&mut self) {
+        self.refused = true;
+    }
+
+    /// The socket accepted the front message, of `len` bytes, queued at `queued`, at `now`.
+    pub(super) fn accepted(&mut self, len: usize, queued: Instant, now: Instant) {
+        if std::mem::take(&mut self.refused) {
+            let from = self.last.map_or(queued, |last| last.max(queued));
+            let gap = now.saturating_duration_since(from);
+            self.samples.push_back((len, gap));
+            self.bytes += len;
+            self.time += gap;
+            if self.samples.len() > RATE_MEMORY {
+                if let Some((b, t)) = self.samples.pop_front() {
+                    self.bytes -= b;
+                    self.time -= t;
+                }
+            }
+        }
+        self.last = Some(now);
+    }
+
+    /// Bytes a second, once a message has waited.
+    pub(super) fn rate(&self) -> Option<f64> {
+        (!self.time.is_zero()).then_some(self.bytes as f64 / self.time.as_secs_f64())
     }
 }
 
 impl Queue {
-    pub(crate) fn new() -> Arc<Queue> {
+    pub(crate) fn new(kind: Kind, origin: Instant, wake: Wake) -> Arc<Queue> {
         Arc::new(Queue {
+            kind,
             state: Mutex::new(Waiting {
                 phase: Phase::Open,
                 messages: VecDeque::new(),
-                spare: Vec::new(),
+                written: 0,
+                backlog: 0,
+                drain: Drain::new(),
+                origin,
+                after: 0,
+                due: None,
+                buffer: Some(SEND_BUFFER),
+                given: None,
+                room_at: 0,
+                wake,
+                spare_datagrams: Vec::new(),
+                spare_frames: Vec::new(),
             }),
             wake: tokio::sync::Notify::new(),
         })
+    }
+
+    pub fn kind(&self) -> Kind {
+        self.kind
     }
 
     /// Its state, locked: its writer writes under this lock.
@@ -222,116 +345,243 @@ impl Queue {
         self.wake.notified().await
     }
 
-    /// Closes it: nothing more leaves, and its writer ends.
-    pub(super) fn close(&self) {
-        let mut w = self.state.lock();
-        w.phase = Phase::Closed;
-        w.messages.clear();
-        drop(w);
+    fn wake(&self) {
         self.wake.notify_one();
     }
 
-    /// Queues the message `encode` writes, to leave at `at`; a closed lane (its session
-    /// gone, or its socket broken) takes nothing.
-    fn push(&self, at: Instant, encode: impl FnOnce(&mut [u8; DATAGRAM]) -> usize) {
+    /// Closes it: nothing more leaves, and its writer ends. What waits stays, for a lane that
+    /// replaces it ([`Queue::take_over`]).
+    pub(super) fn close(&self) {
+        self.state.lock().phase = Phase::Closed;
+        self.wake();
+    }
+
+    /// Takes the messages `old` holds and has not begun to write (a stream lane's message half
+    /// written goes again whole, on the new stream).
+    fn take_over(&self, old: &Queue) {
+        let mut from = old.state.lock();
+        let mut to = self.state.lock();
+        from.written = 0;
+        to.backlog += from.backlog;
+        from.backlog = 0;
+        to.messages.append(&mut from.messages);
+        to.due = None;
+        drop((from, to));
+        self.wake();
+    }
+
+    /// Queues a datagram of `block` that `encode` writes; a closed lane takes nothing.
+    fn push_datagram(
+        &self,
+        block: Seq,
+        now: Instant,
+        encode: impl FnOnce(&mut [u8; DATAGRAM]) -> usize,
+    ) {
         let mut w = self.state.lock();
         if w.phase == Phase::Closed {
             return;
         }
-        let mut buf = w.spare.pop().unwrap_or_else(|| {
-            Box::new(Framed {
-                prefix: [0; 2],
-                body: [0; DATAGRAM],
-            })
+        let mut buf = w
+            .spare_datagrams
+            .pop()
+            .unwrap_or_else(|| Box::new([0; DATAGRAM]));
+        let len = encode(&mut buf);
+        w.backlog += len;
+        w.messages.push_back(Message {
+            queued: now,
+            body: Body::Datagram { block, len, buf },
         });
-        let len = encode(&mut buf.body);
-        buf.prefix = wire::lane_prefix(len);
-        w.messages.push_back(Message { at, len, buf });
         drop(w);
-        self.wake.notify_one();
+        self.wake();
+    }
+
+    /// Queues a stream lane's frame message; a closed lane takes nothing.
+    fn push_frame(&self, frame: Seq, track: Track, bytes: &[u8], now: Instant) {
+        let mut w = self.state.lock();
+        if w.phase == Phase::Closed {
+            return;
+        }
+        let mut buf = w.spare_frames.pop().unwrap_or_default();
+        buf.clear();
+        Lane::encode_frame(frame, track, bytes, &mut buf);
+        w.backlog += buf.len();
+        w.messages.push_back(Message {
+            queued: now,
+            body: Body::Frame(buf),
+        });
+        drop(w);
+        self.wake();
+    }
+
+    /// What waits, and the drain.
+    fn backlog(&self) -> (usize, Option<f64>) {
+        let w = self.state.lock();
+        (w.backlog, w.drain.rate())
     }
 }
 
-/// Whether a lane takes messages: open until its session closes or its socket breaks.
+/// Whether a lane takes messages: open until its session closes, a newer lane replaces it, or
+/// its socket breaks.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum Phase {
     Open,
     Closed,
 }
 
-/// What a lane's writer finds in its queue.
-pub(super) enum Due {
-    /// The lane closed: the writer ends.
-    Closed,
-    /// Nothing waits.
-    Idle,
-    /// The front message leaves at this time.
-    At(Instant),
-    /// The front message, due now, taken out to be written.
-    Now(Message),
-}
-
 impl Waiting {
-    /// What leaves at `now`: the front message, taken out, if it is due.
-    pub(super) fn due(&mut self, now: Instant) -> Due {
-        match (self.phase, self.messages.pop_front()) {
-            (Phase::Closed, _) => Due::Closed,
-            (Phase::Open, None) => Due::Idle,
-            (Phase::Open, Some(m)) if m.at > now => {
-                let at = m.at;
-                self.messages.push_front(m);
-                Due::At(at)
+    /// The front message left, all of it, at `now`: its buffer serves the next. The backlog
+    /// falls here and nowhere else, so here the capture loop is woken when it empties or falls
+    /// under the mark a capture has room under.
+    pub(super) fn sent(&mut self, now: Instant) {
+        if let Some(m) = self.messages.pop_front() {
+            let len = m.len();
+            let before = self.backlog;
+            self.backlog -= len;
+            if self.backlog == 0 || (before >= self.room_at && self.backlog < self.room_at) {
+                (self.wake)();
             }
-            (Phase::Open, Some(m)) => Due::Now(m),
+            self.written = 0;
+            self.drain.accepted(len, m.queued, now);
+            match m.body {
+                Body::Datagram { buf, .. } => self.spare_datagrams.push(buf),
+                Body::Frame(f) => self.spare_frames.push(f),
+            }
+        }
+    }
+
+    /// The socket refused the front message, or the rest of it: it is full.
+    pub(super) fn refused(&mut self) {
+        self.drain.refused();
+    }
+
+    /// Stamps the front message, a datagram, as the socket is about to take it at `now`: when
+    /// it left, and its block's deadline, stamped as the socket takes the block's first piece:
+    /// that moment, the drain of the block's pieces behind it (if any wait), and what a
+    /// deadline waits past it ([`Link::after`]).
+    pub(super) fn stamp(&mut self, now: Instant) {
+        let sent = Stamp::since(self.origin, now);
+        let Some(Message {
+            body: Body::Datagram { block, .. },
+            ..
+        }) = self.messages.front()
+        else {
+            return;
+        };
+        let block = *block;
+        let due = match self.due {
+            Some((b, due)) if b == block => due,
+            _ => {
+                let behind: usize = self
+                    .messages
+                    .iter()
+                    .skip(1)
+                    .take_while(|m| matches!(m.body, Body::Datagram { block: b, .. } if b == block))
+                    .map(Message::len)
+                    .sum();
+                let drain = match (behind, self.drain.rate()) {
+                    (0, _) | (_, None) => 0,
+                    (behind, Some(rate)) => {
+                        wire::tenths(Duration::from_secs_f64(behind as f64 / rate))
+                    }
+                };
+                let due = sent.plus(drain + self.after);
+                self.due = Some((block, due));
+                due
+            }
+        };
+        if let Some(Message {
+            body: Body::Datagram { len, buf, .. },
+            ..
+        }) = self.messages.front_mut()
+        {
+            wire::stamp_datagram(&mut buf[..*len], due, sent);
         }
     }
 
     /// The lane's socket broke: it takes nothing more.
     pub(super) fn broken(&mut self) {
         self.phase = Phase::Closed;
-        self.messages.clear();
-    }
-
-    /// A message that left: its buffer serves the next.
-    pub(super) fn sent(&mut self, m: Message) {
-        self.spare.push(m.buf);
     }
 }
 
 /// Why a report ends its session: the relay said what its decoder cannot have.
 #[derive(Debug, PartialEq)]
 pub enum Broken {
-    /// No frame was sent that it could be of: none is unreported, or the next unreported
-    /// is another.
+    /// No block was sent that it could be of: none is unreported, or the next unreported
+    /// is another, or the lane is a stream lane, which has no reports.
     Unsent(Seq),
-    /// The link refused it for its frame.
+    /// The link refused it for its block.
     Mismatch(crate::lanes::link::Mismatch),
 }
 
-/// A video update the relay missed: its number.
+/// A video update the relay decided, and how.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Missed {
+pub struct Decided {
     pub number: Number,
+    pub outcome: Outcome,
+}
+
+/// The video updates' interval, from the times they started: [`RATE_MEMORY`] gaps.
+struct Updates {
+    starts: VecDeque<Instant>,
+}
+
+impl Updates {
+    fn new() -> Updates {
+        Updates {
+            starts: VecDeque::with_capacity(RATE_MEMORY + 1),
+        }
+    }
+
+    fn push(&mut self, at: Instant) {
+        if self.starts.len() == RATE_MEMORY + 1 {
+            self.starts.pop_front();
+        }
+        self.starts.push_back(at);
+    }
+
+    /// The mean gap, once there is one.
+    fn interval(&self) -> Option<Duration> {
+        match (self.starts.front(), self.starts.back()) {
+            (Some(&first), Some(&last)) if last > first => {
+                Some((last - first) / (self.starts.len() - 1) as u32)
+            }
+            _ => None,
+        }
+    }
 }
 
 impl Sender {
-    /// A session's, with the capability its lanes attach with, its control stream's
-    /// writer, and its clock read from `origin`.
+    /// A session's, with the capability its lane attaches with, its control stream's writer,
+    /// and its clock read from `origin`. Its first word on the control stream, after the
+    /// capability, is the receive buffer the relay is to give its lane socket before it opens
+    /// one: what the kernel gives a fresh lane socket here (`SO_SNDBUF`, `net.core.wmem_default`
+    /// on Linux), until a drain and a round trip size it. Without a socket to read it from, the
+    /// session can have no lane: that error.
     pub fn new(
         capability: Capability,
         control: tokio::sync::mpsc::UnboundedSender<Out>,
         origin: Instant,
-    ) -> Sender {
-        Sender {
+    ) -> std::io::Result<Sender> {
+        let fresh = std::os::unix::net::UnixDatagram::unbound()?;
+        let given = nix::sys::socket::getsockopt(&fresh, nix::sys::socket::sockopt::SndBuf)
+            .map_err(std::io::Error::from)?;
+        let buffer = u32::try_from(given).unwrap_or(u32::MAX);
+        // A session whose control writer has ended is closing, its lane with it.
+        if control.send(Out::Buffer(buffer)).is_err() {
+            log::debug!("the lane's receive buffer not told: the session is closing");
+        }
+        Ok(Sender {
             state: State::Open(Box::new(Open {
                 capability,
                 control,
                 origin,
-                encoder: code::Encoder::new(),
-                capture: Capture::default(),
-                lanes: Attached::None,
+                updates: Updates::new(),
+                frame: Seq::first(),
+                lane: Attached::None,
+                buffer,
             })),
-        }
+        })
     }
 
     /// A recording's, its updates sent on `to`.
@@ -350,14 +600,12 @@ impl Sender {
         }
     }
 
-    /// Its control connection closed: the capability is dropped (and zeroed), and every
-    /// lane is closed before this returns.
+    /// Its control connection closed: the capability is dropped (and zeroed), and its lane is
+    /// closed before this returns.
     pub fn close(&mut self) {
         if let State::Open(o) = std::mem::replace(&mut self.state, State::Closed) {
-            if let Attached::Set { lanes, .. } = &o.lanes {
-                for l in lanes {
-                    l.queue.close();
-                }
+            if let Some(q) = o.lane.queue() {
+                q.close();
             }
         }
     }
@@ -365,136 +613,123 @@ impl Sender {
     /// Whether it has a way to be sent frames on: a lane, or a recording.
     pub fn attached(&self) -> bool {
         match &self.state {
-            State::Open(o) => matches!(o.lanes, Attached::Set { .. }),
+            State::Open(o) => !matches!(o.lane, Attached::None),
             State::Recording(_) => true,
             State::Closed => false,
         }
     }
 
-    /// Lane `index` of set `generation` attached, its queue `queue`, the attach stamped
-    /// `sent` by the relay and arriving at `now`. A newer set replaces the lanes of the one
-    /// before, which are closed; a lane of an older set is refused, as is one of a closed
-    /// session. Whether it was taken.
+    /// A lane of `generation` attached, its queue `queue` (whose kind is the lane's), the
+    /// attach stamped `sent` by the relay with its measured `round_trip`, arriving at `now`.
+    /// A newer generation replaces the lane before, which is closed and whose waiting messages
+    /// the new one sends; an older or the same, or a lane of a closed session, is refused.
+    /// Whether it was taken.
     pub fn attach(
         &mut self,
-        (index, generation): (LaneIndex, Generation),
+        generation: Generation,
         queue: Arc<Queue>,
         sent: Stamp,
+        round_trip: Duration,
         now: Instant,
     ) -> bool {
         let State::Open(o) = &mut self.state else {
             return false;
         };
-        let received = Stamp::since(o.origin, now);
-        let out = Lane {
-            index,
-            queue,
-            held: 0,
-        };
-        match &mut o.lanes {
-            Attached::None => {
-                let link = Link::new(sent, received);
-                let told = link.wanted();
-                o.lanes = Attached::Set {
-                    link,
-                    generation,
-                    lanes: vec![out],
-                    set: Lanes::ONE,
-                    flights: VecDeque::new(),
-                    paced_to: now,
-                    told,
-                };
-                true
+        queue.state.lock().origin = o.origin;
+        if let Some((old, g)) = o.lane.queue().zip(o.lane.generation()) {
+            if generation <= g || queue.kind() != old.kind() {
+                return false;
             }
-            Attached::Set {
-                generation: g,
-                lanes,
-                set,
-                ..
-            } if *g == generation => {
-                // The same place attached again replaces the lane there; a new place makes
-                // the set one larger, which a set of lane indices always counts.
-                let at = lanes.binary_search_by_key(&index.get(), |l| l.index.get());
-                let count = lanes.len() + usize::from(at.is_err());
-                let Some(larger) = u16::try_from(count).ok().and_then(Lanes::new) else {
-                    return false;
-                };
-                match at {
-                    Ok(i) => std::mem::replace(&mut lanes[i], out).queue.close(),
-                    Err(i) => lanes.insert(i, out),
-                }
-                *set = larger;
-                true
-            }
-            Attached::Set {
-                generation: g,
-                lanes,
-                set,
-                ..
-            } if *g < generation => {
-                for l in lanes.drain(..) {
-                    l.queue.close();
-                }
-                lanes.push(out);
-                *set = Lanes::ONE;
-                *g = generation;
-                true
-            }
-            Attached::Set { .. } => false,
+            old.close();
+            queue.take_over(old);
         }
+        match (&mut o.lane, queue.kind()) {
+            (Attached::Datagram(d), Kind::Datagram) => {
+                queue.state.lock().after = d.link.after();
+                d.generation = generation;
+                d.queue = queue;
+            }
+            (Attached::Stream(s), Kind::Stream) => {
+                s.generation = generation;
+                s.queue = queue;
+            }
+            (_, Kind::Datagram) => {
+                let link = Link::new(sent, Stamp::since(o.origin, now), round_trip);
+                queue.state.lock().after = link.after();
+                o.lane = Attached::Datagram(Datagram {
+                    generation,
+                    queue,
+                    encoder: code::Encoder::new(),
+                    link,
+                    capture: Capture::default(),
+                    flights: VecDeque::new(),
+                    missed: 0,
+                    expected: 0.0,
+                });
+            }
+            (_, Kind::Stream) => {
+                o.lane = Attached::Stream(Stream { generation, queue });
+            }
+        }
+        true
     }
 
-    /// What a frame may take now.
+    /// What a frame may take now: nothing waiting, any; else what one update interval of the
+    /// drain leaves past what waits.
     pub fn room(&self) -> Room {
         let o = match &self.state {
             State::Open(o) => o,
             State::Recording(_) => return Room::Unbounded,
             State::Closed => return Room::Full,
         };
-        let Attached::Set {
-            link, lanes, set, ..
-        } = &o.lanes
-        else {
+        let Some(queue) = o.lane.queue() else {
             return Room::Full;
         };
-        let bound = link.lane_bound(*set);
-        match lanes.iter().map(|l| bound.saturating_sub(l.held)).sum() {
-            0 => Room::Full,
-            free => Room::Open(free),
+        match queue.backlog() {
+            (0, _) => Room::Unbounded,
+            (backlog, drain) => {
+                let budget = drain
+                    .zip(o.updates.interval())
+                    .map_or(0, |(rate, gap)| (rate * gap.as_secs_f64()) as usize);
+                queue.state.lock().room_at = budget;
+                match budget.saturating_sub(backlog) {
+                    0 => Room::Full,
+                    free => Room::Open(free),
+                }
+            }
         }
     }
 
-    /// What a keyframe may take: what the pacing's share for the frames themselves sends
-    /// in `time` (`Link::data`: repairs and headers take the rest).
-    pub fn key(&self, time: Duration) -> KeyRoom {
-        let o = match &self.state {
-            State::Open(o) => o,
-            State::Recording(_) => return KeyRoom::Unbounded,
-            State::Closed => return KeyRoom::Bytes(0),
-        };
-        let Attached::Set { link, .. } = &o.lanes else {
-            return KeyRoom::Bytes(0);
-        };
-        KeyRoom::Bytes((link.data() * time.as_secs_f64()) as usize)
+    /// What reaches the page of what it is given; `None` with no lane, or closed.
+    pub fn delivery(&self) -> Option<Delivery> {
+        match &self.state {
+            State::Recording(_) => Some(Delivery::Whole),
+            State::Closed => None,
+            State::Open(o) => match o.lane {
+                Attached::None => None,
+                Attached::Stream(_) => Some(Delivery::Whole),
+                Attached::Datagram(_) => Some(Delivery::Reported),
+            },
+        }
     }
 
-    /// What a sharpening pass may take: the room past what the next capture needs, which
-    /// is what the pacing's share for the frames sends in `frame` (one frame interval). A
-    /// pass so never takes room the next capture needs; with none past it, none.
-    pub fn spare(&self, frame: Duration) -> Room {
-        let o = match &self.state {
-            State::Open(o) => o,
-            State::Recording(_) => return Room::Unbounded,
-            State::Closed => return Room::Full,
+    /// The rate the encoder aims at: unlimited while nothing waits for the socket; once the
+    /// queue has backed up, the drain times the frames' share (a stream lane's frames are all
+    /// it carries).
+    pub fn rate(&self) -> Rate {
+        let State::Open(o) = &self.state else {
+            return Rate::Unlimited;
         };
-        let Attached::Set { link, .. } = &o.lanes else {
-            return Room::Full;
+        let Some(queue) = o.lane.queue() else {
+            return Rate::Unlimited;
         };
-        let next = (link.data() * frame.as_secs_f64()) as usize;
-        match self.room() {
-            Room::Open(free) if free > next => Room::Open(free - next),
-            Room::Open(_) | Room::Full => Room::Full,
-            Room::Unbounded => Room::Unbounded,
+        let share = match &o.lane {
+            Attached::Datagram(d) => d.link.share(),
+            Attached::Stream(_) | Attached::None => 1.0,
+        };
+        match queue.backlog() {
+            (0, _) | (_, None) => Rate::Unlimited,
+            (_, Some(drain)) => Rate::Drain(drain * share),
         }
     }
 
@@ -505,38 +740,41 @@ impl Sender {
             State::Recording(_) => return Way::Recording,
             State::Closed => return Way::Closed,
         };
-        let Attached::Set {
-            link,
-            lanes,
-            set,
-            flights,
-            ..
-        } = &o.lanes
-        else {
-            return Way::Unattached;
-        };
-        let st = link.stats();
         let ms = |d: Duration| d.as_secs_f64() * 1000.0;
-        Way::Lanes {
-            held_bytes: lanes.iter().map(|l| l.held).collect(),
-            lane_bound_bytes: link.lane_bound(*set),
-            unreported_blocks: flights.len(),
-            loss: st.loss,
-            btlbw_bytes_per_s: st.btlbw,
-            rtprop_ms: st.rtprop.map(ms),
-            spread_ms: ms(st.spread),
-            recovery_ms: ms(st.recovery),
-            pacing_bytes_per_s: st.pacing,
-            data_bytes_per_s: link.data(),
-            stale: st.stale,
-            wanted_lanes: link.wanted().get(),
+        match &o.lane {
+            Attached::None => Way::Unattached,
+            Attached::Datagram(d) => {
+                let (backlog, drain) = d.queue.backlog();
+                let st = d.link.stats();
+                Way::Datagram {
+                    backlog_bytes: backlog,
+                    drain_bytes_per_s: drain,
+                    receive_buffer_bytes: o.buffer,
+                    unreported_blocks: d.flights.len(),
+                    missed: d.missed,
+                    expected_misses: d.expected,
+                    loss: st.loss,
+                    rtprop_ms: st.rtprop.map(ms),
+                    spread_ms: ms(st.spread),
+                    miss: st.miss,
+                    share: st.share,
+                }
+            }
+            Attached::Stream(s) => {
+                let (backlog, drain) = s.queue.backlog();
+                Way::Stream {
+                    backlog_bytes: backlog,
+                    drain_bytes_per_s: drain,
+                }
+            }
         }
     }
 
-    /// Video update `number` of `epoch`, `bytes` long, sent at `now` in a block with the
-    /// Opus packet waiting for it; a recording takes the bytes as they are. A recording
-    /// whose recorder has gone takes nothing: its viewer is removed with it.
-    pub fn video(&mut self, (number, epoch): (Number, Epoch), bytes: &bytes::Bytes, now: Instant) {
+    /// Video update `number`, `bytes` long, at `now`: on a datagram lane in a block with the
+    /// Opus packet waiting for it, on a stream lane as a frame of its own; a recording takes
+    /// the bytes as they are. A recording whose recorder has gone takes nothing: its viewer is
+    /// removed with it.
+    pub fn video(&mut self, number: Number, bytes: &bytes::Bytes, now: Instant) {
         let o = match &mut self.state {
             State::Recording(to) => {
                 if to.send(Out::Bin(bytes.clone())).is_err() {
@@ -547,43 +785,34 @@ impl Sender {
             State::Closed => return,
             State::Open(o) => o,
         };
-        o.capture
-            .members
-            .push((Track::Video { number, epoch }, bytes.clone()));
-        self.flush(now);
+        o.updates.push(now);
+        let track = Track::Video { number };
+        match &mut o.lane {
+            Attached::None => {}
+            Attached::Stream(s) => {
+                s.queue.push_frame(o.frame, track, bytes, now);
+                o.frame = o.frame.next();
+            }
+            Attached::Datagram(d) => {
+                let mut members = std::mem::take(&mut d.capture.members);
+                members.push((track, bytes.clone()));
+                let mut audio = std::mem::take(&mut d.capture.audio);
+                let all = members
+                    .iter()
+                    .map(|(t, b)| (*t, &b[..]))
+                    .chain(audio.iter().map(|a| (Track::Audio, &a[..])));
+                send(d, o.origin, all, now);
+                members.clear();
+                d.capture.members = members;
+                d.capture.spare_audio.append(&mut audio);
+                d.capture.audio = audio;
+            }
+        }
     }
 
-    /// The capture gathered so far, with the Opus packet waiting for it, as one block.
-    fn flush(&mut self, now: Instant) {
-        let State::Open(o) = &mut self.state else {
-            return;
-        };
-        let Open {
-            capture,
-            encoder,
-            lanes,
-            origin,
-            control,
-            ..
-        } = &mut **o;
-        let members = capture.members.iter().map(|(t, b)| (*t, &b[..]));
-        let audio = capture.audio.iter().map(|a| (Track::Audio, &a[..]));
-        send(
-            encoder,
-            lanes,
-            *origin,
-            control,
-            &mut capture.spare,
-            members.chain(audio),
-            now,
-        );
-        capture.members.clear();
-        capture.audio = None;
-    }
-
-    /// An Opus packet at `now`, `silent` frames of silence after the one before: on lanes
-    /// it waits for the next capture, and the one before it, whose play time has passed
-    /// with none, goes alone; a recording takes it as it is, with the silence it follows.
+    /// An Opus packet at `now`, `silent` frames of silence after the one before: on a datagram
+    /// lane it waits for the next capture ([`Capture`]); on a stream lane it goes at once, a
+    /// frame of its own; a recording takes it as it is, with the silence it follows.
     pub fn audio(&mut self, packet: &[u8], silent: u32, now: Instant) {
         let o = match &mut self.state {
             State::Recording(to) => {
@@ -596,114 +825,151 @@ impl Sender {
             State::Closed => return,
             State::Open(o) => o,
         };
-        let Open {
-            capture,
-            encoder,
-            lanes,
-            origin,
-            control,
-            ..
-        } = &mut **o;
-        capture.lone = capture.audio.replace(packet.to_vec());
-        if capture.lone.is_some() {
-            let lone = capture.lone.iter().map(|a| (Track::Audio, &a[..]));
-            send(
-                encoder,
-                lanes,
-                *origin,
-                control,
-                &mut capture.spare,
-                lone,
-                now,
-            );
+        match &mut o.lane {
+            Attached::None => {}
+            Attached::Stream(s) => {
+                s.queue.push_frame(o.frame, Track::Audio, packet, now);
+                o.frame = o.frame.next();
+            }
+            Attached::Datagram(d) => {
+                let mut buf = d.capture.spare_audio.pop().unwrap_or_default();
+                buf.clear();
+                buf.extend_from_slice(packet);
+                d.capture.audio.push(buf);
+                let waits = d.queue.backlog().0 > 0;
+                let n = d.capture.audio.len();
+                // The packets before this one, whose play time passed with no capture, go
+                // together, unless the socket has a backlog and there is room in a block.
+                if n > 1 && (!waits || n >= MEMBERS) {
+                    let newest = d.capture.audio.pop();
+                    let mut audio = std::mem::take(&mut d.capture.audio);
+                    send(
+                        d,
+                        o.origin,
+                        audio.iter().map(|a| (Track::Audio, &a[..])),
+                        now,
+                    );
+                    d.capture.spare_audio.append(&mut audio);
+                    d.capture.audio = audio;
+                    d.capture.audio.extend(newest);
+                }
+            }
         }
     }
 
-    /// A report that came up the control stream at `now`: its frame is no longer held on
-    /// its lanes, the link learns from it, and a video update missed is returned, for the
-    /// encoder to forget. Reports come in the order of their frames; any other is broken.
-    pub fn reported(&mut self, report: &Report<'_>, now: Instant) -> Result<Vec<Missed>, Broken> {
+    /// A datagram lane's report that came up the control stream at `now`: the link learns from
+    /// it, the deadline it gives the next blocks and the buffer its socket is given follow,
+    /// and each video update of its block is returned, decided as the block was. Reports come
+    /// in the order of their blocks; any other, or one for a stream lane, is broken.
+    pub fn reported(&mut self, report: &Report<'_>, now: Instant) -> Result<Vec<Decided>, Broken> {
         let o = match &mut self.state {
             State::Open(o) => o,
             State::Closed => return Ok(Vec::new()),
             State::Recording(_) => return Err(Broken::Unsent(report.block)),
         };
-        let Attached::Set {
-            link,
-            generation,
-            lanes,
-            flights,
-            ..
-        } = &mut o.lanes
-        else {
+        let Attached::Datagram(d) = &mut o.lane else {
             return Err(Broken::Unsent(report.block));
         };
-        let sent = match flights.pop_front() {
-            Some(s) if s.flight.head.block == report.block => s,
-            Some(s) => {
-                flights.push_front(s);
+        let flight = match d.flights.pop_front() {
+            Some(f) if f.head.block == report.block => f,
+            Some(f) => {
+                d.flights.push_front(f);
                 return Err(Broken::Unsent(report.block));
             }
             None => return Err(Broken::Unsent(report.block)),
         };
-        link.reported(&sent.flight, report, Stamp::since(o.origin, now))
+        d.link
+            .reported(&flight, report, Stamp::since(o.origin, now))
             .map_err(Broken::Mismatch)?;
-        let head = sent.flight.head;
-        if sent.generation == *generation {
-            for i in 0..head.n() {
-                if let Some(l) = lanes.get_mut(sent.flight.lane(i)) {
-                    l.held = l.held.saturating_sub(head.message_len(i));
-                }
-            }
-        }
-        let missed = match report.fate {
-            Fate::Unseen => true,
-            Fate::Seen { outcome, .. } => outcome == Outcome::Missed,
+        d.queue.state.lock().after = d.link.after();
+        o.buffer = received(&o.control, &d.queue, o.buffer, d.link.stats().rtprop);
+        let outcome = match report.fate {
+            Fate::Unseen => Outcome::Missed,
+            Fate::Seen { outcome, .. } => outcome,
         };
-        let missed = match missed {
-            true => sent
-                .flight
-                .tracks
-                .iter()
-                .filter_map(|t| match *t {
-                    Track::Video { number, .. } => Some(Missed { number }),
-                    Track::Audio => None,
-                })
-                .collect(),
-            false => Vec::new(),
-        };
-        o.capture.spare.push(sent.flight.tracks);
-        Ok(missed)
+        d.missed += u64::from(outcome == Outcome::Missed);
+        d.expected += flight.miss;
+        let decided = flight
+            .tracks
+            .iter()
+            .filter_map(|t| match *t {
+                Track::Video { number } => Some(Decided { number, outcome }),
+                Track::Audio => None,
+            })
+            .collect();
+        d.capture.spare.push(flight.tracks);
+        Ok(decided)
     }
 }
 
-/// A block of `members`: planned by the link, coded, and its messages queued on their lanes
-/// at their times, paced after the block before. Its track list is taken from `spare`.
-fn send<'b>(
-    encoder: &mut code::Encoder,
-    lanes: &mut Attached,
-    origin: Instant,
+impl Attached {
+    fn queue(&self) -> Option<&Arc<Queue>> {
+        match self {
+            Attached::None => None,
+            Attached::Datagram(d) => Some(&d.queue),
+            Attached::Stream(s) => Some(&s.queue),
+        }
+    }
+
+    fn generation(&self) -> Option<Generation> {
+        match self {
+            Attached::None => None,
+            Attached::Datagram(d) => Some(d.generation),
+            Attached::Stream(s) => Some(s.generation),
+        }
+    }
+}
+
+/// The send buffer the daemon gives a lane's socket: the least, one lane datagram ([`DATAGRAM`],
+/// the largest message a datagram lane sends; the kernel floors it at its own least). Not to be
+/// tuned. The socket is the daemon's to the tunnel on this machine: what it holds past
+/// acceptance waits where no deadline sees it, and is measured only as it widens the spread of
+/// arrivals. A buffer sized from that spread (one deadline's worth at the drain) is a
+/// measurement feeding on itself: its own wait widens the spread that sizes it, and in
+/// simulation it ran away, doubling with each power-of-two step until the base round trip read
+/// 30 s and every block came late. With the least, every backlog is in the one queue the daemon
+/// sees ([`Queue`]), and what feeds the path is the tunnel's own queue (quic-go's 32 DATAGRAM
+/// frames, a stream's window).
+pub const SEND_BUFFER: u32 = DATAGRAM as u32;
+
+/// The receive buffer the relay is told to give its datagram lane's socket: what a round trip
+/// of the drain holds, the most the tunnel's window delivers to the relay at once, rounded up
+/// to a power of two so that it changes only when it doubles or halves; told when it changes,
+/// and kept as it `was` until there is a drain and a round trip to size it by.
+fn received(
     control: &tokio::sync::mpsc::UnboundedSender<Out>,
-    spare: &mut Vec<Vec<Track>>,
+    queue: &Queue,
+    was: u32,
+    round_trip: Option<Duration>,
+) -> u32 {
+    let (_, drain) = queue.backlog();
+    let Some((rate, wait)) = drain.zip(round_trip) else {
+        return was;
+    };
+    let bytes = ((rate * wait.as_secs_f64()) as usize)
+        .max(DATAGRAM)
+        .checked_next_power_of_two()
+        .map_or(u32::MAX, |b| u32::try_from(b).unwrap_or(u32::MAX));
+    if bytes != was && control.send(Out::Buffer(bytes)).is_err() {
+        // A session whose control writer has ended is closing, its lane with it.
+        log::debug!("the lane's receive buffer not told: the session is closing");
+    }
+    bytes
+}
+
+/// A block of `members` on a datagram lane: its repairs planned by the link, coded, and its
+/// messages queued, to be stamped and sent as the socket takes them. Its track list is taken
+/// from the spare ones.
+fn send<'b>(
+    d: &mut Datagram,
+    origin: Instant,
     members: impl Iterator<Item = (Track, &'b [u8])> + Clone,
     now: Instant,
 ) {
-    let Attached::Set {
-        link,
-        generation,
-        lanes,
-        set,
-        flights,
-        paced_to,
-        told,
-    } = lanes
-    else {
-        return;
-    };
-    let mut tracks = spare.pop().unwrap_or_default();
+    let mut tracks = d.capture.spare.pop().unwrap_or_default();
     tracks.clear();
     tracks.extend(members.clone().map(|(t, _)| t));
-    let Ok(assembled) = encoder.assemble(members) else {
+    let Ok(assembled) = d.encoder.assemble(members) else {
         // A block the code cannot take (empty, or over its window) is not sent; the
         // encoder's cap keeps frames far under it.
         log::warn!(
@@ -712,42 +978,83 @@ fn send<'b>(
         );
         return;
     };
-    let set = *set;
-    let start = (*paced_to).max(now);
-    let plan = link.plan(assembled.bytes(), &tracks, set, Stamp::since(origin, start));
-    let wanted = link.wanted();
-    if wanted != *told {
-        *told = wanted;
-        // A session whose control writer has ended is closing, its lanes with it.
-        if control.send(Out::Lanes(wanted)).is_err() {
-            log::debug!("the lanes wanted not told: the session is closing");
-        }
-    }
-    let Ok(coded) = assembled.code(plan.m, plan.due) else {
+    let plan = d
+        .link
+        .plan(assembled.bytes(), &tracks, Stamp::since(origin, now));
+    // The deadline and the time each message left are stamped as the socket takes it
+    // (`Waiting::stamp`): coded with none yet.
+    let Ok(coded) = assembled.code(plan.m, Stamp::since(origin, now)) else {
         log::warn!("a block is too large for the lanes with its repairs");
         return;
     };
     let head = *coded.head();
-    let n = head.n();
-    for i in 0..n {
-        // Message `i` leaves `i / n` of the way through the block's sending time.
-        let at = start + plan.sending.mul_f64(i as f64 / n as f64);
-        let sent = Stamp::since(origin, at);
-        let lane = &mut lanes[plan.lane(i)];
-        lane.held += head.message_len(i);
-        lane.queue
-            .push(at, |out| coded.message(i, sent).encode(out));
+    for i in 0..head.n() {
+        d.queue.push_datagram(head.block, now, |out| {
+            coded.encode(i, Stamp::since(origin, now), out)
+        });
     }
-    *paced_to = start + plan.sending;
-    flights.push_back(Sent {
-        flight: plan.flight(&head, tracks),
-        generation: *generation,
+    d.flights.push_back(Flight {
+        head,
+        tracks,
+        miss: plan.miss,
     });
 }
 
 #[cfg(test)]
+impl Queue {
+    /// The front message as the lane's writer gives it to its socket at `now` (stamped, on a
+    /// datagram lane), taken out: its bytes, and the block it is of, if a datagram.
+    pub(crate) fn take(&self, now: Instant) -> Option<(Vec<u8>, Option<Seq>)> {
+        let mut w = self.lock();
+        w.stamp(now);
+        let m = w.messages.front()?;
+        let taken = (
+            m.from(0).to_vec(),
+            match m.body {
+                Body::Datagram { block, .. } => Some(block),
+                Body::Frame(_) => None,
+            },
+        );
+        w.sent(now);
+        Some(taken)
+    }
+
+    /// The socket refused the front message.
+    pub(crate) fn refuse(&self) {
+        self.lock().refused();
+    }
+
+    /// The send buffer the sender asks the socket to have.
+    pub(crate) fn buffer(&self) -> Option<u32> {
+        self.lock().buffer
+    }
+
+    /// The bytes waiting.
+    pub(crate) fn backlog_bytes(&self) -> usize {
+        self.lock().backlog
+    }
+}
+
+#[cfg(test)]
 impl Sender {
-    /// A session's sender with one lane attached at `now`, the lane's queue (which no
+    /// The tracks of `block`, a datagram lane's block not yet reported.
+    pub(crate) fn tracks_of(&self, block: Seq) -> Option<Vec<Track>> {
+        let State::Open(o) = &self.state else {
+            return None;
+        };
+        let Attached::Datagram(d) = &o.lane else {
+            return None;
+        };
+        d.flights
+            .iter()
+            .find(|f| f.head.block == block)
+            .map(|f| f.tracks.clone())
+    }
+}
+
+#[cfg(test)]
+impl Sender {
+    /// A session's sender with a datagram lane attached at `now`, the lane's queue (which no
     /// writer drains: a test reads it), and what its control stream is sent.
     pub fn with_lane(
         now: Instant,
@@ -757,13 +1064,16 @@ impl Sender {
         tokio::sync::mpsc::UnboundedReceiver<Out>,
     ) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut s = Sender::new(Capability::mint().expect("a random source"), tx, now);
-        let queue = Queue::new();
-        let place = (
-            LaneIndex::all(Lanes::ONE).next().expect("one lane"),
+        let mut s = Sender::new(Capability::mint().expect("a random source"), tx, now)
+            .expect("a socket to read the kernel's buffer from");
+        let queue = Queue::new(Kind::Datagram, now, Arc::new(|| {}));
+        assert!(s.attach(
             Generation::first(),
-        );
-        assert!(s.attach(place, queue.clone(), Stamp::since(now, now), now));
+            queue.clone(),
+            Stamp::since(now, now),
+            Duration::from_millis(100),
+            now
+        ));
         (s, queue, rx)
     }
 }
@@ -780,20 +1090,24 @@ pub struct Received {
 #[cfg(test)]
 impl Queue {
     /// The blocks whose every source is queued, in the order they were numbered, each as
-    /// its sources put it back together; the queue is emptied.
+    /// its sources put it back together; the queue is emptied, as if the socket took all.
     pub fn frames(&self) -> Vec<Received> {
         let mut w = self.lock();
         type Sources = Vec<Option<Vec<u8>>>;
         let mut blocks: std::collections::BTreeMap<u64, (wire::Head, Stamp, Sources)> =
             Default::default();
-        while let Some(m) = w.messages.pop_front() {
-            if let Ok(wire::Lane::Piece(s)) = wire::Lane::decode(m.datagram()) {
-                let (_, _, sources) = blocks
-                    .entry(s.head.block.get())
-                    .or_insert_with(|| (s.head, s.sent, vec![None; s.head.k()]));
-                sources[s.index as usize] = Some(s.data.to_vec());
+        let now = Instant::now();
+        while !w.messages.is_empty() {
+            w.stamp(now);
+            if let Some(m) = w.messages.front() {
+                if let Ok(Lane::Piece(s)) = Lane::decode(m.from(0)) {
+                    let (_, _, sources) = blocks
+                        .entry(s.head.block.get())
+                        .or_insert_with(|| (s.head, s.sent, vec![None; s.head.k()]));
+                    sources[s.index as usize] = Some(s.data.to_vec());
+                }
             }
-            w.sent(m);
+            w.sent(now);
         }
         blocks
             .into_values()

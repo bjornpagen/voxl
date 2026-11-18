@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # suite3.sh : Sunshine, streamed to Moonlight (mlclient.py), through the README workloads
 # and links. Configs: sunshine (Sunshine's defaults with its software encoder, the only one
-# without a GPU, at Moonlight's default bitrate), sunshine_tuned (x264 ultrafast on 4
-# threads at 30 Mbps, like voxl). Moonlight doesn't adapt its bitrate, so on the slow links
+# without a GPU, at Moonlight's default bitrate), sunshine_tuned (its software encoder's
+# ultrafast preset on 4 threads at 30 Mbps). Moonlight doesn't adapt its bitrate, so on the slow links
 # both get 80% of the link, as you'd set it by hand. Links: tc netem on Sunshine's own
 # container network (env/sunshine.sh), the same rate, RTT and deep queue as shaper.py.
 # Sunshine restarts for every run; pair mlclient.py's Moonlight with it first (see

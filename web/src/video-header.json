@@ -3,23 +3,20 @@
 		"header": "01 01 1a2b3c4d 5e6f7081",
 		"picture": "00 00 00 01 09 f0",
 		"key": true,
-		"sharpens": false,
 		"frame": 439041101,
 		"pipe": 1584361601
 	},
 	{
-		"header": "01 02 fedcba98 80000001",
+		"header": "01 00 fedcba98 80000001",
 		"picture": "00 00 00 01 41",
 		"key": false,
-		"sharpens": true,
 		"frame": 4275878552,
 		"pipe": 2147483649
 	},
 	{
-		"header": "01 03 00000000 00000000",
+		"header": "01 01 00000000 00000000",
 		"picture": "00 00 00 01 65",
 		"key": true,
-		"sharpens": true,
 		"frame": 0,
 		"pipe": 0
 	}

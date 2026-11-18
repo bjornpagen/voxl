@@ -1,25 +1,24 @@
 //! `voxl relay`: the viewer's side of a session, run on the viewer's machine. It serves the
 //! page on 127.0.0.1 and, for each page that connects, runs a session: `ssh <host> voxl
-//! attach` for the control stream, and the lanes the lanes description names, through a
-//! proxy, for video and audio. It decodes the lanes, reports each frame to the daemon, and
-//! hands the page what it can show.
+//! attach` for the control stream, and one lane, through a proxy, for video and audio. It
+//! hands the page every frame the lane completes, in order.
 //!
-//! **Lanes** ([`set`]). A session holds one lane of datagrams; or every connection the
-//! description names, opened whole (the proxy deals each new stream to the next of its
-//! connections in turn, so only a whole set in order puts each lane on a connection of its
-//! own); or `min(asked, cap)` stream lanes, one until the daemon first asks (`Down::Lanes`),
-//! lanes added or closed within the generation as it asks again. A lane that ends after every
-//! lane of its set was confirmed (`Down::Attached`) opens the set again, whole and in order,
-//! as the next generation; one that ends before that is a transport refusing lanes and ends
-//! the session. A set is reopened only after the daemon confirmed it, never on a timer. An
-//! unconfirmed datagram attach goes again after the least round trip seen (see
-//! `session::Session::round_trip`).
+//! **The lane.** One per session, of the kind the lanes description names. A datagram lane
+//! (a SOCKS5 proxy's UDP relay: Hysteria2's) carries coded blocks with repair; the relay's
+//! decoder completes them, decides each block at its deadline, and reports it to the daemon.
+//! A stream lane (one HTTP CONNECT stream through naive over HTTP/2 or HTTP/3) carries the
+//! frames as they are, in order, whole: TCP or QUIC delivers every byte, so nothing on it has
+//! a deadline and the relay reports nothing. The lane's socket holds what the daemon names
+//! (`Down::Buffer`: one deadline at the drain rate). A lane that ends after the daemon
+//! confirmed it (`Down::Attached`) opens again as the next generation; one that ends before
+//! is a transport refusing lanes and ends the session. An unconfirmed datagram attach goes
+//! again after the least round trip seen (see `session::Session::round_trip`).
 //!
-//! **What the page shows** ([`release`]). The page decodes the screen's one H.264 stream
-//! and shows each update as soon as its decoder puts it out. The relay gives it the updates
-//! in order, each once every earlier one is decided, and only those that refer to nothing
-//! missed. A missed update is never sent again: the screen keeps its last picture until the
-//! first update coded after the daemon heard of the miss, about a round trip later.
+//! **What the page shows** ([`release`]). The page decodes the screen's one VP9 stream and
+//! shows each update as soon as its decoder puts it out. Every update the relay completes is
+//! decodable (the daemon's encoder refers only to pictures it knows the page has), so the
+//! relay gives the page every one, in order; one that missed its deadline on a datagram lane
+//! is passed over, and the next refers past it.
 
 mod access;
 mod description;
@@ -27,7 +26,6 @@ mod files;
 mod proxy;
 mod release;
 mod session;
-mod set;
 mod ssh;
 
 use axum::http::header;

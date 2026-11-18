@@ -1,6 +1,6 @@
 //! The environment voxl runs in: the variables that configure it, and the `VOXL_*`
-//! variables for looking inside it (its debugging logs, x264's own log, and the switches
-//! that turn off x264's hints and reading Xvfb's framebuffer in place). They are read
+//! variables for looking inside it (its debugging logs, and the switch that turns off
+//! reading Xvfb's framebuffer in place). They are read
 //! once, when voxl starts, and handed to what each one changes.
 
 use std::ffi::OsString;
@@ -35,11 +35,6 @@ pub struct Log {
 /// What voxl's `VOXL_*` debugging variables ask for.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Debugging {
-    /// `VOXL_X264_INFO`: how much x264 logs.
-    pub x264_log: X264Log,
-    /// x264 takes the damage's per-block hints and skips the blocks that didn't change,
-    /// unless `VOXL_NO_MBINFO` is set.
-    pub mb_info: bool,
     /// Xvfb's framebuffer is read in place when it can be found, unless
     /// `VOXL_NO_DIRECT_FB` is set.
     pub direct_fb: bool,
@@ -51,16 +46,6 @@ pub struct Debugging {
     pub damage: bool,
     /// `VOXL_DEBUG_ENCODES`: every frame's encode is logged.
     pub encodes: bool,
-}
-
-#[cfg(any(target_os = "linux", test))]
-/// How much x264 logs: warnings; with `VOXL_X264_INFO` set, its summaries; with
-/// `VOXL_X264_INFO=debug`, every frame's QP, macroblock types and size.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum X264Log {
-    Warning,
-    Info,
-    Debug,
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -140,12 +125,6 @@ impl Debugging {
         let var = |name: &str| var(name).and_then(|v| v.into_string().ok());
         let set = |name| var(name).is_some();
         let debug = Debugging {
-            x264_log: match var("VOXL_X264_INFO").as_deref() {
-                None => X264Log::Warning,
-                Some("debug") => X264Log::Debug,
-                Some(_) => X264Log::Info,
-            },
-            mb_info: !set("VOXL_NO_MBINFO"),
             direct_fb: !set("VOXL_NO_DIRECT_FB"),
             marker,
             damage: set("VOXL_DEBUG_DAMAGE"),

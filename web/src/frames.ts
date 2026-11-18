@@ -1,66 +1,58 @@
-// The worker's record of the screen: what its one decoder is. An update is shown as soon as
-// the decoder puts it out: the relay gives the page updates in order and drops those that
-// can no longer be decoded (one referring to an update that missed its deadline), so an
-// update may follow a gap in the frame numbers, which is no failure. Events go in as calls;
-// what the record does goes out through a `World`, which in the worker is WebCodecs and the
-// canvas, and in frames.test.ts a fake of them.
+// The worker's record of the screen: its one decoder. Every update the relay gives the page
+// after a stream's keyframe is decodable (the encoder refers only to pictures it knows the
+// page has), so a stream, whose codec its hello names, decodes from its keyframe on, in
+// order. Before the keyframe the lane's kind decides: on a datagram lane the keyframe may
+// have missed its deadline, and the deltas after it pass undecoded (counted) until the
+// daemon, told of the miss, starts the stream again with a new hello and keyframe; on a
+// stream lane every frame arrives, so a delta before the keyframe is a fault. Every fault (a
+// decoder error, a codec the browser cannot decode) ends the session for its cause. Nothing
+// asks for a keyframe, and nothing is reconfigured. Events go in as calls; what the record
+// does goes out through a `World`, which in the worker is WebCodecs and the page, and in
+// frames.test.ts a fake of them.
+
+/** How the session's lane carries the frames (the relay's lanes description). */
+export type LaneKind = 'datagram' | 'stream';
 
 /** What the record does. `D` is a decoder, `P` a picture, `B` an update's bytes. */
 export interface World<D, P, B> {
-	/** The codec a keyframe's SPS names; throws if it names none. */
-	codec(key: B): string;
 	/** A decoder for `codec`; throws if the codec cannot be configured. Its pictures go to
 	 * `output`, and its error, after which it is closed, to `error`. */
 	open(codec: string): D;
 	/** Gives `dec` an update that arrived at `at`, which names the picture it puts out.
 	 * Throws if the decoder refuses it. */
 	decode(dec: D, key: boolean, at: number, data: B): void;
-	/** Closes a decoder the record gives up on. */
+	/** Closes a decoder the record is done with. */
 	close(dec: D): void;
-	/** Asks the server for a keyframe. */
-	ask(): void;
-	/** Says why the screen stopped decoding. */
-	log(why: string): void;
 	/** Lets go of a picture that will not be shown. */
 	letGo(picture: P): void;
 	/** Shows a picture. */
 	show(picture: P): void;
+	/** A delta passed undecoded while a datagram lane's stream waits for its keyframe. */
+	passed(): void;
+	/** The screen cannot go on: the session ends, for `why`. */
+	end(why: string): void;
 }
 
 /**
- * What the screen's updates go to. Before the stream starts (a hello) and after the
- * socket closes there is no stream, and an update is dropped. In a stream, updates decode
- * with a decoder opened on a keyframe, for the codec that keyframe names. One whose decoder
- * failed waits for a keyframe, and asked for it as it failed; so does every stream as it
- * starts, which the server answers with one unasked. One whose codec this browser cannot
- * decode waits for nothing until the stream starts again: asking would bring a keyframe
- * that fails the same way.
+ * The screen: no stream (before a hello, after the session ended or failed); a stream of a
+ * codec, on a lane of a kind, waiting for its keyframe; or decoding with the decoder opened
+ * on it.
  */
 type Screen<D> =
 	| { readonly s: 'none' }
-	| { readonly s: 'decoding'; readonly dec: D; readonly codec: string }
-	| { readonly s: 'waiting' }
-	| { readonly s: 'unsupported' };
+	| { readonly s: 'waiting'; readonly lane: LaneKind; readonly codec: string }
+	| { readonly s: 'decoding'; readonly dec: D; readonly codec: string };
 
 const NONE = { s: 'none' } as const;
-const WAITING = { s: 'waiting' } as const;
-const UNSUPPORTED = { s: 'unsupported' } as const;
 
 export class Frames<D, P, B> {
 	readonly #world: World<D, P, B>;
 	#screen: Screen<D> = NONE;
-	/** Updates in the live decoder, given and not yet put out. */
-	#held = 0;
-	#dropped = 0;
+	/** The streams begun so far: the newest is the one the record is in, if any. */
+	#streams = 0;
 
 	constructor(world: World<D, P, B>) {
 		this.#world = world;
-	}
-
-	/** Updates that came out of no decoder: dropped as they arrived, or lost in a decoder
-	 * given up on. */
-	get dropped(): number {
-		return this.#dropped;
 	}
 
 	/** What the decoder decodes; null while there is none. */
@@ -68,108 +60,92 @@ export class Frames<D, P, B> {
 		return this.#screen.s === 'decoding' ? this.#screen.codec : null;
 	}
 
-	/** The stream starts (a hello): the decoder is given up on, so no picture put out before
-	 * is shown, since the screen may have changed. */
-	hello() {
-		this.#end();
-		this.#screen = WAITING;
+	/** A stream of `codec` starts on a lane of kind `lane` (a hello): the decoder, if any, is
+	 * closed, so no picture of the old stream is shown. The stream's number, for
+	 * `unsupported`. */
+	hello(lane: LaneKind, codec: string): number {
+		this.#close();
+		this.#screen = { s: 'waiting', lane, codec };
+		return ++this.#streams;
 	}
 
-	/** The socket closed: the decoder is given up on. */
+	/** Stream `stream`'s codec cannot be decoded here: if the record is still in it, the
+	 * session ends. */
+	unsupported(stream: number) {
+		const s = this.#screen;
+		if (s.s === 'none' || stream !== this.#streams) return;
+		this.#fail(`this browser cannot decode ${s.codec}`);
+	}
+
+	/** The session closed: the decoder, if any, is closed. */
 	closed() {
-		this.#end();
+		this.#close();
 		this.#screen = NONE;
 	}
 
 	/** An update arrived at `at`. */
 	part(at: number, key: boolean, data: B) {
-		const s = key ? this.#keyframe(data) : this.#screen;
-		if (s.s !== 'decoding') {
-			this.#dropped++;
-			return;
-		}
-		try {
-			this.#world.decode(s.dec, key, at, data);
-			this.#held++;
-		} catch (e) {
-			this.#close(s.dec);
-			this.#failed(`decode threw ${e}`);
-			this.#dropped++;
+		const s = this.#screen;
+		switch (s.s) {
+			case 'none':
+				return this.#fail('an update outside a stream');
+			case 'waiting': {
+				if (!key)
+					switch (s.lane) {
+						// Its keyframe missed: the daemon starts the stream again.
+						case 'datagram':
+							return this.#world.passed();
+						case 'stream':
+							return this.#fail("a delta before the stream's keyframe");
+					}
+				let dec: D;
+				try {
+					dec = this.#world.open(s.codec);
+				} catch (e) {
+					return this.#fail(`cannot decode ${s.codec}: ${e}`);
+				}
+				this.#screen = { s: 'decoding', dec, codec: s.codec };
+				return this.#decode(dec, key, at, data);
+			}
+			case 'decoding':
+				return this.#decode(s.dec, key, at, data);
 		}
 	}
 
 	/** Decoder `dec` put out `picture`: shown if the record still decodes with it, let go
-	 * otherwise. */
+	 * otherwise (a decoder closed by a hello may still put out what it held). */
 	output(dec: D, picture: P) {
 		const s = this.#screen;
-		if (s.s !== 'decoding' || s.dec !== dec) {
-			this.#world.letGo(picture);
-			return;
-		}
-		this.#held--;
-		this.#world.show(picture);
+		if (s.s === 'decoding' && s.dec === dec) this.#world.show(picture);
+		else this.#world.letGo(picture);
 	}
 
-	/** Decoder `dec` failed with an error named `name`, and is closed. One the record had
-	 * given up on changes nothing. */
+	/** Decoder `dec` failed, and is closed. One the record is done with changes nothing. */
 	error(dec: D, name: string, message: string) {
 		const s = this.#screen;
 		if (s.s !== 'decoding' || s.dec !== dec) return;
-		this.#lost();
-		if (name === 'NotSupportedError') this.#unsupported(message);
-		else this.#failed(`decoder error: ${message}`);
+		this.#screen = NONE;
+		this.#world.end(`the decoder failed: ${name}: ${message}`);
 	}
 
-	/** What the screen is once keyframe `data` arrives: a keyframe of the codec its decoder
-	 * decodes goes to that decoder; any other opens one for its own. */
-	#keyframe(data: B): Screen<D> {
-		const s = this.#screen;
-		if (s.s === 'none' || s.s === 'unsupported') return s;
-		let codec: string;
+	#decode(dec: D, key: boolean, at: number, data: B) {
 		try {
-			codec = this.#world.codec(data);
+			this.#world.decode(dec, key, at, data);
 		} catch (e) {
-			if (s.s === 'decoding') this.#close(s.dec);
-			return this.#unsupported(`${e}`);
-		}
-		if (s.s === 'decoding') {
-			if (s.codec === codec) return s;
-			this.#close(s.dec);
-		}
-		try {
-			const dec = this.#world.open(codec);
-			return (this.#screen = { s: 'decoding', dec, codec });
-		} catch (e) {
-			return this.#unsupported(`configure ${codec}: ${e}`);
+			this.#fail(`the decoder refused an update: ${e}`);
 		}
 	}
 
-	/** The decoder, if any, is given up on. */
-	#end() {
+	/** The decoder, if any, is closed. */
+	#close() {
 		const s = this.#screen;
-		if (s.s === 'decoding') this.#close(s.dec);
+		if (s.s === 'decoding') this.#world.close(s.dec);
 	}
 
-	/** Decoder `dec` is given up on while open. */
-	#close(dec: D) {
-		this.#world.close(dec);
-		this.#lost();
-	}
-
-	/** The decoder is gone: what it held never comes out. */
-	#lost() {
-		this.#dropped += this.#held;
-		this.#held = 0;
-		this.#screen = WAITING;
-	}
-
-	#failed(why: string) {
-		this.#world.log(why);
-		this.#world.ask();
-	}
-
-	#unsupported(why: string): Screen<D> {
-		this.#world.log(`cannot decode: ${why}`);
-		return (this.#screen = UNSUPPORTED);
+	/** The screen cannot go on. */
+	#fail(why: string) {
+		this.#close();
+		this.#screen = NONE;
+		this.#world.end(why);
 	}
 }

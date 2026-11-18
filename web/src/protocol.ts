@@ -33,22 +33,22 @@ export interface Hello {
 	t: 'hello';
 	w: number;
 	h: number;
+	/** The stream's codec as WebCodecs names it (`vp09.PP.LL.DD`: VP9's profile, level and
+	 * bit depth, as the daemon configured its encoder). */
+	codec: string;
 	files: FilesConfig;
 	/** Dynamic resolution: desktop pixels per CSS pixel of the viewer's window. */
 	resize?: { scale: number };
 }
 
-/** How the relay reaches the server for video and audio (its lanes description):
- * datagrams, streams on one connection, or a connection a stream. */
-export type LanesKind = 'datagram' | 'streams' | 'connections';
-
 /** JSON text messages from the relay: src/hub.rs's `ServerMessage` as the server sends
- * them, the lanes the session has, and the session's end with its cause. */
+ * them, and the session's end with its cause. */
 export type ServerMessage =
 	| Hello
 	| { t: 'clip'; d: string }
 	| { t: 'mic'; on: boolean }
-	| { t: 'lanes'; kind: LanesKind }
+	/** The session's lane: datagrams (a keyframe may miss) or a stream (every frame comes). */
+	| { t: 'lane'; kind: 'datagram' | 'stream' }
 	| { t: 'close'; why: string };
 
 /** What a key did. */
@@ -70,29 +70,35 @@ export const cmd = {
 	mic: (on: boolean) => `mi,${on ? 1 : 0}`,
 	/** Ask for a desktop of this size (dynamic resolution). */
 	resize: (w: number, h: number) => `sz,${w},${h}`,
-	keyframe: 'kf',
 } as const;
 
 /** The header of a video message: the relay's type byte, then the 9 bytes src/video.rs's
- * `Header` writes (flags, frame, pipe). Checked against video-header.json, as the
+ * `Header` writes (flags, frame, pipe), before the VP9 frame. Checked against video-header.json, as the
  * server's reader is: `node web/src/video-header.test.ts`. */
 export interface VideoHeader {
 	key: boolean;
-	/** The update sharpens what it codes. */
-	sharpens: boolean;
 	frame: number;
 	/** Server-side pipeline time (capture to send), in 0.1 ms. */
 	pipe: number;
 }
 
-export function parseVideoHeader(b: Uint8Array): VideoHeader {
+/** The flags byte's one bit: the update is a keyframe. */
+const KEY = 1;
+
+/** A video message's header, or the flags byte it carries when that sets a bit other than
+ * the keyframe's: no such message is the relay's. */
+export type ReadHeader =
+	| { readonly ok: true; readonly header: VideoHeader }
+	| { readonly ok: false; readonly flags: number };
+
+export function parseVideoHeader(b: Uint8Array): ReadHeader {
+	const flags = b[1];
+	if ((flags & ~KEY) !== 0) return { ok: false, flags };
 	const u32 = (i: number) =>
 		((b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3]) >>> 0;
 	return {
-		key: (b[1] & 1) === 1,
-		sharpens: (b[1] & 2) === 2,
-		frame: u32(2),
-		pipe: u32(6),
+		ok: true,
+		header: { key: flags === KEY, frame: u32(2), pipe: u32(6) },
 	};
 }
 export const VIDEO_HEADER_BYTES = 10;
@@ -113,8 +119,8 @@ export const Count = {
 	DecodeUs: 3,
 	/** The server's capture to send of the updates arrived, in tenths of a ms. */
 	PipeTenths: 4,
-	/** Updates that came out of no decoder: not a running rate, the record's own total. */
-	Dropped: 5,
+	/** Deltas passed undecoded while a datagram lane's stream waited for its keyframe. */
+	Passed: 5,
 } as const;
 export const COUNTS = 6;
 
@@ -128,7 +134,8 @@ export interface Stats {
 	pipeMs: number | null;
 	/** What the decoder decodes; null while there is none (before a keyframe). */
 	codec: string | null;
-	dropped: number;
+	/** Deltas passed undecoded, waiting for a keyframe, since the last read. */
+	passed: number;
 }
 
 /** Worker -> page. Relay messages other than close are forwarded as is; the session's

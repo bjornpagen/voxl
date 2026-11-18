@@ -1,7 +1,7 @@
-// Owns the WebSocket to the relay, decodes H.264 with WebCodecs and hands each update to the
+// Owns the WebSocket to the relay, decodes VP9 with WebCodecs and hands each update to the
 // page the moment it is decoded, which presents it through <video>. A session that ends stays
 // ended until the page asks for another: nothing reconnects by itself.
-import { Frames } from './frames';
+import { Frames, type LaneKind } from './frames';
 import {
 	Bin,
 	cmd,
@@ -33,8 +33,6 @@ type Audio =
 const post = (m: FromWorker, transfer: Transferable[] = []) =>
 	self.postMessage(m, transfer);
 
-const hex2 = (x: number) => x.toString(16).padStart(2, '0');
-
 /** The decoder's timestamp of an update's picture: when the update arrived, in µs. */
 const micros = (ms: number) => Math.round(ms * 1000);
 
@@ -48,16 +46,17 @@ self.addEventListener('message', function first(e: MessageEvent<ToWorker>) {
 
 function start(init: Init) {
 	let session: Session = { s: 'none' };
+	/** The session's lane kind, as the relay said it before the stream's hello; none until
+	 * it says. */
+	let lane: LaneKind | null = null;
 	let audio: Audio = { s: 'off' };
 	let audioTs = 0;
 	let wantVideo = true;
 	const counts = init.counts;
 	/** What the decoder decodes, as the page was last told. */
 	let told: string | null = null;
-	/** After the record is told something: the page's count of dropped updates and its
-	 * codec follow it. */
+	/** After the record is told something: the page's codec follows it. */
 	function recorded() {
-		Atomics.store(counts, Count.Dropped, frames.dropped);
 		if (frames.codec !== told) {
 			told = frames.codec;
 			post({ t: 'codec', codec: told });
@@ -79,6 +78,7 @@ function start(init: Init) {
 
 	function connect() {
 		if (session.s === 'live') return;
+		lane = null;
 		const ws = new WebSocket(init.url);
 		const live: Session = { s: 'live', ws, ending: { s: 'unsaid' } };
 		session = live;
@@ -124,31 +124,34 @@ function start(init: Init) {
 			return end('the relay sent text that is not JSON');
 		}
 		if (m.t === 'close') return end(m.why);
+		if (m.t === 'lane') {
+			lane = m.kind;
+			return;
+		}
 		if (m.t === 'hello') {
-			frames.hello();
+			if (lane === null) return end('the relay sent a hello before its lane');
+			const codec = m.codec;
+			const stream = frames.hello(lane, codec);
 			recorded();
+			// Checked once a stream: a codec this browser cannot decode ends the session.
+			void (async () => {
+				let r: VideoDecoderSupport;
+				try {
+					r = await VideoDecoder.isConfigSupported({
+						codec,
+						optimizeForLatency: true,
+					});
+				} catch (e) {
+					return end(`the codec ${codec} could not be checked: ${e}`);
+				}
+				if (!r.supported) frames.unsupported(stream);
+			})();
 		}
 		post(m);
 	}
 
-	// The screen arrives as one H.264 stream; each update is shown as it is decoded.
+	// The screen arrives as one VP9 stream; each update is shown as it is decoded.
 	const frames = new Frames<VideoDecoder, VideoFrame, Uint8Array>({
-		/** avc1.PPCCLL from the first SPS in an Annex-B keyframe. */
-		codec(key) {
-			for (let i = 0; i + 4 < key.length; i++) {
-				if (
-					key[i] === 0 &&
-					key[i + 1] === 0 &&
-					key[i + 2] === 1 &&
-					(key[i + 3] & 0x1f) === 7
-				) {
-					return (
-						'avc1.' + hex2(key[i + 4]) + hex2(key[i + 5]) + hex2(key[i + 6])
-					);
-				}
-			}
-			throw new TypeError('a keyframe without an SPS');
-		},
 		open(codec) {
 			const dec = new VideoDecoder({
 				output: (frame) => {
@@ -179,11 +182,12 @@ function start(init: Init) {
 		close(dec) {
 			dec.close();
 		},
-		ask() {
-			send(cmd.keyframe);
+		passed() {
+			Atomics.add(counts, Count.Passed, 1);
 		},
-		log(why) {
+		end(why) {
 			post({ t: 'log', s: `video: ${why}` });
+			end(`the screen cannot be shown: ${why}`);
 		},
 		letGo(frame) {
 			frame.close();
@@ -200,7 +204,10 @@ function start(init: Init) {
 	});
 
 	function onVideo(b: Uint8Array) {
-		const h = parseVideoHeader(b);
+		const read = parseVideoHeader(b);
+		if (!read.ok)
+			return end(`the relay sent a video header with flags ${read.flags}`);
+		const h = read.header;
 		Atomics.add(counts, Count.Bytes, b.length);
 		Atomics.add(counts, Count.Updates, 1);
 		Atomics.add(counts, Count.PipeTenths, h.pipe);
