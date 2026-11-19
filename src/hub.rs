@@ -198,78 +198,177 @@ pub struct Resize {
     pub scale: f64,
 }
 
-/// What a viewer that is sent no video holds of the stream: the picture of a frame its lane
-/// carried, if every frame of the stream up to it went on that lane, in order.
+/// What a viewer holds of the stream while it is not in the chain: the picture of a frame
+/// its lane carried, if every frame of the stream up to it went on that lane, in order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Holds {
     /// Nothing it can go on from: it starts on a keyframe.
     Nothing,
-    /// The stream's frames from a keyframe through the one named here: if no frame was
-    /// coded since, it goes on from that one with the next delta.
+    /// The stream's frames from a keyframe through the one named here: if that is still the
+    /// stream's newest, it goes on from it with the next frame.
     Through(Version),
 }
 
 /// What a client is to the stream. Each change is a method of `Client`, named for the step
-/// that makes it.
+/// that makes it, and each method's rule is one of the pure functions below.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Viewer {
     /// It is sent no video, and holds what it holds.
     NotWatching(Holds),
-    /// It waits to start, and no keyframe has been planned for it: the capture loop plans
-    /// one once it has a lane to be sent it on.
-    Waiting,
-    /// A keyframe has been planned for it: it starts on that keyframe. One still `Waiting` is
-    /// not started by it, as it may have joined after the frame was planned, even after the
+    /// It watches, and is not in the chain: it has just joined or come back, it starts over,
+    /// or its gate was shut when a frame went on without it. What it holds says, at the
+    /// first capture its gate is open for, whether it goes on with that frame or starts on a
+    /// keyframe (`planned`).
+    Watching(Holds),
+    /// A keyframe has been planned for it: it starts on that keyframe. One `Watching` is not
+    /// started by it, as it may have joined after the frame was planned, even after the
     /// stream that coded it ended.
     Promised,
-    /// It is sent every frame from the keyframe it started on, through the one named here:
-    /// its lane carries each in order, so every frame it is sent refers to one it was sent
-    /// before.
+    /// It is in the chain: it is sent every frame from the one it went on from, through the
+    /// one named here, and its lane carries each in order, so every frame it is sent refers
+    /// to one it was sent before.
     Started { through: Version },
 }
 
 /// What starting over makes of a viewer (the stream is rebuilt, or a new lane carries it):
-/// one that watches waits to start on a keyframe, and one that does not holds nothing. A
-/// keyframe planned for it, and what it held, went with the old stream or lane.
+/// one that watches starts on a keyframe, and one that does not holds nothing. A keyframe
+/// planned for it, and what it held, went with the old stream or lane.
 pub(crate) fn restarted(viewer: Viewer) -> Viewer {
     match viewer {
         Viewer::NotWatching(_) => Viewer::NotWatching(Holds::Nothing),
-        Viewer::Waiting | Viewer::Promised | Viewer::Started { .. } => Viewer::Waiting,
+        Viewer::Watching(_) | Viewer::Promised | Viewer::Started { .. } => {
+            Viewer::Watching(Holds::Nothing)
+        }
     }
 }
 
-/// What stopping makes of a viewer (`v,0`): one started holds the frames it was sent; one
-/// waiting for its keyframe holds nothing.
+/// What stopping makes of a viewer (`v,0`): one in the chain holds the frames it was sent;
+/// one promised a keyframe holds nothing; one watching holds what it held.
 pub(crate) fn stopped(viewer: Viewer) -> Viewer {
     match viewer {
         Viewer::Started { through } => Viewer::NotWatching(Holds::Through(through)),
-        Viewer::NotWatching(holds) => Viewer::NotWatching(holds),
-        Viewer::Waiting | Viewer::Promised => Viewer::NotWatching(Holds::Nothing),
+        Viewer::NotWatching(holds) | Viewer::Watching(holds) => Viewer::NotWatching(holds),
+        Viewer::Promised => Viewer::NotWatching(Holds::Nothing),
     }
 }
 
-/// What watching makes of a viewer (`v,1`), the stream's newest frame `head`: one that holds
-/// that frame goes on from it with the next delta, and one that holds less, or nothing,
-/// waits for a keyframe; one already watching watches as it was.
-pub(crate) fn watching(viewer: Viewer, head: Option<Version>) -> Viewer {
-    match (viewer, head) {
-        (Viewer::NotWatching(Holds::Through(through)), Some(head)) if through == head => {
-            Viewer::Started { through }
-        }
-        (Viewer::NotWatching(Holds::Through(_) | Holds::Nothing), Some(_) | None) => {
-            Viewer::Waiting
-        }
-        (
-            viewer @ (Viewer::Waiting | Viewer::Promised | Viewer::Started { .. }),
-            Some(_) | None,
-        ) => viewer,
+/// What watching makes of a viewer (`v,1`): it watches, holding what it held, and the first
+/// capture its gate is open for says whether it goes on from that (`planned`); one already
+/// watching watches as it was.
+pub(crate) fn watching(viewer: Viewer) -> Viewer {
+    match viewer {
+        Viewer::NotWatching(holds) => Viewer::Watching(holds),
+        viewer @ (Viewer::Watching(_) | Viewer::Promised | Viewer::Started { .. }) => viewer,
     }
 }
 
-/// The newest frame of the stream: none before its first, and after a rebuild. A viewer
-/// that holds it resumes on the next delta (`watching`).
+/// What a capture let go is to one viewer of the look.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Part {
+    /// Its gate is open, and it holds the chain: it is sent the frame, a delta or a keyframe
+    /// alike.
+    Sent,
+    /// Its gate is open, and it holds less than the stream's newest frame, or nothing: it is
+    /// promised the frame, which is then a keyframe.
+    Starts,
+    /// Its gate is shut, or it no longer watches: the frame goes on without it. One that was
+    /// in the chain is in it no longer, and holds what it held: once the frame is named, the
+    /// stream's newest is one it was not sent, so it starts on a keyframe when its gate opens.
+    Skipped,
+}
+
+/// What a capture let go makes of a viewer, its gate `gate` as one look saw it, on the chain
+/// whose newest frame is `head`: its part in the frame, and what it is after. The one rule of
+/// who is sent a frame, and it reads this viewer alone: no viewer's gate decides another's
+/// part, and none that is shut is ever sent a frame.
+///
+/// A keyframe is a frame of the chain, which one encoder codes, so a viewer that holds the
+/// chain is sent it as any other: passed by, it would leave the chain, and need a keyframe of
+/// its own, which is the frame it was not sent.
+pub(crate) fn planned(viewer: Viewer, gate: Gate, head: Option<Version>) -> (Part, Viewer) {
+    match (viewer, gate) {
+        (viewer @ (Viewer::Started { .. } | Viewer::Promised), Gate::Open) => (Part::Sent, viewer),
+        (Viewer::Watching(Holds::Through(through)), Gate::Open) if Some(through) == head => {
+            (Part::Sent, Viewer::Started { through })
+        }
+        (Viewer::Watching(Holds::Through(_) | Holds::Nothing), Gate::Open) => {
+            (Part::Starts, Viewer::Promised)
+        }
+        (Viewer::Started { through }, Gate::Full | Gate::Late) => {
+            (Part::Skipped, Viewer::Watching(Holds::Through(through)))
+        }
+        (Viewer::Promised, Gate::Full | Gate::Late) => {
+            (Part::Skipped, Viewer::Watching(Holds::Nothing))
+        }
+        (viewer @ Viewer::Watching(_), Gate::Full | Gate::Late)
+        | (viewer @ Viewer::NotWatching(_), Gate::Open | Gate::Full | Gate::Late) => {
+            (Part::Skipped, viewer)
+        }
+    }
+}
+
+/// Whom a capture now would be for, as one look at the watching viewers saw them: the most
+/// any one of them asks for (`planned`). One whose gate is shut asks for nothing, and so
+/// holds nobody back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Audience {
+    /// No watching viewer's gate is open: a capture now would go to nobody.
+    Nobody,
+    /// A viewer whose gate is open holds the chain, and none starts: a capture is a delta,
+    /// if anything moved.
+    Chain,
+    /// A viewer whose gate is open starts: a capture is a keyframe, whether anything moved
+    /// or not.
+    Starting,
+}
+
+impl Audience {
+    /// What the look `seen` asks of a capture, on the chain whose newest frame is `head`.
+    pub fn of(seen: impl IntoIterator<Item = Seen>, head: Option<Version>) -> Audience {
+        seen.into_iter()
+            .map(|s| match planned(s.viewer, s.gate, head).0 {
+                Part::Skipped => Audience::Nobody,
+                Part::Sent => Audience::Chain,
+                Part::Starts => Audience::Starting,
+            })
+            .fold(Audience::Nobody, Audience::max)
+    }
+}
+
+/// The stream's frames as the capture loop plans them: the newest named, none before the
+/// first. One a stream: a rebuilt stream starts a chain of its own, as its viewers start
+/// over (`Hub::restart_clients`).
 #[derive(Default)]
-pub struct Head(Mutex<Option<Version>>);
+pub struct Chain {
+    head: Option<Version>,
+}
+
+impl Chain {
+    /// Whom a capture now would be for, from one look at the viewers (`Hub::look_into`).
+    pub fn audience(&self, seen: &[(Arc<Client>, Seen)]) -> Audience {
+        Audience::of(seen.iter().map(|(_, s)| *s), self.head)
+    }
+
+    /// A capture is let go: each viewer of the look takes its part in it (`Client::plan`),
+    /// its gate as the look saw it. The viewers it promised the frame, if any: it is then a
+    /// keyframe.
+    pub fn parts(&self, seen: &[(Arc<Client>, Seen)]) -> Option<Starts> {
+        let starts: Vec<Arc<Client>> = seen
+            .iter()
+            .filter(|(c, s)| c.plan(s.gate, self.head))
+            .map(|(c, _)| c.clone())
+            .collect();
+        (!starts.is_empty()).then_some(Starts(starts))
+    }
+
+    /// The frame planned is named, the next name (`Hub::next_version`), and is the chain's
+    /// newest: a viewer it went on without holds less from now on.
+    pub fn name(&mut self, hub: &Hub) -> Version {
+        let version = hub.next_version();
+        self.head = Some(version);
+        version
+    }
+}
 
 /// What a client is to the stream and its lane, under one lock, so that every change to
 /// them is one step, and every read of them one state.
@@ -287,20 +386,19 @@ pub struct Client {
     /// Its control stream's writer.
     control: mpsc::UnboundedSender<Out>,
     viewing: Mutex<Viewing>,
-    /// The stream's newest frame, the hub's: read under `viewing`'s lock when it watches.
-    head: Arc<Head>,
     watcher: Watcher,
 }
 
 /// What the capture loop sees of a watching client with a lane in one look at it: what it
-/// is to the stream, and whether its link lets a capture start.
+/// is to the stream, and whether its link takes a capture now. The gate is this viewer's
+/// alone: it decides this viewer's part in a capture and no other's (`planned`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Seen {
     pub viewer: Viewer,
     pub gate: Gate,
 }
 
-/// The viewers a keyframe starts: at least one, each promised it (`Hub::promise`). A
+/// The viewers a keyframe starts: at least one, each promised it (`Chain::parts`). A
 /// keyframe is coded only for them: nothing else makes one.
 pub struct Starts(Vec<Arc<Client>>);
 
@@ -335,7 +433,8 @@ impl Client {
     }
 
     /// What the capture loop sees of it now, if it watches and has a lane to be sent
-    /// frames on: one without a lane is sent nothing and holds nobody until it has one.
+    /// frames on: one without a lane is not looked at, and takes no part in a capture,
+    /// until it has one.
     ///
     /// Here and wherever its link is given a time, the clock is read under the session's
     /// lock, which is what keeps a link's events in time order (`session::link`).
@@ -344,7 +443,7 @@ impl Client {
         let gate = v.sender.gate(Instant::now())?;
         match v.viewer {
             Viewer::NotWatching(_) => None,
-            viewer @ (Viewer::Waiting | Viewer::Promised | Viewer::Started { .. }) => {
+            viewer @ (Viewer::Watching(_) | Viewer::Promised | Viewer::Started { .. }) => {
                 Some(Seen { viewer, gate })
             }
         }
@@ -362,7 +461,8 @@ impl Client {
         let viewer = match v.viewer {
             Viewer::NotWatching(Holds::Nothing) => "not_watching",
             Viewer::NotWatching(Holds::Through(_)) => "not_watching_holding",
-            Viewer::Waiting => "waiting",
+            Viewer::Watching(Holds::Nothing) => "watching",
+            Viewer::Watching(Holds::Through(_)) => "watching_holding",
             Viewer::Promised => "promised",
             Viewer::Started { .. } => "started",
         };
@@ -380,14 +480,11 @@ impl Client {
         self.viewing.lock().audio == Switch::On
     }
 
-    /// It starts watching (`v,1`): it goes on with the next delta if it holds the stream's
-    /// newest frame, else it waits for a keyframe (`watching`). The head is read under its
-    /// lock, which the encode loop takes to send it a frame after it moved the head on: so
-    /// a frame coded after this read is sent it, and one coded before it is in the head.
+    /// It starts watching (`v,1`), holding what it held (`watching`): the first capture its
+    /// gate is open for says whether it goes on from that or starts on a keyframe.
     pub fn watch(&self) {
         let mut v = self.viewing.lock();
-        let head = *self.head.0.lock();
-        v.viewer = watching(v.viewer, head);
+        v.viewer = watching(v.viewer);
     }
 
     /// It stops watching (`v,0`), holding what it was sent (`stopped`).
@@ -397,7 +494,7 @@ impl Client {
     }
 
     /// The stream starts over for it (it is rebuilt, or a display switch failed): if it
-    /// watches, it waits for a keyframe of what follows, which carries the new size. Under
+    /// watches, it starts on a keyframe of what follows, which carries the new size. Under
     /// the lock a keyframe is planned, sent and taken under, so one planned before is not
     /// sent it.
     pub fn start_over(&self) {
@@ -405,20 +502,14 @@ impl Client {
         v.viewer = restarted(v.viewer);
     }
 
-    /// The capture loop planned a keyframe: one waiting to start, with a way to be sent it
-    /// on, is promised it; one started takes it as any frame. Whether it was promised it.
-    pub fn promise(&self) -> bool {
+    /// A capture is let go on the chain whose newest frame is `head`, its gate `gate` as the
+    /// look saw it: it takes its part in the frame (`planned`), from what it is now, which
+    /// may have changed since the look. Whether it was promised the frame, a keyframe.
+    fn plan(&self, gate: Gate, head: Option<Version>) -> bool {
         let mut v = self.viewing.lock();
-        match (v.viewer, v.sender.sends()) {
-            (Viewer::Waiting, true) => {
-                v.viewer = Viewer::Promised;
-                true
-            }
-            (Viewer::Waiting, false)
-            | (Viewer::NotWatching(_) | Viewer::Promised | Viewer::Started { .. }, true | false) => {
-                false
-            }
-        }
+        let (part, after) = planned(v.viewer, gate, head);
+        v.viewer = after;
+        part == Part::Starts
     }
 
     /// The keyframe it was promised, named `version`, of the stream `configured`, is coded:
@@ -446,8 +537,8 @@ impl Client {
         }
     }
 
-    /// The encode loop has an update named `version` to send: a client that has started
-    /// takes it onto its lane, and holds it. Whether it took it.
+    /// The encode loop has an update named `version` to send: a client in the chain takes it
+    /// onto its lane, and holds it. Whether it took it.
     pub fn takes(&self, bytes: &Bytes, version: Version) -> bool {
         let mut v = self.viewing.lock();
         let Viewing { viewer, sender, .. } = &mut *v;
@@ -457,7 +548,7 @@ impl Client {
                 sender.video(bytes, Instant::now());
                 true
             }
-            Viewer::NotWatching(_) | Viewer::Waiting | Viewer::Promised => false,
+            Viewer::NotWatching(_) | Viewer::Watching(_) | Viewer::Promised => false,
         }
     }
 
@@ -559,7 +650,7 @@ pub struct Hub {
     /// thread waits on it while none wants any.
     audio_asked: parking_lot::Condvar,
     pub next_id: AtomicU64,
-    /// The frames coded since the daemon started: the next one's name.
+    /// The frames named since the daemon started: the next one's name.
     versions: AtomicU32,
     /// Last cursor message, replayed to new clients.
     pub cursor: Mutex<Option<Bytes>>,
@@ -573,8 +664,6 @@ pub struct Hub {
     pub resize_req: Mutex<Option<(u32, u32)>>,
     /// What every session is told first.
     hello: Hello,
-    /// The stream's newest frame, which every client reads when it watches.
-    head: Arc<Head>,
     pub stats: Stats,
     /// Screenshots asked for (`voxl screenshot`), answered by the capture thread with the
     /// screen as it is.
@@ -599,7 +688,6 @@ impl Hub {
             last_clipboard: Mutex::new(None),
             resize_req: Mutex::new(None),
             hello,
-            head: Arc::default(),
             stats: Stats::default(),
             snapshots: Mutex::new(Vec::new()),
             start: Instant::now(),
@@ -610,19 +698,12 @@ impl Hub {
         self.waker.signal();
     }
 
-    /// The name of the frame coded next: the capture's number, counted for the daemon, not
-    /// for a stream, so that a name is one frame's for as long as a viewer may hold it (a
-    /// stream rebuilt for a new size starts no count again). It wraps after 2^32 frames,
-    /// 828 days of them at 60 a second.
-    pub fn next_version(&self) -> Version {
+    /// The name of the frame planned next (`Chain::name`): the capture's number, counted
+    /// for the daemon, not for a stream, so that a name is one frame's for as long as a
+    /// viewer may hold it (a stream rebuilt for a new size starts no count again). It wraps
+    /// after 2^32 frames, 828 days of them at 60 a second.
+    fn next_version(&self) -> Version {
         Version(self.versions.fetch_add(1, Ordering::Relaxed))
-    }
-
-    /// The frame named `version` is coded, the stream's newest: set before any viewer is
-    /// sent it, so that one that watches after this is either sent it or waits for a
-    /// keyframe.
-    pub fn coded(&self, version: Version) {
-        *self.head.0.lock() = Some(version);
     }
 
     pub fn drain_wake(&self) {
@@ -650,7 +731,6 @@ impl Hub {
                 audio: Switch::Off,
                 sender,
             }),
-            head: self.head.clone(),
             watcher,
         });
         self.clients.lock().push(c.clone());
@@ -708,16 +788,6 @@ impl Hub {
         }
     }
 
-    /// A keyframe is planned: the viewers of `seen` it starts (`Client::promise`), if any.
-    pub fn promise(&self, seen: &[(Arc<Client>, Seen)]) -> Option<Starts> {
-        let starts: Vec<Arc<Client>> = seen
-            .iter()
-            .filter(|(c, _)| c.promise())
-            .map(|(c, _)| c.clone())
-            .collect();
-        (!starts.is_empty()).then_some(Starts(starts))
-    }
-
     /// Every client, into `into` in place of what it held: the encode loop's, which keeps
     /// one vector.
     pub fn clients_into(&self, into: &mut Vec<Arc<Client>>) {
@@ -751,10 +821,9 @@ impl Hub {
         ServerMessage::Hello(self.hello.clone())
     }
 
-    /// After the stream restarts (new size): it has no frame yet, and every client starts
-    /// again on a keyframe of the new stream, which carries its size.
+    /// After the stream restarts (new size): its chain has no frame yet (a new `Chain`), and
+    /// every client starts again on a keyframe of the new stream, which carries its size.
     pub fn restart_clients(&self) {
-        *self.head.0.lock() = None;
         for c in self.clients.lock().iter() {
             c.start_over();
         }
@@ -810,7 +879,7 @@ pub(crate) mod tests {
     use crate::session::sender::Way;
     use crate::wire::Capability;
 
-    /// A step of the hub's, for one of two clients or for all.
+    /// A step of the hub's, for one client or for all.
     #[derive(Clone, Copy, Debug)]
     enum Step {
         /// `v,1`.
@@ -824,128 +893,231 @@ pub(crate) mod tests {
         Attach(usize),
         /// The lane's socket breaks.
         Lose(usize),
+        /// The session ends, and a new one joins in its place.
+        Leave(usize),
+        /// What the page's link says of its lane now. Each page's is its own, and any may stay
+        /// shut for good: a page gone, a stalled lane, a background tab.
+        Link(usize, Gate),
         /// `build` starts the stream over for every client (`restart_clients`), once the
-        /// stream before has sent what it held.
+        /// stream before has sent what it held, and the capture loop starts a new chain.
         Restart,
-        /// The capture loop reads the viewers and plans a keyframe if one waits to start, or
-        /// a frame that is not one; the encoder holds at most two.
+        /// The capture loop looks at the viewers and lets a capture go if one's gate is open,
+        /// with something moved: each viewer takes its part, and the frame is named. The
+        /// encoder holds at most two.
         Capture,
         /// The encode loop codes and sends the oldest frame it holds.
         Send,
     }
 
-    const STEPS: [Step; 13] = [
-        Step::Watch(0),
-        Step::Watch(1),
-        Step::StopWatching(0),
-        Step::StopWatching(1),
-        Step::StartOver(0),
-        Step::StartOver(1),
-        Step::Attach(0),
-        Step::Attach(1),
-        Step::Lose(0),
-        Step::Lose(1),
-        Step::Restart,
-        Step::Capture,
-        Step::Send,
-    ];
+    /// What a client of the model is: a page's session, or a recording, which watches from
+    /// its start and takes every frame at once.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Kind {
+        Page,
+        Recording,
+    }
 
-    /// A frame the encoder holds: a keyframe, with the clients its plan promised it to, or a
-    /// frame that is not one.
-    type Held = Option<[bool; 2]>;
+    /// The steps a model of clients `kinds` takes: each page's own, and the stream's.
+    fn steps(kinds: &[Kind]) -> Vec<Step> {
+        let mut steps = Vec::new();
+        for (i, kind) in kinds.iter().enumerate() {
+            match kind {
+                Kind::Page => steps.extend([
+                    Step::Watch(i),
+                    Step::StopWatching(i),
+                    Step::StartOver(i),
+                    Step::Attach(i),
+                    Step::Lose(i),
+                    Step::Leave(i),
+                    Step::Link(i, Gate::Open),
+                    Step::Link(i, Gate::Full),
+                    Step::Link(i, Gate::Late),
+                ]),
+                Kind::Recording => {}
+            }
+        }
+        steps.extend([Step::Restart, Step::Capture, Step::Send]);
+        steps
+    }
 
-    /// What a client's lane is, as the model keeps it.
+    /// What a client's way out is, as the model keeps it.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     enum Lane {
         None,
         Live,
         /// Its socket broke; none has attached since.
         Lost,
+        Recording,
     }
 
-    /// What a client's page decodes from: the frame its decoder showed last, of the stream
-    /// as it is, if its live lane brought every frame up to it. The oracle the hub is held
-    /// to: a page is never sent a delta that does not follow the frame it showed.
+    /// What a client's page decodes from (a recording's file, for a recording): the frame its
+    /// decoder showed last, of the stream as it is, if its way out brought every frame up to
+    /// it. The oracle the hub is held to: a page is never sent a delta that does not follow
+    /// the frame it showed.
     type Page = Option<Version>;
 
-    /// Two clients (what each is to the stream, its lane, its page), the frames the encoder
-    /// holds, oldest first, the stream's newest frame, and the next frame's name.
+    /// A client as the model keeps it: what it is to the stream, its way out, its page, and
+    /// what its link says (a recording's is always open).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    struct Seat {
+        viewer: Viewer,
+        lane: Lane,
+        page: Page,
+        gate: Gate,
+    }
+
+    impl Seat {
+        /// A client as it joins.
+        fn joined(kind: Kind) -> Seat {
+            let (viewer, lane) = match kind {
+                Kind::Page => (Viewer::NotWatching(Holds::Nothing), Lane::None),
+                Kind::Recording => (Viewer::Watching(Holds::Nothing), Lane::Recording),
+            };
+            Seat {
+                viewer,
+                lane,
+                page: None,
+                gate: Gate::Open,
+            }
+        }
+
+        /// Whether the capture loop's look sees it: it watches, with a way to be sent on.
+        fn seen(&self) -> bool {
+            let watches = !matches!(self.viewer, Viewer::NotWatching(_));
+            watches && matches!(self.lane, Lane::Live | Lane::Recording)
+        }
+    }
+
+    /// A frame the encoder holds: its name, the clients its plan promised it to if it is a
+    /// keyframe, and the clients seen with their gates open when it was planned.
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+    struct Held {
+        version: Version,
+        key: Option<Vec<bool>>,
+        open: Vec<bool>,
+    }
+
+    /// The clients, the frames the encoder holds, oldest first, the chain's newest frame as
+    /// planned, the stream's newest frame coded, and the next frame's name.
     #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     struct Model {
-        c: [(Viewer, Lane, Page); 2],
+        c: Vec<Seat>,
         held: Vec<Held>,
         head: Option<Version>,
+        coded: Option<Version>,
         next: u32,
     }
 
-    /// The rule, step by step, as each value and method says it: what each step makes of
-    /// the model, whether it planned a keyframe, and who was sent the frame.
-    fn rule(before: &Model, step: Step) -> (bool, Vec<usize>, Model) {
-        use Viewer::{Promised, Started, Waiting};
+    impl Model {
+        fn new(kinds: &[Kind]) -> Model {
+            Model {
+                c: kinds.iter().map(|&k| Seat::joined(k)).collect(),
+                held: Vec::new(),
+                head: None,
+                coded: None,
+                next: 0,
+            }
+        }
+    }
+
+    /// The rule, step by step, written from what each step means and not from the hub's
+    /// functions (but for `v,1`, `v,0` and starting over, whose rules are the hub's pure
+    /// ones): what each step makes of the model, and whom the frame was sent.
+    fn rule(before: &Model, step: Step) -> (Vec<usize>, Model) {
         let mut m = before.clone();
-        let head = m.head;
-        let c = &mut m.c;
-        let (mut planned, mut sent) = (false, vec![]);
+        let mut sent = Vec::new();
         match step {
-            Step::Watch(i) => c[i].0 = watching(c[i].0, head),
-            Step::StopWatching(i) => c[i].0 = stopped(c[i].0),
+            Step::Watch(i) => m.c[i].viewer = watching(m.c[i].viewer),
+            Step::StopWatching(i) => m.c[i].viewer = stopped(m.c[i].viewer),
             // The page starts over: its decoder too.
-            Step::StartOver(i) => c[i] = (restarted(c[i].0), c[i].1, None),
+            Step::StartOver(i) => (m.c[i].viewer, m.c[i].page) = (restarted(m.c[i].viewer), None),
             // A new lane starts its viewer over: what the lane before took may be lost.
-            Step::Attach(i) => c[i] = (restarted(c[i].0), Lane::Live, None),
-            Step::Lose(i) => c[i] = (c[i].0, Lane::Lost, None),
+            Step::Attach(i) => {
+                let c = &mut m.c[i];
+                (c.viewer, c.lane, c.page) = (restarted(c.viewer), Lane::Live, None);
+            }
+            Step::Lose(i) => (m.c[i].lane, m.c[i].page) = (Lane::Lost, None),
+            Step::Leave(i) => m.c[i] = Seat::joined(Kind::Page),
+            Step::Link(i, gate) => m.c[i].gate = gate,
             Step::Restart => {
-                for c in c.iter_mut() {
-                    *c = (restarted(c.0), c.1, None);
+                for c in m.c.iter_mut() {
+                    (c.viewer, c.page) = (restarted(c.viewer), None);
                 }
                 m.held.clear();
-                m.head = None;
+                (m.head, m.coded) = (None, None);
             }
-            // A keyframe is planned when one waiting to start has a live lane: it is promised
-            // to those.
+            // A capture goes when the gate of a viewer seen is open, whatever the others'. Each
+            // one seen whose gate is open is in the frame: one in the chain, or that holds the
+            // chain's newest, is sent it; any other is promised it, a keyframe. Each one seen
+            // whose gate is shut is passed by: it leaves the chain, holding what it held.
             Step::Capture => {
-                let starts = c.map(|c| (c.0, c.1) == (Waiting, Lane::Live));
-                planned = starts.contains(&true);
-                for (i, c) in c.iter_mut().enumerate() {
-                    if starts[i] {
-                        c.0 = Promised;
+                let open: Vec<bool> =
+                    m.c.iter()
+                        .map(|c| c.seen() && c.gate == Gate::Open)
+                        .collect();
+                if open.contains(&true) {
+                    let mut key = vec![false; m.c.len()];
+                    for (i, c) in m.c.iter_mut().enumerate() {
+                        if !c.seen() {
+                            continue;
+                        }
+                        c.viewer = match (c.viewer, open[i]) {
+                            (Viewer::Watching(Holds::Through(t)), true) if Some(t) == m.head => {
+                                Viewer::Started { through: t }
+                            }
+                            (Viewer::Watching(_), true) => {
+                                key[i] = true;
+                                Viewer::Promised
+                            }
+                            (Viewer::Started { through }, false) => {
+                                Viewer::Watching(Holds::Through(through))
+                            }
+                            (Viewer::Promised, false) => Viewer::Watching(Holds::Nothing),
+                            (v @ (Viewer::Started { .. } | Viewer::Promised), true)
+                            | (v @ (Viewer::Watching(_) | Viewer::NotWatching(_)), false)
+                            | (v @ Viewer::NotWatching(_), true) => v,
+                        };
                     }
+                    let version = Version(m.next);
+                    m.next += 1;
+                    m.head = Some(version);
+                    let key = key.contains(&true).then_some(key);
+                    m.held.push(Held { version, key, open });
                 }
-                m.held.push(planned.then_some(starts));
             }
             Step::Send => {
-                let version = Version(m.next);
-                m.next += 1;
-                m.head = Some(version);
-                let starts = m.held.remove(0);
-                for (i, c) in c.iter_mut().enumerate() {
-                    if starts.is_some_and(|s| s[i]) && c.0 == Promised {
-                        c.0 = Started { through: version };
+                let Held { version, key, .. } = m.held.remove(0);
+                for (i, c) in m.c.iter_mut().enumerate() {
+                    if key.as_ref().is_some_and(|k| k[i]) && c.viewer == Viewer::Promised {
+                        c.viewer = Viewer::Started { through: version };
                     }
-                    if let Started { through } = &mut c.0 {
+                    if let Viewer::Started { through } = &mut c.viewer {
                         *through = version;
                         sent.push(i);
-                        if c.1 == Lane::Live {
-                            c.2 = Some(version);
+                        if matches!(c.lane, Lane::Live | Lane::Recording) {
+                            c.page = Some(version);
                         }
                     }
                 }
+                m.coded = Some(version);
             }
         }
-        (planned, sent, m)
+        (sent, m)
     }
 
     /// Whether the hub takes `step` in this state: the encoder holds two frames at most and
-    /// sends only what it holds; only a live lane breaks.
+    /// sends only what it holds; only a live lane breaks; a link says something new.
     fn applies(m: &Model, step: Step) -> bool {
         match step {
             Step::Capture => m.held.len() < 2,
             Step::Send => !m.held.is_empty(),
-            Step::Lose(i) => m.c[i].1 == Lane::Live,
+            Step::Lose(i) => m.c[i].lane == Lane::Live,
+            Step::Link(i, gate) => m.c[i].gate != gate,
             Step::Watch(_)
             | Step::StopWatching(_)
             | Step::StartOver(_)
             | Step::Attach(_)
+            | Step::Leave(_)
             | Step::Restart => true,
         }
     }
@@ -955,26 +1127,37 @@ pub(crate) mod tests {
         c.attach().expect("an open session takes a lane")
     }
 
-    /// Two real clients of `hub` set to `m`, each with the writer of the lane it was last
-    /// given, if any; the hub's head is `m`'s.
-    fn clients(hub: &Hub, m: &Model) -> Vec<(Arc<Client>, Option<Writer>)> {
-        hub.clients.lock().clear();
-        *hub.head.0.lock() = m.head;
-        m.c.iter()
-            .map(|&(viewer, lane, _)| {
+    /// A real client of `hub` as `seat` says: a page with the writer of the lane it was last
+    /// given, if any, or a recording.
+    fn client(hub: &Hub, seat: &Seat) -> (Arc<Client>, Option<Writer>) {
+        let (c, writer) = match seat.lane {
+            Lane::Recording => {
+                let (to, _) = mpsc::unbounded_channel();
+                let (starts, _) = mpsc::unbounded_channel();
+                (hub.add_recorder(to, starts), None)
+            }
+            lane @ (Lane::None | Lane::Live | Lane::Lost) => {
                 let (tx, _rx) = mpsc::unbounded_channel();
                 let c = hub.add_client(tx, Sender::new(Capability::mint().unwrap()));
                 let writer = match lane {
                     Lane::None => None,
-                    Lane::Live | Lane::Lost => Some(attach(&c)),
+                    Lane::Live | Lane::Lost | Lane::Recording => Some(attach(&c)),
                 };
                 if let (Lane::Lost, Some(w)) = (lane, &writer) {
                     c.lane(|s| s.lost(w));
                 }
-                c.viewing.lock().viewer = viewer;
                 (c, writer)
-            })
-            .collect()
+            }
+        };
+        c.viewing.lock().viewer = seat.viewer;
+        (c, writer)
+    }
+
+    /// The real clients of `hub` set to `m`; the hub names the next frame as `m` does.
+    fn clients(hub: &Hub, m: &Model) -> Vec<(Arc<Client>, Option<Writer>)> {
+        hub.clients.lock().clear();
+        hub.versions.store(m.next, Ordering::Relaxed);
+        m.c.iter().map(|seat| client(hub, seat)).collect()
     }
 
     /// A stream's configuration, as a keyframe's viewers are told it.
@@ -983,72 +1166,140 @@ pub(crate) mod tests {
         Arc::new(crate::av1::tests::configuration(&mut rng))
     }
 
-    /// The same step, by the methods, on two real clients of `hub` set to `m`, the encode
-    /// loop's part as it does it (`video::encode_frames`): what it planned, whom it sent the
-    /// frame, and the model after it as the clients are. Each page is the model's: what the
-    /// clients were sent moves it, and a delta sent a live lane must follow what it showed.
+    /// What the oracles counted over a run.
+    #[derive(Default)]
+    struct Count {
+        steps: usize,
+        /// Viewers that came back holding the chain's newest frame and went on with it.
+        resumed: usize,
+        /// Viewers in the chain a frame went on without.
+        passed: usize,
+        /// Frames planned while a viewer seen had its gate shut.
+        despite: usize,
+    }
+
+    /// The same step, by the methods, on real clients of `hub` set to `m`, the capture loop's
+    /// part through a `Chain` as it does it, the encode loop's as it does it
+    /// (`video::encode_frames`): whom it sent the frame, and the model after it as the clients
+    /// are. The oracles, held to every step:
+    /// - a capture goes exactly when a viewer seen has its gate open, whatever the others'
+    ///   gates: no viewer holds another back;
+    /// - after it, every viewer seen whose gate is open is in the frame, and none whose gate
+    ///   is shut is;
+    /// - a keyframe goes only to a viewer whose page does not show the chain's newest frame;
+    /// - a frame is sent only to a viewer whose gate was open when it was planned;
+    /// - a page is never sent a delta that does not follow the frame it showed;
+    /// - a recording is sent every frame.
     fn new_step(
         hub: &Hub,
         stream: &Arc<crate::av1::Configuration>,
         m: &Model,
         step: Step,
-    ) -> (bool, Vec<usize>, Model) {
+        count: &mut Count,
+    ) -> (Vec<usize>, Model) {
         let mut c = clients(hub, m);
         let mut after = m.clone();
-        let (mut planned, mut sent) = (false, vec![]);
+        let mut sent = Vec::new();
+        let n = m.c.len();
+        let what = format!("{step:?} from {m:?}");
         match step {
             Step::Watch(i) => c[i].0.watch(),
             Step::StopWatching(i) => c[i].0.stop_watching(),
             Step::StartOver(i) => {
                 c[i].0.start_over();
-                after.c[i].2 = None;
+                after.c[i].page = None;
             }
             Step::Attach(i) => {
                 c[i].1 = Some(attach(&c[i].0));
-                after.c[i].2 = None;
+                after.c[i].page = None;
             }
             Step::Lose(i) => {
                 if let Some(w) = &c[i].1 {
                     c[i].0.lane(|s| s.lost(w));
                 }
-                after.c[i].2 = None;
+                after.c[i].page = None;
             }
+            Step::Leave(i) => {
+                hub.remove_client(c[i].0.id);
+                assert!(
+                    hub.clients.lock().iter().all(|x| x.id != c[i].0.id),
+                    "{what}"
+                );
+                c[i] = client(hub, &Seat::joined(Kind::Page));
+                // A new session's link has nothing on the way.
+                (after.c[i].page, after.c[i].gate) = (None, Gate::Open);
+            }
+            Step::Link(i, gate) => after.c[i].gate = gate,
+            // The capture loop of the rebuilt stream starts a chain of its own.
             Step::Restart => {
                 hub.restart_clients();
                 after.held.clear();
-                after.c.iter_mut().for_each(|c| c.2 = None);
+                after.c.iter_mut().for_each(|c| c.page = None);
+                (after.head, after.coded) = (Chain::default().head, None);
             }
             Step::Capture => {
                 let mut seen = Vec::new();
                 hub.look_into(&mut seen);
-                planned = seen.iter().any(|(_, v)| v.viewer == Viewer::Waiting);
-                let starts = match planned {
-                    true => hub.promise(&seen),
-                    false => None,
-                };
-                let promised = |id| {
-                    starts
-                        .as_ref()
-                        .is_some_and(|s| s.0.iter().any(|c| c.id == id))
-                };
-                let promised = [0, 1].map(|i| promised(c[i].0.id));
-                // A keyframe goes only to a viewer that missed frames or has none.
-                for i in 0..2 {
-                    assert!(
-                        !promised[i] || m.head.is_none() || m.c[i].2 != m.head,
-                        "{step:?} from {m:?}: a keyframe for a page that shows the head"
-                    );
+                let at = |id: u64| c.iter().position(|(x, _)| x.id == id).unwrap();
+                // Each page's gate is what the model's link says; a recording's is its own.
+                for (x, s) in seen.iter_mut() {
+                    match m.c[at(x.id)].lane {
+                        Lane::Recording => assert_eq!(s.gate, Gate::Open, "{what}"),
+                        Lane::None | Lane::Live | Lane::Lost => s.gate = m.c[at(x.id)].gate,
+                    }
                 }
-                after.held.push(planned.then_some(promised));
+                let mut open = vec![false; n];
+                let mut shut = vec![false; n];
+                for (x, s) in &seen {
+                    match s.gate {
+                        Gate::Open => open[at(x.id)] = true,
+                        Gate::Full | Gate::Late => shut[at(x.id)] = true,
+                    }
+                }
+                let mut chain = Chain { head: m.head };
+                let audience = chain.audience(&seen);
+                assert_eq!(audience != Audience::Nobody, open.contains(&true), "{what}");
+                if audience != Audience::Nobody {
+                    count.despite += usize::from(shut.contains(&true));
+                    let starts = chain.parts(&seen);
+                    let key = starts.map(|s| {
+                        (0..n)
+                            .map(|i| s.0.iter().any(|x| x.id == c[i].0.id))
+                            .collect::<Vec<bool>>()
+                    });
+                    assert_eq!(key.is_some(), audience == Audience::Starting, "{what}");
+                    for i in 0..n {
+                        let viewer = c[i].0.viewer();
+                        let in_frame = matches!(viewer, Viewer::Started { .. } | Viewer::Promised);
+                        assert!(
+                            !open[i] || in_frame,
+                            "{what}: {i}, open, is not in the frame"
+                        );
+                        assert!(!shut[i] || !in_frame, "{what}: {i}, shut, is in the frame");
+                        let promised = key.as_ref().is_some_and(|k| k[i]);
+                        let shows = m.head.is_some() && m.c[i].page == m.head;
+                        assert!(
+                            !(promised && shows),
+                            "{what}: a keyframe for a page that shows the head"
+                        );
+                        let was = m.c[i].viewer;
+                        if let (Viewer::Watching(_), Viewer::Started { .. }) = (was, viewer) {
+                            count.resumed += 1;
+                        }
+                        if let (Viewer::Started { .. }, Viewer::Watching(_)) = (was, viewer) {
+                            count.passed += 1;
+                        }
+                    }
+                    let version = chain.name(hub);
+                    after.held.push(Held { version, key, open });
+                }
+                after.head = chain.head;
             }
             Step::Send => {
-                let version = Version(after.next);
-                after.next += 1;
-                let key = after.held.remove(0);
-                hub.coded(version);
-                if let Some(starts) = key {
+                let Held { version, key, open } = after.held.remove(0);
+                if let Some(key) = &key {
                     for (i, (c, _)) in c.iter().enumerate() {
-                        if starts[i] {
+                        if key[i] {
                             c.started(version, stream);
                         }
                     }
@@ -1056,108 +1307,250 @@ pub(crate) mod tests {
                 for (i, (c, _)) in c.iter().enumerate() {
                     if c.takes(&Bytes::from_static(&[0; 16]), version) {
                         sent.push(i);
-                        if m.c[i].1 == Lane::Live {
-                            let page = &mut after.c[i].2;
-                            let follows = key.is_some() || *page == m.head;
-                            assert!(follows, "{step:?} from {m:?}: a delta {i} cannot decode");
+                        // A way out it has (one without a lane takes frames into nothing,
+                        // until a lane attaches and starts it over).
+                        if matches!(m.c[i].lane, Lane::Live | Lane::Recording) {
+                            assert!(open[i], "{what}: {i} is sent a frame its shut gate let by");
+                            let page = &mut after.c[i].page;
+                            let follows = key.is_some() || *page == m.coded;
+                            assert!(follows, "{what}: a delta {i} cannot decode");
                             *page = Some(version);
                         }
                     }
                 }
-                after.head = Some(version);
+                for (i, seat) in m.c.iter().enumerate() {
+                    if seat.lane == Lane::Recording {
+                        assert!(sent.contains(&i), "{what}: the recording missed a frame");
+                    }
+                }
+                after.coded = Some(version);
             }
         }
-        // What `voxl stats` says of each lane is what the capture loop was shown of it.
-        for i in 0..2 {
-            let way = c[i].0.lane(|s| s.stats(Instant::now()));
-            let lane = match (&c[i].1, way) {
+        // What `voxl stats` says of each way out is what the capture loop was shown of it.
+        for (i, (x, writer)) in c.iter().enumerate() {
+            let way = x.lane(|s| s.stats(Instant::now()));
+            let lane = match (writer, way) {
                 (None, Way::Unattached) => Lane::None,
+                (None, Way::Recording) => Lane::Recording,
                 (Some(_), Way::Lane(_)) => Lane::Live,
                 (Some(_), Way::Unattached) => Lane::Lost,
                 (None, way @ Way::Lane(_))
-                | (None | Some(_), way @ (Way::Recording | Way::Closed)) => {
-                    panic!("{step:?}: a session's way is {way:?}")
+                | (Some(_), way @ Way::Recording)
+                | (None | Some(_), way @ Way::Closed) => {
+                    panic!("{what}: a session's way is {way:?}")
                 }
             };
-            after.c[i].0 = c[i].0.viewer();
-            after.c[i].1 = lane;
+            after.c[i].viewer = x.viewer();
+            after.c[i].lane = lane;
         }
-        after.head = *hub.head.0.lock();
-        (planned, sent, after)
+        after.next = hub.versions.load(Ordering::Relaxed);
+        (sent, after)
     }
 
-    /// A viewer starts only on a keyframe promised it, a keyframe is promised only to a
-    /// viewer with a live lane to be sent it on whose page does not show the stream's newest
-    /// frame, a viewer is sent frames only once started, a page is never sent a delta that
-    /// does not follow the frame it showed, and a viewer that stopped watching and comes
-    /// back showing the newest frame goes on with the next delta, no keyframe. Over every
-    /// state two clients and the encoder reach in up to 9 of the hub's steps, breadth first,
-    /// every step from every state, run on a real hub's clients through the methods: each
-    /// step does what the rule says, and from every state, once the encoder has sent what it
-    /// holds, one capture and its frame leave every viewer watching with a live lane started.
+    /// One step through the methods, held to the rule: whom it sent the frame, and the model
+    /// after it.
+    fn checked(
+        hub: &Hub,
+        stream: &Arc<crate::av1::Configuration>,
+        m: &Model,
+        step: Step,
+        count: &mut Count,
+    ) -> (Vec<usize>, Model) {
+        count.steps += 1;
+        let got = new_step(hub, stream, m, step, count);
+        assert_eq!(got, rule(m, step), "{step:?} from {m:?}");
+        got
+    }
+
+    /// From `state`, once the encoder has sent what it holds, the pages of `stuck` have their
+    /// gates shut for good (late) and every other page's opens: one capture and its frame
+    /// leave every viewer seen whose gate is open in the chain, sent the frame, and those
+    /// stuck sent nothing. So a viewer that missed frames is back on a keyframe, and no
+    /// viewer whose gate stays shut holds anyone back.
+    fn unstuck(
+        hub: &Hub,
+        stream: &Arc<crate::av1::Configuration>,
+        state: &Model,
+        stuck: &[bool],
+        count: &mut Count,
+    ) {
+        let mut m = state.clone();
+        while !m.held.is_empty() {
+            m = checked(hub, stream, &m, Step::Send, count).1;
+        }
+        for (i, &stuck) in stuck.iter().enumerate() {
+            if m.c[i].lane != Lane::Recording {
+                let gate = [Gate::Open, Gate::Late][usize::from(stuck)];
+                m = checked(hub, stream, &m, Step::Link(i, gate), count).1;
+            }
+        }
+        m = checked(hub, stream, &m, Step::Capture, count).1;
+        let (sent, m) = match m.held.is_empty() {
+            true => (Vec::new(), m),
+            false => checked(hub, stream, &m, Step::Send, count),
+        };
+        for (i, seat) in m.c.iter().enumerate() {
+            match (seat.seen(), stuck[i]) {
+                (true, false) => {
+                    let on = matches!(seat.viewer, Viewer::Started { .. }) && sent.contains(&i);
+                    assert!(on, "{i} left unstarted from {state:?}: {m:?}");
+                }
+                (true, true) => {
+                    assert!(
+                        !sent.contains(&i),
+                        "{i}, stuck, sent a frame from {state:?}"
+                    )
+                }
+                (false, false | true) => {}
+            }
+        }
+    }
+
+    /// Every combination of stuck pages among `kinds`.
+    fn stuck_sets(kinds: &[Kind]) -> Vec<Vec<bool>> {
+        (0..1u32 << kinds.len())
+            .map(|set| {
+                let stuck = |i: usize| set >> i & 1 == 1 && kinds[i] == Kind::Page;
+                (0..kinds.len()).map(stuck).collect()
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// A viewer starts only on a keyframe promised it, or goes on from the chain's newest
+    /// frame it holds; a keyframe is promised only to a viewer with a live lane, its gate open,
+    /// whose page does not show the chain's newest; a viewer is sent frames only in the chain,
+    /// and only those planned while its gate was open; a page is never sent a delta that does
+    /// not follow the frame it showed; a recording is sent every frame; and a capture goes
+    /// whenever any viewer's gate is open, every viewer seen with its gate open in it,
+    /// whatever the others' gates. Over every state two pages and a recording, each page's
+    /// gate its own, and the encoder reach in up to 8 of the hub's steps, breadth first, every
+    /// step from every state, run on a real hub's clients through the methods: each step does
+    /// what the rule says, and from every state, with any of the pages stuck for good, once
+    /// the encoder has sent what it holds, one capture and its frame leave every other viewer
+    /// in the chain.
     #[test]
     fn a_viewer_starts_only_on_a_keyframe_promised_it() {
         let hub = Hub::new(hello()).unwrap();
         let stream = configured();
-        let start = Model {
-            c: [(Viewer::NotWatching(Holds::Nothing), Lane::None, None); 2],
-            held: vec![],
-            head: None,
-            next: 0,
-        };
+        let kinds = [Kind::Page, Kind::Page, Kind::Recording];
+        let steps = steps(&kinds);
+        let start = Model::new(&kinds);
         let mut seen = std::collections::HashSet::from([start.clone()]);
         let mut frontier = vec![start];
-        let (mut steps, mut resumed) = (0, 0);
-        for _depth in 0..9 {
+        let mut count = Count::default();
+        for _depth in 0..8 {
             let mut next = vec![];
             for before in frontier {
-                for step in STEPS {
+                for &step in &steps {
                     if !applies(&before, step) {
                         continue;
                     }
-                    steps += 1;
-                    let what = format!("{step:?} from {before:?}");
-                    let got = new_step(&hub, &stream, &before, step);
-                    assert_eq!(got, rule(&before, step), "{what}");
-                    // One that comes back showing the newest frame goes on from it.
-                    if let Step::Watch(i) = step {
-                        let (v, lane, page) = before.c[i];
-                        if let (Viewer::NotWatching(_), Lane::Live, Some(_)) = (v, lane, page) {
-                            let shows = page == before.head;
-                            let goes_on = matches!(got.2.c[i].0, Viewer::Started { .. });
-                            assert_eq!(goes_on, shows, "{what}");
-                            resumed += usize::from(goes_on);
-                        }
-                    }
-                    if seen.insert(got.2.clone()) {
-                        next.push(got.2);
+                    let got = checked(&hub, &stream, &before, step, &mut count).1;
+                    if seen.insert(got.clone()) {
+                        next.push(got);
                     }
                 }
             }
             frontier = next;
         }
+        let stuck = stuck_sets(&kinds);
         for state in &seen {
-            let mut m = state.clone();
-            while !m.held.is_empty() {
-                m = new_step(&hub, &stream, &m, Step::Send).2;
+            for stuck in &stuck {
+                unstuck(&hub, &stream, state, stuck, &mut Count::default());
             }
-            for step in [Step::Capture, Step::Send] {
-                m = new_step(&hub, &stream, &m, step).2;
-            }
-            assert!(
-                m.c.iter().all(|&(v, lane, _)| match lane {
-                    Lane::Live => matches!(v, Viewer::NotWatching(_) | Viewer::Started { .. }),
-                    Lane::None | Lane::Lost => v != Viewer::Promised,
-                }),
-                "left unstarted from {state:?}: {m:?}"
-            );
         }
         let reached: std::collections::HashSet<std::mem::Discriminant<Viewer>> = seen
             .iter()
-            .flat_map(|m| m.c.map(|c| std::mem::discriminant(&c.0)))
+            .flat_map(|m| m.c.iter().map(|c| std::mem::discriminant(&c.viewer)))
             .collect();
         assert_eq!(reached.len(), 4, "{reached:?}");
-        assert!(steps > 0 && resumed > 0, "{resumed} resumed on a delta");
+        let Count {
+            steps,
+            resumed,
+            passed,
+            despite,
+        } = count;
+        println!(
+            "{} states, {steps} steps, {resumed} resumed, {passed} passed by",
+            seen.len()
+        );
+        assert!(steps > 0 && resumed > 0 && passed > 0 && despite > 0);
+    }
+
+    /// No viewer holds another back: the oracles of each step and the rule, over generated
+    /// sequences of four pages and a recording, each page's gate its own (open, full, late,
+    /// and some never open again), with joins, leaves, `v,0` and `v,1`, lanes replaced and
+    /// lost, restarts, captures and sends; and at each sequence's end, with a generated set
+    /// of pages stuck for good, one capture and its frame leave every other viewer in the
+    /// chain.
+    #[test]
+    fn no_viewer_holds_another_back() {
+        let hub = Hub::new(hello()).unwrap();
+        let stream = configured();
+        let kinds = [
+            Kind::Page,
+            Kind::Page,
+            Kind::Page,
+            Kind::Page,
+            Kind::Recording,
+        ];
+        // Drawn so that sessions get going: a capture, a frame sent, a lane attached and a
+        // viewer watching come more often than what ends them.
+        let steps: Vec<Step> = steps(&kinds)
+            .into_iter()
+            .flat_map(|step| {
+                let weight = match step {
+                    Step::Capture | Step::Send => 24,
+                    Step::Watch(_) | Step::Attach(_) => 4,
+                    Step::Link(_, _) => 2,
+                    Step::StopWatching(_)
+                    | Step::StartOver(_)
+                    | Step::Lose(_)
+                    | Step::Leave(_)
+                    | Step::Restart => 1,
+                };
+                std::iter::repeat_n(step, weight)
+            })
+            .collect();
+        let stuck = stuck_sets(&kinds);
+        let mut rng = crate::xorshift::Xorshift::new(0x9b05_688c_2b3e_6c1f);
+        let mut count = Count::default();
+        for _ in 0..400 {
+            let mut m = Model::new(&kinds);
+            // Pages whose gates, once shut, never open again in this sequence.
+            let gone: Vec<bool> = (0..kinds.len()).map(|_| rng.below(4) == 0).collect();
+            for _ in 0..60 {
+                let step = steps[rng.below(steps.len() as u64) as usize];
+                let reopens = match step {
+                    Step::Link(i, Gate::Open) => !gone[i] || m.c[i].gate == Gate::Open,
+                    Step::Link(_, Gate::Full | Gate::Late)
+                    | Step::Watch(_)
+                    | Step::StopWatching(_)
+                    | Step::StartOver(_)
+                    | Step::Attach(_)
+                    | Step::Lose(_)
+                    | Step::Leave(_)
+                    | Step::Restart
+                    | Step::Capture
+                    | Step::Send => true,
+                };
+                if applies(&m, step) && reopens {
+                    m = checked(&hub, &stream, &m, step, &mut count).1;
+                }
+            }
+            let stuck = &stuck[rng.below(stuck.len() as u64) as usize];
+            unstuck(&hub, &stream, &m, stuck, &mut count);
+        }
+        let Count {
+            steps,
+            resumed,
+            passed,
+            despite,
+        } = count;
+        println!("{steps} steps, {resumed} resumed, {passed} passed by, {despite} despite");
+        assert!(passed > 100 && despite > 1000);
     }
 
     /// The tests' generator, drawing the hub's values.

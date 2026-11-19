@@ -8,11 +8,13 @@
 //! What was delivered is told on the control stream: the lane keeps what it was sent and
 //! has not been told taken (`link::Outstanding`), and the session keeps what the tooks have
 //! shown of the path (`estimate`). From those comes the gate (`link.rs`), which every frame
-//! passes: a capture starts only while it is open, and an Opus packet goes onto the lane only
-//! while it is open. When the path slows or stalls, captures are held and the newest screen
-//! goes next, and the sound is held too, but only the newest packets the page's player holds
-//! ([`PLAYER_PACKETS`]): what is older would be dropped by the page on arrival, behind it on
-//! the lane. Dropping beats lag, at the source.
+//! passes: a video frame goes onto the lane only if its gate was open when the frame's
+//! capture was planned, and an Opus packet only while it is open. The gate is this lane's
+//! alone: when its path slows or stalls, the frames planned meanwhile go on without it, and
+//! once it opens the screen as it then is goes next, on a keyframe (`hub::planned`); every
+//! other session's lane is sent its frames as before. The sound is held too, but only the
+//! newest packets the page's player holds ([`PLAYER_PACKETS`]): what is older would be
+//! dropped by the page on arrival, behind it on the lane. Dropping beats lag, at the source.
 //!
 //! A session has a lane or it has none: a lane whose socket breaks is the session's lane
 //! no longer, and what it held goes with it. The next lane the relay attaches starts its
@@ -262,17 +264,9 @@ impl Sender {
         self.state = State::Closed;
     }
 
-    /// Whether it has a way to be sent frames on: a lane, or a recording.
-    pub fn sends(&self) -> bool {
-        match &self.state {
-            State::Attached(..) | State::Recording(_) => true,
-            State::Unattached(_) | State::Closed => false,
-        }
-    }
-
-    /// Whether its way out lets a capture start at `now`. None if it has no way to be sent
-    /// frames on: it is sent nothing then, and holds nothing back. A recording is no link:
-    /// it takes every frame at once.
+    /// Whether its way out takes a capture at `now`: whether a capture planned now is sent
+    /// it, and goes for it. None if it has no way to be sent frames on: it takes no part in
+    /// a capture then. A recording is no link: it takes every frame at once.
     pub fn gate(&self, now: Instant) -> Option<Gate> {
         match &self.state {
             State::Attached(s, lane) => Some(s.estimate.gate(&lane.sent, now)),
@@ -321,8 +315,8 @@ impl Sender {
         }
     }
 
-    /// A video update, its header and its picture, at `now`, coded because the gate was open
-    /// when its capture started: onto the lane, counted until it is told taken, or to a
+    /// A video update, its header and its picture, at `now`, sent because the gate was open
+    /// when its capture was planned: onto the lane, counted until it is told taken, or to a
     /// recording as it is. A recording whose recorder has gone takes nothing: its viewer is
     /// removed with it.
     pub fn video(&mut self, bytes: &bytes::Bytes, now: Instant) {
@@ -444,7 +438,6 @@ impl Sender {
 
     /// Every frame its lane holds, taken off as its socket would and each told taken at
     /// `now`, as the page and its relay say it: the video updates among them, in order.
-    #[cfg(target_os = "linux")]
     pub(crate) fn delivered(&mut self, now: Instant) -> Vec<Vec<u8>> {
         let frames = self.frames();
         for (sequence, _, _) in &frames {

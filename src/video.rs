@@ -1,17 +1,22 @@
-//! Video pipeline: damage-driven capture -> I420 -> AV1 -> each session's lane, a capture
-//! held while a session's link says too much is on the way, or a frame late.
+//! Video pipeline: damage-driven capture -> I420 -> AV1 -> the lanes of the sessions whose
+//! links take it: a frame goes to each viewer whose gate is open, and a capture waits while
+//! no viewer's is.
 //!
 //! One stream codes the screen for every viewer, from its shape's first watcher until the
 //! screen changes shape. It starts with a keyframe for the viewers it starts, and codes
-//! every later frame from the frames before it, which every viewer's lane carried in order;
-//! a keyframe is coded only for a viewer starting (`hub::Starts`). While nobody watches,
-//! nothing is captured and the encoder waits as it was: a viewer that comes back holding
-//! the stream's newest frame goes on with the next delta (`hub::Holds`). Kept so, libaom
+//! every later frame from the frames before it, the chain (`hub::Chain`), which the lane of
+//! every viewer in it carried in order; a keyframe is coded only for a viewer starting
+//! (`hub::Starts`). Each viewer's gate is its own (`hub::planned`): one whose gate is shut
+//! when a frame goes is passed by, leaves the chain, and starts on a keyframe once its gate
+//! opens, so no viewer holds another back. While nobody watches, nothing is captured and the
+//! encoder waits as it was: a viewer that comes back holding the stream's newest frame goes
+//! on with the next delta (`hub::Holds`). Kept so, libaom
 //! holds 202 MB resident for a 3024x1898 stream on 8 threads and 289 MB for 3840x2400 on
 //! 16 tile columns, after a minute of scrolling (libaom 3.15.1 configured as `av1::Encoder`
 //! configures it, on an M2 Max, 2026-11-19), against the daemon unit's 4 GB memory cap.
-//! Every frame is coded whole, at one quality: a slow or stalled path lowers the frame
-//! rate, through the gate (`session::link`), and the screen as it then is goes next.
+//! Every frame is coded whole, at one quality: a slow or stalled path lowers the frame rate
+//! of its own viewer, through its gate (`session::link`), and the screen as it then is goes
+//! next.
 
 use crate::av1;
 #[cfg(target_os = "linux")]
@@ -22,11 +27,10 @@ use crate::env::{Debugging, Marker};
 use crate::hub::wait_any;
 #[cfg(target_os = "linux")]
 use crate::hub::Waitable;
-use crate::hub::{Hub, Starts};
-use crate::hub::{Seen, Viewer};
+use crate::hub::{Audience, Hub, Starts};
 #[cfg(target_os = "linux")]
-use crate::session::link::Gate;
-use crate::wire::{Coding, Header, Pipe};
+use crate::hub::{Chain, Seen};
+use crate::wire::{Coding, Header, Pipe, Version};
 use bytes::{BufMut, BytesMut};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -83,6 +87,8 @@ struct Job {
     /// The picture: the encode loop's while it codes it, and the capture loop's again once
     /// it comes back.
     buf: Box<I420>,
+    /// Its name, given when it was planned (`hub::Chain::name`).
+    version: Version,
     frame: Plan<Starts>,
     /// When the screen first changed for it: its timestamp, and the start of its pipeline
     /// time (`Pipe`).
@@ -229,28 +235,6 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<(Capturer, av1::Stream), S
     Ok((cap, coded))
 }
 
-/// Whether the viewers' links let a capture start: open while every one's does.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Gated {
-    Open,
-    /// Held by a viewer whose link is full or late: only an update told taken, a lane
-    /// ending, or a viewer coming or going can open the gate, and each of those wakes the
-    /// hub.
-    Held,
-}
-
-impl Gated {
-    #[cfg(target_os = "linux")]
-    /// What the look at the viewers saw of their links: held by any that is not open. A
-    /// recording holds nothing.
-    fn of(seen: &[(Arc<crate::hub::Client>, Seen)]) -> Gated {
-        match seen.iter().all(|(_, v)| v.gate == Gate::Open) {
-            true => Gated::Open,
-            false => Gated::Held,
-        }
-    }
-}
-
 /// Captures may come this share of the frame interval apart, so that a source's jitter
 /// does not alias into dropped frames. Upstream's guess, unmeasured. It caps the capture
 /// rate at the frame rate over it (70.6 a second at 60): at 1, a frame that lands a
@@ -258,7 +242,7 @@ impl Gated {
 const MIN_INTERVAL_SHARE: f64 = 0.85;
 
 /// What the capture loop does next. A frame is coded only for a `Start` or a `Capture`:
-/// both come from `step` alone, which lets neither go while a viewer's link holds the gate.
+/// both come from `step` alone, which lets neither go while no viewer's gate is open.
 #[derive(Debug, PartialEq)]
 enum Step<S, B> {
     /// Wait, the encoder as it was.
@@ -281,9 +265,9 @@ enum Wait {
     /// The rest of the least interval since the last capture, or a wake: damage that comes
     /// meanwhile goes with the capture it holds back.
     Interval { rest: Duration },
-    /// The links: an update told taken, a lane ending, a viewer going (a wake), or damage
-    /// to take in. No time: a link opens only when it is told something, and with nothing
-    /// told nothing goes.
+    /// A viewer's gate to open: an update told taken, a lane attached or ending, a viewer
+    /// coming or going (a wake), or damage to take in. No time: a link opens only when it
+    /// is told something, and with nothing told nothing goes.
     Gate,
     /// A buffer back from the encoder, which wakes the waker as it hands it back; damage
     /// waits for the capture this leads to.
@@ -320,24 +304,6 @@ impl Wait {
             Wait::Interval { rest } => poll(On::Wake, Some(rest)),
             Wait::Gate => poll(On::Event, None),
             Wait::Buffer => poll(On::Wake, None),
-        }
-    }
-}
-
-/// Whether a viewer waits to start.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Key {
-    /// One does: the next capture is a keyframe, for every viewer it starts.
-    Wanted,
-    NotWanted,
-}
-
-impl Key {
-    /// What the look at the viewers saw: a keyframe is wanted if one waits to start.
-    fn of(seen: &[(Arc<crate::hub::Client>, Seen)]) -> Key {
-        match seen.iter().any(|(_, v)| v.viewer == Viewer::Waiting) {
-            true => Key::Wanted,
-            false => Key::NotWanted,
         }
     }
 }
@@ -410,14 +376,14 @@ enum Encoder<S, B> {
 /// What the capture loop knows when it looks, with somebody watching.
 #[derive(Clone, Copy)]
 struct Look {
-    key: Key,
+    /// Whom a capture now would be for (`hub::Audience`).
+    audience: Audience,
     damage: Damage,
     now: Instant,
     /// When the last capture went.
     captured: Instant,
     /// The least time between two captures.
     min_interval: Duration,
-    gate: Gated,
 }
 
 /// What the loop does next, from what it knows: the one place a capture is let go, the
@@ -425,37 +391,39 @@ struct Look {
 /// is home; a wait leaves the encoder as it was.
 fn step<S, B>(look: Look, encoder: Encoder<S, B>) -> Step<S, B> {
     let Look {
-        key,
+        audience,
         damage,
         now,
         captured,
         min_interval,
-        gate,
     } = look;
-    match (key, damage, &encoder) {
-        // Nobody waits to start, and nothing moved, or no stream runs to show it on (what
-        // moves meanwhile is in the whole screen the next stream starts with): nothing
-        // to capture.
-        (Key::NotWanted, Damage::None, Encoder::Stopped(_) | Encoder::Running(_))
-        | (Key::NotWanted, Damage::Unreported | Damage::Rows { .. }, Encoder::Stopped(_)) => {
+    match (audience, damage, &encoder) {
+        // No viewer's gate is open: a capture now would go to nobody, whatever moved. A
+        // viewer whose gate is shut is no reason to wait when another's is open: it is
+        // passed by (`hub::planned`).
+        (
+            Audience::Nobody,
+            Damage::None | Damage::Unreported | Damage::Rows { .. },
+            Encoder::Stopped(_) | Encoder::Running(_),
+        ) => return Step::Wait(Wait::Gate, encoder),
+        // Nobody starts, and nothing moved, or no stream runs to show it on (what moves
+        // meanwhile is in the whole screen the next stream starts with): nothing to capture.
+        (Audience::Chain, Damage::None, Encoder::Stopped(_) | Encoder::Running(_))
+        | (Audience::Chain, Damage::Unreported | Damage::Rows { .. }, Encoder::Stopped(_)) => {
             return Step::Wait(Wait::Change, encoder);
         }
         (
-            Key::Wanted,
+            Audience::Starting,
             Damage::None | Damage::Unreported | Damage::Rows { .. },
             Encoder::Stopped(_) | Encoder::Running(_),
         )
-        | (Key::NotWanted, Damage::Unreported | Damage::Rows { .. }, Encoder::Running(_)) => {}
+        | (Audience::Chain, Damage::Unreported | Damage::Rows { .. }, Encoder::Running(_)) => {}
     }
     // The loop reads `now` after the capture it stamped `captured`: on one thread, in order.
     let since = now - captured;
     if since < min_interval {
         let rest = min_interval - since;
         return Step::Wait(Wait::Interval { rest }, encoder);
-    }
-    // A capture goes once every viewer's link lets one.
-    if gate == Gated::Held {
-        return Step::Wait(Wait::Gate, encoder);
     }
     match encoder {
         Encoder::Stopped(with) => Step::Start(with),
@@ -470,12 +438,14 @@ fn step<S, B>(look: Look, encoder: Encoder<S, B>) -> Step<S, B> {
 /// What a capture is sent as, or why nothing is.
 enum Planned<S> {
     Send(Plan<S>),
-    /// The damage held no area after all, and no keyframe was promised.
+    /// The damage held no area after all, and no keyframe was promised: no frame is named,
+    /// and a viewer the capture would have gone on without holds the chain's newest still.
     Empty,
 }
 
 /// What a capture whose damage came to `band` is sent as: a keyframe for the viewers
-/// `starts` if a keyframe was wanted and promised to any; else what moved, if anything did.
+/// `starts` if it was promised to any (`hub::Chain::parts`); else what moved, if anything
+/// did.
 fn plan<S>(starts: Option<S>, band: Option<Band>) -> Planned<S> {
     match (starts, band) {
         (Some(s), Some(_) | None) => Planned::Send(Plan::Key(s)),
@@ -613,6 +583,8 @@ fn capture_loop(
     // round is. Every way out of the loop drops it, and with it waits for the encoder to send
     // what it holds.
     let mut stream: Option<(Stream, Buffer<Box<I420>>)> = None;
+    // The stream's frames as planned: a new stream's, as `build` started every viewer over.
+    let mut chain = Chain::default();
     // What the loop saw of each watching viewer when it last looked: kept, so that a look
     // allocates nothing once there is room for every viewer.
     let mut seen: Vec<(Arc<crate::hub::Client>, Seen)> = Vec::new();
@@ -663,9 +635,9 @@ fn capture_loop(
                 }
             }
         }
-        // One reading of the clock and one look at each viewer: the stream, the keyframe and
-        // whom it starts and the gate are all decided from them. The capture itself
-        // is stamped `t0` below, after any wait for a buffer.
+        // One reading of the clock and one look at each viewer: the stream, the keyframe,
+        // whom the capture is for and each viewer's part in it are all decided from them.
+        // The capture itself is stamped `t0` below, after any wait for a buffer.
         let now = Instant::now();
         hub.look_into(&mut seen);
         if seen.is_empty() {
@@ -676,18 +648,11 @@ fn capture_loop(
             continue;
         }
         let look = Look {
-            key: Key::of(&seen),
+            audience: chain.audience(&seen),
             damage: *cap.damage(),
             now,
             captured,
             min_interval,
-            gate: Gated::of(&seen),
-        };
-        // What the look promises its keyframe to, if it wants one: asked once a capture
-        // is let go.
-        let promise = || match look.key {
-            Key::Wanted => hub.promise(&seen),
-            Key::NotWanted => None,
         };
         // The one decision, for a stream to start as for one that runs: nothing below
         // captures but what `step` let go.
@@ -698,7 +663,7 @@ fn capture_loop(
                 // A viewer that has left since the look is promised nothing: with nobody
                 // to start, the next look sees who is there.
                 Step::Start(()) => {
-                    if let Some(starts) = promise() {
+                    if let Some(starts) = chain.parts(&seen) {
                         let (cw, ch) = cap.size();
                         cap.grab(cap.full())?;
                         // The whole screen is grabbed: it holds what was drawn while
@@ -711,6 +676,7 @@ fn capture_loop(
                         captured = t0;
                         let first = Job {
                             buf,
+                            version: chain.name(&hub),
                             frame: Plan::Key(starts),
                             damage: t0,
                             marker_ms: None,
@@ -754,9 +720,9 @@ fn capture_loop(
             );
         }
         let marker_ms = marker_reading(cap.bgrx(), probe);
-        // What this capture is sent as, decided once; with nothing to send, the buffer
-        // goes back home.
-        let frame = match plan(promise(), band) {
+        // Each viewer's part in this capture, and what it is sent as, decided once; with
+        // nothing to send, the buffer goes back home.
+        let frame = match plan(chain.parts(&seen), band) {
             Planned::Send(frame) => frame,
             Planned::Empty => {
                 *picture = Buffer::Home(buf);
@@ -779,6 +745,7 @@ fn capture_loop(
         if s.job_tx
             .send(Job {
                 buf,
+                version: chain.name(&hub),
                 frame,
                 damage: origin,
                 marker_ms,
@@ -958,7 +925,7 @@ fn encode_frames(
     // Kept from frame to frame, so a frame allocates nothing for it.
     let mut viewers = Vec::new();
     // A picture goes home only once its frame is on its viewers' lanes: the capture loop,
-    // woken by it, looks at the gate next, and the lanes must count that frame. A
+    // woken by it, looks at the gates next, and the lanes must count that frame. A
     // capture loop gone has no home to send it to, and ends this loop at its next job.
     let home = |buf: Box<I420>| {
         if ret.send(buf).is_ok() {
@@ -974,7 +941,7 @@ fn encode_frames(
             message: mut bytes,
         } = coded;
         let enc_us = t0.elapsed().as_micros() as u64;
-        let version = hub.next_version();
+        let version = job.version;
         let header = Header {
             coding,
             version,
@@ -987,9 +954,8 @@ fn encode_frames(
         hub.stats
             .bytes
             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        // The stream's newest frame, before anyone is sent it; the viewers a keyframe
-        // starts start on it, and are sent it.
-        hub.coded(version);
+        // The viewers a keyframe starts start on it, and are sent it, with every viewer in
+        // the chain: those the capture went on without left it when it was planned.
         if let Plan::Key(starts) = &job.frame {
             hub.stats.keyframes.fetch_add(1, Ordering::Relaxed);
             starts.started(version, &configured);
@@ -1093,6 +1059,7 @@ fn marker_age(ms: u32) -> Result<i64, std::time::SystemTimeError> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::hub::{Chain, Holds, Part, Seen, Viewer};
     use crate::session::estimate::tests::Link;
     use crate::session::link::tests::Simulated;
     use crate::session::link::{Gate, Path};
@@ -1121,22 +1088,24 @@ pub(crate) mod tests {
         av1::Stream::new(shape, std::num::NonZeroUsize::MIN).unwrap()
     }
 
-    /// The viewers of `hub` waiting to start, promised a keyframe, as the capture loop
-    /// promises them.
-    fn promised(hub: &Hub) -> Starts {
+    /// The viewers of `hub` waiting to start, promised a keyframe on `chain` as the capture
+    /// loop promises them, and the keyframe's name.
+    fn promised(hub: &Hub, chain: &mut Chain) -> (Starts, Version) {
         let mut seen = Vec::new();
         hub.look_into(&mut seen);
-        hub.promise(&seen).expect("a viewer waiting to start")
+        let starts = chain.parts(&seen).expect("a viewer waiting to start");
+        (starts, chain.name(hub))
     }
 
-    /// A job of `frame` on a picture of `w` x `h` whose luma is random.
-    fn job(w: u32, h: u32, frame: Plan<Starts>, rng: &mut Xorshift) -> Job {
+    /// A job of `frame`, named `version`, on a picture of `w` x `h` whose luma is random.
+    fn job(w: u32, h: u32, frame: Plan<Starts>, version: Version, rng: &mut Xorshift) -> Job {
         let mut buf = I420::new(w as usize, h as usize);
         for p in buf.y.iter_mut() {
             *p = rng.below(256) as u8;
         }
         Job {
             buf: Box::new(buf),
+            version,
             frame,
             damage: Instant::now(),
             marker_ms: None,
@@ -1192,13 +1161,18 @@ pub(crate) mod tests {
             while hub.clients.lock().len() < 2 {
                 tokio::task::yield_now().await;
             }
-            let first = job(w, h, Plan::Key(promised(&hub)), &mut rng);
+            let mut chain = Chain::default();
+            let (starts, version) = promised(&hub, &mut chain);
+            let first = job(w, h, Plan::Key(starts), version, &mut rng);
             let s = Stream::start(&hub, coded(w, h), first, Debugging::read(|_| None).unwrap())
                 .unwrap();
             s.ret_rx.recv().unwrap();
             let n = 1 + rng.below(20) as usize;
             for _ in 0..n {
-                s.job_tx.send(job(w, h, Plan::Motion, &mut rng)).unwrap();
+                let version = chain.name(&hub);
+                s.job_tx
+                    .send(job(w, h, Plan::Motion, version, &mut rng))
+                    .unwrap();
                 s.ret_rx.recv().unwrap();
             }
             drop(s);
@@ -1347,56 +1321,81 @@ pub(crate) mod tests {
     }
 
     /// Every viewer's lane carries the stream from the keyframe it starts on, through the
-    /// real encode loop, a replaced lane included: over generated runs, a viewer
-    /// watches from the start, a second joins partway, and a third's lane is replaced partway
-    /// (the relay reopened it) and again later; a keyframe is coded whenever one waits to
-    /// start, as the capture loop codes one. The first viewer's lane is the whole stream.
-    /// Each lane's updates begin with a keyframe and are a run of the whole stream's, in its
-    /// order, none left out: what a viewer is sent refers only to what it was sent before.
+    /// real encode loop, a replaced lane included, and a page that takes nothing holds no one
+    /// back: over generated runs, a viewer watches from the start, a second joins partway, a
+    /// third's lane is replaced partway (the relay reopened it) and again later, and a
+    /// fourth's page takes nothing after the first keyframe, so its gate stays shut. Each
+    /// frame is planned as the capture loop plans it (`Chain`), and each page but the
+    /// fourth takes what its lane carried before the next is planned. The first viewer's
+    /// lane is the whole stream, every frame planned. Each lane's updates begin with a
+    /// keyframe and are a run of the whole stream's, in its order, none left out: what a
+    /// viewer is sent refers only to what it was sent before. The fourth's lane carries the
+    /// first keyframe and nothing after.
     #[test]
     fn every_lane_starts_on_a_keyframe_and_misses_nothing_after() {
         let (w, h) = (64u32, 64u32);
         let mut rng = Xorshift::new(0x510e_527f_ade6_82d1);
         let mut lanes_checked = 0;
+        // What `c`'s page took off its lane, onto `into`, as its relay says each taken.
+        let take = |c: &crate::hub::Client, into: &mut Vec<Vec<u8>>| {
+            into.extend(c.lane(|s| s.delivered(Instant::now())));
+        };
         for case in 0..8 {
             let hub = Hub::new(crate::hub::tests::hello()).unwrap();
             let whole = viewer(&hub);
             whole.watch();
             let moved = viewer(&hub);
             moved.watch();
-            let first = job(w, h, Plan::Key(promised(&hub)), &mut rng);
+            let stuck = viewer(&hub);
+            stuck.watch();
+            let mut chain = Chain::default();
+            let (starts, version) = promised(&hub, &mut chain);
+            let first = job(w, h, Plan::Key(starts), version, &mut rng);
             let s = Stream::start(&hub, coded(w, h), first, Debugging::read(|_| None).unwrap())
                 .unwrap();
             s.ret_rx.recv().unwrap();
             let (join, reopen) = (rng.range(5, 50), rng.range(5, 40));
             let again = reopen + rng.range(1, 20);
-            // Each lane's updates, as its socket took them.
-            let mut lanes: Vec<Vec<Vec<u8>>> = Vec::new();
-            let mut joined = None;
+            // Each lane's updates, as its page took them: the whole stream's, the moved
+            // viewer's lanes before its lane now, and its lane now.
+            let (mut all, mut lanes, mut now) = (Vec::new(), Vec::new(), Vec::new());
+            take(&whole, &mut all);
+            take(&moved, &mut now);
+            let mut joined: Option<(Arc<crate::hub::Client>, Vec<Vec<u8>>)> = None;
             for f in 0..60 {
                 if f == join {
                     let b = viewer(&hub);
                     b.watch();
-                    joined = Some(b);
+                    joined = Some((b, Vec::new()));
                 }
                 if f == reopen || f == again {
-                    // The socket took what the lane held before it broke.
-                    lanes.push(updates(&moved));
+                    lanes.push(std::mem::take(&mut now));
                     moved.attach().expect("an open session takes a lane");
                 }
                 let mut seen = Vec::new();
                 hub.look_into(&mut seen);
-                let frame = match Key::of(&seen) {
-                    Key::Wanted => Plan::Key(promised(&hub)),
-                    Key::NotWanted => Plan::Motion,
+                let frame = match chain.parts(&seen) {
+                    Some(starts) => Plan::Key(starts),
+                    None => Plan::Motion,
                 };
-                s.job_tx.send(job(w, h, frame, &mut rng)).unwrap();
+                let version = chain.name(&hub);
+                s.job_tx.send(job(w, h, frame, version, &mut rng)).unwrap();
                 s.ret_rx.recv().unwrap();
+                take(&whole, &mut all);
+                take(&moved, &mut now);
+                if let Some((b, got)) = &mut joined {
+                    take(b, got);
+                }
             }
             drop(s);
-            lanes.push(updates(&moved));
-            lanes.extend(joined.map(|b| updates(&b)));
-            let all = updates(&whole);
+            lanes.push(now);
+            lanes.extend(joined.map(|(_, got)| got));
+            assert_eq!(
+                all.len(),
+                61,
+                "case {case}: the first viewer missed a frame"
+            );
+            assert_eq!(updates(&stuck), all[..1], "case {case}: the stuck lane");
             for (l, got) in lanes.iter().enumerate() {
                 assert!(!got.is_empty(), "case {case}: lane {l} carried nothing");
                 assert!(
@@ -1427,7 +1426,8 @@ pub(crate) mod tests {
         let page = viewer(&hub);
         page.watch();
         let mut rng = Xorshift::new(0x6a09_e667_f3bc_c908);
-        let first = job(w, h, Plan::Key(promised(&hub)), &mut rng);
+        let (starts, version) = promised(&hub, &mut Chain::default());
+        let first = job(w, h, Plan::Key(starts), version, &mut rng);
         // A resize ends the capture loop, and a second page joins, before the encode loop
         // has coded that keyframe.
         let second = viewer(&hub);
@@ -1967,17 +1967,16 @@ pub(crate) mod tests {
         assert_eq!(all, 0, "{}", c.said());
     }
 
-    /// One look, as the capture loop reads it: the capturer's damage, whether a viewer
-    /// waits to start, the last capture, the pacing, the gate, the encoder (none running,
-    /// or one with the buffer home or away), and the area the damage comes to when taken.
+    /// One look, as the capture loop reads it: the capturer's damage, whom a capture is for,
+    /// the last capture, the pacing, the encoder (none running, or one with the buffer home
+    /// or away), and the area the damage comes to when taken.
     #[derive(Clone, Copy)]
     struct StepCase {
         damage: Damage,
-        key: Key,
+        audience: Audience,
         now: Instant,
         captured: Instant,
         min_interval: Duration,
-        gate: Gated,
         encoder: Encoder<(), ()>,
         band: Option<Band>,
     }
@@ -1985,25 +1984,24 @@ pub(crate) mod tests {
     impl StepCase {
         fn look(&self) -> Look {
             Look {
-                key: self.key,
+                audience: self.audience,
                 damage: self.damage,
                 now: self.now,
                 captured: self.captured,
                 min_interval: self.min_interval,
-                gate: self.gate,
             }
         }
     }
 
     /// How many looks `each_case` makes: four frame rates, three damages, seven times since
-    /// the last capture, the gate open or held, the encoder's three states, and 4 ways for
-    /// the rest.
-    const CASES: usize = 4 * 3 * 7 * 2 * 3 * 4;
+    /// the last capture, three audiences, the encoder's three states, and damage that came
+    /// to an area or to none.
+    const CASES: usize = 4 * 3 * 7 * 3 * 3 * 2;
 
     /// Every look over a discretised domain: each state the capturer's damage takes; four
     /// frame rates, at seven times since the last capture, either side of the least interval
-    /// and its rounding to whole milliseconds; a viewer waiting to start or not; the gate
-    /// open or held; no stream running, or one with the buffer home or out; damage that
+    /// and its rounding to whole milliseconds; a capture for nobody, for the chain, or for a
+    /// viewer starting; no stream running, or one with the buffer home or out; damage that
     /// came to an area or to none.
     fn each_case(mut check: impl FnMut(StepCase)) -> usize {
         let ns = Duration::from_nanos;
@@ -2041,21 +2039,20 @@ pub(crate) mod tests {
                 .into_iter()
                 .flat_map(|d| sinces.map(move |s| (d, s)))
             {
-                for (gate, encoder, case) in [Gated::Open, Gated::Held]
+                let audiences = [Audience::Nobody, Audience::Chain, Audience::Starting];
+                for (audience, encoder, area) in audiences
                     .into_iter()
-                    .flat_map(|g| encoders.map(move |e| (g, e)))
-                    .flat_map(|(g, e)| (0..4).map(move |c| (g, e, c)))
+                    .flat_map(|a| encoders.map(move |e| (a, e)))
+                    .flat_map(|(a, e)| [false, true].map(move |b| (a, e, b)))
                 {
-                    let bit = |i: u32| case >> i & 1 == 1;
                     check(StepCase {
                         damage,
-                        key: [Key::NotWanted, Key::Wanted][usize::from(bit(0))],
+                        audience,
                         now,
                         captured: now - since,
                         min_interval,
-                        gate,
                         encoder,
-                        band: bit(1).then_some(Band { y0: 16, y1: 48 }),
+                        band: area.then_some(Band { y0: 16, y1: 48 }),
                     });
                     cases += 1;
                 }
@@ -2064,29 +2061,29 @@ pub(crate) mod tests {
         cases
     }
 
-    /// A look waits for the first of these that holds it, and only for that: a still screen
-    /// (nobody waiting to start, and nothing damaged or no stream running to show it on),
-    /// for a change; the rest of the least interval since the last capture; a viewer's link
-    /// that holds the gate, with no time. Else it starts a stream if none runs, captures
-    /// if the encoder is idle, or waits for the buffer to come home. So no stream starts,
-    /// and no capture goes, while the gate is held. Checked over every look of `each_case`.
+    /// A look waits for the first of these that holds it, and only for that: no viewer's
+    /// gate open, with no time; a still screen (nobody starting, and nothing damaged or no
+    /// stream running to show it on), for a change; the rest of the least interval since the
+    /// last capture. Else it starts a stream if none runs, captures if the encoder is idle,
+    /// or waits for the buffer to come home. So no stream starts, and no capture goes, while
+    /// it would go to nobody. Checked over every look of `each_case`.
     #[test]
     fn a_capture_waits_only_for_what_holds_it() {
         let cases = each_case(|c| {
             let got = step(c.look(), c.encoder);
             let nothing = c.damage == Damage::None || c.encoder == Encoder::Stopped(());
-            let still = nothing && c.key == Key::NotWanted;
+            let still = nothing && c.audience == Audience::Chain;
             let since = c.now - c.captured;
             let early = (since < c.min_interval).then(|| c.min_interval - since);
             // A wait leaves the encoder as it was; a capture takes the buffer.
             let wait = |w| Step::Wait(w, c.encoder);
-            let want = match (still, early, c.gate, c.encoder) {
-                (true, _, _, _) => wait(Wait::Change),
-                (false, Some(rest), _, _) => wait(Wait::Interval { rest }),
-                (false, None, Gated::Held, _) => wait(Wait::Gate),
-                (false, None, Gated::Open, Encoder::Running(Buffer::Away)) => wait(Wait::Buffer),
-                (false, None, Gated::Open, Encoder::Running(Buffer::Home(()))) => Step::Capture(()),
-                (false, None, Gated::Open, Encoder::Stopped(())) => Step::Start(()),
+            let want = match (c.audience, still, early, c.encoder) {
+                (Audience::Nobody, _, _, _) => wait(Wait::Gate),
+                (_, true, _, _) => wait(Wait::Change),
+                (_, false, Some(rest), _) => wait(Wait::Interval { rest }),
+                (_, false, None, Encoder::Running(Buffer::Away)) => wait(Wait::Buffer),
+                (_, false, None, Encoder::Running(Buffer::Home(()))) => Step::Capture(()),
+                (_, false, None, Encoder::Stopped(())) => Step::Start(()),
             };
             assert_eq!(got, want, "still {still}, early {early:?}, {:?}", c.encoder);
         });
@@ -2127,9 +2124,9 @@ pub(crate) mod tests {
         let mut cases = 0;
         each_case(|c| {
             for promised in [false, true] {
-                let wanted = c.key == Key::Wanted;
+                let wanted = c.audience == Audience::Starting;
                 let starts = (wanted && promised).then_some(());
-                let shown = format!("{:?}, band {:?}, {promised}", c.key, c.band);
+                let shown = format!("{:?}, band {:?}, {promised}", c.audience, c.band);
                 match plan(starts, c.band) {
                     Planned::Send(Plan::Key(())) => assert!(wanted && promised, "{shown}"),
                     Planned::Send(Plan::Motion) => {
@@ -2141,6 +2138,84 @@ pub(crate) mod tests {
             }
         });
         assert_eq!(cases, 2 * CASES);
+    }
+
+    /// No viewer holds back a capture another's gate lets go. Over generated looks at one to
+    /// six viewers, each in the chain, promised a keyframe, or watching with the chain's
+    /// newest frame, an older one or nothing, each gate open, full or late, on chains with a
+    /// frame and without: whom a capture is for is, from the definitions, nobody if no gate
+    /// is open, a keyframe if an open viewer cannot go on from the chain's newest frame, else
+    /// a delta; and at every look of `each_case`'s damages, times and encoders, the capture
+    /// loop lets a capture go for the whole look whenever it lets one go for any one viewer
+    /// of it alone, a keyframe whenever that one's would be.
+    #[test]
+    fn no_viewer_holds_back_a_capture() {
+        let mut rng = Xorshift::new(0x6c62_272e_07bb_0142);
+        let newest = Version(7);
+        let viewers = [
+            Viewer::Started { through: newest },
+            Viewer::Promised,
+            Viewer::Watching(Holds::Through(newest)),
+            Viewer::Watching(Holds::Through(Version(3))),
+            Viewer::Watching(Holds::Nothing),
+        ];
+        let gates = [Gate::Open, Gate::Full, Gate::Late];
+        let lets = |s: &Step<(), ()>| matches!(s, Step::Start(()) | Step::Capture(()));
+        let (mut despite, mut looks) = (0, 0);
+        for _ in 0..300 {
+            let head = [None, Some(newest)][rng.below(2) as usize];
+            let look: Vec<Seen> = (0..rng.range(1, 7))
+                .map(|_| Seen {
+                    viewer: viewers[rng.below(5) as usize],
+                    gate: gates[rng.below(3) as usize],
+                })
+                .collect();
+            let open = |s: &Seen| s.gate == Gate::Open;
+            let goes_on = |s: &Seen| match s.viewer {
+                Viewer::Started { .. } | Viewer::Promised => true,
+                Viewer::Watching(Holds::Through(t)) => Some(t) == head,
+                Viewer::Watching(Holds::Nothing) | Viewer::NotWatching(_) => false,
+            };
+            let want = match (
+                look.iter().any(open),
+                look.iter().any(|s| open(s) && !goes_on(s)),
+            ) {
+                (false, _) => Audience::Nobody,
+                (true, true) => Audience::Starting,
+                (true, false) => Audience::Chain,
+            };
+            let all = Audience::of(look.iter().copied(), head);
+            assert_eq!(all, want, "{look:?} on {head:?}");
+            each_case(|c| {
+                let whole = step(
+                    Look {
+                        audience: all,
+                        ..c.look()
+                    },
+                    c.encoder,
+                );
+                for one in &look {
+                    let alone = Audience::of([*one], head);
+                    let by_itself = step(
+                        Look {
+                            audience: alone,
+                            ..c.look()
+                        },
+                        c.encoder,
+                    );
+                    if lets(&by_itself) {
+                        assert!(lets(&whole), "{one:?} held back by {look:?}");
+                        assert!(alone <= all, "{one:?} not started in {look:?}");
+                        despite += usize::from(look.iter().any(|s| !open(s)));
+                    }
+                }
+                looks += 1;
+            });
+        }
+        assert!(
+            looks > 0 && despite > 1000,
+            "{despite} captures beside a shut gate"
+        );
     }
 
     /// The capturer's damage, against what was drawn: over every sequence of five events
@@ -2275,6 +2350,8 @@ pub(crate) mod tests {
     #[derive(Clone, Copy)]
     struct Work {
         done: Instant,
+        /// Its name, given when it was planned.
+        version: crate::wire::Version,
         drawn: Instant,
         bytes: u64,
         coding: Coding,
@@ -2295,15 +2372,16 @@ pub(crate) mod tests {
     /// bytes the screen then codes to; a whole screen, a keyframe, codes to `whole`); the
     /// capture loop's own decision (`step`) says what to do at each look, with the gate the
     /// session's link gives; a capture is coded for a time within `CODING_MS` and sent if
-    /// its viewer has started, and the path says each frame taken. The screen as it is
+    /// its viewer is in the chain, and the path says each frame taken. The screen as it is
     /// goes next: a change drawn while another waits replaces it, and a keyframe holds both.
     ///
     /// Around `step`, the session does what the capture loop and the hub do: a stream ends
     /// when its screen is resized, once its encoder has sent what it holds, and the loop
     /// looks at nothing until then; a rebuilt stream starts its viewer over; nobody watching
-    /// is looked at by nobody, and a viewer that comes back holding the newest frame goes on
-    /// from it; a viewer waiting to start is promised the next keyframe let go, and starts
-    /// when that keyframe is coded, if it is still promised it.
+    /// is looked at by nobody; a capture let go is what the hub's rule (`hub::planned`) makes
+    /// of it for the viewer, so one that comes back holding the newest frame goes on from it,
+    /// and one that does not is promised a keyframe, and starts when it is coded, if it is
+    /// still promised it.
     fn session(
         path: &mut Simulated,
         (start, whole): (Instant, u64),
@@ -2320,8 +2398,8 @@ pub(crate) mod tests {
         let mut coding_times = Xorshift::new(0x1b87_3593_cc9e_2d51);
         // The change waiting to be captured: when the first of it was drawn, and its bytes.
         let mut drawn: Option<(Instant, u64)> = None;
-        let (mut viewer, mut sim) = (Viewer::Waiting, Sim::Stopped);
-        // The stream's newest frame, and the next frame's name.
+        let (mut viewer, mut sim) = (Viewer::Watching(Holds::Nothing), Sim::Stopped);
+        // The chain's newest frame as planned, and the next frame's name.
         let (mut head, mut versions) = (None, 0u32);
         // The stream is to end, and its viewer to start over on the one rebuilt.
         let (mut ending, mut rebuilt) = (false, false);
@@ -2343,25 +2421,23 @@ pub(crate) mod tests {
                 match turn {
                     Turn::Resize => (ending, rebuilt) = (true, true),
                     Turn::StopWatching => viewer = crate::hub::stopped(viewer),
-                    Turn::Watch => viewer = crate::hub::watching(viewer, head),
+                    Turn::Watch => viewer = crate::hub::watching(viewer),
                 }
             }
             path.tell(now, |sequence, at| link.took(sequence, at));
             if let Sim::Busy(frame) = sim {
                 if frame.done <= now {
                     sim = Sim::Idle;
-                    // The frame is the stream's newest; the keyframe a viewer was promised
-                    // starts it; only a viewer that has started is sent a frame, and holds it.
-                    let version = crate::wire::Version(versions);
-                    versions += 1;
-                    head = Some(version);
+                    // The keyframe a viewer was promised starts it; only a viewer in the chain
+                    // is sent a frame, and holds it.
+                    let version = frame.version;
                     viewer = match (viewer, frame.coding) {
                         (Viewer::Promised, Coding::Key)
                         | (Viewer::Started { .. }, Coding::Key | Coding::Delta) => {
                             Viewer::Started { through: version }
                         }
                         (Viewer::Promised, Coding::Delta)
-                        | (Viewer::NotWatching(_) | Viewer::Waiting, _) => viewer,
+                        | (Viewer::NotWatching(_) | Viewer::Watching(_), _) => viewer,
                     };
                     if let Viewer::Started { .. } = viewer {
                         let Work {
@@ -2403,14 +2479,16 @@ pub(crate) mod tests {
                 (Sim::Idle, false) => Some(Encoder::Running(Buffer::Home(()))),
                 (Sim::Busy(_), false) => Some(Encoder::Running(Buffer::Away)),
             };
-            let key = match viewer {
-                Viewer::Waiting => Key::Wanted,
-                Viewer::NotWatching(_) | Viewer::Promised | Viewer::Started { .. } => {
-                    Key::NotWanted
+            // Nobody watching is looked at by nobody, as in the loop.
+            let gate = link.gate(now);
+            let seen = match viewer {
+                Viewer::NotWatching(_) => None,
+                Viewer::Watching(_) | Viewer::Promised | Viewer::Started { .. } => {
+                    Some(Seen { viewer, gate })
                 }
             };
             let look = Look {
-                key,
+                audience: Audience::of(seen, head),
                 damage: match drawn {
                     Some((first, _)) => Damage::Rows {
                         first,
@@ -2422,38 +2500,38 @@ pub(crate) mod tests {
                 now,
                 captured,
                 min_interval,
-                gate: match link.gate(now) {
-                    Gate::Open => Gated::Open,
-                    Gate::Full | Gate::Late => Gated::Held,
-                },
             };
-            // Nobody watching is looked at by nobody, as in the loop.
             let stepped = encoder
-                .filter(|_| !matches!(viewer, Viewer::NotWatching(_)))
+                .filter(|_| seen.is_some())
                 .map(|encoder| step(look, encoder));
             let wait = match stepped {
                 Some(Step::Start(()) | Step::Capture(())) => {
+                    let (part, after) = crate::hub::planned(viewer, gate, head);
+                    viewer = after;
+                    let coding = match part {
+                        Part::Starts => Coding::Key,
+                        Part::Sent => Coding::Delta,
+                        Part::Skipped => panic!("a capture its viewer's gate did not let go"),
+                    };
                     // A keyframe is the whole screen, and holds what was drawn; a frame
                     // that is not one is what was drawn.
-                    let (first, bytes) = match (key, drawn.take()) {
-                        (Key::Wanted, drawn) => (drawn.map_or(now, |(first, _)| first), whole),
-                        (Key::NotWanted, Some(drawn)) => drawn,
-                        (Key::NotWanted, None) => panic!("a capture with nothing to show"),
+                    let (first, bytes) = match (coding, drawn.take()) {
+                        (Coding::Key, drawn) => (drawn.map_or(now, |(first, _)| first), whole),
+                        (Coding::Delta, Some(drawn)) => drawn,
+                        (Coding::Delta, None) => panic!("a capture with nothing to show"),
                     };
-                    if key == Key::Wanted {
-                        viewer = Viewer::Promised;
-                    }
+                    let version = crate::wire::Version(versions);
+                    versions += 1;
+                    head = Some(version);
                     captured = now;
                     let (least, most) = CODING_MS;
                     let takes = Duration::from_millis(coding_times.range(least, most + 1));
                     sim = Sim::Busy(Work {
                         done: now + takes,
+                        version,
                         drawn: first,
                         bytes,
-                        coding: match key {
-                            Key::Wanted => Coding::Key,
-                            Key::NotWanted => Coding::Delta,
-                        },
+                        coding,
                         allowed: match link.stats(now).path {
                             Path::Known(known) => known.window(),
                             Path::Unknown => 0,

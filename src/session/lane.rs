@@ -28,8 +28,8 @@ pub async fn lanes(listener: UnixListener, hub: Arc<Hub>) {
 }
 
 /// A lane: the capability it presents, read into a buffer of that size and nothing more;
-/// then, attached, its writer. When the lane ends the capture loop is woken, since a lane
-/// whose socket broke holds no capture back now.
+/// then, attached, its writer. When the lane ends the capture loop is woken, to look again
+/// at who watches with a lane.
 pub(super) async fn lane(stream: tokio::net::UnixStream, hub: Arc<Hub>) {
     let (mut read, write) = stream.into_split();
     let mut first = [0u8; CAPABILITY];

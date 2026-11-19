@@ -7,14 +7,16 @@
 //! same window), the relay says so on the control stream (`wire::Up::Took`), and what is on
 //! the way is exactly what was sent and no took has named yet ([`Outstanding`]).
 //!
-//! A capture may start ([`Gate`], [`Outstanding::gate`]) when what is on the way is within
-//! what the path takes in its round trip and [`RESPONSE`], and no frame sent is later than
-//! any frame that window lets go can be. The path's round trip and rate are not found
-//! here: whoever knows them says them ([`Path`]). Today that is `estimate`, which guesses
-//! them from the tooks.
+//! A lane's gate ([`Gate`], [`Outstanding::gate`]) is open, and the lane takes the next
+//! capture, when what is on the way is within what the path takes in its round trip and
+//! [`RESPONSE`], and no frame sent is later than any frame that window lets go can be. The
+//! path's round trip and rate are not found here: whoever knows them says them ([`Path`]).
+//! Today that is `estimate`, which guesses them from the tooks. Each lane's gate is its
+//! own: a capture goes while any watching lane's is open, and is sent only to those
+//! (`hub::planned`); a lane whose gate is shut is passed by, and holds no other back.
 //!
 //! Every frame is coded whole, at one quality (`av1`): the gate alone bounds what is in
-//! flight, by holding the next capture, never by shrinking a frame.
+//! flight on its lane, by passing the lane by while it is shut, never by shrinking a frame.
 //!
 //! Everything here is a function of state and one event, with the time an argument:
 //! nothing reads a clock. A lane's events come in time order: each is given a time no
@@ -125,8 +127,9 @@ impl Known {
     }
 }
 
-/// Whether a capture may start.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+/// Whether a lane takes a capture now: a capture planned while it is open is sent it, and
+/// goes for it; one planned while it is shut goes on without it (`hub::planned`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Gate {
     /// What is on the way is within the window, and none of it is late.

@@ -57,18 +57,22 @@ browser page --WebSocket, 127.0.0.1--> voxl relay (the viewer's machine)
   most one undecoded update, and nothing queues in the browser, whose socket would
   otherwise hold about a megabyte where no one sees it. The relay tells the daemon each
   update the page took, on the control stream, and that is all the daemon knows of
-  delivery: its socket accepts far more than has arrived. A screen is captured only while
-  what was sent and not yet taken is within what the path carries in its round trip and
-  the response time (a tenth of a second), and no frame is late: none sent has gone
-  untaken longer than twice the round trip, plus the response time, plus its own bytes'
-  time at the path's rate. Until the transport states the path, its round trip and rate
-  are estimated from the page's tooks, and before the first took any frame not yet taken
-  is late. A slow link or a slow page lowers the frame rate, and the newest screen goes
-  next. Every frame is coded whole, at one quality.
+  delivery: its socket accepts far more than has arrived. A screen is sent to a viewer only
+  while what was sent it and not yet taken is within what its path carries in its round
+  trip and the response time (a tenth of a second), and no frame is late: none sent has
+  gone untaken longer than twice the round trip, plus the response time, plus its own
+  bytes' time at the path's rate. Until the transport states the path, its round trip and
+  rate are estimated from the page's tooks, and before the first took any frame not yet
+  taken holds the next. A screen is captured while any viewer's link lets one go. A slow
+  link or a slow page lowers its own viewer's frame rate, and the newest screen goes next;
+  it holds no other viewer, nor a recording, back: frames go on without it, and it starts
+  again on a keyframe once its link lets one go. Every frame is coded whole, at one
+  quality.
 - **The stream.** A viewer starts on a keyframe, and every frame after it refers to the
   frames before it, which the lane carried in order. Keyframes are sent only when a viewer
-  starts, which a lane that reopens or a resize also is. The desktop's size is the
-  keyframe's: the page lays itself out from the pictures it decodes.
+  starts, which a lane that reopens, a viewer that frames went on without, or a resize
+  also is. The desktop's size is the keyframe's: the page lays itself out from the
+  pictures it decodes.
 
 ## Benchmarks
 
@@ -253,9 +257,9 @@ takes `--runtime DIR`, as `voxl attach` does, for a daemon whose runtime folder 
 forward error correction, and on a real path most loss turned out to be its own
 congestion: repair added load, which added loss. A stream through a QUIC or TCP transport
 leaves loss and pacing to the transport, which is built for them, and voxl keeps lag down
-at the source instead: it captures a screen only while the page has taken what was sent
-before, as fast as the link has been delivering, so a slow link lowers the frame rate
-rather than queueing old screens. The page still talks to one WebSocket, on 127.0.0.1,
+at the source instead: it sends a page a screen only while the page has taken what was
+sent it before, as fast as its link has been delivering, so a slow link lowers that
+page's frame rate rather than queueing old screens. The page still talks to one WebSocket, on 127.0.0.1,
 takes one update at a time and decodes it the moment it arrives with WebCodecs.
 
 **How is it different from Moonlight and Sunshine?** They're for playing games on your
