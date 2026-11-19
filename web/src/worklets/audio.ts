@@ -1,5 +1,5 @@
-// PCM player. Receives planar Float32 [L, R] chunks on a MessagePort, already paced by the
-// relay, and plays them through a ring of a packet or two.
+// PCM player. Receives planar Float32 [L, R] chunks on a MessagePort, as the lane delivers
+// their packets, and plays them through a ring of a packet or two.
 import type { PcmChunk } from '../protocol';
 import wire from '../wire.json' with { type: 'json' };
 
@@ -10,10 +10,10 @@ const FRAME = wire.desktopAudio.frameSamples;
  * "render quantum size", 128). Published. */
 const QUANTUM = 128;
 
-/** What the buffer plays from once it primes: one packet. The relay gives packets at their
- * deadlines, as evenly as the daemon sent them, so the path's jitter is taken out before
- * they get here (at the cost of that spread, on every packet); what is left is the decoder
- * putting a packet out as one. Derived. */
+/** What the buffer plays from once it primes: one packet. Chosen when the relay gave packets
+ * at deadlines that took the path's jitter out; it no longer does, and packets come as the
+ * stream delivers them, behind the video frames before them, with the path's jitter. To be
+ * measured again: what the player underruns at, on the live link. */
 const TARGET = FRAME;
 /** The most the buffer holds before it drops the oldest: the packet playing, the next one
  * decoded, and a render quantum the player has not yet taken. Derived. */

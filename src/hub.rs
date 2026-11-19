@@ -1,11 +1,11 @@
 //! Shared state between media producers (video, audio, cursor, clipboard) and the
 //! sessions that watch them.
 
-use crate::lanes::wire::{Attach, Generation, Number, Outcome};
-use crate::session::sender::{Delivery, Queue, Rate, Room, Sender};
+use crate::session::sender::{Queue, Sender};
+use crate::wire::Capability;
 use bytes::Bytes;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -17,17 +17,10 @@ use tokio::sync::mpsc;
 pub enum Out {
     Bin(Bytes),
     Text(ServerMessage),
-    Attached {
-        generation: Generation,
-    },
-    /// The send buffer the session's lane socket was given, for the relay's receive buffer.
-    Buffer(u32),
-    /// The session's lane of this generation broke under the daemon.
-    Lost {
-        generation: Generation,
-    },
+    /// A lane attached.
+    Attached,
     /// An Opus packet of desktop audio, to a recording alone (a session's audio goes on
-    /// its lanes): the packet, and the frames of silence the encoder left out since the
+    /// its lane): the packet, and the frames of silence the encoder left out since the
     /// one before.
     Audio {
         packet: Bytes,
@@ -62,8 +55,6 @@ impl ServerMessage {
         });
         match self {
             ServerMessage::Hello(h) => {
-                o.raw("w", &h.w.to_string());
-                o.raw("h", &h.h.to_string());
                 if let Some(codec) = &h.codec {
                     o.text("codec", codec);
                 }
@@ -150,19 +141,18 @@ fn float(f: f64) -> String {
     }
 }
 
-/// The `hello` message: the stream's geometry and codec and the server's settings, the
-/// fields `Hello` in web/src/protocol.ts names.
+/// The `hello` message: the stream's codec and the server's settings, the fields `Hello` in
+/// web/src/protocol.ts names. The desktop's size is the keyframe's: the page lays out from the
+/// picture it decodes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Hello {
-    pub w: u32,
-    pub h: u32,
     /// The stream's codec as WebCodecs names it: none only before the first pipeline is
     /// built, whose hello goes to nobody.
     pub codec: Option<String>,
     pub settings: Settings,
 }
 
-/// What a hello tells a viewer besides the geometry: what voxl started with, which `run`
+/// What a hello tells a viewer besides the codec: what voxl started with, which `run`
 /// says once, before it serves a viewer, and dynamic resolution's scale.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Settings {
@@ -218,21 +208,22 @@ pub enum Viewer {
     /// not started by it, as it may have joined after the frame was planned, even after the
     /// stream that coded it ended.
     Promised,
-    /// It is sent every frame, from keyframe `key` on: on a datagram lane, a report of that
-    /// keyframe missed starts it again.
-    Started { key: Number },
+    /// It is sent every frame from the keyframe it started on: its lane carries each in order,
+    /// so every frame it is sent refers to one it was sent before.
+    Started,
 }
 
-/// What starting the stream over makes of a viewer: one that watches waits to start on the
-/// new stream. A keyframe planned for it went with the old one.
+/// What starting over makes of a viewer (the stream is rebuilt, or a new lane carries it):
+/// one that watches waits to start on a keyframe. A keyframe planned for it went with the
+/// old stream or lane.
 fn restarted(viewer: Viewer) -> Viewer {
     match viewer {
         Viewer::NotWatching => Viewer::NotWatching,
-        Viewer::Waiting | Viewer::Promised | Viewer::Started { .. } => Viewer::Waiting,
+        Viewer::Waiting | Viewer::Promised | Viewer::Started => Viewer::Waiting,
     }
 }
 
-/// What a client is to the stream and its lanes, under one lock, so that every change to
+/// What a client is to the stream and its lane, under one lock, so that every change to
 /// them is one step, and every read of them one state.
 struct Viewing {
     viewer: Viewer,
@@ -250,11 +241,11 @@ pub struct Client {
 }
 
 /// What the capture loop sees of a watching client with a lane in one look at it: what it
-/// is to the stream, and what its lane lets a frame take.
+/// is to the stream, and whether its bytes wait for its lane's socket.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Seen {
     pub viewer: Viewer,
-    pub room: Room,
+    pub waits: bool,
 }
 
 /// The viewers a keyframe starts: at least one, each promised it (`Hub::promise`). A
@@ -262,10 +253,10 @@ pub struct Seen {
 pub struct Starts(Vec<Arc<Client>>);
 
 impl Starts {
-    /// The keyframe, update `key`, is coded: each viewer it was promised to starts on it.
-    pub fn started(&self, key: Number) {
+    /// The keyframe is coded: each viewer it was promised to starts on it.
+    pub fn started(&self) {
         for c in &self.0 {
-            c.started(key);
+            c.started();
         }
     }
 }
@@ -285,8 +276,8 @@ impl Client {
         self.viewing.lock().viewer
     }
 
-    /// Its lanes, for one step (a report, a desktop audio packet, its close).
-    pub fn lanes<R>(&self, f: impl FnOnce(&mut Sender) -> R) -> R {
+    /// Its lane, for one step (a desktop audio packet, its close).
+    pub fn lane<R>(&self, f: impl FnOnce(&mut Sender) -> R) -> R {
         f(&mut self.viewing.lock().sender)
     }
 
@@ -297,14 +288,8 @@ impl Client {
         let watches = v.viewer != Viewer::NotWatching && v.sender.attached();
         watches.then(|| Seen {
             viewer: v.viewer,
-            room: v.sender.room(),
+            waits: v.sender.waits(),
         })
-    }
-
-    /// The rate its lane drains frames at, if it watches.
-    pub fn rate(&self) -> Option<Rate> {
-        let v = self.viewing.lock();
-        (v.viewer != Viewer::NotWatching).then(|| v.sender.rate())
     }
 
     /// What `voxl stats` says of it, as one read of it sees it.
@@ -314,7 +299,7 @@ impl Client {
             Viewer::NotWatching => "not_watching",
             Viewer::Waiting => "waiting",
             Viewer::Promised => "promised",
-            Viewer::Started { .. } => "started",
+            Viewer::Started => "started",
         };
         serde_json::json!({
             "id": self.id,
@@ -334,72 +319,62 @@ impl Client {
         self.viewing.lock().viewer = Viewer::NotWatching;
     }
 
-    /// The stream starts over for it (it is rebuilt, or a display switch failed), and its
-    /// page is told so by `hello`, which resets the page's decoders: if it watches, it waits
-    /// for a keyframe of what follows. The hello is queued under the lock a keyframe is
-    /// planned, sent and taken under, so a keyframe planned for it after this reaches the
-    /// page behind the hello, and one planned before is not sent it.
-    pub fn start_over(&self, hello: ServerMessage) {
+    /// The stream starts over for it (it is rebuilt, or a display switch failed): if it
+    /// watches, it waits for a keyframe of what follows, which carries the new size. Under
+    /// the lock a keyframe is planned, sent and taken under, so one planned before is not
+    /// sent it.
+    pub fn start_over(&self) {
         let mut v = self.viewing.lock();
         v.viewer = restarted(v.viewer);
-        self.send(Out::Text(hello));
     }
 
     /// The capture loop planned a keyframe: one waiting to start, with a lane to be sent it
-    /// on, is promised it; so is one started on a datagram lane, which could lose it, and
-    /// which is told `hello` first, so its page waits for that keyframe and decodes nothing
-    /// that refers to it before it; one started on a lane that delivers everything takes it
-    /// as any frame. Whether it was promised it.
-    pub fn promise(&self, hello: &ServerMessage) -> bool {
+    /// on, is promised it; one started takes it as any frame. Whether it was promised it.
+    pub fn promise(&self) -> bool {
         let mut v = self.viewing.lock();
-        match (v.viewer, v.sender.delivery()) {
-            (Viewer::Waiting, Some(_)) => {
+        match (v.viewer, v.sender.attached()) {
+            (Viewer::Waiting, true) => {
                 v.viewer = Viewer::Promised;
                 true
             }
-            (Viewer::Started { .. }, Some(Delivery::Reported)) => {
-                self.send(Out::Text(hello.clone()));
-                v.viewer = Viewer::Promised;
-                true
-            }
-            (Viewer::Started { .. }, Some(Delivery::Whole))
-            | (Viewer::Waiting | Viewer::Started { .. }, None)
-            | (Viewer::NotWatching | Viewer::Promised, _) => false,
+            (Viewer::Waiting, false)
+            | (Viewer::NotWatching | Viewer::Promised | Viewer::Started, _) => false,
         }
     }
 
-    /// The keyframe it was promised, update `key`, is coded: it starts on it. A client that
-    /// has since stopped watching or started over is what that made it.
-    fn started(&self, key: Number) {
+    /// The keyframe it was promised is coded: it starts on it. A client that has since
+    /// stopped watching or started over is what that made it.
+    fn started(&self) {
         let mut v = self.viewing.lock();
         if v.viewer == Viewer::Promised {
-            v.viewer = Viewer::Started { key };
+            v.viewer = Viewer::Started;
         }
     }
 
-    /// The encode loop has update `number` to send at `now`: a client that has started takes
-    /// it onto its lane. How its lane delivers it, if it took it.
-    pub fn takes(&self, number: Number, bytes: &Bytes, now: Instant) -> Option<Delivery> {
+    /// The encode loop has an update to send at `now`: a client that has started takes it
+    /// onto its lane. Whether it took it.
+    pub fn takes(&self, bytes: &Bytes) -> bool {
         let mut v = self.viewing.lock();
         let Viewing { viewer, sender } = &mut *v;
         match viewer {
-            Viewer::Started { .. } => {
-                sender.video(number, bytes, now);
-                sender.delivery()
+            Viewer::Started => {
+                sender.video(bytes);
+                true
             }
-            Viewer::NotWatching | Viewer::Waiting | Viewer::Promised => None,
+            Viewer::NotWatching | Viewer::Waiting | Viewer::Promised => false,
         }
     }
 
-    /// Its relay decided update `number`: a keyframe it started on that missed leaves it with
-    /// nothing to decode from, and it waits to start again.
-    pub fn decided(&self, number: Number, outcome: Outcome) {
+    /// A lane attached with its capability, its queue `queue`, in place of any before: the
+    /// viewer starts over on a keyframe sent on it, since bytes a lane before took may never
+    /// have reached the page. Whether it was taken.
+    pub fn attach(&self, queue: Arc<Queue>) -> bool {
         let mut v = self.viewing.lock();
-        if let (Viewer::Started { key }, Outcome::Missed) = (v.viewer, outcome) {
-            if key == number {
-                v.viewer = Viewer::Waiting;
-            }
+        let taken = v.sender.attach(queue);
+        if taken {
+            v.viewer = restarted(v.viewer);
         }
+        taken
     }
 }
 
@@ -479,8 +454,6 @@ pub struct Stats {
     pub encode_us: AtomicU64,
     pub grab_us: AtomicU64,
     pub convert_us: AtomicU64,
-    /// Still pictures coded again at the target quality.
-    pub passes: AtomicU64,
     pub keyframes: AtomicU64,
     pub damage_wait_us: AtomicU64,
     pub send_lat_us: AtomicU64,
@@ -492,11 +465,9 @@ pub struct Hub {
     /// thread waits on it while none wants any.
     audio_asked: parking_lot::Condvar,
     pub next_id: AtomicU64,
-    pub width: AtomicU32,
-    pub height: AtomicU32,
     /// Last cursor message, replayed to new clients.
     pub cursor: Mutex<Option<Bytes>>,
-    /// Wakes the capture thread (reports, joins, lanes attached, lanes drained).
+    /// Wakes the capture thread (joins, lanes attached, lanes emptied or ended).
     pub waker: Wake,
     pub input: Mutex<Option<std::sync::mpsc::Sender<crate::event::InputEvent>>>,
     #[cfg(target_os = "linux")]
@@ -506,10 +477,8 @@ pub struct Hub {
     pub resize_req: Mutex<Option<(u32, u32)>>,
     /// Largest desktop size (Some when dynamic resolution is on).
     pub resize_max: Mutex<Option<(u32, u32)>>,
-    /// What every `hello` says besides the geometry.
+    /// What every `hello` says besides the codec.
     pub settings: Mutex<Settings>,
-    /// The updates' numbers, and what the sessions' relays decided of them, for the encoder.
-    pub updates: Arc<crate::video::Updates>,
     /// How the stream is coded, once the first pipeline is built: its recordings' `vpcC`.
     pub stream: Mutex<Option<crate::vp9::Stream>>,
     /// The codec every hello names, the same for the daemon's whole life: the level of the
@@ -534,8 +503,6 @@ impl Hub {
             clients: Mutex::new(Vec::new()),
             audio_asked: parking_lot::Condvar::new(),
             next_id: AtomicU64::new(1),
-            width: AtomicU32::new(0),
-            height: AtomicU32::new(0),
             cursor: Mutex::new(None),
             waker: Wake::new()?,
             input: Mutex::new(None),
@@ -544,7 +511,6 @@ impl Hub {
             resize_req: Mutex::new(None),
             resize_max: Mutex::new(None),
             settings: Mutex::new(Settings::default()),
-            updates: Arc::default(),
             stream: Mutex::new(None),
             codec: std::sync::OnceLock::new(),
             stats: Stats::default(),
@@ -561,7 +527,7 @@ impl Hub {
         self.waker.drain();
     }
 
-    /// A session joins, its control stream written through `control`, its lanes `sender`.
+    /// A session joins, its control stream written through `control`, its lane `sender`.
     pub fn add_client(&self, control: mpsc::UnboundedSender<Out>, sender: Sender) -> Arc<Client> {
         let c = Arc::new(Client {
             id: self.next_id.fetch_add(1, Ordering::Relaxed),
@@ -593,22 +559,21 @@ impl Hub {
         self.wake();
     }
 
-    /// A lane's attach, arriving at `now` with its writer's queue: it joins the session
-    /// whose capability it presents, which is told so on its control stream. Every open
-    /// session's capability is compared, each in constant time. Whether one took it.
-    pub fn attach(&self, attach: Attach, queue: Arc<Queue>, now: Instant) -> bool {
+    /// A lane presenting a capability, with its writer's queue: it joins the session whose
+    /// capability it is, which is told so on its control stream. Every open session's
+    /// capability is compared, each in constant time. Whether one took it.
+    pub fn attach(&self, presented: &Capability, queue: Arc<Queue>) -> bool {
         let clients = self.clients.lock().clone();
         let whose = clients.iter().fold(None, |found, c| {
-            let is = c.lanes(|s| s.is(&attach.capability));
+            let is = c.lane(|s| s.is(presented));
             found.or(is.then_some(c))
         });
         let Some(c) = whose else {
             return false;
         };
-        let generation = attach.generation;
-        let taken = c.lanes(|s| s.attach(generation, queue, attach.sent, attach.round_trip, now));
+        let taken = c.attach(queue);
         if taken {
-            c.send(Out::Attached { generation });
+            c.send(Out::Attached);
             self.wake();
         }
         taken
@@ -626,26 +591,12 @@ impl Hub {
 
     /// A keyframe is planned: the viewers of `seen` it starts (`Client::promise`), if any.
     pub fn promise(&self, seen: &[(Arc<Client>, Seen)]) -> Option<Starts> {
-        let hello = self.hello();
         let starts: Vec<Arc<Client>> = seen
             .iter()
-            .filter(|(c, _)| c.promise(&hello))
+            .filter(|(c, _)| c.promise())
             .map(|(c, _)| c.clone())
             .collect();
         (!starts.is_empty()).then_some(Starts(starts))
-    }
-
-    /// The rate the stream is sent at: the slowest drain of the watching clients' lanes;
-    /// unlimited while none has a queue backed up.
-    pub fn rate(&self) -> Rate {
-        let clients = self.clients.lock();
-        clients
-            .iter()
-            .filter_map(|c| c.rate())
-            .fold(Rate::Unlimited, |least, r| match (least, r) {
-                (Rate::Unlimited, r) | (r, Rate::Unlimited) => r,
-                (Rate::Drain(a), Rate::Drain(b)) => Rate::Drain(a.min(b)),
-            })
     }
 
     /// Every client, into `into` in place of what it held: the encode loop's, which keeps
@@ -669,7 +620,6 @@ impl Hub {
             "encode_us_total": n(&st.encode_us),
             "grab_us_total": n(&st.grab_us),
             "convert_us_total": n(&st.convert_us),
-            "passes": n(&st.passes),
             "keyframes": n(&st.keyframes),
             "damage_wait_us_total": n(&st.damage_wait_us),
             "send_lat_us_total": n(&st.send_lat_us),
@@ -677,23 +627,20 @@ impl Hub {
         })
     }
 
-    /// The `hello` message: current geometry and codec plus the server's settings.
+    /// The `hello` message: the codec and the server's settings.
     pub fn hello(&self) -> ServerMessage {
         let settings = self.settings.lock().clone();
         ServerMessage::Hello(Hello {
-            w: self.width.load(Ordering::Relaxed),
-            h: self.height.load(Ordering::Relaxed),
             codec: self.codec.get().cloned(),
             settings,
         })
     }
 
-    /// After the stream restarts (new size): every client needs the new geometry and codec,
-    /// and to start again.
+    /// After the stream restarts (new size): every client starts again on a keyframe of
+    /// the new stream, which carries its size.
     pub fn restart_clients(&self) {
-        let hello = self.hello();
         for c in self.clients.lock().iter() {
-            c.start_over(hello.clone());
+            c.start_over();
         }
     }
 
@@ -722,12 +669,11 @@ impl Hub {
 
     #[cfg(target_os = "linux")]
     /// An Opus packet of desktop audio, `silent` frames of silence after the one before:
-    /// onto the lanes of every session that wants it.
+    /// onto the lane of every session that wants it.
     pub fn audio(&self, packet: &[u8], silent: u32) {
-        let now = Instant::now();
         for c in self.clients.lock().iter() {
             if c.audio.load(Ordering::Relaxed) {
-                c.lanes(|s| s.audio(packet, silent, now));
+                c.lane(|s| s.audio(packet, silent));
             }
         }
     }
@@ -743,9 +689,7 @@ impl Hub {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lanes::wire::Capability;
-    use crate::session::sender::Kind;
-    use std::time::Duration;
+    use crate::wire::Capability;
 
     /// A step of the hub's, for one of two clients or for all.
     #[derive(Clone, Copy, Debug)]
@@ -757,8 +701,10 @@ mod tests {
         /// The hello after a failed display switch: the stream starts over for this client
         /// alone, and what the encoder holds is still sent.
         StartOver(usize),
-        /// A lane of this kind attaches, replacing any before.
-        Attach(usize, Kind),
+        /// A lane attaches, replacing any before (the relay reopened it).
+        Attach(usize),
+        /// The lane's socket breaks.
+        Lose(usize),
         /// `build` starts the stream over for every client (`restart_clients`), once the
         /// stream before has sent what it held.
         Restart,
@@ -767,127 +713,73 @@ mod tests {
         Capture,
         /// The encode loop codes and sends the oldest frame it holds.
         Send,
-        /// The client's relay reports the keyframe it started on missed.
-        KeyMissed(usize),
     }
 
-    const STEPS: [Step; 15] = [
+    const STEPS: [Step; 13] = [
         Step::Watch(0),
         Step::Watch(1),
         Step::StopWatching(0),
         Step::StopWatching(1),
         Step::StartOver(0),
         Step::StartOver(1),
-        Step::Attach(0, Kind::Datagram),
-        Step::Attach(1, Kind::Datagram),
-        Step::Attach(0, Kind::Stream),
-        Step::Attach(1, Kind::Stream),
+        Step::Attach(0),
+        Step::Attach(1),
+        Step::Lose(0),
+        Step::Lose(1),
         Step::Restart,
         Step::Capture,
         Step::Send,
-        Step::KeyMissed(0),
-        Step::KeyMissed(1),
     ];
 
     /// A frame the encoder holds: a keyframe, with the clients its plan promised it to, or a
     /// frame that is not one.
     type Held = Option<[bool; 2]>;
 
-    /// What a client is to the stream, its keyframe kept as whether it has one: the numbers
-    /// are the encode loop's.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-    enum Is {
-        NotWatching,
-        Waiting,
-        Promised,
-        Started,
-    }
-
-    fn is(v: Viewer) -> Is {
-        match v {
-            Viewer::NotWatching => Is::NotWatching,
-            Viewer::Waiting => Is::Waiting,
-            Viewer::Promised => Is::Promised,
-            Viewer::Started { .. } => Is::Started,
-        }
-    }
-
-    /// A lane's kind, as the model keeps it.
+    /// What a client's lane is, as the model keeps it.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     enum Lane {
-        Datagram,
-        Stream,
+        None,
+        Live,
+        /// Its socket broke; none has attached since.
+        Lost,
     }
 
-    impl From<Kind> for Lane {
-        fn from(k: Kind) -> Lane {
-            match k {
-                Kind::Datagram => Lane::Datagram,
-                Kind::Stream => Lane::Stream,
-            }
-        }
-    }
-
-    impl From<Lane> for Kind {
-        fn from(l: Lane) -> Kind {
-            match l {
-                Lane::Datagram => Kind::Datagram,
-                Lane::Stream => Kind::Stream,
-            }
-        }
-    }
-
-    /// Two clients (what each is to the stream, and its lane's kind), and the frames the
-    /// encoder holds, oldest first.
+    /// Two clients (what each is to the stream, and its lane), and the frames the encoder
+    /// holds, oldest first.
     #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     struct Model {
-        c: [(Is, Option<Lane>); 2],
+        c: [(Viewer, Lane); 2],
         held: Vec<Held>,
     }
 
     /// The rule, step by step, as each value and method says it: what each step makes of
-    /// the model, whether it planned a keyframe, whom a planned keyframe told `hello`, and
-    /// who was sent the frame.
-    fn rule(before: &Model, step: Step) -> (bool, Vec<usize>, Vec<usize>, Model) {
-        use Is::{NotWatching, Promised, Started, Waiting};
+    /// the model, whether it planned a keyframe, and who was sent the frame.
+    fn rule(before: &Model, step: Step) -> (bool, Vec<usize>, Model) {
+        use Viewer::{NotWatching, Promised, Started, Waiting};
         let mut m = before.clone();
         let c = &mut m.c;
-        let (mut planned, mut helloed, mut sent) = (false, vec![], vec![]);
+        let (mut planned, mut sent) = (false, vec![]);
         match step {
             Step::Watch(i) => c[i].0 = Waiting,
             Step::StopWatching(i) => c[i].0 = NotWatching,
-            Step::StartOver(i) => {
-                if c[i].0 != NotWatching {
-                    c[i].0 = Waiting;
-                }
-            }
-            Step::Attach(i, kind) => c[i].1 = Some(kind.into()),
+            Step::StartOver(i) => c[i].0 = restarted(c[i].0),
+            // A new lane starts its viewer over: what the lane before took may be lost.
+            Step::Attach(i) => c[i] = (restarted(c[i].0), Lane::Live),
+            Step::Lose(i) => c[i].1 = Lane::Lost,
             Step::Restart => {
                 for c in c.iter_mut() {
-                    if c.0 != NotWatching {
-                        c.0 = Waiting;
-                    }
+                    c.0 = restarted(c.0);
                 }
                 m.held.clear();
             }
-            // A keyframe is planned when one waiting to start has a lane: it is promised to
-            // those, and to those started on a datagram lane, who are told hello.
+            // A keyframe is planned when one waiting to start has a live lane: it is promised
+            // to those.
             Step::Capture => {
-                planned = c.iter().any(|c| c.0 == Waiting && c.1.is_some());
-                let mut starts = [false; 2];
-                if planned {
-                    for (i, c) in c.iter_mut().enumerate() {
-                        match *c {
-                            (Waiting, Some(_)) => starts[i] = true,
-                            (Started, Some(Lane::Datagram)) => {
-                                starts[i] = true;
-                                helloed.push(i);
-                            }
-                            _ => {}
-                        }
-                        if starts[i] {
-                            c.0 = Promised;
-                        }
+                let starts = c.map(|c| c == (Waiting, Lane::Live));
+                planned = starts.contains(&true);
+                for (i, c) in c.iter_mut().enumerate() {
+                    if starts[i] {
+                        c.0 = Promised;
                     }
                 }
                 m.held.push(planned.then_some(starts));
@@ -903,80 +795,68 @@ mod tests {
                     }
                 }
             }
-            Step::KeyMissed(i) => {
-                if c[i].0 == Started {
-                    c[i].0 = Waiting;
-                }
-            }
         }
-        (planned, helloed, sent, m)
+        (planned, sent, m)
     }
 
     /// Whether the hub takes `step` in this state: the encoder holds two frames at most and
-    /// sends only what it holds; only a datagram lane's relay reports; a lane is replaced
-    /// only by one of its kind.
+    /// sends only what it holds; only a live lane breaks.
     fn applies(m: &Model, step: Step) -> bool {
         match step {
             Step::Capture => m.held.len() < 2,
             Step::Send => !m.held.is_empty(),
-            Step::KeyMissed(i) => m.c[i].0 == Is::Started && m.c[i].1 == Some(Lane::Datagram),
-            // A session's lane is replaced only by a newer one of its kind.
-            Step::Attach(i, kind) => m.c[i].1.is_none_or(|l| l == Lane::from(kind)),
-            Step::Watch(_) | Step::StopWatching(_) | Step::StartOver(_) | Step::Restart => true,
+            Step::Lose(i) => m.c[i].1 == Lane::Live,
+            Step::Watch(_)
+            | Step::StopWatching(_)
+            | Step::StartOver(_)
+            | Step::Attach(_)
+            | Step::Restart => true,
         }
     }
 
-    /// A client of `hub`, with its control stream's receiver.
-    fn client(hub: &Hub) -> (Arc<Client>, mpsc::UnboundedReceiver<Out>) {
-        let now = Instant::now();
-        let (tx, rx) = mpsc::unbounded_channel();
-        let sender = Sender::new(Capability::mint().unwrap(), tx.clone(), now).unwrap();
-        (hub.add_client(tx, sender), rx)
+    /// A lane attaches to `c`: its queue.
+    fn attach(c: &Client) -> Arc<Queue> {
+        let queue = Queue::new(Arc::new(|| {}));
+        assert!(c.attach(queue.clone()));
+        queue
     }
 
-    /// A lane of `kind` attaches to `c`, replacing any before.
-    fn attach(c: &Client, kind: Kind, generation: Generation) {
-        let now = Instant::now();
-        let sent = crate::lanes::wire::Stamp::since(now, now);
-        let queue = Queue::new(kind, now, Arc::new(|| {}));
-        let rtt = Duration::from_millis(100);
-        assert!(c.lanes(|s| s.attach(generation, queue, sent, rtt, now)));
-    }
-
-    /// Two real clients of `hub` set to `m`, each with its control stream's receiver.
-    fn clients(hub: &Hub, m: &Model) -> Vec<(Arc<Client>, mpsc::UnboundedReceiver<Out>)> {
+    /// Two real clients of `hub` set to `m`, each with its lane's queue, if any.
+    fn clients(hub: &Hub, m: &Model) -> Vec<(Arc<Client>, Option<Arc<Queue>>)> {
         hub.clients.lock().clear();
         m.c.iter()
-            .map(|&(state, lane)| {
-                let (c, rx) = client(hub);
-                if let Some(lane) = lane {
-                    attach(&c, lane.into(), Generation::first());
-                }
-                c.viewing.lock().viewer = match state {
-                    Is::NotWatching => Viewer::NotWatching,
-                    Is::Waiting => Viewer::Waiting,
-                    Is::Promised => Viewer::Promised,
-                    Is::Started => Viewer::Started {
-                        key: Number::first(),
-                    },
+            .map(|&(viewer, lane)| {
+                let (tx, _rx) = mpsc::unbounded_channel();
+                let c = hub.add_client(tx, Sender::new(Capability::mint().unwrap()));
+                let queue = match lane {
+                    Lane::None => None,
+                    Lane::Live | Lane::Lost => Some(attach(&c)),
                 };
-                (c, rx)
+                if let (Lane::Lost, Some(q)) = (lane, &queue) {
+                    q.lose();
+                }
+                c.viewing.lock().viewer = viewer;
+                (c, queue)
             })
             .collect()
     }
 
     /// The same step, by the methods, on two real clients of `hub` set to `m`: what it
-    /// planned, whom it told hello, whom it sent the frame, and the model after it as the
-    /// clients are.
-    fn new_step(hub: &Hub, m: &Model, step: Step) -> (bool, Vec<usize>, Vec<usize>, Model) {
+    /// planned, whom it sent the frame, and the model after it as the clients are.
+    fn new_step(hub: &Hub, m: &Model, step: Step) -> (bool, Vec<usize>, Model) {
         let mut c = clients(hub, m);
         let mut after = m.clone();
         let (mut planned, mut sent) = (false, vec![]);
         match step {
             Step::Watch(i) => c[i].0.watch(),
             Step::StopWatching(i) => c[i].0.stop_watching(),
-            Step::StartOver(i) => c[i].0.start_over(hub.hello()),
-            Step::Attach(i, kind) => attach(&c[i].0, kind, Generation::first().next()),
+            Step::StartOver(i) => c[i].0.start_over(),
+            Step::Attach(i) => c[i].1 = Some(attach(&c[i].0)),
+            Step::Lose(i) => {
+                if let Some(q) = &c[i].1 {
+                    q.lose();
+                }
+            }
             Step::Restart => {
                 hub.restart_clients();
                 after.held.clear();
@@ -999,62 +879,49 @@ mod tests {
                     .push(planned.then(|| [0, 1].map(|i| promised(c[i].0.id))));
             }
             Step::Send => {
-                let key = Number::first().next();
                 if let Some(starts) = after.held.remove(0) {
                     for (i, (c, _)) in c.iter().enumerate() {
                         if starts[i] {
-                            c.started(key);
+                            c.started();
                         }
                     }
                 }
                 for (i, (c, _)) in c.iter().enumerate() {
-                    let update = Bytes::from_static(&[0; 16]);
-                    if c.takes(key, &update, Instant::now()).is_some() {
+                    if c.takes(&Bytes::from_static(&[0; 16])) {
                         sent.push(i);
                     }
                 }
             }
-            Step::KeyMissed(i) => c[i].0.decided(Number::first(), Outcome::Missed),
         }
-        let helloed = (0..2)
-            .filter(|&i| {
-                std::iter::from_fn(|| c[i].1.try_recv().ok())
-                    .any(|o| matches!(o, Out::Text(ServerMessage::Hello(_))))
-            })
-            .filter(|_| step_hellos(step))
-            .collect();
-        after.c = [0, 1].map(|i| (is(c[i].0.viewer()), m.c[i].1.or(after.c[i].1)));
-        if let Step::Attach(i, kind) = step {
-            after.c[i].1 = Some(kind.into());
-        }
-        (planned, helloed, sent, after)
-    }
-
-    /// Whether a step's hellos are a planned keyframe's (start-overs and restarts send
-    /// theirs by their own rule).
-    fn step_hellos(step: Step) -> bool {
-        matches!(step, Step::Capture)
+        after.c = [0, 1].map(|i| {
+            let lane = match &c[i].1 {
+                None => Lane::None,
+                Some(_) if c[i].0.lane(|s| s.attached()) => Lane::Live,
+                Some(_) => Lane::Lost,
+            };
+            (c[i].0.viewer(), lane)
+        });
+        (planned, sent, after)
     }
 
     /// A viewer starts only on a keyframe promised it, a keyframe is promised only to a
-    /// viewer with a lane to be sent it on, a viewer is sent frames only once started, a
-    /// viewer started on a datagram lane is told hello before any keyframe it could lose,
-    /// and one whose keyframe missed waits to start again; every viewer watching with a lane
-    /// is started in the end. Over every state two clients and the encoder reach in up to 8
-    /// of the hub's steps, breadth first, every step from every state, run on a real hub's
-    /// clients through the methods: each step does what the rule says, and from every state,
-    /// once the encoder has sent what it holds, one capture and its keyframe start every
-    /// viewer watching with a lane.
+    /// viewer with a live lane to be sent it on, a viewer is sent frames only once started,
+    /// and a viewer whose lane is replaced starts over on a keyframe sent on the new one;
+    /// every viewer watching with a live lane is started in the end. Over every state two
+    /// clients and the encoder reach in up to 8 of the hub's steps, breadth first, every
+    /// step from every state, run on a real hub's clients through the methods: each step
+    /// does what the rule says, and from every state, once the encoder has sent what it
+    /// holds, one capture and its keyframe start every viewer watching with a live lane.
     #[test]
     fn a_viewer_starts_only_on_a_keyframe_promised_it() {
         let hub = Hub::new().unwrap();
         let start = Model {
-            c: [(Is::NotWatching, None); 2],
+            c: [(Viewer::NotWatching, Lane::None); 2],
             held: vec![],
         };
         let mut seen = std::collections::HashSet::from([start.clone()]);
         let mut frontier = vec![start];
-        let (mut steps, mut helloed) = (0, 0);
+        let mut steps = 0;
         for _depth in 0..8 {
             let mut next = vec![];
             for before in frontier {
@@ -1066,9 +933,8 @@ mod tests {
                     let what = format!("{step:?} from {before:?}");
                     let got = new_step(&hub, &before, step);
                     assert_eq!(got, rule(&before, step), "{what}");
-                    helloed += got.1.len();
-                    if seen.insert(got.3.clone()) {
-                        next.push(got.3);
+                    if seen.insert(got.2.clone()) {
+                        next.push(got.2);
                     }
                 }
             }
@@ -1077,23 +943,23 @@ mod tests {
         for state in &seen {
             let mut m = state.clone();
             while !m.held.is_empty() {
-                m = new_step(&hub, &m, Step::Send).3;
+                m = new_step(&hub, &m, Step::Send).2;
             }
             for step in [Step::Capture, Step::Send] {
-                m = new_step(&hub, &m, step).3;
+                m = new_step(&hub, &m, step).2;
             }
             assert!(
                 m.c.iter().all(|&(v, lane)| match lane {
-                    Some(_) => matches!(v, Is::NotWatching | Is::Started),
-                    None => matches!(v, Is::NotWatching | Is::Waiting),
+                    Lane::Live => matches!(v, Viewer::NotWatching | Viewer::Started),
+                    Lane::None | Lane::Lost => v != Viewer::Promised,
                 }),
                 "left unstarted from {state:?}: {m:?}"
             );
         }
-        let reached: std::collections::HashSet<Is> =
+        let reached: std::collections::HashSet<Viewer> =
             seen.iter().flat_map(|m| m.c.map(|c| c.0)).collect();
         assert_eq!(reached.len(), 4, "{reached:?}");
-        assert!(steps > 0 && helloed > 0);
+        assert!(steps > 0);
     }
 
     /// The tests' generator, drawing the hub's values.
@@ -1157,8 +1023,6 @@ mod tests {
         fn message(&mut self) -> ServerMessage {
             match self.below(3) {
                 0 => ServerMessage::Hello(Hello {
-                    w: self.next() as u32,
-                    h: self.next() as u32,
                     codec: (self.next() & 1 == 1).then(|| self.text()),
                     settings: self.settings(),
                 }),
@@ -1170,17 +1034,15 @@ mod tests {
         }
     }
 
-    /// Gives `hub` the geometry and settings of `m`, if it is a hello.
+    /// Gives `hub` the settings of `m`, if it is a hello.
     fn say(hub: &Hub, m: &ServerMessage) {
         if let ServerMessage::Hello(h) = m {
-            hub.width.store(h.w, Ordering::Relaxed);
-            hub.height.store(h.h, Ordering::Relaxed);
             *hub.settings.lock() = h.settings.clone();
         }
     }
 
     /// The model: a message is a JSON object of its fields, and its kind as `t`, first. A
-    /// hub's hello, before a stream is built, is its geometry and its settings.
+    /// hub's hello, before a stream is built, is its settings.
     #[test]
     fn a_message_is_its_fields_after_its_kind() {
         let mut rng = Rng(crate::xorshift::Xorshift::new(0x2545_f491_4f6c_dd1d));
@@ -1194,11 +1056,9 @@ mod tests {
                 assert_eq!(hub.hello().json(), m.json());
             }
             let (kind, fields) = match &m {
-                // Its geometry and its settings, as `Hello` in web/src/protocol.ts names them.
+                // Its codec and its settings, as `Hello` in web/src/protocol.ts names them.
                 ServerMessage::Hello(h) => {
                     let mut f = serde_json::Map::new();
-                    f.insert("w".into(), h.w.into());
-                    f.insert("h".into(), h.h.into());
                     if let Some(codec) = &h.codec {
                         f.insert("codec".into(), codec.clone().into());
                     }

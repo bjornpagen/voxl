@@ -9,7 +9,7 @@
 //! MP4 beside the video; where the desktop is silent, or has no audio, the track has a
 //! gap, or (with no sound at all) isn't there.
 
-use crate::hub::{Hub, Out, ServerMessage};
+use crate::hub::{Hub, Out};
 use crate::mp4;
 use crate::video::{Header, Video};
 use std::sync::Arc;
@@ -84,8 +84,8 @@ pub async fn record(hub: &Arc<Hub>, until: Until, max: Duration) -> Result<Vec<u
     res
 }
 
-/// The frames and audio on `rx` until `until`, `max`, or (once there is a frame) a hello (the
-/// stream restarted): the MP4.
+/// The frames and audio on `rx` until `until`, `max`, or a keyframe of another size than the
+/// first's (the stream restarted at a new size): the MP4.
 async fn collect(
     hub: &Hub,
     mut rx: mpsc::UnboundedReceiver<Out>,
@@ -115,30 +115,36 @@ async fn collect(
         frames: Vec::new(),
         audio: Vec::new(),
     };
-    // The picture's size and level, read at the first frame: a restart (a new size) ends
-    // the recording before either could change.
+    // The picture's size and level, read at the first frame, a keyframe: a keyframe of
+    // another size (a restart) ends the recording before either could change.
     let mut size = (0, 0, mp4::Vp9 { level: 0 });
     // One message: taken into the recording, or the recording's end.
     let mut take = |m: Out| -> Taken {
         match m {
             Out::Bin(b) => {
-                let h = match Header::read(&b) {
-                    Ok(Video::Picture(h, _)) => h,
+                let (h, picture) = match Header::read(&b) {
+                    Ok(Video::Picture(h, picture)) => (h, picture),
                     // Not a picture: the stream sends no empty frame.
                     Ok(Video::Empty(_)) | Err(crate::video::Short) => return Taken::On,
                 };
-                if tracks.frames.is_empty() {
-                    use std::sync::atomic::Ordering::Relaxed;
-                    // A frame comes only from a built stream, which the hub holds.
-                    let Some(stream) = *hub.stream.lock() else {
-                        return Taken::On;
-                    };
-                    let level = stream.level();
-                    size = (
-                        hub.width.load(Relaxed),
-                        hub.height.load(Relaxed),
-                        mp4::Vp9 { level },
-                    );
+                match (tracks.frames.is_empty(), crate::vp9::keyframe_size(picture)) {
+                    // A recording starts on a keyframe, as every viewer does.
+                    (true, None) => return Taken::On,
+                    (true, Some((w, h))) => {
+                        // A frame comes only from a built stream, which the hub holds.
+                        let Some(stream) = *hub.stream.lock() else {
+                            return Taken::On;
+                        };
+                        size = (
+                            w,
+                            h,
+                            mp4::Vp9 {
+                                level: stream.level(),
+                            },
+                        );
+                    }
+                    (false, Some(wh)) if wh != (size.0, size.1) => return Taken::End,
+                    (false, _) => {}
                 }
                 // Time the frame was captured: now, less the pipeline time in its header.
                 let ms = (start.elapsed().as_millis() as u64).saturating_sub(h.pipe.millis());
@@ -161,9 +167,7 @@ async fn collect(
                 tracks.audio.push(mp4::AudioPacket { ms, data: packet });
                 Taken::On
             }
-            // A restart of the stream ends this recording.
-            Out::Text(ServerMessage::Hello(_)) if !tracks.frames.is_empty() => Taken::End,
-            Out::Text(_) | Out::Attached { .. } | Out::Buffer(_) | Out::Lost { .. } => Taken::On,
+            Out::Text(_) | Out::Attached => Taken::On,
         }
     };
     let asked_to_end = loop {
@@ -194,13 +198,24 @@ async fn collect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hub::ServerMessage;
 
-    /// Video frame `id`: a keyframe's header, and bytes standing for its VP9.
-    fn video(id: u32) -> Out {
-        let mut m = vec![1];
-        m.extend_from_slice(&id.to_be_bytes());
+    /// Video frame `id`: a keyframe of `w` x `h`, or a delta, and bytes standing for its
+    /// VP9 (a keyframe's uncompressed header as far as its size, then `id`).
+    fn video(id: u32, key: Option<(u16, u16)>) -> Out {
+        let mut m = vec![u8::from(key.is_some())];
         m.extend_from_slice(&[0; 4]);
-        m.extend_from_slice(&[0x82, 0x49, 0x83, 0x42, 0x00]);
+        match key {
+            // Profile 0, a keyframe shown; the sync code; BT.601 at studio range; the size.
+            Some((w, h)) => {
+                m.extend_from_slice(&[0x82, 0x49, 0x83, 0x42]);
+                let size = u64::from(w - 1) << 16 | u64::from(h - 1);
+                // Four bits of colour, then 32 of size: 36 bits, in five bytes.
+                m.extend_from_slice(&(size << 4).to_be_bytes()[3..]);
+            }
+            None => m.extend_from_slice(&[0x86, 0x00]),
+        }
+        m.extend_from_slice(&id.to_be_bytes());
         Out::Bin(bytes::Bytes::from(m))
     }
 
@@ -223,9 +238,10 @@ mod tests {
         u32::from_be_bytes(mp4[stsz + 12..stsz + 16].try_into().unwrap())
     }
 
-    /// A recording holds the frames that came before the first hello (a capture restart)
-    /// after its first frame, whatever else a viewer is told, and whatever the desktop's
-    /// clipboard says.
+    /// A recording holds the frames from its first keyframe to the first keyframe of
+    /// another size (a capture restart), whatever else a viewer is told (a hello, a
+    /// clipboard that says anything, the microphone), and whatever keyframes of its own size
+    /// come (other viewers starting).
     #[tokio::test]
     async fn a_recording_ends_at_a_restart_and_nothing_else() {
         const CLIPS: [&str; 7] = [
@@ -242,9 +258,19 @@ mod tests {
         for _ in 0..2_000 {
             let (tx, rx) = mpsc::unbounded_channel();
             let (mut held, mut ended) = (0, false);
+            let mut first: Option<(u16, u16)> = None;
             for id in 0..rng.next() % 12 {
-                let m = match rng.next() % 6 {
-                    0..=2 => video(id as u32),
+                let m = match rng.next() % 7 {
+                    0 | 1 => video(id as u32, None),
+                    2 => {
+                        let size = [(64, 64), (64, 64), (128, 96)][rng.below(3) as usize];
+                        match (first, ended) {
+                            (None, _) => first = Some(size),
+                            (Some(f), false) if f != size => ended = true,
+                            (Some(_), _) => {}
+                        }
+                        video(id as u32, Some(size))
+                    }
                     3 => Out::Text(hub.hello()),
                     4 => Out::Text(ServerMessage::Clip {
                         d: CLIPS[(rng.next() % CLIPS.len() as u64) as usize].into(),
@@ -253,10 +279,8 @@ mod tests {
                         on: rng.next() & 1 == 1,
                     }),
                 };
-                match &m {
-                    Out::Bin(_) if !ended => held += 1,
-                    Out::Text(ServerMessage::Hello(_)) if held > 0 => ended = true,
-                    _ => {}
+                if let (Out::Bin(_), Some(_), false) = (&m, first, ended) {
+                    held += 1;
                 }
                 tx.send(m).unwrap();
             }
@@ -286,10 +310,10 @@ mod tests {
         let mut reached = [0u32; 3];
         for _ in 0..1_000 {
             let (tx, rx) = mpsc::unbounded_channel();
-            tx.send(video(0)).unwrap();
+            tx.send(video(0, Some((64, 64)))).unwrap();
             let mut sent: Vec<(Vec<u8>, u32)> = Vec::new();
             for id in 1..1 + rng.next() % 12 {
-                tx.send(video(id as u32)).unwrap();
+                tx.send(video(id as u32, None)).unwrap();
             }
             for _ in 0..rng.next() % 13 {
                 let packet: Vec<u8> = (0..1 + rng.below(30))
@@ -303,7 +327,7 @@ mod tests {
                 .unwrap();
                 sent.push((packet, silent));
                 if rng.next() & 1 == 1 {
-                    tx.send(video(99)).unwrap();
+                    tx.send(video(99, None)).unwrap();
                 }
             }
             reached[match (sent.len(), sent.iter().any(|(_, s)| *s > 0)) {

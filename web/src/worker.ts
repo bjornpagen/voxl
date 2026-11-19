@@ -1,7 +1,7 @@
 // Owns the WebSocket to the relay, decodes VP9 with WebCodecs and hands each update to the
 // page the moment it is decoded, which presents it through <video>. A session that ends stays
 // ended until the page asks for another: nothing reconnects by itself.
-import { Frames, type LaneKind } from './frames';
+import { Frames } from './frames';
 import {
 	Bin,
 	cmd,
@@ -46,9 +46,6 @@ self.addEventListener('message', function first(e: MessageEvent<ToWorker>) {
 
 function start(init: Init) {
 	let session: Session = { s: 'none' };
-	/** The session's lane kind, as the relay said it before the stream's hello; none until
-	 * it says. */
-	let lane: LaneKind | null = null;
 	let audio: Audio = { s: 'off' };
 	let audioTs = 0;
 	let wantVideo = true;
@@ -78,7 +75,6 @@ function start(init: Init) {
 
 	function connect() {
 		if (session.s === 'live') return;
-		lane = null;
 		const ws = new WebSocket(init.url);
 		const live: Session = { s: 'live', ws, ending: { s: 'unsaid' } };
 		session = live;
@@ -140,17 +136,11 @@ function start(init: Init) {
 			return end('the relay sent text that is not JSON');
 		}
 		if (m.t === 'close') return end(m.why);
-		if (m.t === 'lane') {
-			lane = m.kind;
-			return;
-		}
 		if (m.t === 'hello') {
-			if (lane === null) return end('the relay sent a hello before its lane');
 			const codec = m.codec;
-			const begun = frames.hello(lane, codec);
+			const begun = frames.hello(codec);
 			recorded();
-			// Checked once a session, at its first hello: a codec this browser cannot decode
-			// ends it.
+			// Checked once, at the session's hello: a codec this browser cannot decode ends it.
 			if (begun !== null) checkCodec(codec, begun);
 		}
 		post(m);
@@ -187,9 +177,6 @@ function start(init: Init) {
 		},
 		close(dec) {
 			dec.close();
-		},
-		passed() {
-			Atomics.add(counts, Count.Passed, 1);
 		},
 		end(why) {
 			post({ t: 'log', s: `video: ${why}` });

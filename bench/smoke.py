@@ -56,8 +56,9 @@ async def main():
             m = await asyncio.wait_for(ws.recv(), 10)
             if isinstance(m, str) and '"hello"' in m:
                 hello = json.loads(m)
-        check(hello is not None and hello.get('w', 0) > 0, f'hello: {hello}')
-        w, h = hello['w'], hello['h']
+        check(hello is not None and 'codec' in hello, f'hello: {hello}')
+        # The desktop's size: the screenshot's (its PNG header's width and height).
+        w, h = int.from_bytes(png[16:20], 'big'), int.from_bytes(png[20:24], 'big')
         stats = {'video': 0, 'key': 0, 'cursor': 0, 'clip': None}
         await ws.send('v,1')
         await frames(ws, 4, stats)

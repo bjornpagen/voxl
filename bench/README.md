@@ -84,7 +84,7 @@ is its log. CBR from 30 Mbps, with congestion control down to 2 Mbps.
 ## What is here
 
 Everything above runs against `voxl relay` on port 6902 (`env/voxl.sh` starts the daemon;
-the relay reaches it over ssh and the lanes, as it reaches a real desktop):
+the relay reaches it over ssh and the lane, as it reaches a real desktop):
 `nclient.py voxl` reads the relay's page socket, `measure.mjs`, `shot.mjs`,
 `inputtest.mjs` and `keytest.mjs` drive its page in Chromium, `keyhold.py` and `smoke.py`
 talk to its socket as the page does. The other clients (`kclient.py`, `nkclient.py`,

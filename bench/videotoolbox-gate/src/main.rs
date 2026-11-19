@@ -1,13 +1,13 @@
 //! The VideoToolbox gate: this Mac's hardware VP9 decoder, the one the page's WebCodecs
-//! decoder uses, decodes the daemon's stream as libavcodec's software decoder does, whatever
-//! a viewer lost. `cargo test` proves the stream in software everywhere; this measures the
-//! one decoder it cannot reach, so it runs here, by hand, before a deploy.
+//! decoder uses, decodes the daemon's stream as libavcodec's software decoder does, from
+//! whichever keyframe a viewer starts on. `cargo test` proves the stream in software
+//! everywhere; this measures the one decoder it cannot reach, so it runs here, by hand,
+//! before a deploy.
 //!
 //! Over generated runs of typing and scrolling on a page of text, at a small size and at
-//! the production size (3024x1898), each frame but the first lost with a quarter's chance
-//! (the live link's measured loss before repair), each loss and each decode reported a
-//! generated round trip of 1 to 30 frames later: the frames that arrived, decoded by FFmpeg
-//! through VideoToolbox with every error fatal, come out as exactly the pictures the whole
+//! the production size (3024x1898), with keyframes where viewers start (the first frame,
+//! and now and then later): the stream from a generated keyframe on, decoded by FFmpeg
+//! through VideoToolbox with every error fatal, comes out as exactly the pictures the whole
 //! stream decodes to in software. Exits 0 with one line per run, or 1 at the first that
 //! does not.
 
@@ -18,7 +18,7 @@ mod vp9;
 #[path = "../../../src/xorshift.rs"]
 mod xorshift;
 
-use vp9::{Coding, Encoder, Fineness, Planes, Shape, Stream};
+use vp9::{Coding, Encoder, Planes, Shape, Stream};
 use xorshift::Xorshift;
 
 /// A page of text-like lines, `rows` tall: dark marks on a light page.
@@ -84,7 +84,7 @@ fn ivf_frame(b: &mut Vec<u8>, pts: u64, frame: &[u8]) {
     b.extend_from_slice(frame);
 }
 
-/// One run: whether VideoToolbox decoded every frame that arrived as software decodes it.
+/// One run: whether VideoToolbox decoded the stream from a keyframe as software decodes it.
 fn run(
     case: u64,
     w: usize,
@@ -94,7 +94,6 @@ fn run(
 ) -> Result<String, String> {
     const FRAMES: u64 = 120;
     let text = page(w, h * 4, rng);
-    let lag = 1 + rng.below(30);
     let shape = Shape {
         width: w as u32,
         height: h as u32,
@@ -102,23 +101,12 @@ fn run(
     };
     let cores = std::thread::available_parallelism().map_err(|e| e.to_string())?;
     let stream = Stream::new(shape, cores).map_err(|e| format!("{e:?}"))?;
-    let mut enc = Encoder::new(&stream, 8_000).map_err(|e| e.to_string())?;
-    let (mut slots, key) = stream.start(0);
-    let mut key = Some(key);
+    let mut enc = Encoder::new(&stream).map_err(|e| e.to_string())?;
     let (u, v) = (vec![128u8; w * h / 4], vec![128u8; w * h / 4]);
-    let mut due: Vec<(u64, u64, bool)> = Vec::new();
-    let (mut whole, mut arrived_ivf) = (ivf_header(w, h), ivf_header(w, h));
-    let mut arrived = Vec::new();
+    let mut frames: Vec<(bool, Vec<u8>)> = Vec::new();
     let mut top = 0usize;
     let mut screen = text[..w * h].to_vec();
     for f in 0..FRAMES {
-        for &(_, n, came) in due.iter().filter(|d| d.0 <= f) {
-            match came {
-                true => slots.decoded(n),
-                false => slots.lost(n),
-            }
-        }
-        due.retain(|d| d.0 > f);
         match rng.below(3) {
             0 => {
                 top = (top + 1 + rng.below(8) as usize).min(h * 3);
@@ -129,9 +117,10 @@ fn run(
                 screen[at] = screen[at].wrapping_add(128);
             }
         }
-        let coding: Coding = match key.take() {
-            Some(k) => k.into(),
-            None => slots.code(f).into(),
+        let key = f == 0 || rng.below(30) == 0;
+        let coding = match key {
+            true => Coding::Key,
+            false => Coding::Delta,
         };
         let mut out = Vec::new();
         let p = Planes {
@@ -141,43 +130,39 @@ fn run(
             stride_y: w,
             stride_uv: w / 2,
         };
-        enc.encode(&p, f as i64 * 16, coding, Fineness::Rate, &mut out)
+        enc.encode(&p, f as i64 * 16, coding, &mut out)
             .map_err(|e| e.to_string())?;
-        slots.sent(f, 1);
-        ivf_frame(&mut whole, f, &out);
-        let came = f == 0 || rng.below(4) > 0;
-        due.push((f + lag, f, came));
-        if came {
-            ivf_frame(&mut arrived_ivf, f, &out);
-            arrived.push(f as usize);
-        }
+        frames.push((key, out));
     }
-    let (whole_file, arrived_file) = (
-        dir.join(format!("whole{case}.ivf")),
-        dir.join(format!("arrived{case}.ivf")),
-    );
-    std::fs::write(&whole_file, &whole).map_err(|e| e.to_string())?;
-    std::fs::write(&arrived_file, &arrived_ivf).map_err(|e| e.to_string())?;
+    let keys: Vec<usize> = (0..frames.len()).filter(|&f| frames[f].0).collect();
+    let from = keys[rng.below(keys.len() as u64) as usize];
+    let file = |name: &str, from: usize| -> Result<std::path::PathBuf, String> {
+        let mut ivf = ivf_header(w, h);
+        for (f, (_, b)) in frames.iter().enumerate().skip(from) {
+            ivf_frame(&mut ivf, f as u64, b);
+        }
+        let path = dir.join(format!("{name}{case}.ivf"));
+        std::fs::write(&path, ivf).map_err(|e| e.to_string())?;
+        Ok(path)
+    };
     let frame = w * h * 3 / 2;
-    let truth = decode(&whole_file, false)?;
-    let got = decode(&arrived_file, true)?;
-    if got.len() != arrived.len() * frame || truth.len() != FRAMES as usize * frame {
+    let truth = decode(&file("whole", 0)?, false)?;
+    let got = decode(&file("from", from)?, true)?;
+    let from_on = FRAMES as usize - from;
+    if got.len() != from_on * frame || truth.len() != FRAMES as usize * frame {
         return Err(format!(
-            "{} pictures for {} arrived",
-            got.len() / frame,
-            arrived.len()
+            "{} pictures for {from_on} frames from keyframe {from}",
+            got.len() / frame
         ));
     }
-    for (i, &f) in arrived.iter().enumerate() {
-        if got[i * frame..][..frame] != truth[f * frame..][..frame] {
-            return Err(format!("frame {f} differs"));
-        }
+    if got[..] != truth[from * frame..] {
+        return Err(format!("a frame from keyframe {from} differs"));
     }
     Ok(format!(
-        "{w}x{h} ({}, {} threads), round trip {lag} frames: {} of {FRAMES} frames arrived, all as software decodes them",
+        "{w}x{h} ({}, {} threads), from keyframe {from} of {}: {from_on} frames, all as software decodes them",
         stream.codec(),
         stream.threads,
-        arrived.len()
+        keys.len()
     ))
 }
 

@@ -1,12 +1,12 @@
 # voxl
 
-A fork of [tembo/voxl](https://github.com/tembo/voxl) that went its own way: it carries the desktop over lanes through a proxy, with a code that repairs loss by each frame's deadline, so that it stays usable on a lossy, bursty path where one TCP stream stalls.
+A fork of [tembo/voxl](https://github.com/tembo/voxl) that went its own way: it carries the desktop over one stream through a proxy (a QUIC stream under Hysteria 2 or naive over HTTP/3, TCP under naive over HTTP/2), and lets the transport do its job.
 
 Low-latency desktop streaming for the browser, written in Rust. voxl streams an X11
 display as VP9 to a small web client that decodes
 with WebCodecs, with input, clipboard, audio, microphone, file and folder transfer and
-dynamic resolution. It is built for links that lose packets: video and audio cross as a
-code that repairs losses without waiting for a resend, and ssh is the only way in.
+dynamic resolution. When the link slows, it skips screens rather than queue them, and ssh
+is the only way in.
 
 ## Quick start
 
@@ -17,12 +17,11 @@ cargo install --git https://github.com/bjornpagen/voxl   # needs libvpx, libyuv,
 DISPLAY=:1 voxl             # streams display :1 to the sessions that attach to it
 ```
 
-On the machine you watch from, describe the lanes your proxy gives (see
-[Lanes](#lanes)) and run the relay:
+On the machine you watch from, name the HTTP proxy that reaches the server and run the
+relay:
 
 ```sh
-echo 'datagram 127.0.0.1:1080' > ~/.config/voxl-lanes
-voxl relay --lanes ~/.config/voxl-lanes --ssh desktop --port 6901
+voxl relay --proxy 127.0.0.1:1080 --ssh desktop --port 6901
 ```
 
 Open `http://127.0.0.1:6901/`. The daemon runs on Linux; the relay runs on Linux and
@@ -33,56 +32,33 @@ macOS.
 ```
 browser page --WebSocket, 127.0.0.1--> voxl relay (the viewer's machine)
    voxl relay --ssh--> voxl attach --unix socket--> voxl daemon   (the control stream)
-   voxl relay --lanes, through a proxy--> the server's proxy --unix sockets--> voxl daemon
+   voxl relay --one stream, through a proxy--> the server's proxy --unix socket--> voxl daemon
 ```
 
 - **The relay** (`voxl relay`) runs where you watch. It serves the page on 127.0.0.1 and,
   for each page that connects, runs a session.
 - **The control stream** is `ssh <host> voxl attach`: whatever ssh's own configuration
   makes of the host (its keys, its master connection) is the door. It carries everything
-  that must arrive whole: the hello, input, clipboard, cursor images, the microphone,
-  and on a datagram lane a report of every block. `voxl attach` only joins ssh's stdio to the daemon's control
-  socket, which takes connections from the daemon's own user and no one else.
-- **The lane** carries video and audio, one way, from the daemon to the relay, through a
-  proxy (a SOCKS5 proxy with UDP, or an HTTP CONNECT proxy) whose server end reaches the
-  daemon's lane sockets at `localhost:6901`. Each session's daemon makes a 256-bit
-  capability and sends it first on the control stream; the lane presents it once, as its
-  first message, and the daemon acts on nothing else a lane sends. The capability dies
-  with the control stream, and the lane attached with it is dropped. voxl itself encrypts
-  nothing: the tunnel encrypts the wire, and every other hop is on one machine.
+  but the picture and the sound: the hello, input, clipboard, cursor images and the
+  microphone. `voxl attach` only joins ssh's stdio to the daemon's control socket, which
+  takes connections from the daemon's own user and no one else.
+- **The lane** is one HTTP CONNECT stream through the proxy, whose server end reaches the
+  daemon's lane socket at `localhost:6901`. It carries video and audio, interleaved, one
+  way, from the daemon to the relay. Each session's daemon makes a 256-bit capability and
+  sends it first on the control stream; the lane presents it as its first bytes, and the
+  daemon reads nothing else a lane sends. The capability dies with the control stream, and
+  the lane attached with it is dropped. voxl itself encrypts nothing: the tunnel encrypts
+  the wire, and every other hop is on one machine.
 - **The rate is the transport's.** The daemon writes to the lane only what its socket
-  accepts, never drops what it decided to send, and sizes the encoder by the rate the
-  socket drains; it runs no congestion control of its own.
-- **References.** The VP9 encoder refers only to pictures the page is known to have, so
-  every frame the relay completes decodes, and the relay gives the page every one, in
-  order. Keyframes are sent only when a viewer starts.
-- **The code** (datagram lanes only). A frame (one update of the screen, or one Opus
-  packet) is cut into pieces and sent with as many repairs (combinations of its pieces over
-  GF(256)) as make the best use of the link, given the losses the reports show. A piece
-  that has not arrived by the frame's deadline is erased; the relay rebuilds the frame from
-  any large enough set of pieces and repairs. A frame that misses is never sent again: the
-  next update refers past it. On a stream lane TCP or QUIC delivers every frame, in order,
-  and nothing is coded.
-
-### Lanes
-
-The relay reads a one-line lanes description (`--lanes`) at every session start, so the
-transport may change between sessions. Fields are one space apart and the line ends in a
-newline:
-
-```
-datagram <socks5 host:port>
-stream <proxy host:port>
-```
-
-- **`datagram`**: the lane is datagrams through the proxy's UDP ASSOCIATE (Hysteria2's UDP
-  relay), coded with repair. A loss costs only the piece.
-- **`stream`**: the lane is one HTTP CONNECT stream through the proxy (naive over HTTP/2 or
-  HTTP/3): frames as they are, in order. A loss holds the stream until it is resent, so a
-  frame waits for it.
-
-A description that cannot be read or is malformed ends the session with the reason on
-the page; nothing is assumed.
+  accepts, and the relay reads the next frame only once the page has taken the one before,
+  so nothing queues anywhere but in the transport's window. A screen is captured only
+  while none of the daemon's bytes wait for the lane's socket: a slow link or a slow page
+  lowers the frame rate, and the newest screen goes next. voxl runs no congestion control
+  of its own, and codes every frame at one quality.
+- **The stream.** A viewer starts on a keyframe, and every frame after it refers to the
+  frames before it, which the lane carried in order. Keyframes are sent only when a viewer
+  starts, which a lane that reopens or a resize also is. The desktop's size is the
+  keyframe's: the page lays itself out from the pictures it decodes.
 
 ## Benchmarks
 
@@ -145,7 +121,7 @@ frame being decoded. voxl's column is its best run of each test. To reproduce, s
 - **Links:** a bottleneck with a deep queue: a TCP proxy for the WebSocket servers, and
   `tc netem` for Neko's WebRTC media and Sunshine's video (UDP). None of them drop
   packets, where UDP with error correction would have the edge.
-- These runs predate the lanes: voxl's video then crossed one WebSocket, as the other
+- These runs predate the lane through a proxy: voxl's video then crossed one WebSocket, as the other
   WebSocket servers' did.
 
 ## Usage
@@ -180,12 +156,12 @@ Run it against an X display:
 DISPLAY=:1 ./target/release/voxl
 ```
 
-It listens on three unix sockets and no network port, all in its runtime folder
+It listens on two unix sockets and no network port, all in its runtime folder
 (`--runtime`), with the microphone's FIFO and its scratch keymap: `control`,
-`lane-stream`, `lane-datagram`, `mic` and `keymap`. The folder must be the daemon user's,
+`lane-stream`, `mic` and `keymap`. The folder must be the daemon user's,
 with no write bit for others, or the daemon does not start; make it at boot (a tmpfiles.d
 rule) with the group the proxy's user is in. The server's proxy maps `localhost:6901` to
-the lane sockets: TCP to `lane-stream`, UDP to `lane-datagram`. PulseAudio's
+the lane socket: TCP to `lane-stream`. PulseAudio's
 `module-pipe-source` reads the microphone from `mic`. Start Xvfb with `-shmem` for zero-copy
 capture, and use the patched Xvfb
 (`nix-build -E 'with import <nixpkgs> {}; callPackage ./xvfb.nix {}'`) for smooth
@@ -207,29 +183,29 @@ desktop follows the viewer's window) are always on.
 ### The relay
 
 ```sh
-voxl relay --lanes FILE --ssh DESTINATION --port PORT [--runtime DIR] [--place localhost:PORT]
+voxl relay --proxy HOST:PORT --ssh DESTINATION --port PORT [--runtime DIR] [--place localhost:PORT]
 ```
 
-| Flag        |                                                                                                   |
-| ----------- | ------------------------------------------------------------------------------------------------- |
-| `--lanes`   | the lanes description, read at every session start (see [Lanes](#lanes))                          |
-| `--ssh`     | where `voxl attach` and `voxl files` run: anything `ssh` takes as its destination                 |
-| `--port`    | the page's port on `127.0.0.1`                                                                    |
-| `--runtime` | the runtime folder of the daemon `voxl attach` reaches, on the server; else the daemon's default  |
-| `--place`   | where the lanes go, as the server's proxy is asked for it; else the protocol's `localhost:6901`   |
+| Flag        |                                                                                                  |
+| ----------- | ------------------------------------------------------------------------------------------------ |
+| `--proxy`   | the HTTP proxy the lane goes through (`host:port`; an IPv6 address in brackets)                  |
+| `--ssh`     | where `voxl attach` and `voxl files` run: anything `ssh` takes as its destination                |
+| `--port`    | the page's port on `127.0.0.1`                                                                   |
+| `--runtime` | the runtime folder of the daemon `voxl attach` reaches, on the server; else the daemon's default |
+| `--place`   | where the lane goes, as the server's proxy is asked for it; else the protocol's `localhost:6901` |
 
-`--lanes`, `--ssh` and `--port` are required; `--runtime` and `--place` are for a server
-that runs more than one daemon, each in a folder of its own with its lanes at a port of its
-own on the server's loopback (`localhost:PORT`, no longer than `localhost:6901`: the daemon
-sizes its datagrams for that). The relay listens on `127.0.0.1` only, and answers only requests
-for an IP address or `localhost`, from its own page. That keeps out other web pages,
-which browsers let connect to any address, including pages whose domain is pointed at
-127.0.0.1 (DNS rebinding). Programs that aren't browsers send no `Origin` and get
-through.
+`--proxy`, `--ssh` and `--port` are required; `--runtime` and `--place` are for a server
+that runs more than one daemon, each in a folder of its own with its lane at a port of its
+own on the server's loopback (`localhost:PORT`). The relay listens on `127.0.0.1` only, and
+answers only requests for an IP address or `localhost`, from its own page. That keeps out
+other web pages, which browsers let connect to any address, including pages whose domain
+is pointed at 127.0.0.1 (DNS rebinding). Programs that aren't browsers send no `Origin`
+and get through.
 
-A session's WebSocket, its ssh and its lanes start together and end together; the page
+A session's WebSocket, its ssh and its lane start together and end together; the page
 shows why a session ended, and clicking it starts a new one. Nothing reconnects by
-itself.
+itself, but a lane the transport closes is opened again, and its viewer starts over on a
+keyframe.
 
 ### `voxl attach` and `voxl files`
 
@@ -263,19 +239,20 @@ takes `--runtime DIR`, as `voxl attach` does, for a daemon whose runtime folder 
 
 ## FAQ
 
-**Why lanes and a code, and not one TCP connection?** On a link that loses packets, a
-lost packet holds up everything behind it on a TCP connection until it is resent, a
-round trip or more later. voxl sends each frame with repairs sized to the losses the
-reports show, so a frame is rebuilt from what arrived by its deadline, and a frame that
-misses is replaced by the next instead of waited for. The page still talks to one
-WebSocket, on 127.0.0.1, and the browser decodes each update the moment it arrives with
-WebCodecs.
+**Why one stream, and no code of its own against loss?** voxl tried datagrams with
+forward error correction, and on a real path most loss turned out to be its own
+congestion: repair added load, which added loss. A stream through a QUIC or TCP transport
+leaves loss and pacing to the transport, which is built for them, and voxl keeps lag down
+at the source instead: it captures a screen only once the last one is on its way, so a
+slow link lowers the frame rate rather than queueing old screens. The page still talks to
+one WebSocket, on 127.0.0.1, and the browser decodes each update the moment it arrives
+with WebCodecs.
 
 **How is it different from Moonlight and Sunshine?** They're for playing games on your
 own GPU machine through the Moonlight app, and for that they're the better fit. voxl was
 built for things like software factories that use headless VMs and sandboxes (CI,
 computer-use agents), usually on Xvfb with no GPU, reached over ssh. It streams them to
-a plain browser tab, across links that lose packets.
+a plain browser tab, through a proxy.
 
 **How is it different from RustDesk?** RustDesk is an open-source alternative to
 TeamViewer and AnyDesk, for reaching your own computers or helping someone with theirs:

@@ -14,14 +14,14 @@ export interface App {
 	tools: HTMLElement;
 	isMac: boolean;
 	inIframe: boolean;
-	/** The desktop as the session's hello describes it. */
+	/** The desktop as the pictures decoded show it. */
 	desk: Desk;
 	/** On-screen CSS pixels per desktop pixel, before any pinch zoom (zoom.ts). */
 	view: { scale: number };
 }
 
-/** The desktop: none before a session's hello and after the session ends; otherwise its
- * size in pixels. */
+/** The desktop: none before a session's first picture and after the session ends;
+ * otherwise its size in pixels, the size of the pictures decoded. */
 export type Desk =
 	| { readonly s: 'none' }
 	| {

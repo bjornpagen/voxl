@@ -1,5 +1,5 @@
 //! voxl: low-latency desktop streaming for the browser, from an X11 display on Linux. The
-//! daemon codes the desktop as VP9 and sends it, with its audio, over a session's lanes;
+//! daemon codes the desktop as VP9 and sends it, with its audio, over a session's lane;
 //! `voxl attach` (run over ssh) is a session's control stream; `voxl relay` on the viewer's
 //! machine serves the page and joins the two. The daemon runs on Linux alone; elsewhere
 //! `voxl` is the relay, and the daemon's platform-free core is built there for its tests.
@@ -25,7 +25,6 @@ mod help;
 mod hub;
 #[cfg(target_os = "linux")]
 mod input;
-pub mod lanes;
 mod logging;
 #[cfg(target_os = "linux")]
 mod mic;
@@ -44,6 +43,7 @@ mod sound;
 mod video;
 #[cfg(any(target_os = "linux", test))]
 mod vp9;
+pub mod wire;
 #[cfg(test)]
 mod xorshift;
 

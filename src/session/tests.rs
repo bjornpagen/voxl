@@ -1,13 +1,14 @@
 //! The session's properties, each against what the relay's side of the sockets sees: a
 //! still desktop sends nothing; a lane attaches only with its session's capability, and
-//! nothing else from a lane counts; a closed session's lanes get no byte more; and the
-//! capability goes nowhere but the control stream.
+//! nothing else from a lane counts; a closed session's lane gets no byte more; a lane whose
+//! socket breaks gates nothing; the capture gate is open exactly while nothing waits for the
+//! socket, and captures follow the socket's rate; and the capability goes nowhere but the
+//! control stream.
 
 use super::control::{connection, Daemon};
-use super::lane::{datagrams, stream_lane};
 use super::query::Opening;
 use crate::hub::Hub;
-use crate::lanes::wire::{self, Attach, Capability, Down, Framer, Generation, Stamp, Up};
+use crate::wire::{Capability, Down, Frame, Framer, Track, Up};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -35,8 +36,6 @@ struct Relay {
 enum Said {
     Capability(Vec<u8>),
     Attached,
-    Buffer,
-    Lost(Generation),
     Text(String),
     Binary(Vec<u8>),
 }
@@ -49,7 +48,7 @@ impl Relay {
         relay.write_all(&Opening::Session.bytes()).await.unwrap();
         Relay {
             socket: relay,
-            framer: Framer::control(),
+            framer: Framer::new(),
         }
     }
 
@@ -66,18 +65,13 @@ impl Relay {
         }
     }
 
-    /// The capability, the lane's receive buffer and the hello, as a session opens.
+    /// The capability and the hello, as a session opens.
     async fn greeted(&mut self) -> (Capability, Vec<u8>) {
         let (Said::Capability(raw), Some(c)) = self.next().await else {
             panic!("the first message is no capability");
         };
-        assert_eq!(
-            self.next().await.0,
-            Said::Buffer,
-            "the second message is no buffer"
-        );
         let (Said::Text(hello), None) = self.next().await else {
-            panic!("the third message is no hello");
+            panic!("the second message is no hello");
         };
         assert!(hello.starts_with("{\"t\":\"hello\""), "{hello}");
         (c, raw)
@@ -104,9 +98,7 @@ impl Relay {
         let raw = self.framer.frame().unwrap()?.to_vec();
         Some(match Down::decode(&raw).unwrap() {
             Down::Capability(c) => (Said::Capability(raw[1..].to_vec()), Some(c.keep())),
-            Down::Attached { .. } => (Said::Attached, None),
-            Down::Buffer { .. } => (Said::Buffer, None),
-            Down::Lost { generation } => (Said::Lost(generation), None),
+            Down::Attached => (Said::Attached, None),
             Down::Text(t) => (Said::Text(t.into()), None),
             Down::Binary(b) => (Said::Binary(b.into()), None),
         })
@@ -128,37 +120,20 @@ async fn settle() {
     }
 }
 
-/// A lane's attach, with a round trip of 100 ms measured.
-fn attach(c: &Capability, generation: Generation) -> [u8; Attach::LEN] {
-    let now = Instant::now();
-    Attach::encode(
-        c,
-        generation,
-        Stamp::since(now, now),
-        Duration::from_millis(100),
-    )
+/// A lane's first bytes: the capability it presents.
+fn attach(c: &Capability) -> [u8; crate::wire::CAPABILITY] {
+    *c.bytes()
 }
 
-/// A lane's attach as a stream lane writes it: its length, then it.
-fn attach_framed(c: &Capability, generation: Generation) -> [u8; Attach::STREAM_LEN] {
-    let now = Instant::now();
-    Attach::encode_stream(
-        c,
-        generation,
-        Stamp::since(now, now),
-        Duration::from_millis(100),
-    )
-}
-
-/// A stream lane opened to `hub` with `bytes` first: the relay's end.
-async fn stream(hub: &Arc<Hub>, bytes: &[u8]) -> UnixStream {
+/// A lane opened to `hub` with `bytes` first: the relay's end.
+async fn open_lane(hub: &Arc<Hub>, bytes: &[u8]) -> UnixStream {
     let (mut relay, ours) = UnixStream::pair().unwrap();
-    tokio::spawn(stream_lane(ours, hub.clone()));
+    tokio::spawn(super::lane::lane(ours, hub.clone()));
     relay.write_all(bytes).await.unwrap();
     relay
 }
 
-/// Reads a stream lane until it ends: what it carried.
+/// Reads a lane until it ends: what it carried.
 async fn to_the_end(lane: &mut UnixStream) -> Vec<u8> {
     let mut all = Vec::new();
     lane.read_to_end(&mut all).await.unwrap();
@@ -174,7 +149,7 @@ async fn a_still_desktop_sends_nothing_after_the_hello() {
     let d = daemon(&hub);
     let mut relay = Relay::open(&d).await;
     let (c, _) = relay.greeted().await;
-    let lane = stream(&hub, &attach_framed(&c, Generation::first())).await;
+    let lane = open_lane(&hub, &attach(&c)).await;
     assert_eq!(relay.next().await.0, Said::Attached);
     relay.say(Up::Text("v,1")).await;
     relay.say(Up::Text("au,1")).await;
@@ -212,12 +187,10 @@ async fn a_wrong_or_stale_capability_is_refused() {
     for i in 0..raw.len() {
         let mut changed = raw.clone();
         changed[i] ^= 1 << (i % 8);
-        let mut a = attach(&c, Generation::first());
-        a[1..33].copy_from_slice(&changed);
-        wrong.push(Attach::decode(&a).unwrap().capability);
+        wrong.push(Capability::presented(&changed.try_into().unwrap()));
     }
     for w in &wrong {
-        let mut lane = stream(&hub, &attach_framed(w, Generation::first())).await;
+        let mut lane = open_lane(&hub, &attach(w)).await;
         assert!(
             to_the_end(&mut lane).await.is_empty(),
             "a refused lane was answered"
@@ -225,77 +198,32 @@ async fn a_wrong_or_stale_capability_is_refused() {
     }
     // Neither a lane of a few bytes, nor one of another message, is an attach.
     for first in [&[0u8, 3, 1][..], &[0, 42], b"GET / HTTP/1.1\r\n\r\n"] {
-        let mut lane = stream(&hub, first).await;
+        let mut lane = open_lane(&hub, first).await;
         drop(lane.shutdown().await);
         assert!(to_the_end(&mut lane).await.is_empty());
     }
-    let _lane = stream(&hub, &attach_framed(&c, Generation::first())).await;
+    let _lane = open_lane(&hub, &attach(&c)).await;
     assert_eq!(relay.next().await.0, Said::Attached);
     assert!(relay.silent().await, "a refused lane was confirmed");
 }
 
-/// The datagram socket: an attach with a wrong capability is dropped with no reply; one
-/// with the right capability attaches its sender; anything that sender sends after (an
-/// attach for another session among it) is dropped unread, and that other session hears of
-/// no lane until one from another sender attaches to it. Datagrams are taken in order, so
-/// a confirmation is a mark that everything before it was taken.
-#[tokio::test]
-async fn a_datagram_lane_is_its_sender() {
-    let dir = std::env::temp_dir().join(format!("voxl-lanes-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("lane-datagram");
-    let _ = std::fs::remove_file(&path);
-    let hub = Hub::new().unwrap();
-    let d = daemon(&hub);
-    let socket = super::listen::datagram(&path).unwrap();
-    tokio::spawn(datagrams(socket, hub.clone()));
-    let mut a = Relay::open(&d).await;
-    let (ca, _) = a.greeted().await;
-    let mut b = Relay::open(&d).await;
-    let (cb, _) = b.greeted().await;
-    let peer = |name: &str| {
-        let p = dir.join(name);
-        let _ = std::fs::remove_file(&p);
-        std::os::unix::net::UnixDatagram::bind(&p).unwrap()
-    };
-    let attach = |c: &Capability| attach(c, Generation::first());
-    let p = peer("p");
-    p.set_nonblocking(true).unwrap();
-    p.send_to(&attach(&Capability::mint().unwrap()), &path)
-        .unwrap();
-    p.send_to(&attach(&ca), &path).unwrap();
-    assert_eq!(a.next().await.0, Said::Attached);
-    let mut buf = [0u8; 64];
-    assert!(p.recv(&mut buf).is_err(), "a datagram lane was answered");
-    // From the attached sender: an attach for b, and bytes that are nothing.
-    p.send_to(&attach(&cb), &path).unwrap();
-    p.send_to(b"nothing at all", &path).unwrap();
-    let q = peer("q");
-    q.send_to(&attach(&cb), &path).unwrap();
-    assert_eq!(b.next().await.0, Said::Attached);
-    assert!(b.silent().await, "b heard of a lane from a's sender");
-    assert!(a.silent().await);
-    std::fs::remove_dir_all(&dir).unwrap();
-}
-
-/// Once its control connection closes, a session's lanes get no byte more: frames sent
+/// Once its control connection closes, a session's lane gets no byte more: frames sent
 /// before the close reach the lane as it is read, in order, the lane then ends, and frames
 /// sent after it make nothing; another lane attaching with its capability is refused.
 #[tokio::test]
 async fn after_the_close_no_lane_gets_a_byte() {
-    use crate::lanes::wire::{Lane, Number};
     let hub = Hub::new().unwrap();
     let d = daemon(&hub);
     let mut relay = Relay::open(&d).await;
     let (c, raw) = relay.greeted().await;
-    let mut lane = stream(&hub, &attach_framed(&c, Generation::first())).await;
+    let mut lane = open_lane(&hub, &attach(&c)).await;
     assert_eq!(relay.next().await.0, Said::Attached);
     let client = hub.clients.lock()[0].clone();
-    let frame = bytes::Bytes::from(vec![7u8; 3000]);
-    for _ in 0..5 {
-        client.lanes(|s| s.video(Number::first(), &frame, Instant::now()));
+    for i in 0..5u8 {
+        let frame = bytes::Bytes::from(vec![i; 3000]);
+        client.lane(|s| s.video(&frame));
     }
-    let mut framer = Framer::stream();
+    let mut framer = Framer::new();
     let mut buf = [0u8; 4096];
     let mut carried = 0;
     while carried < 5 {
@@ -303,30 +231,33 @@ async fn after_the_close_no_lane_gets_a_byte() {
         assert!(n > 0, "the lane ended before the close");
         framer.push(&buf[..n]);
         while let Some(m) = framer.frame().unwrap() {
-            let Ok(Lane::Frame { frame, .. }) = Lane::decode(m) else {
-                panic!("a stream lane carries frames");
+            let Ok(Frame {
+                track: Track::Video,
+                bytes,
+            }) = Frame::decode(m)
+            else {
+                panic!("a lane carries the updates");
             };
-            assert_eq!(frame.get(), carried, "in order");
+            assert_eq!(bytes[0], carried, "in order");
             carried += 1;
         }
     }
+    let frame = bytes::Bytes::from(vec![7u8; 3000]);
     drop(relay);
     while !hub.clients.lock().is_empty() {
         tokio::task::yield_now().await;
     }
     for _ in 0..5 {
-        client.lanes(|s| s.video(Number::first(), &frame, Instant::now()));
-        client.lanes(|s| s.audio(&frame[..200], 0, Instant::now()));
+        client.lane(|s| s.video(&frame));
+        client.lane(|s| s.audio(&frame[..200], 0));
     }
     assert!(
         to_the_end(&mut lane).await.is_empty(),
         "a byte after the close"
     );
     // Its capability is forgotten: a lane presenting it is refused.
-    let mut a = attach(&c, Generation::first());
-    a[1..33].copy_from_slice(&raw);
-    let again = Attach::decode(&a).unwrap().capability;
-    let mut late = stream(&hub, &attach_framed(&again, Generation::first())).await;
+    let again = Capability::presented(&raw.clone().try_into().unwrap());
+    let mut late = open_lane(&hub, &attach(&again)).await;
     assert!(to_the_end(&mut late).await.is_empty());
 }
 
@@ -408,13 +339,9 @@ async fn the_capability_reaches_nothing() {
     let d = daemon(&hub);
     let mut relay = Relay::open(&d).await;
     let (c, raw) = relay.greeted().await;
-    let _lane = stream(&hub, &attach_framed(&c, Generation::first())).await;
+    let _lane = open_lane(&hub, &attach(&c)).await;
     assert_eq!(relay.next().await.0, Said::Attached);
-    let mut refused = stream(
-        &hub,
-        &attach_framed(&Capability::mint().unwrap(), Generation::first()),
-    )
-    .await;
+    let mut refused = open_lane(&hub, &attach(&Capability::mint().unwrap())).await;
     to_the_end(&mut refused).await;
     drop(relay);
     while !hub.clients.lock().is_empty() {
@@ -514,11 +441,7 @@ async fn a_query_never_mints_a_capability_or_reaches_a_lane() {
             "{q:?}: the session's capability in a query's answer"
         );
         // Only the session attaches; nothing a query left behind does.
-        let mut refused = stream(
-            &hub,
-            &attach_framed(&Capability::mint().unwrap(), Generation::first()),
-        )
-        .await;
+        let mut refused = open_lane(&hub, &attach(&Capability::mint().unwrap())).await;
         assert!(to_the_end(&mut refused).await.is_empty(), "{q:?}");
     }
     let stats = query(&d, Query::Stats).await;
@@ -527,11 +450,11 @@ async fn a_query_never_mints_a_capability_or_reaches_a_lane() {
     let clients = stats["clients"].as_array().unwrap();
     assert_eq!(clients.len(), 1, "{stats}");
     assert_eq!(clients[0]["way"]["way"], "unattached");
-    let _lane = stream(&hub, &attach_framed(&c, Generation::first())).await;
+    let _lane = open_lane(&hub, &attach(&c)).await;
     assert_eq!(relay.next().await.0, Said::Attached);
     let stats = query(&d, Query::Stats).await;
     let stats: serde_json::Value = serde_json::from_slice(&stats[1..]).unwrap();
-    assert_eq!(stats["clients"][0]["way"]["way"], "stream", "{stats}");
+    assert_eq!(stats["clients"][0]["way"]["way"], "lane", "{stats}");
 }
 
 /// A screenshot is a PNG of the screen as captured: its header, its size, and every
@@ -637,11 +560,11 @@ fn a_runtime_folder_is_one_nobody_else_may_write_in() {
 }
 
 /// What the daemon makes in its runtime folder is reachable by the folder's group only
-/// where the proxy needs it: the lane sockets are the group's too (0660), the control
+/// where the proxy needs it: the lane socket is the group's too (0660), the control
 /// socket and the keymap scratch file the user's alone (0600), whatever the umask, and
 /// whatever mode a keymap a crashed voxl left had.
 #[tokio::test]
-async fn only_the_lanes_are_the_groups() {
+async fn only_the_lane_is_the_groups() {
     use std::os::unix::fs::PermissionsExt;
     let dir = std::env::temp_dir().join(format!("voxl-entries-{}", std::process::id()));
     std::fs::create_dir(&dir).unwrap();
@@ -649,8 +572,7 @@ async fn only_the_lanes_are_the_groups() {
     let runtime = super::Runtime::open(dir.clone()).unwrap();
     let sockets = runtime.sockets();
     let _control = super::listen::control(&sockets.control).unwrap();
-    let _stream = super::listen::stream(&sockets.stream).unwrap();
-    let _datagram = super::listen::datagram(&sockets.datagram).unwrap();
+    let _lane = super::listen::lane(&sockets.lane).unwrap();
     // A keymap a crashed voxl left, group- and world-readable.
     std::fs::write(runtime.keymap(), b"92").unwrap();
     std::fs::set_permissions(runtime.keymap(), std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -669,7 +591,6 @@ async fn only_the_lanes_are_the_groups() {
         [
             ("control".into(), 0o600),
             ("keymap".into(), 0o600),
-            ("lane-datagram".into(), 0o660),
             ("lane-stream".into(), 0o660),
         ]
     );
@@ -677,471 +598,232 @@ async fn only_the_lanes_are_the_groups() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// A datagram lane's queue as its socket takes it: each message out, stamped at `now`, decoded
-/// with its bytes.
-#[cfg(test)]
-fn accepted(queue: &super::sender::Queue, now: Instant) -> Vec<(Vec<u8>, wire::Head, Stamp)> {
-    let mut out = Vec::new();
-    while let Some((m, _)) = queue.take(now) {
-        if let Ok(wire::Lane::Piece(s) | wire::Lane::Repair(s)) = wire::Lane::decode(&m) {
-            let (head, sent) = (s.head, s.sent);
-            out.push((m, head, sent));
-        }
-    }
-    out
-}
-
-/// The room never waits on a report: over a datagram lane whose socket takes what it holds now
-/// and then, fed generated video sizes at generated times, the room is the same before and
-/// after any report comes back, decoded or missed. A room that counted unreported bytes (the
-/// in-flight cap that wedged a session when its reports stopped) fails this.
+/// The capture gate is open exactly while nothing waits for a live lane's socket. Over
+/// generated sequences on a sender (lanes attaching, each replacing the one before; video
+/// updates and Opus packets of generated sizes; the socket taking some of what waits; the
+/// socket breaking): after every step, the gate is shut exactly when a lane is live and its
+/// queue holds bytes, and the sender counts as attached exactly while a lane is live. A gate
+/// that let a frame wait, or read a broken lane's bytes, fails this.
 #[test]
-fn the_room_never_waits_on_a_report() {
-    use crate::lanes::wire::{Arrivals, Fate, Late, Number, Outcome, Report};
-    use crate::session::sender::Sender;
-    let mut rng = crate::xorshift::Xorshift::new(0x7a3d_1c0e_9b42_f5a1);
-    let mut now = Instant::now();
-    let (mut s, queue, _control) = Sender::with_lane(now);
-    let mut number = Number::first();
-    let mut unreported: std::collections::VecDeque<(wire::Head, Stamp)> = Default::default();
-    let mut checked = 0;
-    for _ in 0..2_000 {
-        now += Duration::from_micros(rng.range(0, 40_000));
-        if rng.below(2) == 0 {
-            let frame = bytes::Bytes::from(vec![0u8; rng.range(1, 30_000) as usize]);
-            s.video(number, &frame, now);
-            number = number.next();
-        }
-        if rng.below(3) == 0 {
-            for (_, head, sent) in accepted(&queue, now) {
-                if unreported.back().is_none_or(|(h, _)| h.block != head.block) {
-                    unreported.push_back((head, sent));
-                }
-            }
-        }
-        while rng.below(2) == 0 {
-            let Some((head, sent)) = unreported.pop_front() else {
-                break;
-            };
-            let n = head.n();
-            let bits = vec![0xffu8; n.div_ceil(8)];
-            let mut bits = bits;
-            if n % 8 != 0 {
-                *bits.last_mut().expect("a byte") = (1u8 << (n % 8)) - 1;
-            }
-            let delays = vec![0u8; 4 * n];
-            let outcome = match rng.below(4) {
-                0 => Outcome::Missed,
-                _ => Outcome::Decoded,
-            };
-            let report = Report {
-                block: head.block,
-                sent,
-                fate: Fate::Seen {
-                    outcome,
-                    arrivals: Arrivals::new(n as u16, &bits, &delays).expect("arrivals"),
-                },
-                late: Late::new(&[], head.block).expect("none late"),
-            };
-            let before = s.room();
-            s.reported(&report, now).expect("its own block, in order");
-            assert_eq!(s.room(), before, "a report moved the room");
-            checked += 1;
-        }
-    }
-    assert!(checked > 100, "{checked} reports");
-}
-
-/// A datagram block's deadline is the moment the socket took its first piece, the block's own
-/// pieces behind it drained at the measured rate, and the base delay and the spread: with no
-/// report yet and no drain measured, exactly the first piece's stamp and the relay's round trip
-/// (100 ms here), the same in every piece of the block, each piece stamped as the socket took
-/// it. A deadline that waited a stall, a regime or a pacing schedule fails this.
-#[test]
-fn a_deadline_is_the_acceptance_and_the_wait() {
-    use crate::lanes::wire::{tenths, Number};
-    use crate::session::sender::Sender;
-    let mut rng = crate::xorshift::Xorshift::new(0x1f83_d9ab_fb41_bd6b);
-    let start = Instant::now();
-    let mut now = start;
-    let (mut s, queue, _control) = Sender::with_lane(now);
-    let mut number = Number::first();
-    for _ in 0..300 {
-        now += Duration::from_millis(rng.range(1, 100));
-        let frame = bytes::Bytes::from(vec![0u8; rng.range(1, 30_000) as usize]);
-        s.video(number, &frame, now);
-        number = number.next();
-        let taken = accepted(&queue, now);
-        let stamp = Stamp::since(start, now);
-        let (_, first, _) = taken.first().expect("a block");
-        for (_, head, sent) in &taken {
-            assert_eq!(*sent, stamp, "stamped as the socket took it");
-            assert_eq!(head.due, first.due, "one deadline a block");
-            assert_eq!(
-                head.due,
-                stamp.plus(tenths(Duration::from_millis(100))),
-                "the acceptance and the wait"
-            );
-        }
-    }
-}
-
-/// A stream lane has no report path and no code: every frame sent is one message, in order,
-/// whole, with its track; it is delivered whole; and a report is refused, since no block was
-/// ever sent on it.
-#[test]
-fn a_stream_lane_has_no_reports() {
-    use crate::lanes::wire::{Fate, Generation, Lane, Late, Number, Report, Seq, Track};
-    use crate::session::sender::{Broken, Delivery, Kind, Queue, Sender};
-    let mut rng = crate::xorshift::Xorshift::new(0x5be0_cd19_137e_2179);
-    let now = Instant::now();
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut s = Sender::new(Capability::mint().expect("random"), tx, now).expect("a socket");
-    let queue = Queue::new(Kind::Stream, now, Arc::new(|| {}));
-    assert!(s.attach(
-        Generation::first(),
-        queue.clone(),
-        Stamp::since(now, now),
-        Duration::from_millis(100),
-        now
-    ));
-    assert_eq!(s.delivery(), Some(Delivery::Whole));
-    let mut sent = Vec::new();
-    let mut number = Number::first();
-    for _ in 0..500 {
-        match rng.below(2) {
-            0 => {
-                let frame = bytes::Bytes::from(vec![7u8; rng.range(1, 100_000) as usize]);
-                s.video(number, &frame, now);
-                sent.push((Track::Video { number }, frame.len()));
-                number = number.next();
-            }
-            _ => {
-                let packet = vec![3u8; rng.range(1, 400) as usize];
-                s.audio(&packet, 0, now);
-                sent.push((Track::Audio, packet.len()));
-            }
-        }
-    }
-    let mut got = Vec::new();
-    let mut next = Seq::first();
-    let mut framer = Framer::stream();
-    while let Some((m, block)) = queue.take(now) {
-        assert_eq!(block, None, "a stream lane's message is of no block");
-        framer.push(&m);
-        while let Some(f) = framer.frame().expect("framed") {
-            let Ok(Lane::Frame {
-                frame,
-                track,
-                bytes,
-            }) = Lane::decode(f)
-            else {
-                panic!("a stream lane carries frames");
-            };
-            assert_eq!(frame, next, "in order");
-            next = next.next();
-            got.push((track, bytes.len()));
-        }
-    }
-    assert_eq!(got, sent, "every frame, whole");
-    let report = Report {
-        block: Seq::first(),
-        sent: Stamp::since(now, now),
-        fate: Fate::Unseen,
-        late: Late::new(&[], Seq::first()).expect("none late"),
-    };
-    assert_eq!(s.reported(&report, now), Err(Broken::Unsent(Seq::first())));
-}
-
-/// The drain is the transport's rate: behind the socket a transport queue of `room` bytes
-/// drains at `rate` bytes a second, and bursts of equal messages arrive after generated quiet
-/// spells. A message the socket refuses is taken the moment the queue has room for it; each
-/// such message but a burst's first was refused right after the one before it filled the queue,
-/// so its time is exactly its own drain, and the first's is at most that. Over any window of
-/// [`RATE_MEMORY`] refused messages, then, the drain is at least the rate and above it by at
-/// most the window's bursts' first messages. A drain that counted the messages the queue took
-/// at once (a burst after a quiet spell fills it at no cost) reads the rate several times over,
-/// and fails this.
-#[test]
-fn the_drain_is_the_transports_rate() {
-    use crate::lanes::path::RATE_MEMORY;
-    use crate::session::sender::Drain;
-    let mut rng = crate::xorshift::Xorshift::new(0x2f6b_5d0a_83c1_e947);
-    let start = Instant::now();
-    let at = |t: f64| start + Duration::from_secs_f64(t);
-    for _ in 0..200 {
-        let len = rng.range(100, 1201) as usize;
-        let rate = rng.range(100_000, 10_000_001) as f64;
-        let held = rng.range(1, 33) as usize;
-        let room = held * len;
-        let burst = held + rng.range(10, 61) as usize;
-        let firsts = RATE_MEMORY.div_ceil(burst - held) + 1;
-        let most = rate * RATE_MEMORY as f64 / (RATE_MEMORY - firsts) as f64;
-        let mut drain = Drain::new();
-        // The transport queue's bytes as of `then`.
-        let (mut holding, mut then) = (0.0f64, 0.0f64);
-        let mut now = 0.0f64;
-        let mut checked = 0;
-        for _ in 0..50 {
-            now += rng.range(0, 2 * (burst * len) as u64) as f64 / rate;
-            let queued = now;
-            for _ in 0..burst {
-                let left = (holding - rate * (now - then)).max(0.0);
-                let over = left + len as f64 - room as f64;
-                if over > 0.0 {
-                    drain.refused();
-                    now += over / rate;
-                }
-                holding = (holding - rate * (now - then)).max(0.0) + len as f64;
-                then = now;
-                drain.accepted(len, at(queued), at(now));
-                if let Some(read) = drain.rate() {
-                    assert!(
-                        read >= rate * (1.0 - 1e-3) && read <= most * (1.0 + 1e-3),
-                        "drain {read:.0} of a transport at {rate:.0} (at most {most:.0}): \
-                         {len} B messages, bursts of {burst} into {room} B"
-                    );
-                    checked += 1;
-                }
-            }
-        }
-        assert!(checked > 0);
-    }
-}
-
-/// Deadlines follow the blocks' order, whatever the wait does between them. The relay decides
-/// a block nothing of which came once a later block's deadline has passed, and with it every
-/// frame before that later block's; that is sound only while no earlier block is still due
-/// after it. Over generated waits that shrink between two blocks by more than the time between
-/// them (three blocks: the first of which nothing comes, the second part of which comes on
-/// time, the third of which a piece comes just past its own deadline), stamped by the daemon's
-/// queue and taken by the relay's decoder: no block comes out whole once a decision has
-/// released its frames. Without the daemon keeping each deadline at or after the one before,
-/// the third block's deadline falls before the second's, the first is decided with the
-/// second's frame, and the second then comes out whole.
-#[test]
-fn no_frame_is_released_before_an_earlier_one_is_decided() {
-    use crate::lanes::code::{Decoder, Took};
-    use crate::lanes::wire::{Lane, Number, SYMBOL};
-    use crate::session::sender::Sender;
-    let mut rng = crate::xorshift::Xorshift::new(0x510e_527f_ade6_82d1);
-    for _ in 0..300 {
-        let start = Instant::now();
-        let mut now = start;
-        let (mut s, queue, _control) = Sender::with_lane(now);
-        let mut number = Number::first();
-        let first_wait = rng.range(1_000, 3_000) as i64;
-        let mut blocks = Vec::new();
-        for i in 0..3 {
-            // The wait, in tenths: the third block's shrinks by more than the time since the
-            // second's (under 50).
-            queue.lock().after = match i {
-                2 => rng.range(0, (first_wait - 60) as u64) as i64,
-                _ => first_wait,
-            };
-            let bytes = rng.range(2 * SYMBOL as u64, 20_000) as usize;
-            s.video(number, &bytes::Bytes::from(vec![1u8; bytes]), now);
-            number = number.next();
-            blocks.push(accepted(&queue, now));
-            now += Duration::from_micros(100 * rng.range(1, 50));
-        }
-        let [_, second, third] = &blocks[..] else {
-            panic!("three blocks")
-        };
-        let mut dec = Decoder::new();
-        let on_time = second[0].2.plus(1);
-        let took = dec
-            .take(Lane::decode(&second[0].0).unwrap(), on_time)
-            .unwrap();
-        assert_eq!(took, Took::Held, "a block of two sources or more, one come");
-        // Just past the third block's own deadline.
-        let past = third[0].1.due.plus(1);
-        assert_eq!(
-            dec.take(Lane::decode(&third[0].0).unwrap(), past).unwrap(),
-            Took::Late
-        );
-        let mut released = None;
-        while let Some(d) = dec.decide(past) {
-            released = Some(d.last);
-        }
-        for (m, _, _) in &second[1..] {
-            if let Took::Whole(head, _) = dec.take(Lane::decode(m).unwrap(), past).unwrap() {
-                assert!(
-                    released.is_none_or(|r| head.first > r),
-                    "block {:?} whole after its frame {:?} was released",
-                    head.block,
-                    head.first
-                );
-            }
-        }
-    }
-}
-
-/// The capture gate is open while no lane is live and closed only by a live lane's backlog.
-/// Over generated sequences on a sender (lanes of one kind attaching, generation after
-/// generation; video updates of generated sizes; the socket taking some of what waits; the
-/// socket breaking), after every step: the room is unbounded exactly when no lane is live or
-/// the live lane's queue is empty, the sender counts as attached exactly while a lane is live,
-/// and each live lane that breaks is told exactly once, with its generation. A gate that read
-/// a lost lane's backlog froze its session until a reload.
-#[test]
-fn only_a_live_lanes_backlog_gates_the_capture() {
-    use crate::hub::Out;
-    use crate::lanes::wire::Number;
-    use crate::session::sender::{Kind, Queue, Room, Sender};
+fn the_gate_is_shut_exactly_while_bytes_wait() {
+    use crate::session::sender::{Queue, Sender};
     let mut rng = crate::xorshift::Xorshift::new(0x9b05_688c_2b3e_6c1f);
-    for case in 0..200 {
-        let now = Instant::now();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut s = Sender::new(Capability::mint().unwrap(), tx, now).unwrap();
-        let kind = match case % 2 {
-            0 => Kind::Datagram,
-            _ => Kind::Stream,
-        };
-        let (mut queue, mut live): (Option<(Arc<Queue>, Generation)>, bool) = (None, false);
-        let (mut generation, mut number) = (Generation::first(), Number::first());
-        let mut lost = Vec::new();
-        for _ in 0..rng.range(1, 60) {
-            match rng.below(4) {
+    let (mut open, mut shut) = (0, 0);
+    for _ in 0..500 {
+        let mut s = Sender::new(Capability::mint().unwrap());
+        let (mut queue, mut live): (Option<Arc<Queue>>, bool) = (None, false);
+        for _ in 0..rng.range(1, 80) {
+            match rng.below(6) {
                 0 => {
-                    let q = Queue::new(kind, now, Arc::new(|| {}));
-                    let rtt = Duration::from_millis(100);
-                    assert!(s.attach(generation, q.clone(), Stamp::since(now, now), rtt, now));
-                    (queue, live) = (Some((q, generation)), true);
-                    generation = generation.next();
+                    let q = Queue::new(Arc::new(|| {}));
+                    assert!(s.attach(q.clone()));
+                    (queue, live) = (Some(q), true);
                 }
-                1 => {
-                    let frame = bytes::Bytes::from(vec![3u8; rng.range(1, 30_000) as usize]);
-                    s.video(number, &frame, now);
-                    number = number.next();
-                }
-                2 if live => {
-                    if let Some((q, _)) = &queue {
-                        for _ in 0..rng.below(20) {
-                            q.take(now);
+                1 => s.video(&bytes::Bytes::from(vec![
+                    3u8;
+                    rng.range(1, 30_000) as usize
+                ])),
+                2 => s.audio(&vec![4u8; rng.range(1, 400) as usize], 0),
+                3 | 4 => {
+                    if let Some(q) = &queue {
+                        for _ in 0..rng.below(3) {
+                            q.take();
                         }
                     }
                 }
                 _ => {
-                    if let Some((q, g)) = &queue {
+                    if let Some(q) = &queue {
                         q.lose();
-                        if live {
-                            lost.push(*g);
-                        }
                         live = false;
                     }
                 }
             }
-            let waits = queue.as_ref().map_or(0, |(q, _)| q.backlog_bytes());
+            let waiting = queue.as_ref().map_or(0, |q| q.waiting_bytes());
             assert_eq!(
-                s.room() == Room::Unbounded,
-                !live || waits == 0,
-                "live {live}, {waits} B waiting: {:?}",
-                s.room()
+                s.waits(),
+                live && waiting > 0,
+                "live {live}, {waiting} B waiting"
             );
+            match s.waits() {
+                true => shut += 1,
+                false => open += 1,
+            }
             assert_eq!(s.attached(), live);
         }
-        let mut told = Vec::new();
-        while let Ok(m) = rx.try_recv() {
-            if let Out::Lost { generation } = m {
-                told.push(generation);
+    }
+    assert!(open > 1000 && shut > 1000, "open {open}, shut {shut}");
+}
+
+/// Captures follow the socket's rate, and never more than one update waits for it. A
+/// simulated session: the lane's socket takes bytes at a generated rate, a write waiting
+/// until the transport has taken what came before (as a stream's does); Opus packets come
+/// every 10 ms; the capture loop captures as the gate and the frame interval let it, each
+/// capture coded for a generated time into an update of a generated size. Over generated
+/// rates, coding times and sizes, on a virtual clock:
+/// - every capture starts with nothing waiting, and no more than one update ever waits;
+/// - the socket idles only while a capture is coded or the frame interval holds it: the
+///   bytes it took are its rate over the time anything waited, and the captures are as
+///   many as that allows.
+///
+/// A gate that let a capture start with bytes waiting fails this.
+#[test]
+fn captures_follow_the_sockets_rate() {
+    use crate::session::sender::Sender;
+    let mut rng = crate::xorshift::Xorshift::new(0x2f6b_5d0a_83c1_e947);
+    let us = Duration::from_micros;
+    let interval = us(16_667);
+    let seconds = 5.0;
+    for case in 0..300 {
+        let rate = rng.range(20_000, 5_000_001) as f64;
+        let coding = us(rng.range(1_000, 20_000));
+        let most = rng.range(1, 400_000) as usize;
+        // Opus packets of at most a quarter of the socket's rate: more would hold the gate
+        // shut on their own.
+        let audio = (rng.range(80, 400) as usize)
+            .min((rate / 400.0) as usize)
+            .max(1);
+        let start = Instant::now();
+        let (mut s, queue) = Sender::with_lane();
+        // When the socket began to take the front message.
+        let mut began = start;
+        // The capture loop: when its last capture went, and when the one it codes is done.
+        let (mut captured, mut coded): (Option<Instant>, Option<Instant>) = (None, None);
+        let mut next_audio = start;
+        let (mut captures, mut busy, mut taken) = (0u64, Duration::ZERO, 0usize);
+        let mut now = start;
+        let end = start + Duration::from_secs_f64(seconds);
+        while now < end {
+            // The next event: the socket taking the front message, a coded update, an Opus
+            // packet, or a capture the gate and the interval let go.
+            let waiting = queue.waiting_bytes() > 0;
+            let accept = queue
+                .front_len()
+                .map(|len| began + Duration::from_secs_f64(len as f64 / rate));
+            let capture = match (s.waits(), coded) {
+                (false, None) => Some(captured.map_or(now, |c| (c + interval).max(now))),
+                (true, _) | (false, Some(_)) => None,
+            };
+            let at = [accept, coded, Some(next_audio), capture]
+                .into_iter()
+                .flatten()
+                .min()
+                .unwrap();
+            if waiting {
+                busy += at - now;
+            }
+            now = at;
+            if accept == Some(now) {
+                taken += queue.take().unwrap().len();
+                began = now;
+                continue;
+            }
+            if coded == Some(now) {
+                let bytes = rng.range(1, most as u64 + 1) as usize;
+                s.video(&bytes::Bytes::from(vec![1u8; bytes]));
+                assert!(
+                    queue.updates_waiting() <= 1,
+                    "case {case}: two updates wait"
+                );
+                coded = None;
+            } else if next_audio == now {
+                s.audio(&vec![2u8; audio], 0);
+                next_audio += us(10_000);
+            } else {
+                assert!(!waiting, "case {case}: a capture with bytes waiting");
+                captures += 1;
+                captured = Some(now);
+                coded = Some(now + coding);
+            }
+            // A message queued while nothing waited is begun at once.
+            if !waiting {
+                began = now;
             }
         }
-        assert_eq!(told, lost, "each lost lane told once");
+        // The socket took its rate over the time anything waited, less the message it was
+        // taking at the end.
+        let frame = (most + 16) as f64;
+        let (took, owed) = (taken as f64, rate * busy.as_secs_f64());
+        assert!(
+            took <= owed * (1.0 + 1e-4) + 1.0 && took >= owed * (1.0 - 1e-4) - frame,
+            "case {case}: took {took:.0} in {busy:?} busy at {rate:.0}"
+        );
+        // Each capture cycle is at most its coding, the frame interval, and its update taken
+        // at what the Opus packets leave of the rate: as many as fit.
+        let most_cycle = (coding + interval).as_secs_f64() + frame / (0.75 * rate);
+        let least = (seconds / most_cycle) as u64;
+        assert!(
+            captures + 2 >= least,
+            "case {case}: {captures} captures, at least {least} fit"
+        );
     }
 }
 
-/// A lost lane is told, and the next carries what waited. Over generated sequences on a
-/// session with stream lanes (video updates of generated sizes; the relay reading what has
-/// come; the relay's end of the lane vanishing at any point: idle, mid-frame, or just after
-/// its attach): the daemon says `Lost` exactly once for each lane whose socket broke, with
-/// its generation; the relay attaches the next generation; and the frames read whole across
-/// the lanes are every frame sent, each once, in order. The relay reads all that has come
-/// before its end vanishes, so what the lost socket held is read; a frame it held only part
-/// of goes again whole on the next lane.
+/// A lane whose socket breaks ends, and the next attaches in its place: over generated
+/// sessions (updates of generated sizes; the relay reading what has come; the relay's end of
+/// the lane vanishing at any point, idle, with updates waiting or mid-update), once the next
+/// update finds the socket broken the session's gate is open and it is not attached, the
+/// control stream says nothing of it, and the next lane attaches and carries the updates
+/// sent after it, whole and in order. What the broken lane held is dropped: its viewer starts
+/// over on a keyframe on the next lane (`hub`'s), never on a stream with a hole in it.
 #[tokio::test]
-async fn a_lost_lane_is_told_and_the_next_carries_what_waited() {
-    use crate::lanes::wire::{Lane, Number};
+async fn a_broken_lane_ends_and_the_next_attaches() {
     let mut rng = crate::xorshift::Xorshift::new(0x1f83_d9ab_5be0_cd19);
-    // Lanes lost with nothing waiting, with frames waiting, and with a frame read in part.
-    let (mut idle, mut waiting, mut partial) = (0, 0, 0);
+    let mut waited = 0;
     for _ in 0..30 {
         let hub = Hub::new().unwrap();
         let d = daemon(&hub);
         let mut relay = Relay::open(&d).await;
         let (c, _) = relay.greeted().await;
-        let mut generation = Generation::first();
-        let mut lane = stream(&hub, &attach_framed(&c, generation)).await;
+        let mut lane = open_lane(&hub, &attach(&c)).await;
         assert_eq!(relay.next().await.0, Said::Attached);
         let client = hub.clients.lock()[0].clone();
-        let mut framer = Framer::stream();
-        let (mut sent, mut got) = (0u64, Vec::new());
-        // The current lane's bytes read, and those of the frames read whole.
-        let mut counts = (0usize, 0usize);
-        // Everything that has come on the lane, read without waiting.
-        let read = |lane: &mut UnixStream,
-                    framer: &mut Framer,
-                    got: &mut Vec<u64>,
-                    counts: &mut (usize, usize)| {
-            let mut buf = [0u8; 8192];
-            while let Ok(n @ 1..) = lane.try_read(&mut buf) {
-                framer.push(&buf[..n]);
-                counts.0 += n;
-            }
-            while let Some(m) = framer.frame().unwrap() {
-                counts.1 += wire::STREAM_PREFIX + m.len();
-                let Ok(Lane::Frame { frame, .. }) = Lane::decode(m) else {
-                    panic!("a stream lane carries frames");
-                };
-                got.push(frame.get());
-            }
+        let mut sent = 0u8;
+        let mut send = |rng: &mut crate::xorshift::Xorshift| {
+            let frame = bytes::Bytes::from(vec![sent; rng.range(1, 60_000) as usize]);
+            client.lane(|s| s.video(&frame));
+            sent = sent.wrapping_add(1);
+            sent.wrapping_sub(1)
         };
-        let send = |sent: &mut u64, rng: &mut crate::xorshift::Xorshift| {
-            let frame = bytes::Bytes::from(vec![5u8; rng.range(1, 6000) as usize]);
-            client.lanes(|s| s.video(Number::first(), &frame, Instant::now()));
-            *sent += 1;
-        };
-        for _ in 0..rng.range(1, 30) {
-            match rng.below(4) {
-                0 | 1 => send(&mut sent, &mut rng),
-                2 => {
-                    settle().await;
-                    read(&mut lane, &mut framer, &mut got, &mut counts);
-                }
-                _ => {
-                    settle().await;
-                    read(&mut lane, &mut framer, &mut got, &mut counts);
-                    match client.lanes(|s| s.stats()) {
-                        crate::session::sender::Way::Stream {
-                            backlog_bytes: 0, ..
-                        } => idle += 1,
-                        _ => waiting += 1,
-                    }
-                    partial += usize::from(counts.0 > counts.1);
-                    drop(lane);
-                    // The next frame finds the socket broken, if what waited did not.
-                    send(&mut sent, &mut rng);
-                    assert_eq!(relay.said().await, Some(Said::Lost(generation)));
-                    generation = generation.next();
-                    lane = stream(&hub, &attach_framed(&c, generation)).await;
-                    assert_eq!(relay.next().await.0, Said::Attached);
-                    (framer, counts) = (Framer::stream(), (0, 0));
-                }
+        for _ in 0..rng.range(1, 10) {
+            for _ in 0..rng.below(4) {
+                send(&mut rng);
             }
-        }
-        while got.len() < sent as usize {
             settle().await;
-            read(&mut lane, &mut framer, &mut got, &mut counts);
+            let mut buf = vec![0u8; rng.range(1, 70_000) as usize];
+            drop(lane.try_read(&mut buf));
+            waited += usize::from(client.lane(|s| s.waits()));
+            drop(lane);
+            // An update finds the socket broken, if what waited did not. (On macOS a test's
+            // child process may hold the relay's end a moment: a socket pair is made close-on-exec
+            // only after it is made, and a fork between the two inherits it.)
+            let ended = tokio::time::timeout(Duration::from_secs(5), async {
+                while client.lane(|s| s.attached()) {
+                    send(&mut rng);
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            });
+            assert!(ended.await.is_ok(), "a broken lane is live");
+            assert!(!client.lane(|s| s.waits()), "a broken lane gates");
+            assert_eq!(relay.said().await, None, "a broken lane told");
+            lane = open_lane(&hub, &attach(&c)).await;
+            assert_eq!(relay.next().await.0, Said::Attached);
+            let first = send(&mut rng);
+            let second = send(&mut rng);
+            let mut framer = Framer::new();
+            let mut got = Vec::new();
+            let mut buf = [0u8; 8192];
+            while got.len() < 2 {
+                let n = lane.read(&mut buf).await.unwrap();
+                assert!(n > 0, "the next lane ended");
+                framer.push(&buf[..n]);
+                while let Some(m) = framer.frame().unwrap() {
+                    let f = Frame::decode(m).unwrap();
+                    assert_eq!(f.track, Track::Video);
+                    got.push(f.bytes[0]);
+                }
+            }
+            assert_eq!(got, [first, second], "whole and in order");
         }
-        assert_eq!(
-            got,
-            (0..sent).collect::<Vec<_>>(),
-            "every frame, once, in order"
-        );
-        assert!(relay.silent().await, "a lane told lost twice");
     }
-    assert!(
-        idle > 0 && waiting > 0 && partial > 0,
-        "lost idle {idle}, waiting {waiting}, mid-frame {partial}"
-    );
+    assert!(waited > 0, "no lane broke with updates waiting");
 }

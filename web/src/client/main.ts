@@ -128,12 +128,18 @@ function main() {
 	worker.addEventListener('message', (e: MessageEvent<FromWorker>) => {
 		const m = e.data;
 		switch (m.t) {
-			case 'frame':
+			case 'frame': {
+				// The desktop is the size of the pictures it sends: a keyframe of another size
+				// (a resize) lays the page out again.
+				const { displayWidth: w, displayHeight: h } = m.frame;
+				if (app.desk.s === 'none' || app.desk.w !== w || app.desk.h !== h) {
+					app.desk = { s: 'shown', w, h };
+					video.layout();
+				}
 				video.present(m.frame);
 				break;
+			}
 			case 'hello': {
-				app.desk = { s: 'shown', w: m.w, h: m.h };
-				video.layout();
 				files.setup(m.files);
 				mic.setup();
 				resize.setup(m.resize);

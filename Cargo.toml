@@ -6,12 +6,12 @@ edition = "2021"
 # The Rust that CI's Linux job builds with (nixpkgs 25.05), so clippy flags anything newer
 # on every platform.
 license = "MIT"
-description = "Low-latency desktop streaming for the browser: an X11 display as VP9, sent over lanes through a proxy and joined in the browser by a relay"
+description = "Low-latency desktop streaming for the browser: an X11 display as VP9, sent over a stream through a proxy and joined in the browser by a relay"
 repository = "https://github.com/bjornpagen/voxl"
 readme = "README.md"
 # Lets programs that embed voxl read DEP_VOXL_RPATH (see build.rs).
 links = "voxl"
-keywords = ["remote-desktop", "streaming", "x11", "vp9", "erasure-code"]
+keywords = ["remote-desktop", "streaming", "x11", "vp9"]
 categories = ["command-line-utilities", "multimedia::video"]
 # What `cargo publish` uploads: the sources build.rs and the server need, nothing from bench/.
 include = [
@@ -61,8 +61,6 @@ futures-util = { version = "0.3", default-features = false, features = [
 ] }
 base64 = "0.22"
 getrandom = "0.3"
-# The code's GF(256) region kernels (src/lanes/gf.rs): portable SIMD without unsafe.
-fearless_simd = "1.2"
 zip = { version = "9", default-features = false, features = [
 	"deflate-flate2-zlib-rs",
 ] }
@@ -104,13 +102,6 @@ serde_json = { version = "1", features = ["float_roundtrip"] }
 [build-dependencies]
 bindgen = "0.72"
 pkg-config = "0.3"
-
-# The tests of this crate built optimised: the lane simulator's properties each run minutes of
-# a session, and the plan's and the code's loops run some thirty times slower unoptimised.
-# Debug assertions and overflow checks stay on (the test profile inherits dev's), and the
-# dependencies keep dev's level, so their build does not grow.
-[profile.test.package.voxl-server]
-opt-level = 3
 
 [profile.release]
 opt-level = 3

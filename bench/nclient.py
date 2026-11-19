@@ -50,7 +50,7 @@ async def main():
                 continue
             if mode == 'voxl':
                 if msg[0] != 1: continue
-                fid = int.from_bytes(msg[2:6], 'big'); payload = msg[10:]
+                fid = 0; payload = msg[6:]  # past the type byte and the 5-byte header
             else:
                 if msg[0] != 4: continue
                 fid = int.from_bytes(msg[2:4], 'big'); payload = msg[12:]  # past the 12-byte header

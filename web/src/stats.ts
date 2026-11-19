@@ -16,8 +16,6 @@ export const Count = {
 	DecodeUs: 3,
 	/** The server's capture to send of the updates arrived, in tenths of a ms. */
 	PipeTenths: 4,
-	/** Deltas passed undecoded while a datagram lane's stream waited for its keyframe. */
-	Passed: 5,
 } as const;
 type Counter = (typeof Count)[keyof typeof Count];
 
@@ -28,8 +26,6 @@ export interface Rates {
 	/** Mean arrival to shown, and the server's capture to send; null when none came. */
 	decodeMs: number | null;
 	pipeMs: number | null;
-	/** Deltas passed undecoded, waiting for a keyframe. */
-	passed: number;
 }
 
 /** What `window.voxlStats` reads: the rates since the last read. */
@@ -56,7 +52,6 @@ function between(from: Reading, to: Reading): Rates {
 		kbps: (moved(Count.Bytes) * 8) / 1000 / seconds,
 		decodeMs: frames ? moved(Count.DecodeUs) / 1000 / frames : null,
 		pipeMs: updates ? moved(Count.PipeTenths) / 10 / updates : null,
-		passed: moved(Count.Passed),
 	};
 }
 

@@ -1,13 +1,12 @@
 //! The daemon's sessions: one for each `voxl attach`, which is a viewer's relay come over
 //! ssh. A session is its control connection (the ssh channel: hello, input, clipboard,
-//! cursor, microphone, reports) and the lanes the relay attaches to it through a proxy,
-//! which carry video and audio one way. The daemon serves no network port: the control
-//! socket and the two lane sockets are unix sockets, reached only through ssh and the
-//! proxy on this machine.
+//! cursor, microphone) and the lane the relay attaches to it through a proxy, which carries
+//! video and audio one way. The daemon serves no network port: the control socket and the
+//! lane socket are unix sockets, reached only through ssh and the proxy on this machine.
 
 pub mod attach;
 pub mod control;
-mod lane;
+pub(crate) mod lane;
 mod listen;
 pub mod query;
 pub mod sender;
@@ -18,7 +17,7 @@ use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
 
-/// The folder everything the daemon opens by name is in (`--runtime`): its three sockets,
+/// The folder everything the daemon opens by name is in (`--runtime`): its two sockets,
 /// the microphone's FIFO and the keymap's scratch file, each by a fixed name. The host makes it at boot (a
 /// tmpfiles.d rule, setgid to the group the proxy's user is in); the daemon and its
 /// subcommands take it only if it is a folder of this user's that nobody else may write
@@ -65,12 +64,11 @@ impl Runtime {
         }
     }
 
-    /// The daemon's three sockets in it.
+    /// The daemon's two sockets in it.
     pub fn sockets(&self) -> Sockets {
         Sockets {
             control: self.control(),
-            stream: self.0.join("lane-stream"),
-            datagram: self.0.join("lane-datagram"),
+            lane: self.0.join("lane-stream"),
         }
     }
 
@@ -93,7 +91,7 @@ impl Runtime {
 
 /// Writes `bytes` as the file at `path`, this user's alone (0600) whatever the umask and
 /// whatever mode a file already there had: the runtime folder's group may reach only the
-/// lane sockets.
+/// lane socket.
 pub fn private_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -107,32 +105,27 @@ pub fn private_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
     f.write_all(bytes)
 }
 
-/// The daemon's three sockets.
+/// The daemon's two sockets.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sockets {
     /// `voxl attach` connects here; only this user's processes are let in.
     pub control: PathBuf,
     /// A proxy's TCP to `localhost:6901` arrives here.
-    pub stream: PathBuf,
-    /// A proxy's UDP to `localhost:6901` arrives here.
-    pub datagram: PathBuf,
+    pub lane: PathBuf,
 }
 
 #[cfg(target_os = "linux")]
-/// Binds the daemon's three sockets and serves sessions on them until the daemon ends; a
+/// Binds the daemon's two sockets and serves sessions on them until the daemon ends; a
 /// socket that cannot be bound is the error, and nothing is served.
 pub async fn serve(sockets: &Sockets, daemon: Arc<control::Daemon>) -> Result<(), listen::Unbound> {
     let control = listen::control(&sockets.control)?;
-    let stream = listen::stream(&sockets.stream)?;
-    let datagram = listen::datagram(&sockets.datagram)?;
+    let lane = listen::lane(&sockets.lane)?;
     log::info!(
-        "serving sessions at {}, lanes at {} and {}",
+        "serving sessions at {}, the lane at {}",
         sockets.control.display(),
-        sockets.stream.display(),
-        sockets.datagram.display()
+        sockets.lane.display()
     );
-    tokio::spawn(lane::streams(stream, daemon.hub.clone()));
-    tokio::spawn(lane::datagrams(datagram, daemon.hub.clone()));
+    tokio::spawn(lane::lanes(lane, daemon.hub.clone()));
     control::serve(control, daemon).await;
     Ok(())
 }

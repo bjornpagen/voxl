@@ -1,31 +1,19 @@
 //! `voxl relay`: the viewer's side of a session, run on the viewer's machine. It serves the
 //! page on 127.0.0.1 and, for each page that connects, runs a session: `ssh <host> voxl
 //! attach` for the control stream (to the daemon of `--runtime`'s folder, when it is given),
-//! and its lanes to `--place` on the server (the protocol's `localhost:6901` by default), and one lane, through a proxy, for video and audio. It
-//! hands the page every frame the lane completes, in order.
+//! and one lane, through a proxy, to `--place` on the server (the protocol's `localhost:6901`
+//! by default), for video and audio.
 //!
-//! **The lane.** One per session, of the kind the lanes description names. A datagram lane
-//! (a SOCKS5 proxy's UDP relay: Hysteria2's) carries coded blocks with repair; the relay's
-//! decoder completes them, decides each block at its deadline, and reports it to the daemon.
-//! A stream lane (one HTTP CONNECT stream through naive over HTTP/2 or HTTP/3) carries the
-//! frames as they are, in order, whole: TCP or QUIC delivers every byte, so nothing on it has
-//! a deadline and the relay reports nothing. The lane's socket holds what the daemon names
-//! (`Down::Buffer`: one deadline at the drain rate). A lane that ends after the daemon
-//! confirmed it (`Down::Attached`) opens again as the next generation; one that ends before
-//! is a transport refusing lanes and ends the session. An unconfirmed datagram attach goes
-//! again after the least round trip seen (see `session::Session::round_trip`).
-//!
-//! **What the page shows** ([`release`]). The page decodes the screen's one VP9 stream and
-//! shows each update as soon as its decoder puts it out. Every update the relay completes is
-//! decodable (the daemon's encoder refers only to pictures it knows the page has), so the
-//! relay gives the page every one, in order; one that missed its deadline on a datagram lane
-//! is passed over, and the next refers past it.
+//! **The lane.** One HTTP CONNECT stream through `--proxy` (naive over HTTP/2 or HTTP/3, or
+//! Hysteria 2's HTTP proxy): the transport delivers every byte, in order, and the relay gives
+//! the page each frame as it arrives, as it is, reading the next only once the page has taken
+//! it. A lane that ends after the daemon confirmed it (`Down::Attached`) opens again, and the
+//! daemon starts its viewer over on a keyframe; one that ends before is the daemon or the
+//! transport refusing it, and ends the session.
 
 mod access;
-mod description;
 mod files;
 mod proxy;
-mod release;
 mod session;
 mod ssh;
 
@@ -34,15 +22,14 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 /// What `voxl relay` is told: each flag given once, every one but `--runtime` and `--place`
 /// required.
 #[derive(Debug, PartialEq)]
 struct Flags {
-    /// `--lanes`: the lanes description, read at every session start.
-    lanes: PathBuf,
+    /// `--proxy`: the HTTP proxy the lane goes through.
+    proxy: proxy::Endpoint,
     /// `--ssh`: where `voxl attach` and `voxl files` run.
     ssh: ssh::Destination,
     /// `--port`: the page's port on 127.0.0.1.
@@ -50,18 +37,18 @@ struct Flags {
     /// `--runtime`: the folder of the daemon `voxl attach` reaches, on the server; when
     /// not given, the daemon's default one.
     runtime: Option<ssh::Runtime>,
-    /// `--place`: where the lanes go, as the server's proxy is asked for it; when not
+    /// `--place`: where the lane goes, as the server's proxy is asked for it; when not
     /// given, the protocol's.
     place: proxy::Place,
 }
 
-const USAGE: &str = "usage: voxl relay --lanes FILE --ssh DESTINATION --port PORT [--runtime DIR] [--place localhost:PORT]";
+const USAGE: &str = "usage: voxl relay --proxy HOST:PORT --ssh DESTINATION --port PORT [--runtime DIR] [--place localhost:PORT]";
 
 impl Flags {
     /// `--name value` or `--name=value`, each at most once, the three required ones
     /// exactly once, and nothing else.
     fn parse(args: &[String]) -> Result<Flags, String> {
-        let (mut lanes, mut ssh, mut port, mut runtime, mut place) = (None, None, None, None, None);
+        let (mut proxy, mut ssh, mut port, mut runtime, mut place) = (None, None, None, None, None);
         let mut it = args.iter();
         while let Some(a) = it.next() {
             let (name, value) = match a.split_once('=') {
@@ -74,7 +61,7 @@ impl Flags {
                 ),
             };
             let slot = match name {
-                "--lanes" => &mut lanes,
+                "--proxy" => &mut proxy,
                 "--ssh" => &mut ssh,
                 "--port" => &mut port,
                 "--runtime" => &mut runtime,
@@ -88,7 +75,7 @@ impl Flags {
         let need = |v: Option<String>, name: &str| v.ok_or_else(|| format!("{name} is required"));
         let port = need(port, "--port")?;
         Ok(Flags {
-            lanes: PathBuf::from(need(lanes, "--lanes")?),
+            proxy: proxy::Endpoint::parse(&need(proxy, "--proxy")?)?,
             ssh: ssh::Destination::parse(&need(ssh, "--ssh")?)?,
             port: port
                 .parse()
@@ -142,7 +129,7 @@ async fn serve(flags: Flags) -> std::io::Result<()> {
         grant: parking_lot::Mutex::new(None),
     });
     let sessions = Arc::new(session::Config {
-        lanes: flags.lanes,
+        proxy: flags.proxy,
         ssh: flags.ssh,
         runtime: flags.runtime,
         place: flags.place,
@@ -242,7 +229,7 @@ mod tests {
 
     /// Over drawn command lines (each of the five flags given zero, one or two times, in
     /// either spelling, with a value or without one at the end, ports good and bad,
-    /// destinations, runtime folders and places good and bad, an unknown flag now and then,
+    /// proxies, destinations, runtime folders and places good and bad, an unknown flag now and then,
     /// in any order): a line is read exactly when each required flag is given once,
     /// `--runtime` and `--place` at most once, each with a value it takes, and nothing else
     /// is; and it is read as the values given, a runtime folder not given read as none and a
@@ -252,6 +239,14 @@ mod tests {
     fn the_relay_takes_exactly_its_flags() {
         let mut rng = Xorshift::new(0xC6A4A7935BD1E995);
         let ports = ["6901", "1", "65535", "0", "65536", "-1", "x", ""];
+        let proxies = [
+            "127.0.0.1:1080",
+            "[::1]:443",
+            "proxy.example:8443",
+            "127.0.0.1",
+            "a:0",
+            "",
+        ];
         let dests = ["desk", "a.example", "-oProxyCommand=x", "a b", ""];
         let runtimes = ["/run/voxl", "/run/voxl-bench/3", "a b", "--x", "x=y", ""];
         let places = [
@@ -263,17 +258,17 @@ mod tests {
             "",
         ];
         let mut read = 0;
-        for _ in 0..20_000 {
+        for _ in 0..40_000 {
             // Per flag: the values given, in order.
             let mut given: [Vec<String>; 5] = Default::default();
             let mut words: Vec<Vec<String>> = Vec::new();
-            for (f, name) in ["--lanes", "--ssh", "--port", "--runtime", "--place"]
+            for (f, name) in ["--proxy", "--ssh", "--port", "--runtime", "--place"]
                 .into_iter()
                 .enumerate()
             {
                 for _ in 0..[0, 1, 1, 1, 2][rng.below(5) as usize] {
                     let v = match f {
-                        0 => format!("/lanes/{}", rng.below(9)),
+                        0 => proxies[rng.below(proxies.len() as u64) as usize].to_string(),
                         1 => dests[rng.below(dests.len() as u64) as usize].to_string(),
                         3 => runtimes[rng.below(runtimes.len() as u64) as usize].to_string(),
                         4 => places[rng.below(places.len() as u64) as usize].to_string(),
@@ -305,6 +300,7 @@ mod tests {
             let valid = once
                 && !unknown
                 && !cut
+                && proxy::Endpoint::parse(&given[0][0]).is_ok()
                 && ssh::Destination::parse(&given[1][0]).is_ok()
                 && given[2][0].parse::<u16>().is_ok_and(|p| p != 0)
                 && given[3].iter().all(|r| !r.is_empty())
@@ -312,7 +308,7 @@ mod tests {
             match Flags::parse(&args) {
                 Ok(flags) => {
                     assert!(valid, "{args:?} read");
-                    assert_eq!(flags.lanes, PathBuf::from(&given[0][0]));
+                    assert_eq!(flags.proxy, proxy::Endpoint::parse(&given[0][0]).unwrap());
                     assert_eq!(flags.ssh, ssh::Destination::parse(&given[1][0]).unwrap());
                     assert_eq!(flags.port.to_string(), given[2][0]);
                     assert_eq!(

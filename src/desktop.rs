@@ -18,7 +18,7 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
 use crate::event::{Bin, ClipContent};
-use crate::lanes::wire::MAX_DOWN_BINARY;
+use crate::wire::MAX_DOWN_BINARY;
 use x11rb::errors::{ConnectionError, ReplyError};
 
 /// The largest clipboard image sent to the viewers: what a page's binary message carries

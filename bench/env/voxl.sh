@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # (Re)start the voxl daemon on the benchmark display, its runtime folder (sockets and
 # microphone FIFO) $VOXL_BENCH_RUN (default /tmp/voxl-bench), this user's alone. Extra args are passed through. Viewers reach it through
-# `voxl relay` on port 6902 (`--ssh` to this machine, `--lanes` naming a proxy that reaches
-# the lane sockets), as they reach a real desktop.
+# `voxl relay` on port 6902 (`--ssh` to this machine, `--proxy` naming a proxy that reaches
+# the lane socket), as they reach a real desktop.
 cd "$(dirname "$(readlink -f "$0")")"
 BIN=${VOXL_BIN:-../../target/release/voxl}
 RUN=${VOXL_BENCH_RUN:-/tmp/voxl-bench}

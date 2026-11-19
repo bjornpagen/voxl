@@ -22,17 +22,16 @@ the tunnel the lane crosses encrypts it, and every other hop is on one machine. 
 - **ssh is the door:** a session starts as `ssh <host> voxl attach`, and whoever ssh lets
   in as the daemon's user gets the desktop. Keep that account's keys as you would its
   shell.
-- **The daemon listens on no network port:** its three sockets are unix sockets. The
+- **The daemon listens on no network port:** its two sockets are unix sockets. The
   control socket is mode 0600 and takes a connection only from the daemon's own user
-  (checked by the peer's uid); anything else is closed unread. The two lane sockets are
-  mode 0660, for a group the server's proxy runs in, which reaches them as
-  `localhost:6901`.
+  (checked by the peer's uid); anything else is closed unread. The lane socket is mode
+  0660, for a group the server's proxy runs in, which reaches it as `localhost:6901`.
 - **Lanes:** for each control connection the daemon makes a 256-bit capability from the
   system's random source and sends it as the session's first control message, over ssh.
-  A lane's first message must present it, with its generation; a wrong or stale
-  one gets the lane closed or the datagram dropped, without a reply, and the daemon acts
-  on nothing else a lane sends. A datagram lane belongs to the session by the address its
-  attach came from. Lanes carry video and audio one way, from the daemon to the relay:
+  A lane's first bytes must present it; a wrong or stale one gets the lane closed without
+  a reply, and the daemon reads nothing else a lane sends. A lane that presents it replaces
+  the session's lane before. The lane carries video and audio one way, from the daemon to
+  the relay:
   input, clipboard, files and the microphone go only over ssh. The capability is never in
   argv, the environment, a file or a log line, is compared in constant time and zeroed
   when it drops, and both ends turn core dumps off. When the control stream closes, the
@@ -40,9 +39,9 @@ the tunnel the lane crosses encrypts it, and every other hop is on one machine. 
 - **Agent commands:** `voxl stats`, `voxl screenshot` and `voxl record`, run over ssh,
   ask the daemon through the same control socket, so the same uid rule admits them. Each
   is answered once on its own connection; none gets a capability or reaches a lane.
-- **Malformed input:** every reader of a lane message, a control message or an attach
-  checks lengths before it reads, has a fixed maximum, and returns a typed error; none
-  allocates by a length it read.
+- **Malformed input:** every reader of a frame or a control message checks lengths
+  before it reads, has a fixed maximum, and returns a typed error; none allocates by a
+  length it read.
 - **The relay:** `voxl relay` serves the page on `127.0.0.1` only, and answers only
   requests for an IP address or `localhost` from its own page, turning away other sites'
   pages (and DNS rebinding) that browsers would let connect to it. Anyone who can reach

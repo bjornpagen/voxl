@@ -1,11 +1,10 @@
 //! Video pipeline: damage-driven capture -> I420 -> VP9 -> each session's lane, a capture
-//! held while a session's lane is full.
+//! held while anything waits for a session's lane socket.
 //!
 //! One stream codes the screen for every viewer. It starts with a keyframe for the viewers
-//! it starts, and codes every later frame from a picture every viewer has (`vp9::Slots`);
-//! a keyframe is coded only for a viewer starting (`hub::Starts`). A still screen whose last
-//! frame the rate held back from the quality target is coded once more at it, when every
-//! lane is empty.
+//! it starts, and codes every later frame from the frames before it, which every viewer's
+//! lane carried in order; a keyframe is coded only for a viewer starting (`hub::Starts`).
+//! Every frame is coded at one quality: a slow link lowers the frame rate, through the gate.
 
 #[cfg(target_os = "linux")]
 use crate::capture::Capturer;
@@ -17,10 +16,6 @@ use crate::hub::wait_any;
 use crate::hub::Waitable;
 use crate::hub::{Hub, Starts};
 use crate::hub::{Seen, Viewer};
-use crate::lanes::wire::{Number, Outcome};
-#[cfg(target_os = "linux")]
-use crate::session::sender::Room;
-use crate::session::sender::{Delivery, Rate};
 use crate::vp9;
 use bytes::{BufMut, BytesMut};
 use std::sync::atomic::Ordering;
@@ -65,22 +60,16 @@ impl VideoConfig {
     }
 }
 
-/// What a video frame says before its VP9, on the lanes: the encode loop writes it, and
+/// What a video frame says before its VP9, on the lane: the encode loop writes it, and
 /// the recorder, the relay (which hands it to the page) and web/src/protocol.ts read it,
 /// each checking its reader against web/src/video-header.json. What a frame is (video or
-/// audio) the lane's `Track` says: the page's type byte is the relay's to add.
+/// audio) the lane's `Track` says, as the page's type byte. Every update refers only to the
+/// keyframe before it on its lane and frames after that keyframe, all of which the lane
+/// carried before it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Header {
     /// The frame is a keyframe.
     pub key: bool,
-    /// The frame's number: the encode loop's count of the frames it sent, wrapping.
-    pub frame: u32,
-    /// The number of the keyframe the frame descends from (a keyframe's own): every
-    /// reference it makes is to that keyframe or to a frame after it. The page decodes a
-    /// delta only if it decoded this keyframe, so a delta whose keyframe it missed is passed
-    /// over, whatever order the keyframe, the delta and the stream's hello (on the control
-    /// stream) arrive in.
-    pub from: u32,
     pub pipe: Pipe,
 }
 
@@ -102,17 +91,15 @@ impl Pipe {
 
 impl Header {
     /// The VP9 starts this far into a frame.
-    pub const LEN: usize = 13;
+    pub const LEN: usize = 5;
     /// The flags byte's one bit.
     const KEY: u8 = 1;
 
-    /// Flags, frame, from, pipe: the integers big-endian.
+    /// Flags, then pipe, big-endian.
     pub fn bytes(&self) -> [u8; Header::LEN] {
         let mut b = [0; Header::LEN];
         b[0] = if self.key { Header::KEY } else { 0 };
-        b[1..5].copy_from_slice(&self.frame.to_be_bytes());
-        b[5..9].copy_from_slice(&self.from.to_be_bytes());
-        b[9..13].copy_from_slice(&self.pipe.0.to_be_bytes());
+        b[1..5].copy_from_slice(&self.pipe.0.to_be_bytes());
         b
     }
 
@@ -129,9 +116,7 @@ impl Header {
     fn of(b: &[u8; Header::LEN]) -> Header {
         Header {
             key: b[0] & Header::KEY != 0,
-            frame: u32::from_be_bytes([b[1], b[2], b[3], b[4]]),
-            from: u32::from_be_bytes([b[5], b[6], b[7], b[8]]),
-            pipe: Pipe(u32::from_be_bytes([b[9], b[10], b[11], b[12]])),
+            pipe: Pipe(u32::from_be_bytes([b[1], b[2], b[3], b[4]])),
         }
     }
 }
@@ -139,7 +124,7 @@ impl Header {
 /// A video frame, read.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Video<'a> {
-    /// Its header, and its H.264 after it.
+    /// Its header, and its VP9 after it.
     Picture(Header, &'a [u8]),
     /// A header with nothing after it. The encode loop sends no frame that coded nothing.
     Empty(Header),
@@ -155,9 +140,6 @@ enum Plan<S> {
     Key(S),
     /// What changed on screen.
     Motion,
-    /// Nothing changed, the last frame came out coarser than the target, and every lane is
-    /// empty: the same picture again, at the target.
-    Pass,
 }
 
 /// A capture, as the encode loop is given it.
@@ -179,13 +161,6 @@ struct Job {
 pub struct Band {
     pub y0: u32,
     pub y1: u32,
-}
-
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // read by the Linux-only capture loop
-/// A buffer back from the encoder, and how fine its frame came out.
-struct Returned {
-    buf: Box<I420>,
-    came: vp9::Came,
 }
 
 #[cfg(target_os = "linux")]
@@ -210,12 +185,11 @@ struct Stream {
     /// Dropped first (fields drop in order), which ends the encode loop once it has sent
     /// what it was given.
     job_tx: mpsc::SyncSender<Job>,
-    ret_rx: mpsc::Receiver<Returned>,
+    /// The buffer back from the encoder, once its frame is on its viewers' lanes.
+    ret_rx: mpsc::Receiver<Box<I420>>,
     buf: Buffer<Box<I420>>,
     /// The rows that changed on screen since the buffer was last converted into.
     pending: Option<Band>,
-    /// How fine the last frame came out.
-    came: vp9::Came,
     /// Dropped last: waits until the encode loop has stopped.
     _encode: Stopped,
 }
@@ -260,7 +234,7 @@ impl Stream {
         log::info!("streaming");
         let (job_tx, job_rx) = mpsc::sync_channel::<Job>(1);
         // One picture goes round, so no more than one comes back at once.
-        let (ret_tx, ret_rx) = mpsc::sync_channel::<Returned>(1);
+        let (ret_tx, ret_rx) = mpsc::sync_channel::<Box<I420>>(1);
         let hub = hub.clone();
         let encode = encoder_thread(hub.clone(), move || {
             encode_loop(coded, first, job_rx, ret_tx, hub, debug)
@@ -270,16 +244,8 @@ impl Stream {
             ret_rx,
             buf: Buffer::Away,
             pending: None,
-            came: vp9::Came::AtTarget,
             _encode: encode,
         })
-    }
-
-    #[cfg(target_os = "linux")]
-    /// The buffer the encoder is done with: back home, with how fine its frame came out.
-    fn returned(&mut self, r: Returned) {
-        self.buf = Buffer::Home(r.buf);
-        self.came = r.came;
     }
 }
 
@@ -287,7 +253,7 @@ impl Stream {
 /// Runs the pipeline. With a `Screen` (dynamic resolution), the capture loop gives a
 /// client's size request to the screen; only if the screen's size really changes does
 /// the loop end: the encoder drains, the pipeline is rebuilt at the new size, and clients
-/// get the new geometry and a keyframe.
+/// get a keyframe of it.
 pub fn spawn(
     cfg: VideoConfig,
     hub: Arc<Hub>,
@@ -339,8 +305,6 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<(Capturer, vp9::Stream), S
     };
     let coded =
         vp9::Stream::new(shape, cfg.cores).map_err(|e| format!("no VP9 level holds {:?}", e.0))?;
-    hub.width.store(w, Ordering::Relaxed);
-    hub.height.store(h, Ordering::Relaxed);
     *hub.stream.lock() = Some(coded);
     // A desktop that cannot be resized declares its one size's codec, at its first build.
     hub.codec.get_or_init(|| coded.codec());
@@ -349,42 +313,31 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<(Capturer, vp9::Stream), S
         coded.codec(),
         coded.threads
     );
-    // New geometry and codec for clients already connected; no-op at startup.
+    // Clients already connected start again on a keyframe of the new size; no-op at startup.
     hub.restart_clients();
     Ok((cap, coded))
 }
 
-/// Whether the sessions' lanes let a capture go: open while every viewer has room.
+/// Whether the sessions' lanes let a capture go: open while nothing waits for any viewer's
+/// lane socket.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Gated {
     Open,
-    /// Held by a viewer whose lane is full: only a report, a lane draining, a viewer coming
-    /// or going can open the gate, and each of those wakes the hub.
+    /// Held by a viewer whose lane socket has not yet taken what waits for it: only the
+    /// socket taking it, the lane ending, or a viewer coming or going can open the gate, and
+    /// each of those wakes the hub.
     Held,
-}
-
-/// Whether every lane is empty: what a pass waits for, so that it never stands in the way
-/// of a change.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Lanes {
-    Idle,
-    Busy,
 }
 
 impl Gated {
     #[cfg(target_os = "linux")]
-    /// What the look at the viewers saw of their lanes: held by any with no room, and idle
-    /// while every one is empty. A recording bounds nothing.
-    fn of(rooms: impl IntoIterator<Item = Room>) -> (Gated, Lanes) {
-        let (mut gate, mut lanes) = (Gated::Open, Lanes::Idle);
-        for room in rooms {
-            match room {
-                Room::Full => (gate, lanes) = (Gated::Held, Lanes::Busy),
-                Room::Open(_) => lanes = Lanes::Busy,
-                Room::Unbounded => {}
-            }
+    /// What the look at the viewers saw of their lanes: held by any whose bytes wait. A
+    /// recording bounds nothing.
+    fn of(seen: &[(Arc<crate::hub::Client>, Seen)]) -> Gated {
+        match seen.iter().any(|(_, v)| v.waits) {
+            true => Gated::Held,
+            false => Gated::Open,
         }
-        (gate, lanes)
     }
 }
 
@@ -399,24 +352,23 @@ const MIN_INTERVAL_SHARE: f64 = 0.85;
 enum Step<B> {
     /// Wait, the buffer where it was.
     Wait(Wait, Buffer<B>),
-    /// Capture a change or a pass into the buffer that was home.
-    Capture(Next, B),
+    /// Capture into the buffer that was home.
+    Capture(B),
 }
 
 /// What the capture loop waits for before it looks again. Damage wakes it through the
-/// capturer; the hub's waker, through a viewer's command or report, a lane draining, a
-/// viewer leaving, a screenshot or recording asked for, or a buffer coming home from the
-/// encoder.
+/// capturer; the hub's waker, through a viewer's command, a lane emptying or ending, a viewer
+/// leaving, a screenshot or recording asked for, or a buffer coming home from the encoder.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Wait {
     /// Damage or a wake: nothing is due.
     Change,
-    /// The rest of the least interval since the capture that gates this one (`Captured`),
-    /// or what the capture it holds back is woken by (`Next::interval_ends`).
-    Interval { rest: Duration, next: Next },
-    /// The lanes: a report or a drain that makes room or empties them, a viewer going (a
-    /// wake), or damage to take in. No time: a capture held by the lanes waits for what they
-    /// answer, and with nothing answered nothing goes.
+    /// The rest of the least interval since the last capture, or a wake: damage that comes
+    /// meanwhile goes with the capture it holds back.
+    Interval { rest: Duration },
+    /// The lanes: a socket taking what waits, a lane ending, a viewer going (a wake), or
+    /// damage to take in. No time: a capture held by the lanes waits for what they answer,
+    /// and with nothing answered nothing goes.
     Gate,
     /// A buffer back from the encoder, which wakes the waker as it hands it back; damage
     /// waits for the capture this leads to.
@@ -450,7 +402,7 @@ impl Wait {
     fn through(self, poll: impl FnOnce(On, Option<Duration>)) {
         match self {
             Wait::Change => poll(On::Event, None),
-            Wait::Interval { rest, next } => poll(next.interval_ends(), Some(rest)),
+            Wait::Interval { rest } => poll(On::Wake, Some(rest)),
             Wait::Gate => poll(On::Event, None),
             Wait::Buffer => poll(On::Wake, None),
         }
@@ -531,14 +483,12 @@ enum Buffer<B> {
 struct Look<B> {
     key: Key,
     damage: Damage,
-    /// How fine the last frame came out.
-    came: vp9::Came,
     now: Instant,
-    captured: Captured,
+    /// When the last capture went.
+    captured: Instant,
     /// The least time between two captures.
     min_interval: Duration,
     gate: Gated,
-    lanes: Lanes,
     buffer: Buffer<B>,
 }
 
@@ -548,44 +498,30 @@ fn step<B>(look: Look<B>) -> Step<B> {
     let Look {
         key,
         damage,
-        came,
         now,
         captured,
         min_interval,
         gate,
-        lanes,
         buffer,
     } = look;
-    let next = match (damage, key) {
-        // Nothing moved and nobody waits to start: a pass, if the last frame came out
-        // coarser than the target, once every lane is empty and the encoder idle. Until
-        // then a change may come, and with it the capture is motion's. No time decides it.
-        (Damage::None, Key::NotWanted) => match (came, lanes, &buffer) {
-            (vp9::Came::Coarser, Lanes::Idle, Buffer::Home(_)) => Next::Pass,
-            (vp9::Came::Coarser, Lanes::Busy, Buffer::Home(_)) => {
-                return Step::Wait(Wait::Gate, buffer)
-            }
-            (vp9::Came::Coarser, _, Buffer::Away) | (vp9::Came::AtTarget, _, _) => {
-                return Step::Wait(Wait::Change, buffer)
-            }
-        },
-        (Damage::Unreported | Damage::Rows { .. }, Key::Wanted | Key::NotWanted)
-        | (Damage::None, Key::Wanted) => Next::Change,
-    };
-    let since = now.saturating_duration_since(captured.gate(next));
+    // Nothing moved and nobody waits to start: nothing to capture.
+    if let (Damage::None, Key::NotWanted) = (damage, key) {
+        return Step::Wait(Wait::Change, buffer);
+    }
+    let since = now.saturating_duration_since(captured);
     if since < min_interval {
         let rest = min_interval - since;
-        return Step::Wait(Wait::Interval { rest, next }, buffer);
+        return Step::Wait(Wait::Interval { rest }, buffer);
     }
-    // A change goes while every lane has room; a pass went only once they were empty.
-    if let (Next::Change, Gated::Held) = (next, gate) {
+    // A capture goes once every lane is empty.
+    if gate == Gated::Held {
         return Step::Wait(Wait::Gate, buffer);
     }
     // A capture goes only to an idle encoder. One made while it codes the frame before
     // would wait for it, a whole encode older by the time it is coded; made once it is
     // done, it holds what changed meanwhile, and goes at once.
     match buffer {
-        Buffer::Home(buf) => Step::Capture(next, buf),
+        Buffer::Home(buf) => Step::Capture(buf),
         Buffer::Away => Step::Wait(Wait::Buffer, Buffer::Away),
     }
 }
@@ -593,76 +529,17 @@ fn step<B>(look: Look<B>) -> Step<B> {
 /// What a capture is sent as, or why nothing is.
 enum Planned<S> {
     Send(Plan<S>),
-    /// The damage held no area after all, and no pass was due.
+    /// The damage held no area after all, and no keyframe was promised.
     Empty,
 }
 
-/// What capture `next`, whose damage came to `band`, is sent as: a keyframe for the viewers
-/// `starts` if a keyframe was wanted and promised to any; else what moved; else the pass.
-fn plan<S>(starts: Option<S>, band: Option<Band>, next: Next) -> Planned<S> {
-    match (starts, band, next) {
-        (Some(s), _, _) => Planned::Send(Plan::Key(s)),
-        (None, Some(_), _) => Planned::Send(Plan::Motion),
-        (None, None, Next::Pass) => Planned::Send(Plan::Pass),
-        (None, None, Next::Change) => Planned::Empty,
-    }
-}
-
-/// What the capture loop is about to capture.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Next {
-    /// Something moved, or a viewer wants a keyframe.
-    Change,
-    /// Nothing moved, blocks are pending, and the lanes have room to spare.
-    Pass,
-}
-
-impl Next {
-    /// What ends the wait for the frame interval before capturing this, besides its time.
-    /// Before a pass, damage too: it makes the capture a change, which the pass does not
-    /// hold back.
-    fn interval_ends(self) -> On {
-        match self {
-            Next::Change => On::Wake,
-            Next::Pass => On::Event,
-        }
-    }
-}
-
-/// When the last frames were captured: what holds the next one to the frame rate.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Captured {
-    /// Any frame, a pass included.
-    any: Instant,
-    /// The last change: motion or a keyframe.
-    change: Instant,
-}
-
-impl Captured {
-    #[cfg(target_os = "linux")]
-    fn new(at: Instant) -> Self {
-        Captured {
-            any: at,
-            change: at,
-        }
-    }
-    /// The capture the next frame waits a frame interval after. A pass waits after any
-    /// frame, so passes go at most at the frame rate and never right behind a change. A
-    /// change waits only after the last change: a keystroke that comes just after a pass
-    /// is captured at once and waits for that pass's encode at most, not for a frame.
-    fn gate(&self, next: Next) -> Instant {
-        match next {
-            Next::Pass => self.any,
-            Next::Change => self.change,
-        }
-    }
-    #[cfg(target_os = "linux")]
-    fn on_capture(&mut self, next: Next, at: Instant) {
-        self.any = at;
-        match next {
-            Next::Pass => {}
-            Next::Change => self.change = at,
-        }
+/// What a capture whose damage came to `band` is sent as: a keyframe for the viewers
+/// `starts` if a keyframe was wanted and promised to any; else what moved, if anything did.
+fn plan<S>(starts: Option<S>, band: Option<Band>) -> Planned<S> {
+    match (starts, band) {
+        (Some(s), _) => Planned::Send(Plan::Key(s)),
+        (None, Some(_)) => Planned::Send(Plan::Motion),
+        (None, None) => Planned::Empty,
     }
 }
 
@@ -774,7 +651,8 @@ fn capture_loop(
     let (w, h) = (w as usize, h as usize);
     let interval = Duration::from_secs_f64(1.0 / f64::from(FRAMERATE));
     let min_interval = interval.mul_f64(MIN_INTERVAL_SHARE);
-    let mut captured = Captured::new(Instant::now() - interval);
+    // When the last capture went: an interval ago, so the first goes at once.
+    let mut captured = Instant::now() - interval;
     let marker = cfg.debug.marker;
     // The marker is read only where all of it fits this capture (a resize builds a new
     // loop): past an edge its squares are outside the picture or in the next row.
@@ -837,14 +715,14 @@ fn capture_loop(
         if let Some(s) = stream.as_mut() {
             loop {
                 match s.ret_rx.try_recv() {
-                    Ok(r) => s.returned(r),
+                    Ok(buf) => s.buf = Buffer::Home(buf),
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => return Err("encoder gone".into()),
                 }
             }
         }
         // One reading of the clock and one look at each viewer: the stream, the keyframe and
-        // whom it starts, the gate and a pass are all decided from them. The capture itself
+        // whom it starts and the gate are all decided from them. The capture itself
         // is stamped `t0` below, after any wait for a buffer.
         let now = Instant::now();
         hub.look_into(&mut seen);
@@ -876,7 +754,7 @@ fn capture_loop(
             let mut buf = Box::new(I420::new(cw as usize, ch as usize));
             cap.convert(&mut buf, 0, ch as usize)?;
             hub.stats.captured.fetch_add(1, Ordering::Relaxed);
-            captured.on_capture(Next::Change, t0);
+            captured = t0;
             let first = Job {
                 buf,
                 frame: Plan::Key(starts),
@@ -886,25 +764,22 @@ fn capture_loop(
             stream = Some(Stream::start(&hub, coded, first, cfg.debug)?);
             continue;
         };
-        let (gate, lanes) = Gated::of(seen.iter().map(|(_, v)| v.room));
         let look = Look {
             key,
             damage: *cap.damage(),
-            came: s.came,
             now,
             captured,
             min_interval,
-            gate,
-            lanes,
+            gate: Gated::of(&seen),
             buffer: std::mem::replace(&mut s.buf, Buffer::Away),
         };
-        let (next, mut buf) = match step(look) {
+        let mut buf = match step(look) {
             Step::Wait(wait, buffer) => {
                 s.buf = buffer;
                 wait.wait(cap, &hub)?;
                 continue;
             }
-            Step::Capture(next, buf) => (next, buf),
+            Step::Capture(buf) => buf,
         };
         let t0 = Instant::now();
         let origin = match *cap.damage() {
@@ -922,7 +797,7 @@ fn capture_loop(
         if marker.is_some() {
             log::info!(
                 "cap dt {:.1} ms band {:?} grab {} us",
-                captured.any.elapsed().as_secs_f64() * 1000.0,
+                captured.elapsed().as_secs_f64() * 1000.0,
                 band,
                 (t1 - t0).as_micros()
             );
@@ -934,7 +809,7 @@ fn capture_loop(
             Key::Wanted => hub.promise(&seen),
             Key::NotWanted => None,
         };
-        let frame = match plan(starts, band, next) {
+        let frame = match plan(starts, band) {
             Planned::Send(frame) => frame,
             Planned::Empty => {
                 s.buf = Buffer::Home(buf);
@@ -957,10 +832,7 @@ fn capture_loop(
             .convert_us
             .fetch_add((t2 - t1).as_micros() as u64, Ordering::Relaxed);
         hub.stats.captured.fetch_add(1, Ordering::Relaxed);
-        if let Plan::Pass = frame {
-            hub.stats.passes.fetch_add(1, Ordering::Relaxed);
-        }
-        captured.on_capture(next, t0);
+        captured = t0;
         if s.job_tx
             .send(Job {
                 buf,
@@ -975,78 +847,13 @@ fn capture_loop(
     }
 }
 
-/// The updates' numbers, from stream to stream (a number is never given twice, so a report
-/// of an update of a stream before names no picture of this one), and what the sessions'
-/// relays decided of them, for the coder to take before its next frame.
-pub struct Updates(parking_lot::Mutex<Count>);
-
-struct Count {
-    next: Number,
-    decided: Vec<(Number, Outcome)>,
-}
-
-impl Default for Updates {
-    fn default() -> Updates {
-        Updates(parking_lot::Mutex::new(Count {
-            next: Number::first(),
-            decided: Vec::new(),
-        }))
-    }
-}
-
-impl Updates {
-    /// A session's relay decided update `number`.
-    pub fn decided(&self, number: Number, outcome: Outcome) {
-        self.0.lock().decided.push((number, outcome));
-    }
-
-    /// The next update's number.
-    fn next(&self) -> Number {
-        let mut c = self.0.lock();
-        let n = c.next;
-        c.next = n.next();
-        n
-    }
-
-    /// What was decided since the last take, into `into` (emptied), whose buffer the count
-    /// keeps in exchange: a take allocates nothing once both are big enough.
-    fn take(&self, into: &mut Vec<(Number, Outcome)>) {
-        into.clear();
-        std::mem::swap(&mut self.0.lock().decided, into);
-    }
-}
-
-/// Codes each frame: the encoder, the pictures the viewers have, and the rate it was told.
+/// Codes each frame: the encoder, and what it puts out.
 struct Coder {
     enc: vp9::Encoder,
-    slots: vp9::Slots,
-    /// The most the stream is sent at (its level's), and what the encoder was last told.
-    ceiling: u32,
-    kbps: u32,
-    updates: Arc<Updates>,
-    /// What the relays decided, taken before each frame; kept, so a frame allocates nothing.
-    decided: Vec<(Number, Outcome)>,
-    /// What libvpx put out for the last frame: kept likewise.
+    /// What libvpx put out for the last frame: kept, so a frame allocates nothing.
     out: Vec<u8>,
     arenas: Arenas,
     debug: bool,
-}
-
-/// A frame coded.
-struct Coded {
-    number: Number,
-    came: vp9::Came,
-    /// A header's room, then the VP9.
-    bytes: BytesMut,
-}
-
-/// The kbit/s the stream is told for `rate`: the drain of the slowest lane, at most the
-/// ceiling; the ceiling while no lane is backed up.
-fn kbps(rate: Rate, ceiling: u32) -> u32 {
-    match rate {
-        Rate::Unlimited => ceiling,
-        Rate::Drain(bytes) => ((bytes * 8.0 / 1000.0) as u32).clamp(1, ceiling),
-    }
 }
 
 impl Coder {
@@ -1054,68 +861,22 @@ impl Coder {
     /// with the viewers it starts.
     fn start(
         coded: vp9::Stream,
-        hub: &Hub,
         first: &I420,
         ms: i64,
         debug: bool,
-    ) -> Result<(Coder, Coded), vp9::Failed> {
-        let ceiling = coded.ceiling();
-        let kbps = kbps(hub.rate(), ceiling);
-        let number = hub.updates.next();
-        let (slots, key) = coded.start(number.get());
+    ) -> Result<(Coder, BytesMut), vp9::Failed> {
         let mut coder = Coder {
-            enc: vp9::Encoder::new(&coded, kbps)?,
-            slots,
-            ceiling,
-            kbps,
-            updates: hub.updates.clone(),
-            decided: Vec::new(),
+            enc: vp9::Encoder::new(&coded)?,
             out: Vec::new(),
             arenas: Arenas::new(),
             debug,
         };
-        let coded = coder.encode(first, ms, number, key.into(), vp9::Fineness::Rate)?;
+        let coded = coder.code(first, ms, vp9::Coding::Key)?;
         Ok((coder, coded))
     }
 
-    /// Codes `frame` of `buf` at `ms`, at the rate `rate`: from a picture every viewer has,
-    /// or a keyframe for the viewers it starts.
-    fn code(
-        &mut self,
-        buf: &I420,
-        ms: i64,
-        frame: &Plan<Starts>,
-        rate: Rate,
-    ) -> Result<Coded, vp9::Failed> {
-        self.updates.take(&mut self.decided);
-        for &(n, outcome) in &self.decided {
-            match outcome {
-                Outcome::Decoded => self.slots.decoded(n.get()),
-                Outcome::Missed => self.slots.lost(n.get()),
-            }
-        }
-        let kbps = kbps(rate, self.ceiling);
-        if kbps != self.kbps {
-            self.enc.set_rate(kbps)?;
-            self.kbps = kbps;
-        }
-        let number = self.updates.next();
-        let (coding, fineness) = match frame {
-            Plan::Key(_) => (self.slots.start(number.get()).into(), vp9::Fineness::Rate),
-            Plan::Motion => (self.slots.code(number.get()).into(), vp9::Fineness::Rate),
-            Plan::Pass => (self.slots.code(number.get()).into(), vp9::Fineness::Target),
-        };
-        self.encode(buf, ms, number, coding, fineness)
-    }
-
-    fn encode(
-        &mut self,
-        buf: &I420,
-        ms: i64,
-        number: Number,
-        coding: vp9::Coding,
-        fineness: vp9::Fineness,
-    ) -> Result<Coded, vp9::Failed> {
+    /// Codes `buf` at `ms` as `coding`: a header's room, then the VP9.
+    fn code(&mut self, buf: &I420, ms: i64, coding: vp9::Coding) -> Result<BytesMut, vp9::Failed> {
         let planes = vp9::Planes {
             y: &buf.y,
             u: &buf.u,
@@ -1125,24 +886,18 @@ impl Coder {
         };
         self.out.clear();
         let te = Instant::now();
-        let came = self
-            .enc
-            .encode(&planes, ms, coding, fineness, &mut self.out)?;
+        self.enc.encode(&planes, ms, coding, &mut self.out)?;
         if self.debug {
             match thread_cpu_us() {
                 Ok(cpu) => log::info!(
-                    "encode {} us wall, thread cpu total {cpu} us, {} bytes, {came:?}",
+                    "encode {} us wall, thread cpu total {cpu} us, {} bytes",
                     te.elapsed().as_micros(),
                     Header::LEN + self.out.len()
                 ),
                 Err(e) => log::error!("this thread's CPU time: {e}"),
             }
         }
-        Ok(Coded {
-            number,
-            came,
-            bytes: self.arenas.message(&self.out),
-        })
+        Ok(self.arenas.message(&self.out))
     }
 }
 
@@ -1220,7 +975,7 @@ fn encode_loop(
     coded: vp9::Stream,
     first: Job,
     rx: mpsc::Receiver<Job>,
-    ret: mpsc::SyncSender<Returned>,
+    ret: mpsc::SyncSender<Box<I420>>,
     hub: Arc<Hub>,
     debug: Debugging,
 ) {
@@ -1235,7 +990,7 @@ fn encode_frames(
     coded: vp9::Stream,
     first: Job,
     rx: mpsc::Receiver<Job>,
-    ret: mpsc::SyncSender<Returned>,
+    ret: mpsc::SyncSender<Box<I420>>,
     hub: &Hub,
     debug: bool,
 ) -> Result<(), vp9::Failed> {
@@ -1243,36 +998,20 @@ fn encode_frames(
     let ms = |job: &Job| job.damage.saturating_duration_since(epoch).as_millis() as i64;
     // Kept from frame to frame, so a frame allocates nothing for it.
     let mut viewers = Vec::new();
-    // A frame's number, which its header carries: the encode loop's own count, wrapping.
-    let mut frame_number = 0u32;
-    // The newest keyframe's number: what every frame after it descends from.
-    let mut descends = 0u32;
     // A picture goes home only once its frame is on its viewers' lanes: the capture loop,
-    // woken by it, asks the lanes for room next, and they must count that frame. A
+    // woken by it, looks at the gate next, and the lanes must count that frame. A
     // capture loop gone has no home to send it to, and ends this loop at its next job.
-    let home = |r: Returned| {
-        if ret.send(r).is_ok() {
+    let home = |buf: Box<I420>| {
+        if ret.send(buf).is_ok() {
             hub.wake();
         }
     };
     let t0 = Instant::now();
-    let (mut coder, out) = Coder::start(coded, hub, &first.buf, ms(&first), debug)?;
-    let mut sent = |coder: &mut Coder, job: Job, out: Coded, t0: Instant| {
+    let (mut coder, out) = Coder::start(coded, &first.buf, ms(&first), debug)?;
+    let mut sent = |job: Job, mut bytes: BytesMut, t0: Instant| {
         let enc_us = t0.elapsed().as_micros() as u64;
-        frame_number = frame_number.wrapping_add(1);
-        let key = matches!(job.frame, Plan::Key(_));
-        if key {
-            descends = frame_number;
-        }
-        let Coded {
-            number,
-            came,
-            mut bytes,
-        } = out;
         let header = Header {
-            key,
-            frame: frame_number,
-            from: descends,
+            key: matches!(job.frame, Plan::Key(_)),
             pipe: Pipe::of(job.damage.elapsed()),
         };
         bytes[..Header::LEN].copy_from_slice(&header.bytes());
@@ -1285,16 +1024,13 @@ fn encode_frames(
         // The viewers a keyframe starts start on it, and are sent it.
         if let Plan::Key(starts) = &job.frame {
             hub.stats.keyframes.fetch_add(1, Ordering::Relaxed);
-            starts.started(number);
+            starts.started();
         }
-        let now = Instant::now();
         hub.clients_into(&mut viewers);
-        let reporting = viewers
-            .iter()
-            .filter(|c| c.takes(number, &bytes, now) == Some(Delivery::Reported))
-            .count();
-        coder.slots.sent(number.get(), reporting as u32);
-        home(Returned { buf: job.buf, came });
+        for c in &viewers {
+            c.takes(&bytes);
+        }
+        home(job.buf);
         // What the viewers were sent is on their lanes now: dropped here, its arena is
         // taken back.
         drop(bytes);
@@ -1309,11 +1045,15 @@ fn encode_frames(
             }
         }
     };
-    sent(&mut coder, first, out, t0);
+    sent(first, out, t0);
     while let Ok(job) = rx.recv() {
         let t0 = Instant::now();
-        let out = coder.code(&job.buf, ms(&job), &job.frame, hub.rate())?;
-        sent(&mut coder, job, out, t0);
+        let coding = match job.frame {
+            Plan::Key(_) => vp9::Coding::Key,
+            Plan::Motion => vp9::Coding::Delta,
+        };
+        let out = coder.code(&job.buf, ms(&job), coding)?;
+        sent(job, out, t0);
     }
     Ok(())
 }
@@ -1388,16 +1128,12 @@ fn marker_age(ms: u32) -> Result<i64, std::time::SystemTimeError> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    #[cfg(target_os = "linux")]
-    use crate::lanes::wire::Outcome;
-    use crate::lanes::wire::Track;
     use crate::session::sender::{Queue, Sender};
     use crate::xorshift::Xorshift;
 
-    /// A session of `hub` with one datagram lane, which no writer drains, and the lane's
-    /// queue.
+    /// A session of `hub` with a lane, which no writer drains, and the lane's queue.
     fn viewer(hub: &Hub) -> (Arc<crate::hub::Client>, Arc<Queue>) {
-        let (sender, queue, _control) = Sender::with_lane(Instant::now());
+        let (sender, queue) = Sender::with_lane();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         (hub.add_client(tx, sender), queue)
     }
@@ -1432,19 +1168,6 @@ pub(crate) mod tests {
             damage: Instant::now(),
             marker_ms: None,
         }
-    }
-
-    /// The video updates a lane's queue holds, in order: each update's number and bytes.
-    fn updates(queue: &Queue) -> Vec<(Number, Vec<u8>)> {
-        queue
-            .frames()
-            .into_iter()
-            .flat_map(|f| f.members)
-            .filter_map(|(track, bytes)| match track {
-                Track::Video { number } => Some((number, bytes)),
-                Track::Audio => None,
-            })
-            .collect()
     }
 
     /// The top-level boxes of an MP4, each its type and body, if they tile it exactly.
@@ -1483,8 +1206,6 @@ pub(crate) mod tests {
         let mut rng = Xorshift::new(0x1f83_d9ab_fb41_bd6b);
         for run in 0..6 {
             let hub = Hub::new().unwrap();
-            hub.width.store(w, Ordering::Relaxed);
-            hub.height.store(h, Ordering::Relaxed);
             *hub.stream.lock() = Some(coded(w, h));
             let (stop, stopped) = tokio::sync::oneshot::channel();
             let recording = tokio::spawn({
@@ -1652,41 +1373,47 @@ pub(crate) mod tests {
         }
     }
 
-    /// A frame refers only to pictures a viewer has, through the real encode loop: over
-    /// generated runs, a viewer on a datagram lane starts, its relay reports each block a
-    /// generated round trip later, decoded or missed (a quarter of them, the live link's
-    /// measured loss before repair), a second viewer joins partway, and a keyframe is coded
-    /// whenever one waits to start, as the capture loop codes one. The first viewer's page,
-    /// as its decoder follows the stream (a keyframe it receives starts it; one it lost, of
-    /// which it was told by hello, leaves it waiting for the next), decodes every update it
-    /// received after a keyframe it received, by ffmpeg with every error fatal, to exactly
-    /// what the whole stream decodes it to; the second starts on a keyframe.
+    /// Every viewer's lane carries a stream that decodes from the keyframe it starts on,
+    /// through the real encode loop, a replaced lane included: over generated runs, a viewer
+    /// watches from the start, a second joins partway, and a third's lane is replaced partway
+    /// (the relay reopened it) and again later; a keyframe is coded whenever one waits to
+    /// start, as the capture loop codes one. The first viewer's lane is the whole stream.
+    /// Each lane's updates begin with a keyframe, and decode, by ffmpeg with every error
+    /// fatal, to exactly what the whole stream decodes them to.
     #[test]
-    fn what_a_viewer_receives_decodes_whatever_was_lost() {
+    fn every_lane_decodes_from_its_keyframe() {
         let (w, h) = (64u32, 64u32);
         let mut rng = Xorshift::new(0x510e_527f_ade6_82d1);
         let dir = std::env::temp_dir().join(format!("voxl-video-gate-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let (mut decoded, mut missed_keys) = (0, 0);
+        let mut lanes_checked = 0;
         for case in 0..8 {
             let hub = Hub::new().unwrap();
-            let (a, a_lane) = viewer(&hub);
-            a.watch();
+            let (whole, whole_lane) = viewer(&hub);
+            whole.watch();
+            let (moved, first_lane) = viewer(&hub);
+            moved.watch();
             let first = job(w, h, Plan::Key(promised(&hub)), &mut rng);
             let s = Stream::start(&hub, coded(w, h), first, Debugging::read(|_| None).unwrap())
                 .unwrap();
             s.ret_rx.recv().unwrap();
-            let lag = 1 + rng.below(12) as usize;
-            // Blocks taken off a's lane and not yet reported, oldest first.
-            let mut pending: Vec<crate::session::sender::Received> = Vec::new();
-            // Every update coded (the whole stream), and whether a received it.
-            let mut whole: Vec<(Number, Vec<u8>, bool)> = Vec::new();
-            let mut b_lane = None;
+            let (join, reopen) = (rng.range(5, 50), rng.range(5, 40));
+            let again = reopen + rng.range(1, 20);
+            // Each lane's updates, as its socket took them; the lane `moved` has now.
+            let mut lanes: Vec<Vec<Vec<u8>>> = Vec::new();
+            let mut moving = first_lane;
+            let mut joined = None;
             for f in 0..60 {
-                if f == 30 {
+                if f == join {
                     let (b, lane) = viewer(&hub);
                     b.watch();
-                    b_lane = Some(lane);
+                    joined = Some((b, lane));
+                }
+                if f == reopen || f == again {
+                    // The socket took what the lane held before it broke.
+                    lanes.push(moving.updates());
+                    moving = Queue::new(Arc::new(|| {}));
+                    assert!(moved.attach(moving.clone()));
                 }
                 let mut seen = Vec::new();
                 hub.look_into(&mut seen);
@@ -1696,77 +1423,39 @@ pub(crate) mod tests {
                 };
                 s.job_tx.send(job(w, h, frame, &mut rng)).unwrap();
                 s.ret_rx.recv().unwrap();
-                pending.extend(a_lane.frames());
-                while pending.len() > lag {
-                    let block = pending.remove(0);
-                    let came = rng.below(4) > 0;
-                    for (track, bytes) in &block.members {
-                        if let Track::Video { number } = *track {
-                            missed_keys += usize::from(!came && bytes[0] & 1 == 1);
-                            whole.push((number, bytes.clone(), came));
-                        }
-                    }
-                    let outcome = match came {
-                        true => Outcome::Decoded,
-                        false => Outcome::Missed,
-                    };
-                    let now = Instant::now();
-                    let r = block.report(Some(outcome), |r| {
-                        crate::session::control::reported(&hub, &a, r, now)
-                    });
-                    assert_eq!(r, Ok(()));
-                }
             }
             drop(s);
-            let decode = |name: &str, frames: &[&(Number, Vec<u8>, bool)]| {
+            lanes.push(moving.updates());
+            lanes.extend(joined.map(|(_, lane)| lane.updates()));
+            let decode = |name: &str, frames: &[Vec<u8>]| {
                 let mut file = vp9::tests::ivf_header(w as usize, h as usize);
-                for (n, b, _) in frames {
-                    vp9::tests::ivf_frame(&mut file, n.get(), &b[Header::LEN..]);
+                for (n, b) in frames.iter().enumerate() {
+                    vp9::tests::ivf_frame(&mut file, n as u64, &b[Header::LEN..]);
                 }
                 let path = dir.join(format!("{name}{case}.ivf"));
                 std::fs::write(&path, file).unwrap();
                 vp9::tests::decode(&path).unwrap_or_else(|e| panic!("case {case} {name}: {e}"))
             };
             let frame = (w * h * 3 / 2) as usize;
-            let truth = decode("whole", &whole.iter().collect::<Vec<_>>());
-            // a's page: a run from each keyframe it received to the next keyframe coded.
-            let mut runs: Vec<Vec<usize>> = Vec::new();
-            let mut decoding = false;
-            for (i, (_, bytes, came)) in whole.iter().enumerate() {
-                if bytes[0] & 1 == 1 {
-                    decoding = *came;
-                    if decoding {
-                        runs.push(Vec::new());
-                    }
-                }
-                if let (true, true, Some(run)) = (decoding, *came, runs.last_mut()) {
-                    run.push(i);
-                }
+            let all = whole_lane.updates();
+            let truth = decode("whole", &all);
+            assert_eq!(truth.len(), all.len() * frame, "case {case}");
+            for (l, got) in lanes.iter().enumerate() {
+                assert!(!got.is_empty(), "case {case}: lane {l} carried nothing");
+                assert_eq!(got[0][0] & 1, 1, "case {case}: lane {l} starts on a delta");
+                // Where the lane's first update is in the whole stream: the same bytes.
+                let at = all.iter().position(|u| *u == got[0]).unwrap();
+                assert_eq!(got[..], all[at..at + got.len()], "case {case}: lane {l}");
+                let pictures = decode(&format!("lane{l}-"), got);
+                assert!(
+                    pictures[..] == truth[at * frame..(at + got.len()) * frame],
+                    "case {case}: lane {l}"
+                );
+                lanes_checked += 1;
             }
-            for (r, run) in runs.iter().enumerate() {
-                let frames: Vec<_> = run.iter().map(|&i| &whole[i]).collect();
-                let got = decode(&format!("a{r}-"), &frames);
-                assert_eq!(got.len(), run.len() * frame, "case {case}, run {r}");
-                for (k, &i) in run.iter().enumerate() {
-                    assert!(
-                        got[k * frame..][..frame] == truth[i * frame..][..frame],
-                        "case {case}: update {:?}",
-                        whole[i].0
-                    );
-                    decoded += 1;
-                }
-            }
-            let b_got = updates(&b_lane.unwrap());
-            assert!(
-                b_got[0].1[0] & 1 == 1,
-                "case {case}: b starts on a keyframe"
-            );
         }
         std::fs::remove_dir_all(&dir).unwrap();
-        assert!(
-            decoded > 200 && missed_keys > 0,
-            "{decoded} decoded, {missed_keys} keys missed"
-        );
+        assert_eq!(lanes_checked, 8 * 4);
     }
 
     /// A viewer that joins while the stream is rebuilt (a resize, a display switch)
@@ -1794,12 +1483,12 @@ pub(crate) mod tests {
         // build(): the rebuilt stream's hello.
         hub.restart_clients();
         assert_eq!(
-            updates(&page_lane).len(),
+            page_lane.updates().len(),
             1,
             "the first page had no keyframe"
         );
         assert!(
-            updates(&second_lane).is_empty(),
+            second_lane.updates().is_empty(),
             "the second page's lane had a frame of the old stream before its hello"
         );
     }
@@ -2160,8 +1849,8 @@ pub(crate) mod tests {
     /// does, so no X server is needed), at the defaults, with one viewer: the stream it
     /// makes for that viewer is the one a real viewer gets. The test draws text scrolling
     /// through rows of any height, and lets the screen go still until its pass goes when
-    /// one is due; and plays the viewer, taking each frame's messages and reporting each
-    /// decoded. First each kind of step goes through 24 times, which brings every buffer the
+    /// one is due; and plays the viewer's socket, taking each frame off its lane. First each
+    /// kind of step goes through 24 times, which brings every buffer the
     /// stream keeps to its size; then 60 generated steps are counted. The test's own thread
     /// is the viewer, so it is not the stream's.
     ///
@@ -2184,6 +1873,7 @@ pub(crate) mod tests {
         let hub = Hub::new().unwrap();
         let (client, lane) = viewer(&hub);
         client.watch();
+        drop(client);
         let canvas = Arc::new(Canvas {
             w,
             h,
@@ -2215,45 +1905,26 @@ pub(crate) mod tests {
                 .spawn(move || capture_loop(&mut drawing, coded, cfg, hub, None))
                 .unwrap()
         };
-        // The viewer: it takes frames off its lane until there is one, reporting each
-        // decoded, as its relay does.
+        // The viewer: it takes frames off its lane until there is one, as its socket does.
         struct Viewer {
             lane: Arc<Queue>,
-            client: Arc<crate::hub::Client>,
-            hub: Arc<Hub>,
             frames: usize,
         }
         impl Viewer {
             fn frame(&mut self) {
                 loop {
-                    let frames = self.lane.frames();
-                    if frames.is_empty() {
+                    let updates = self.lane.updates().len();
+                    if updates == 0 {
                         // Nothing yet: the stream's threads are coding it.
                         std::thread::yield_now();
                         continue;
                     }
-                    for f in &frames {
-                        let now = Instant::now();
-                        let reported = f.report(Some(Outcome::Decoded), |r| {
-                            crate::session::control::reported(&self.hub, &self.client, r, now)
-                        });
-                        assert_eq!(reported, Ok(()));
-                        self.frames += f
-                            .members
-                            .iter()
-                            .filter(|(t, _)| matches!(t, Track::Video { .. }))
-                            .count();
-                    }
+                    self.frames += updates;
                     return;
                 }
             }
         }
-        let mut viewer = Viewer {
-            lane,
-            client,
-            hub: hub.clone(),
-            frames: 0,
-        };
+        let mut viewer = Viewer { lane, frames: 0 };
         let mut rng = Xorshift::new(0x2545F4914F6CDD1D);
         let mut next = move |n: u64| rng.below(n);
         // Text scrolls: a line, a block of lines, the whole screen.
@@ -2328,29 +1999,21 @@ pub(crate) mod tests {
     }
 
     /// One look, as the capture loop reads it: the capturer's damage, whether a viewer
-    /// waits to start, how the last frame came out, the last capture, the pacing, the gate,
-    /// the lanes, whether the buffer is home, and the area the damage comes to when taken.
+    /// waits to start, the last capture, the pacing, the gate, whether the buffer is home, and
+    /// the area the damage comes to when taken.
     #[derive(Clone, Copy)]
     struct StepCase {
         damage: Damage,
         want_key: bool,
-        came: vp9::Came,
         now: Instant,
-        captured: Captured,
+        captured: Instant,
         min_interval: Duration,
         gate: Gated,
-        lanes: Lanes,
         home: bool,
         band: Option<Band>,
     }
 
     impl StepCase {
-        fn key(&self) -> Key {
-            match self.want_key {
-                true => Key::Wanted,
-                false => Key::NotWanted,
-            }
-        }
         fn buffer(&self) -> Buffer<()> {
             match self.home {
                 true => Buffer::Home(()),
@@ -2359,40 +2022,34 @@ pub(crate) mod tests {
         }
         fn look(&self) -> Look<()> {
             Look {
-                key: self.key(),
+                key: match self.want_key {
+                    true => Key::Wanted,
+                    false => Key::NotWanted,
+                },
                 damage: self.damage,
-                came: self.came,
                 now: self.now,
                 captured: self.captured,
                 min_interval: self.min_interval,
                 gate: self.gate,
-                lanes: self.lanes,
                 buffer: self.buffer(),
             }
         }
     }
 
-    /// How many looks `each_case` makes: four frame rates, three damages, 28 pairs of
-    /// times since the last change and the last capture, three states of the lanes (open
-    /// and idle, open and busy, held), and 16 ways for the rest.
-    const CASES: usize = 4 * 3 * 28 * 3 * 16;
+    /// How many looks `each_case` makes: four frame rates, three damages, seven times since
+    /// the last capture, the gate open or held, and 8 ways for the rest.
+    const CASES: usize = 4 * 3 * 7 * 2 * 8;
 
     /// Every look over a discretised domain: each state the capturer's damage takes; four
-    /// frame rates, at seven times since the last change and since the last capture (no
-    /// longer ago than the change), either side of the least interval and its rounding to
-    /// whole milliseconds; a viewer waiting to start or not; the last frame at the target or
-    /// coarser; the lanes idle, busy with room, or held; the buffer home or out; damage that
-    /// came to an area or to none.
+    /// frame rates, at seven times since the last capture, either side of the least interval
+    /// and its rounding to whole milliseconds; a viewer waiting to start or not; the lanes
+    /// empty (the gate open) or not; the buffer home or out; damage that came to an area or
+    /// to none.
     fn each_case(mut check: impl FnMut(StepCase)) -> usize {
         let ns = Duration::from_nanos;
         let us = Duration::from_micros;
         let ms = Duration::from_millis;
         let now = Instant::now() + Duration::from_secs(10);
-        let lanes = [
-            (Gated::Open, Lanes::Idle),
-            (Gated::Open, Lanes::Busy),
-            (Gated::Held, Lanes::Busy),
-        ];
         let damages = [
             Damage::None,
             Damage::Unreported,
@@ -2415,33 +2072,22 @@ pub(crate) mod tests {
                 min_interval + ns(1),
                 Duration::from_secs(5),
             ];
-            // The last capture of any kind is the last change or later.
-            let captures = sinces.iter().enumerate().flat_map(|(i, &change)| {
-                sinces[..=i].iter().map(move |&any| Captured {
-                    any: now - any,
-                    change: now - change,
-                })
-            });
-            for (damage, captured) in damages
+            for (damage, since) in damages
                 .into_iter()
-                .flat_map(|d| captures.clone().map(move |c| (d, c)))
+                .flat_map(|d| sinces.map(move |s| (d, s)))
             {
-                for ((gate, lanes), case) in
-                    lanes.into_iter().flat_map(|l| (0..16).map(move |c| (l, c)))
+                for (gate, case) in [Gated::Open, Gated::Held]
+                    .into_iter()
+                    .flat_map(|g| (0..8).map(move |c| (g, c)))
                 {
                     let bit = |i: u32| case >> i & 1 == 1;
                     check(StepCase {
                         damage,
                         want_key: bit(0),
-                        came: match bit(3) {
-                            true => vp9::Came::Coarser,
-                            false => vp9::Came::AtTarget,
-                        },
                         now,
-                        captured,
+                        captured: now - since,
                         min_interval,
                         gate,
-                        lanes,
                         home: bit(1),
                         band: bit(2).then_some(Band { y0: 16, y1: 48 }),
                     });
@@ -2453,51 +2099,34 @@ pub(crate) mod tests {
     }
 
     /// A look waits for the first of these that holds it, and only for that, else it
-    /// captures if the encoder is idle, or waits for the buffer to come home: a still
-    /// screen (nothing damaged, nobody waiting to start, and the last frame at the target,
-    /// or coarser while the encoder holds the buffer: for a change; or coarser while a lane
-    /// is not empty: for the lanes, with no time); the rest of the least interval since the
-    /// last capture; a full lane, before a change, with no time. Checked over every look of
-    /// `each_case`.
+    /// captures if the encoder is idle, or waits for the buffer to come home: a still screen
+    /// (nothing damaged, nobody waiting to start), for a change; the rest of the least
+    /// interval since the last capture; bytes waiting for a lane's socket, with no time.
+    /// Checked over every look of `each_case`.
     #[test]
     fn a_capture_waits_only_for_what_holds_it() {
         let cases = each_case(|c| {
             let got = step(c.look());
-            let moved = c.damage != Damage::None || c.want_key;
-            let coarser = c.came == vp9::Came::Coarser;
-            // A pass goes only to an idle encoder, once every lane is empty.
-            let pass_goes = !moved && coarser && c.home && c.lanes == Lanes::Idle;
-            let still = !moved && !pass_goes;
-            // A change waits a frame after the last change, a pass after any capture.
-            let (next, after) = match moved {
-                true => (Next::Change, c.captured.change),
-                false => (Next::Pass, c.captured.any),
-            };
-            let since = c.now - after;
+            let still = c.damage == Damage::None && !c.want_key;
+            let since = c.now - c.captured;
             let early = (since < c.min_interval).then(|| c.min_interval - since);
             // A wait leaves the buffer where it was; a capture takes it.
             let wait = |w| Step::Wait(w, c.buffer());
-            let want = match (still, early) {
-                (true, _) => wait(match (coarser, c.home, c.lanes) {
-                    (true, true, Lanes::Busy) => Wait::Gate,
-                    (true, true, Lanes::Idle) => unreachable!("a pass that goes"),
-                    (true, false, _) | (false, _, _) => Wait::Change,
-                }),
-                (false, Some(rest)) => wait(Wait::Interval { rest, next }),
-                (false, None) => match (next, c.gate, c.home) {
-                    (Next::Change, Gated::Held, _) => wait(Wait::Gate),
-                    (_, _, false) => wait(Wait::Buffer),
-                    (_, _, true) => Step::Capture(next, ()),
-                },
+            let want = match (still, early, c.gate, c.home) {
+                (true, _, _, _) => wait(Wait::Change),
+                (false, Some(rest), _, _) => wait(Wait::Interval { rest }),
+                (false, None, Gated::Held, _) => wait(Wait::Gate),
+                (false, None, Gated::Open, false) => wait(Wait::Buffer),
+                (false, None, Gated::Open, true) => Step::Capture(()),
             };
             assert_eq!(got, want, "still {still}, early {early:?}, home {}", c.home);
         });
         assert_eq!(cases, CASES);
     }
 
-    /// Each wait wakes on what it waits for, and ends on its time: a change on damage or
-    /// a wake, with no limit; the interval before a change only on a wake, before a pass on
-    /// damage too, or once over; the gate on damage or a wake (a report or a lane drained),
+    /// Each wait wakes on what it waits for, and ends on its time: a change on damage or a
+    /// wake, with no limit; the interval only on a wake (damage meanwhile goes with the
+    /// capture it holds back), or once over; the gate on damage or a wake (a lane emptied),
     /// with no limit: no time opens it; a buffer only on a wake, with no limit. Over every
     /// wait `step` makes in `each_case`.
     #[test]
@@ -2512,14 +2141,7 @@ pub(crate) mod tests {
             wait.through(|on, t| polled = Some((on, t)));
             let want = match wait {
                 Wait::Change => (On::Event, None),
-                Wait::Interval {
-                    rest,
-                    next: Next::Change,
-                } => (On::Wake, Some(rest)),
-                Wait::Interval {
-                    rest,
-                    next: Next::Pass,
-                } => (On::Event, Some(rest)),
+                Wait::Interval { rest } => (On::Wake, Some(rest)),
                 Wait::Gate => (On::Event, None),
                 Wait::Buffer => (On::Wake, None),
             };
@@ -2529,40 +2151,26 @@ pub(crate) mod tests {
     }
 
     /// A capture is a keyframe exactly when one was wanted and promised to a viewer: the
-    /// only way one is planned; else what moved, if anything did; else a pass, if it was
-    /// captured as one; else nothing is sent. Over every look of `each_case`, as a change
-    /// and as a pass, with the keyframe promised or not.
+    /// only way one is planned; else what moved, if anything did; else nothing is sent. Over
+    /// every look of `each_case`, with the keyframe promised or not.
     #[test]
     fn a_capture_is_sent_as_what_it_holds() {
         let mut cases = 0;
         each_case(|c| {
-            for (next, promised) in [Next::Change, Next::Pass]
-                .into_iter()
-                .flat_map(|n| [false, true].map(|p| (n, p)))
-            {
+            for promised in [false, true] {
                 let starts = (c.want_key && promised).then_some(());
-                let shown = format!(
-                    "key {}, band {:?}, {next:?}, {promised}",
-                    c.want_key, c.band
-                );
-                match plan(starts, c.band, next) {
+                let shown = format!("key {}, band {:?}, {promised}", c.want_key, c.band);
+                match plan(starts, c.band) {
                     Planned::Send(Plan::Key(())) => assert!(c.want_key && promised, "{shown}"),
                     Planned::Send(Plan::Motion) => {
                         assert!(starts.is_none() && c.band.is_some(), "{shown}")
                     }
-                    Planned::Send(Plan::Pass) => assert!(
-                        starts.is_none() && c.band.is_none() && next == Next::Pass,
-                        "{shown}"
-                    ),
-                    Planned::Empty => assert!(
-                        starts.is_none() && c.band.is_none() && next == Next::Change,
-                        "{shown}"
-                    ),
+                    Planned::Empty => assert!(starts.is_none() && c.band.is_none(), "{shown}"),
                 }
                 cases += 1;
             }
         });
-        assert_eq!(cases, 4 * CASES);
+        assert_eq!(cases, 2 * CASES);
     }
 
     /// The capturer's damage, against what was drawn: over every sequence of five events
@@ -2611,30 +2219,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Damage that comes while the loop waits out the frame interval for a pass ends the
-    /// wait: it makes the capture a change, which the pass does not hold back. Waiting out
-    /// the interval for a change, more damage changes nothing, and only a wake ends it
-    /// early. Over every interval wait `step` makes in `each_case`.
-    #[test]
-    fn damage_ends_the_wait_before_a_pass() {
-        let mut waits = [0; 2];
-        each_case(|c| {
-            let Step::Wait(wait @ Wait::Interval { .. }, _) = step(c.look()) else {
-                return;
-            };
-            // What the capture held back would be, as the look says.
-            let (next, on) = match c.damage != Damage::None || c.want_key {
-                true => (Next::Change, On::Wake),
-                false => (Next::Pass, On::Event),
-            };
-            waits[usize::from(next == Next::Pass)] += 1;
-            let mut polled = None;
-            wait.through(|on, _| polled = Some(on));
-            assert_eq!(polled, Some(on), "waiting out the interval for {next:?}");
-        });
-        assert!(waits.iter().all(|&n| n > 0), "unreached: {waits:?}");
-    }
-
     /// The tests' generator, drawing the header's values.
     struct Rng(Xorshift);
     impl Rng {
@@ -2651,8 +2235,6 @@ pub(crate) mod tests {
     fn random_header(rng: &mut Rng) -> Header {
         Header {
             key: rng.next() & 1 == 1,
-            frame: rng.any() as u32,
-            from: rng.any() as u32,
             pipe: Pipe(rng.any() as u32),
         }
     }
@@ -2701,8 +2283,6 @@ pub(crate) mod tests {
         header: String,
         picture: String,
         key: bool,
-        frame: u32,
-        from: u32,
         pipe: u32,
     }
 
@@ -2723,8 +2303,6 @@ pub(crate) mod tests {
         for c in cases {
             let header = Header {
                 key: c.key,
-                frame: c.frame,
-                from: c.from,
                 pipe: Pipe(c.pipe),
             };
             let page = hex(&c.header);
@@ -2743,8 +2321,8 @@ pub(crate) mod tests {
 
     /// The hot path at production's shape, as a benchmark (`--ignored`, by name; wall
     /// clock, not a test): one 3024x1898 page of text, coded and sent onto a session's lane
-    /// as the encode loop does, a capture a frame interval apart; the relay reports each
-    /// block decoded once it is on the lane. Typing-sized updates (a glyph changed) and
+    /// as the encode loop does, a capture a frame interval apart; the lane's socket takes
+    /// each frame once it is on the lane. Typing-sized updates (a glyph changed) and
     /// scroll-sized ones (the page moved up 8 rows), 600 captures each, at each thread
     /// count from one, doubling, to the count `vp9::Stream::new` derives for this machine's
     /// cores and that count itself. Prints, per workload and thread count, the CPU each
@@ -2800,6 +2378,7 @@ pub(crate) mod tests {
             let hub = Hub::new().unwrap();
             let (client, lane) = viewer(&hub);
             client.watch();
+            drop(client);
             let mut buf = Box::new(I420::new(W, H));
             buf.y.copy_from_slice(&page[..W * H]);
             let first = Job {
@@ -2815,10 +2394,10 @@ pub(crate) mod tests {
                 Debugging::read(|_| None).unwrap(),
             )
             .unwrap();
-            let mut buf = s.ret_rx.recv().unwrap().buf;
+            let mut buf = s.ret_rx.recv().unwrap();
             let mut latencies = Vec::with_capacity(CAPTURES);
             let mut bytes = 0;
-            // The test's relay reading the lane back: not the daemon's work.
+            // The test's socket reading the lane back: not the daemon's work.
             let mut relay_us = 0;
             let (wall, cpu0) = (Instant::now(), cpu());
             for i in 1..=CAPTURES {
@@ -2846,18 +2425,10 @@ pub(crate) mod tests {
                         marker_ms: None,
                     })
                     .unwrap();
-                buf = s.ret_rx.recv().unwrap().buf;
+                buf = s.ret_rx.recv().unwrap();
                 latencies.push(t0.elapsed());
-                let now = Instant::now();
                 let relay0 = thread_cpu_us().unwrap();
-                for block in lane.frames() {
-                    bytes += block.members.iter().map(|(_, b)| b.len()).sum::<usize>();
-                    block
-                        .report(Some(Outcome::Decoded), |r| {
-                            crate::session::control::reported(&hub, &client, r, now)
-                        })
-                        .unwrap();
-                }
+                bytes += lane.updates().iter().map(Vec::len).sum::<usize>();
                 relay_us += thread_cpu_us().unwrap() - relay0;
                 let next = t0 + Duration::from_micros(16_667);
                 std::thread::sleep(next.saturating_duration_since(Instant::now()));

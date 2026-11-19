@@ -12,7 +12,7 @@ Usage: voxl [--flag=value]...
        voxl relay ...
 
 Runs the daemon: streams the X display in $DISPLAY to the sessions that attach to it. A
-session is `voxl attach` run over ssh (its control stream) and the lanes its relay opens
+session is `voxl attach` run over ssh (its control stream) and the lane its relay opens
 through a proxy (video and audio); the daemon listens on unix sockets only. Flags take
 --name=value or --name value; a flag alone is true.
 

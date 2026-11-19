@@ -4,7 +4,7 @@
 // hands them in `init` (a structured clone, which shares the memory). Between reads, at
 // drawn times, the worker counts what it did as the real one does (Atomics.add): updates
 // arrived (each with its bytes and the server's capture-to-send time), updates shown (each
-// with its arrival-to-shown time) and deltas passed. The first interval adds amounts up to
+// with its arrival-to-shown time). The first interval adds amounts up to
 // 2^32 - 1, so later intervals wrap the totals.
 //
 // What it checks are the fake's own facts: each read reports what the worker did since the
@@ -35,7 +35,6 @@ interface Did {
 	bytes: number;
 	decodeUs: number;
 	pipeTenths: number;
-	passed: number;
 }
 
 /** Clauses some run must reach. */
@@ -63,7 +62,6 @@ function run(seed: number) {
 			bytes: 0,
 			decodeUs: 0,
 			pipeTenths: 0,
-			passed: 0,
 		};
 		if (r === 0) {
 			did.shown = draw(2 ** 32);
@@ -71,18 +69,16 @@ function run(seed: number) {
 			did.bytes = draw(2 ** 32);
 			did.decodeUs = draw(2 ** 32);
 			did.pipeTenths = draw(2 ** 32);
-			did.passed = draw(2 ** 32);
 			Atomics.add(worker, Count.Frames, did.shown);
 			Atomics.add(worker, Count.Updates, did.arrived);
 			Atomics.add(worker, Count.Bytes, did.bytes);
 			Atomics.add(worker, Count.DecodeUs, did.decodeUs);
 			Atomics.add(worker, Count.PipeTenths, did.pipeTenths);
-			Atomics.add(worker, Count.Passed, did.passed);
 		} else {
 			// Events one at a time, interleaved as the worker meets them.
 			const events = draw(4) === 0 ? 0 : draw(300);
 			for (let e = 0; e < events; e++) {
-				switch (draw(3)) {
+				switch (draw(2)) {
 					case 0: {
 						const bytes = 15 + draw(400_000);
 						const pipe = draw(2000);
@@ -102,10 +98,6 @@ function run(seed: number) {
 						did.decodeUs += us;
 						break;
 					}
-					case 2:
-						Atomics.add(worker, Count.Passed, 1);
-						did.passed++;
-						break;
 				}
 			}
 		}
@@ -128,7 +120,6 @@ function run(seed: number) {
 			kbps: (did.bytes * 8) / 1000 / seconds,
 			decodeMs: did.shown ? did.decodeUs / 1000 / did.shown : null,
 			pipeMs: did.arrived ? did.pipeTenths / 10 / did.arrived : null,
-			passed: did.passed,
 		};
 		// Exact: JSON writes each number so that it reads back as the same double.
 		const got = JSON.stringify(meter.read(at));

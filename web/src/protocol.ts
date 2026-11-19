@@ -29,10 +29,10 @@ export interface FilesConfig {
 	root: string;
 }
 
+/** The session's hello: its codec and settings. The desktop's size is the keyframe's: the
+ * page lays out from the pictures it decodes. */
 export interface Hello {
 	t: 'hello';
-	w: number;
-	h: number;
 	/** The stream's codec as WebCodecs names it (`vp09.PP.LL.DD`: VP9's profile, level and
 	 * bit depth, as the daemon configured its encoder). */
 	codec: string;
@@ -47,8 +47,6 @@ export type ServerMessage =
 	| Hello
 	| { t: 'clip'; d: string }
 	| { t: 'mic'; on: boolean }
-	/** The session's lane: datagrams (a keyframe may miss) or a stream (every frame comes). */
-	| { t: 'lane'; kind: 'datagram' | 'stream' }
 	| { t: 'close'; why: string };
 
 /** What a key did. */
@@ -72,14 +70,11 @@ export const cmd = {
 	resize: (w: number, h: number) => `sz,${w},${h}`,
 } as const;
 
-/** The header of a video message: the relay's type byte, then the 13 bytes src/video.rs's
- * `Header` writes (flags, frame, from, pipe), before the VP9 frame. Checked against
- * video-header.json, as the server's reader is: `node web/src/video-header.test.ts`. */
+/** The header of a video message: its type byte, then the 5 bytes src/video.rs's `Header`
+ * writes (flags, pipe), before the VP9 frame. Checked against video-header.json, as the
+ * server's reader is: `node web/src/video-header.test.ts`. */
 export interface VideoHeader {
 	key: boolean;
-	frame: number;
-	/** The number of the keyframe the update descends from (a keyframe's own). */
-	from: number;
 	/** Server-side pipeline time (capture to send), in 0.1 ms. */
 	pipe: number;
 }
@@ -100,10 +95,10 @@ export function parseVideoHeader(b: Uint8Array): ReadHeader {
 		((b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3]) >>> 0;
 	return {
 		ok: true,
-		header: { key: flags === KEY, frame: u32(2), from: u32(6), pipe: u32(10) },
+		header: { key: flags === KEY, pipe: u32(2) },
 	};
 }
-export const VIDEO_HEADER_BYTES = 14;
+export const VIDEO_HEADER_BYTES = 6;
 
 // ---- page <-> worker ----
 

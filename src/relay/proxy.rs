@@ -1,13 +1,103 @@
-//! Reaching the server's lane sockets through a proxy: an HTTP CONNECT stream, or a SOCKS5
-//! UDP association (RFC 1928) whose datagrams go to the same destination.
+//! Reaching the server's lane socket through a proxy: an HTTP CONNECT stream.
 
-use super::description::{Endpoint, Host};
-use crate::lanes::wire::DESTINATION;
+use crate::wire::DESTINATION;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::os::fd::{AsRawFd, RawFd};
+use std::num::NonZeroU16;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpSocket, TcpStream, UdpSocket};
+use tokio::net::TcpStream;
+
+/// The proxy's address, as `--proxy` gives it: `host:port`, one spelling for each (a number
+/// without sign or leading zero, an IPv6 address in brackets and in its shortest form).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Endpoint {
+    pub host: Host,
+    pub port: NonZeroU16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Host {
+    V4(Ipv4Addr),
+    V6(Ipv6Addr),
+    /// A DNS name: dot-separated labels of letters, digits and hyphens, none starting or
+    /// ending with a hyphen, the last not all digits.
+    Name(String),
+}
+
+/// A whole number as written without sign or leading zero.
+fn whole(v: &str) -> Option<u64> {
+    let digits = !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit());
+    let canonical = v == "0" || !v.starts_with('0');
+    // `parse` refuses a number past u64.
+    (digits && canonical).then(|| v.parse().ok())?
+}
+
+impl Endpoint {
+    /// `host:port` in its one spelling, or the flag's error.
+    pub fn parse(v: &str) -> Result<Endpoint, String> {
+        let bad = || {
+            format!(
+                "--proxy {v:?}: not host:port (an IPv6 address in brackets, in its shortest form)"
+            )
+        };
+        let (host, port) = v.rsplit_once(':').ok_or_else(bad)?;
+        let port = whole(port)
+            .and_then(|p| u16::try_from(p).ok())
+            .and_then(NonZeroU16::new)
+            .ok_or_else(bad)?;
+        let host = match host.strip_prefix('[') {
+            Some(rest) => {
+                let ip: Ipv6Addr = rest
+                    .strip_suffix(']')
+                    .ok_or_else(bad)?
+                    .parse()
+                    .map_err(|_| bad())?;
+                // One spelling: the shortest form, as written back.
+                (format!("[{ip}]") == host)
+                    .then_some(Host::V6(ip))
+                    .ok_or_else(bad)?
+            }
+            None => match host.parse::<Ipv4Addr>() {
+                Ok(ip) => Host::V4(ip),
+                Err(_) if is_name(host) => Host::Name(host.to_string()),
+                Err(_) => return Err(bad()),
+            },
+        };
+        Ok(Endpoint { host, port })
+    }
+}
+
+/// The longest DNS label, and name written out, in octets: RFC 1035 §2.3.4 has 63 for a
+/// label and 255 for a name on the wire, which written out is 253 (less the first label's
+/// length byte and the root's). Published.
+const LABEL_MOST: usize = 63;
+const NAME_MOST: usize = 253;
+
+/// A DNS name (RFC 1123 labels; RFC 3696 §2: a top-level label is not all digits).
+fn is_name(v: &str) -> bool {
+    let label = |l: &str| {
+        (1..=LABEL_MOST).contains(&l.len())
+            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+    };
+    v.len() <= NAME_MOST
+        && v.split('.').all(label)
+        && !v
+            .rsplit('.')
+            .next()
+            .is_some_and(|top| top.bytes().all(|b| b.is_ascii_digit()))
+}
+
+impl fmt::Display for Endpoint {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match &self.host {
+            Host::V4(ip) => write!(f, "{ip}:{}", self.port),
+            Host::V6(ip) => write!(f, "[{ip}]:{}", self.port),
+            Host::Name(name) => write!(f, "{name}:{}", self.port),
+        }
+    }
+}
 
 /// The longest answer to a CONNECT read: Chromium's bound on a response's head
 /// (`net/http/http_stream_parser.h`, `kMaxHeaderBufSize`, 256 KiB), what a browser takes
@@ -23,10 +113,6 @@ pub enum ProxyError {
     Refused(String),
     /// The proxy's answer to a CONNECT was not an HTTP head within `CONNECT_ANSWER_MOST`.
     Answer,
-    /// The kernel would not hold a lane's `bytes` (`SO_RCVBUF` above its ceiling).
-    Buffer { bytes: u32, error: std::io::Error },
-    /// The SOCKS5 proxy refused: the step and its reply code.
-    Socks { step: &'static str, code: u8 },
 }
 
 impl fmt::Display for ProxyError {
@@ -35,13 +121,6 @@ impl fmt::Display for ProxyError {
             ProxyError::Io(e) => write!(f, "the proxy: {e}"),
             ProxyError::Refused(status) => write!(f, "the proxy refused the lane: {status}"),
             ProxyError::Answer => write!(f, "the proxy's answer to CONNECT is not HTTP"),
-            ProxyError::Buffer { bytes, error } => write!(
-                f,
-                "the kernel would not hold the lane's {bytes} bytes (raise its socket buffer ceiling): {error}"
-            ),
-            ProxyError::Socks { step, code } => {
-                write!(f, "the SOCKS5 proxy refused the {step} (reply {code})")
-            }
         }
     }
 }
@@ -49,45 +128,6 @@ impl fmt::Display for ProxyError {
 impl From<std::io::Error> for ProxyError {
     fn from(e: std::io::Error) -> Self {
         ProxyError::Io(e)
-    }
-}
-
-/// What the kernel may hold of a lane the relay has not yet read (`SO_RCVBUF`), in bytes: the
-/// size the daemon names (`Down::Buffer`, one deadline at the drain rate). A lane socket is
-/// built only with one, set before it receives a byte (and, for a stream, before its
-/// connect, which fixes TCP's window scale), so no lane is ever read through a buffer of the
-/// kernel's guess.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Buffer(u32);
-
-impl Buffer {
-    /// The size the daemon named; only the session, reading `Down::Buffer`, makes one.
-    pub(in crate::relay) fn named(bytes: u32) -> Buffer {
-        Buffer(bytes)
-    }
-
-    /// Sets it on the socket `fd`.
-    pub fn hold(self, fd: RawFd) -> Result<(), ProxyError> {
-        let refused = |error| ProxyError::Buffer {
-            bytes: self.0,
-            error,
-        };
-        let bytes = libc::c_int::try_from(self.0).map_err(|e| refused(std::io::Error::other(e)))?;
-        // SAFETY: `fd` is a socket the caller holds open, and the option's value is a c_int
-        // that outlives the call.
-        let set = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
-                (&bytes as *const libc::c_int).cast(),
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            )
-        };
-        match set {
-            0 => Ok(()),
-            _ => Err(refused(std::io::Error::last_os_error())),
-        }
     }
 }
 
@@ -104,27 +144,17 @@ async fn address(proxy: &Endpoint) -> std::io::Result<SocketAddr> {
     }
 }
 
-/// A TCP connection to the proxy; for a lane, its receive buffer set before it connects.
-async fn reach(proxy: &Endpoint, lane: Option<Buffer>) -> Result<TcpStream, ProxyError> {
-    let addr = address(proxy).await?;
-    let socket = match addr {
-        SocketAddr::V4(_) => TcpSocket::new_v4()?,
-        SocketAddr::V6(_) => TcpSocket::new_v6()?,
-    };
-    if let Some(buffer) = lane {
-        buffer.hold(socket.as_raw_fd())?;
-    }
-    let tcp = socket.connect(addr).await?;
+/// A TCP connection to the proxy.
+async fn reach(proxy: &Endpoint) -> Result<TcpStream, ProxyError> {
+    let tcp = TcpStream::connect(address(proxy).await?).await?;
     tcp.set_nodelay(true)?;
     Ok(tcp)
 }
 
-/// Where a session's lanes go, as the server's proxy is asked for it (`--place`):
+/// Where a session's lane goes, as the server's proxy is asked for it (`--place`):
 /// `localhost:<port>`, the server's own loopback at the port its proxy maps to one daemon's
-/// lane sockets. The protocol's is [`DESTINATION`]; a server that runs more than one daemon
-/// maps a port to each. Its text is never longer than `DESTINATION`'s: the daemon sizes a
-/// lane datagram for a Hysteria 2 message that names `DESTINATION` (`wire::DATAGRAM`), so a
-/// longer place would carry a full datagram past what one QUIC datagram holds.
+/// lane socket. The protocol's is [`DESTINATION`]; a server that runs more than one daemon
+/// maps a port to each.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Place {
     port: std::num::NonZeroU16,
@@ -136,30 +166,14 @@ impl Place {
         Place::parse(DESTINATION).expect("the lanes' destination is a place")
     }
 
-    /// `localhost:<port>`, the port a decimal number from 1 without sign or leading zero,
-    /// the whole no longer than [`DESTINATION`].
+    /// `localhost:<port>`, the port a decimal number from 1 without sign or leading zero.
     pub fn parse(v: &str) -> Result<Place, String> {
         let port = v
             .strip_prefix("localhost:")
             .filter(|p| !p.starts_with('0') && p.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|p| p.parse::<std::num::NonZeroU16>().ok())
-            .filter(|_| v.len() <= DESTINATION.len())
-            .ok_or_else(|| {
-                format!(
-                    "--place {v:?}: not localhost:<port> of at most {} characters, as {DESTINATION}",
-                    DESTINATION.len()
-                )
-            })?;
+            .ok_or_else(|| format!("--place {v:?}: not localhost:<port>, as {DESTINATION}"))?;
         Ok(Place { port })
-    }
-
-    /// The SOCKS5 header a datagram to the place carries: RSV, FRAG 0, ATYP 3 (a domain
-    /// name), its length, the name, the port.
-    fn header(&self) -> Vec<u8> {
-        let mut h = vec![0, 0, 0, 3, b"localhost".len() as u8];
-        h.extend_from_slice(b"localhost");
-        h.extend_from_slice(&self.port.get().to_be_bytes());
-        h
     }
 }
 
@@ -171,12 +185,8 @@ impl std::fmt::Display for Place {
 
 /// A stream to `place` through `proxy`'s HTTP CONNECT. What the proxy sent past its
 /// answer's head stays in the reader, as the stream's first bytes.
-pub async fn connect(
-    proxy: &Endpoint,
-    place: &Place,
-    buffer: Buffer,
-) -> Result<BufReader<TcpStream>, ProxyError> {
-    let mut tcp = reach(proxy, Some(buffer)).await?;
+pub async fn connect(proxy: &Endpoint, place: &Place) -> Result<BufReader<TcpStream>, ProxyError> {
+    let mut tcp = reach(proxy).await?;
     tcp.write_all(format!("CONNECT {place} HTTP/1.1\r\nHost: {place}\r\n\r\n").as_bytes())
         .await?;
     let mut reader = BufReader::new(tcp);
@@ -203,147 +213,22 @@ pub async fn connect(
     }
 }
 
-/// A SOCKS5 UDP association: datagrams to and from a [`Place`]. It lasts as long as
-/// the TCP connection that asked for it (RFC 1928 §7), which `control` holds; a read of
-/// `control` ending is the association ending.
-pub struct Association {
-    pub control: TcpStream,
-    /// Connected to the proxy's relay address, so the kernel drops datagrams from anyone
-    /// else.
-    pub socket: UdpSocket,
-    /// The SOCKS5 header of every datagram it sends: to its place.
-    header: Vec<u8>,
-}
-
-/// The longest SOCKS5 UDP header: RSV, FRAG, ATYP, a 255-byte name with its length, the
-/// port (RFC 1928 §7). Derived.
-pub const UDP_HEADER_MOST: usize = 2 + 1 + 1 + 1 + 255 + 2;
-
-/// The payload of a datagram from the proxy, without its SOCKS5 header; `None` for one
-/// that is not a whole unfragmented SOCKS5 datagram (RFC 1928 §7: a datagram with FRAG
-/// other than 0 is dropped by an implementation that does not reassemble).
-pub fn payload(d: &[u8]) -> Option<&[u8]> {
-    let [0, 0, 0, atyp, rest @ ..] = d else {
-        return None;
-    };
-    let addr = match atyp {
-        1 => 4,
-        4 => 16,
-        3 => 1 + usize::from(*rest.first()?),
-        _ => return None,
-    };
-    rest.get(addr + 2..)
-}
-
-impl Association {
-    /// Asks `proxy` for an association whose datagrams go to `place`.
-    pub async fn open(
-        proxy: &Endpoint,
-        place: &Place,
-        buffer: Buffer,
-    ) -> Result<Association, ProxyError> {
-        let mut control = reach(proxy, None).await?;
-        // No authentication: the proxy is the user's own, on their machine.
-        control.write_all(&[5, 1, 0]).await?;
-        let mut choice = [0u8; 2];
-        control.read_exact(&mut choice).await?;
-        if choice != [5, 0] {
-            return Err(ProxyError::Socks {
-                step: "greeting",
-                code: choice[1],
-            });
-        }
-        // The address datagrams come from is not known yet: zeros (RFC 1928 §6).
-        let peer = control.peer_addr()?;
-        let unspecified = match peer.ip() {
-            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-        };
-        control.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
-        let mut reply = [0u8; 4];
-        control.read_exact(&mut reply).await?;
-        if reply[0] != 5 || reply[1] != 0 {
-            return Err(ProxyError::Socks {
-                step: "UDP ASSOCIATE",
-                code: reply[1],
-            });
-        }
-        let ip = match reply[3] {
-            1 => {
-                let mut a = [0u8; 4];
-                control.read_exact(&mut a).await?;
-                IpAddr::from(a)
-            }
-            4 => {
-                let mut a = [0u8; 16];
-                control.read_exact(&mut a).await?;
-                IpAddr::from(a)
-            }
-            atyp => {
-                return Err(ProxyError::Socks {
-                    step: "UDP ASSOCIATE's address type",
-                    code: atyp,
-                })
-            }
-        };
-        let mut port = [0u8; 2];
-        control.read_exact(&mut port).await?;
-        // An unspecified relay address is the proxy's own (common practice).
-        let ip = match ip.is_unspecified() {
-            true => peer.ip(),
-            false => ip,
-        };
-        let socket = std::net::UdpSocket::bind(SocketAddr::new(unspecified, 0))?;
-        buffer.hold(socket.as_raw_fd())?;
-        socket.set_nonblocking(true)?;
-        let socket = UdpSocket::from_std(socket)?;
-        socket
-            .connect(SocketAddr::new(ip, u16::from_be_bytes(port)))
-            .await?;
-        Ok(Association {
-            control,
-            socket,
-            header: place.header(),
-        })
-    }
-
-    /// Waits on the association's TCP connection, on which the proxy says nothing: its end
-    /// (or anything else on it) is the association's end.
-    pub async fn control_read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        loop {
-            self.control.readable().await?;
-            match self.control.try_read(buf) {
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                r => return r,
-            }
-        }
-    }
-
-    /// Sends `payload` to the association's place.
-    pub async fn send(&self, payload: &[u8]) -> std::io::Result<()> {
-        let mut d = self.header.clone();
-        d.extend_from_slice(payload);
-        self.socket.send(&d).await.map(drop)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::xorshift::Xorshift;
 
-    /// A place drawn as `--place` takes it: a port of 1 to 9999 drawn, the place the protocol's
-    /// own way of writing a lane's port to its proxy.
+    /// A place drawn as `--place` takes it: a port of 1 to 65535 drawn.
     fn drawn_place(rng: &mut Xorshift) -> Place {
-        Place::parse(&format!("localhost:{}", rng.range(1, 10_000))).unwrap()
+        Place::parse(&format!("localhost:{}", rng.range(1, 65_536))).unwrap()
     }
 
     /// A place is read exactly when it is `localhost:` and a port from 1 written without sign
-    /// or leading zero, the whole no longer than the protocol's destination, and it is read
-    /// as itself: over drawn strings of that form and near misses of it (other hosts, ports 0
-    /// and past 65535, leading zeros, signs, spaces, nothing). The protocol's own is one.
+    /// or leading zero, and it is read as itself: over drawn strings of that form and near
+    /// misses of it (other hosts, ports 0 and past 65535, leading zeros, signs, spaces,
+    /// nothing). The protocol's own is one.
     #[test]
-    fn a_place_is_localhost_and_a_port_no_longer_than_the_protocols() {
+    fn a_place_is_localhost_and_a_port() {
         let mut rng = Xorshift::new(0x2545F4914F6CDD1D);
         let mut read = 0;
         for _ in 0..50_000 {
@@ -367,8 +252,7 @@ mod tests {
             let canonical = host == "localhost"
                 && port
                     .parse::<u32>()
-                    .is_ok_and(|p| (1..=65_535).contains(&p) && p.to_string() == port)
-                && v.len() <= DESTINATION.len();
+                    .is_ok_and(|p| (1..=65_535).contains(&p) && p.to_string() == port);
             match Place::parse(&v) {
                 Ok(p) => {
                     assert!(canonical, "{v:?} read");
@@ -380,58 +264,6 @@ mod tests {
         }
         assert!(read > 5_000, "{read}");
         assert_eq!(Place::protocol().to_string(), DESTINATION);
-    }
-
-    /// Every lane message goes to the place named: through a SOCKS5 proxy on 127.0.0.1 (its
-    /// greeting, UDP ASSOCIATE and relay socket, as RFC 1928 has them), each datagram an
-    /// association sends arrives at the proxy's relay whole, its header naming the place's
-    /// host and port (ATYP 3) and its payload what was sent, over drawn places and payloads.
-    /// The stream lane's CONNECT naming its place is the test below's.
-    #[tokio::test]
-    async fn every_lane_datagram_goes_to_the_place_named() {
-        let mut rng = Xorshift::new(0x94D049BB133111EB);
-        for _ in 0..40 {
-            let place = drawn_place(&mut rng);
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let proxy_port = listener.local_addr().unwrap().port();
-            let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            let relay_port = relay.local_addr().unwrap().port();
-            let control = tokio::spawn(async move {
-                let (mut tcp, _) = listener.accept().await.unwrap();
-                let mut greeting = [0u8; 3];
-                tcp.read_exact(&mut greeting).await.unwrap();
-                assert_eq!(greeting, [5, 1, 0]);
-                tcp.write_all(&[5, 0]).await.unwrap();
-                let mut ask = [0u8; 10];
-                tcp.read_exact(&mut ask).await.unwrap();
-                assert_eq!(ask[..2], [5, 3]);
-                let mut reply = vec![5, 0, 0, 1, 127, 0, 0, 1];
-                reply.extend_from_slice(&relay_port.to_be_bytes());
-                tcp.write_all(&reply).await.unwrap();
-                tcp
-            });
-            let endpoint = Endpoint {
-                host: Host::V4(Ipv4Addr::LOCALHOST),
-                port: std::num::NonZeroU16::new(proxy_port).unwrap(),
-            };
-            let a = Association::open(&endpoint, &place, Buffer::named(64 << 10))
-                .await
-                .unwrap();
-            let _held = control.await.unwrap();
-            for _ in 0..1 + rng.below(8) {
-                let sent: Vec<u8> = (0..rng.below(1200)).map(|_| rng.next() as u8).collect();
-                a.send(&sent).await.unwrap();
-                let mut got = vec![0u8; UDP_HEADER_MOST + 1200];
-                let n = relay.recv(&mut got).await.unwrap();
-                let got = &got[..n];
-                let name = b"localhost";
-                assert_eq!(got[..5], [0, 0, 0, 3, name.len() as u8], "{place}");
-                assert_eq!(&got[5..5 + name.len()], name);
-                let port = u16::from_be_bytes([got[5 + name.len()], got[6 + name.len()]]);
-                assert_eq!(format!("localhost:{port}"), place.to_string());
-                assert_eq!(payload(got), Some(sent.as_slice()));
-            }
-        }
     }
 
     /// A CONNECT asks the proxy for the lane's place, takes a `200` answer with any
@@ -477,7 +309,7 @@ mod tests {
                 port: std::num::NonZeroU16::new(port).unwrap(),
             };
             let place = drawn_place(&mut rng);
-            let got = connect(&endpoint, &place, Buffer::named(64 << 10)).await;
+            let got = connect(&endpoint, &place).await;
             let asked = proxy.await.unwrap();
             assert_eq!(
                 asked,
@@ -504,73 +336,87 @@ mod tests {
         }
     }
 
-    /// What the kernel holds of a lane socket is at least what the daemon named: over named
-    /// sizes from a page to a megabyte, a UDP and a TCP socket built with one report, read
-    /// back from the kernel (`getsockopt`), no less (Linux doubles what it is given; macOS
-    /// keeps it). The oracle is the kernel.
-    #[test]
-    fn a_lane_socket_holds_what_the_daemon_named() {
-        let mut rng = Xorshift::new(0x510E527FADE682D1);
-        let held = |fd: RawFd| {
-            let mut v: libc::c_int = 0;
-            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-            // SAFETY: `fd` is a socket this test holds open; `v` and `len` outlive the call.
-            let got = unsafe {
-                libc::getsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_RCVBUF,
-                    (&mut v as *mut libc::c_int).cast(),
-                    &mut len,
-                )
-            };
-            assert_eq!(got, 0);
-            v as u32
+    fn draw_name(rng: &mut Xorshift) -> String {
+        const LDH: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-";
+        let labels = rng.range(1, 4);
+        let mut out = Vec::new();
+        for _ in 0..labels {
+            let len = rng.range(1, 12) as usize;
+            let mut l: Vec<u8> = (0..len)
+                .map(|_| LDH[rng.below(LDH.len() as u64) as usize])
+                .collect();
+            // A label neither starts nor ends with a hyphen, and the last is not all digits.
+            l[0] = b'a' + rng.below(26) as u8;
+            let last = l.len() - 1;
+            if l[last] == b'-' {
+                l[last] = b'z';
+            }
+            out.push(String::from_utf8(l).unwrap());
+        }
+        out.join(".")
+    }
+
+    fn draw(rng: &mut Xorshift) -> Endpoint {
+        let host = match rng.below(3) {
+            0 => Host::V4(Ipv4Addr::from(rng.next() as u32)),
+            1 => {
+                // Mostly zeros, so the shortest form's `::` is drawn often.
+                let mut segs = [0u16; 8];
+                for s in &mut segs {
+                    if rng.below(3) == 0 {
+                        *s = rng.next() as u16;
+                    }
+                }
+                Host::V6(Ipv6Addr::from(segs))
+            }
+            _ => Host::Name(draw_name(rng)),
         };
-        for _ in 0..200 {
-            let bytes = rng.range(4096, 1 << 20) as u32;
-            let b = Buffer::named(bytes);
-            let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-            b.hold(udp.as_raw_fd()).unwrap();
-            assert!(held(udp.as_raw_fd()) >= bytes, "UDP {bytes}");
-            let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            b.hold(tcp.as_raw_fd()).unwrap();
-            assert!(held(tcp.as_raw_fd()) >= bytes, "TCP {bytes}");
+        Endpoint {
+            host,
+            port: NonZeroU16::new(rng.range(1, 65536) as u16).unwrap(),
         }
     }
 
-    /// A datagram's payload is what follows its header, for every address type and every
-    /// length of name, and nothing is read from a datagram cut anywhere inside its header,
-    /// fragmented, or of an address type RFC 1928 does not have.
+    /// Every endpoint is read back from what it is written as.
     #[test]
-    fn a_datagrams_payload_follows_its_header() {
-        let mut rng = Xorshift::new(0xD1B54A32D192ED03);
+    fn an_endpoint_reads_back_from_its_text() {
+        let mut rng = Xorshift::new(0x5DEECE66D);
         for _ in 0..50_000 {
-            let addr: Vec<u8> = match rng.below(3) {
-                0 => vec![1, 127, 0, 0, 1],
-                1 => [vec![4], vec![0; 15], vec![1]].concat(),
-                _ => {
-                    let n = rng.below(256) as u8;
-                    [vec![3, n], vec![b'a'; usize::from(n)]].concat()
-                }
-            };
-            let body: Vec<u8> = (0..rng.below(64)).map(|_| rng.next() as u8).collect();
-            let d = [vec![0, 0, 0], addr.clone(), vec![0x1a, 0xf5], body.clone()].concat();
-            assert_eq!(payload(&d), Some(body.as_slice()));
-            let head = 3 + addr.len() + 2;
-            assert!(head <= UDP_HEADER_MOST);
-            let cut = rng.below(head as u64) as usize;
-            assert_eq!(payload(&d[..cut]), None, "cut at {cut} of {head}");
-            let mut frag = d.clone();
-            frag[2] = 1 + rng.below(255) as u8;
-            assert_eq!(payload(&frag), None);
-            let mut atyp = d.clone();
-            atyp[3] = [0, 2, 5, 255][rng.below(4) as usize];
-            assert_eq!(payload(&atyp), None);
+            let e = draw(&mut rng);
+            assert_eq!(Endpoint::parse(&e.to_string()), Ok(e.clone()), "{e}");
         }
-        assert_eq!(
-            payload(&[Place::protocol().header(), b"x".to_vec()].concat()),
-            Some(&b"x"[..])
-        );
+    }
+
+    /// Text is read only if it is the one spelling of what it reads as: over every endpoint's
+    /// text with one byte inserted, deleted or replaced (a byte of its own alphabet, or one
+    /// around it: a space, a sign, a colon, a bracket), and every text cut short, whatever
+    /// reads writes back as exactly the text read. So nothing is read loosely, and nothing
+    /// as another.
+    #[test]
+    fn only_an_endpoints_one_spelling_is_read() {
+        const BYTES: &[u8] = b" \t:[]+-.0123456789abcdefxyzADGSTRM";
+        let mut rng = Xorshift::new(0x2545F4914F6CDD1D);
+        let mut refused = 0;
+        for _ in 0..100_000 {
+            let text = draw(&mut rng).to_string().into_bytes();
+            let at = rng.below(text.len() as u64 + 1) as usize;
+            let byte = BYTES[rng.below(BYTES.len() as u64) as usize];
+            let mut v = text.clone();
+            match rng.below(4) {
+                0 => v.insert(at, byte),
+                1 if at < v.len() => {
+                    v.remove(at);
+                }
+                2 if at < v.len() => v[at] = byte,
+                _ => v.truncate(at),
+            }
+            let text = String::from_utf8(v).unwrap();
+            match Endpoint::parse(&text) {
+                Ok(e) => assert_eq!(e.to_string(), text, "{text:?} read loosely"),
+                Err(_) => refused += 1,
+            }
+        }
+        // The oracle above holds vacuously if nothing is refused.
+        assert!(refused > 30_000, "{refused}");
     }
 }

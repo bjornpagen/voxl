@@ -1,6 +1,5 @@
-//! The daemon's three unix sockets, bound where the flags say, each with the mode its
-//! callers need: the control socket only for this user, the lane sockets also for the
-//! proxy's group.
+//! The daemon's two unix sockets, bound where the flags say, each with the mode its callers
+//! need: the control socket only for this user, the lane socket also for the proxy's group.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -65,11 +64,10 @@ enum Before {
     Left,
 }
 
-/// What is at `path`, as a socket of `kind` is about to be bound there: nothing, or a
-/// socket nothing answers on (a connect of its kind is refused), which a crash leaves
-/// behind and is removed. Anything else (a live socket, a file, a folder) is an error, and
-/// nothing is deleted.
-fn clear(path: &Path, kind: Kind) -> std::io::Result<Before> {
+/// What is at `path`, as a socket is about to be bound there: nothing, or a socket nothing
+/// answers on (a connect is refused), which a crash leaves behind and is removed. Anything
+/// else (a live socket, a file, a folder) is an error, and nothing is deleted.
+fn clear(path: &Path) -> std::io::Result<Before> {
     use std::os::unix::fs::FileTypeExt;
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Before::Nothing),
@@ -82,11 +80,7 @@ fn clear(path: &Path, kind: Kind) -> std::io::Result<Before> {
         }
         Ok(_) => {}
     }
-    let answer = match kind {
-        Kind::Stream => std::os::unix::net::UnixStream::connect(path).map(drop),
-        Kind::Datagram => std::os::unix::net::UnixDatagram::unbound()?.connect(path),
-    };
-    match answer {
+    match std::os::unix::net::UnixStream::connect(path).map(drop) {
         Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
             std::fs::remove_file(path)?;
             Ok(Before::Left)
@@ -99,15 +93,8 @@ fn clear(path: &Path, kind: Kind) -> std::io::Result<Before> {
     }
 }
 
-/// A socket's kind, as `clear` connects to one left at its path.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Kind {
-    Stream,
-    Datagram,
-}
-
 fn listener(what: &'static str, path: &Path, mode: Mode) -> Result<UnixListener, Unbound> {
-    if clear(path, Kind::Stream).map_err(unbound(what, path))? == Before::Left {
+    if clear(path).map_err(unbound(what, path))? == Before::Left {
         log::info!(
             "removed the {what} socket a stopped daemon left at {}",
             path.display()
@@ -122,26 +109,9 @@ fn listener(what: &'static str, path: &Path, mode: Mode) -> Result<UnixListener,
 pub fn control(path: &Path) -> Result<UnixListener, Unbound> {
     listener("control", path, Mode::User)
 }
-/// The lane stream socket at `path`, where a proxy's TCP to the lane port arrives.
-pub fn stream(path: &Path) -> Result<UnixListener, Unbound> {
-    listener("lane stream", path, Mode::Group)
-}
-
-/// The lane datagram socket at `path`, where a proxy's UDP to the lane port arrives:
-/// non-blocking, as the std socket the lanes' writers send from with a peer's address
-/// (`send_to_addr`, which tokio's socket lacks for abstract addresses).
-pub fn datagram(path: &Path) -> Result<std::os::unix::net::UnixDatagram, Unbound> {
-    let what = "lane datagram";
-    if clear(path, Kind::Datagram).map_err(unbound(what, path))? == Before::Left {
-        log::info!(
-            "removed the {what} socket a stopped daemon left at {}",
-            path.display()
-        );
-    }
-    let d = std::os::unix::net::UnixDatagram::bind(path).map_err(unbound(what, path))?;
-    d.set_nonblocking(true).map_err(unbound(what, path))?;
-    chmod(path, Mode::Group).map_err(unbound(what, path))?;
-    Ok(d)
+/// The lane socket at `path`, where a proxy's TCP to the lane port arrives.
+pub fn lane(path: &Path) -> Result<UnixListener, Unbound> {
+    listener("lane", path, Mode::Group)
 }
 
 /// Whether the peer of a control connection runs as this process's user: `SO_PEERCRED`
@@ -166,9 +136,9 @@ mod tests {
     }
 
     /// Each socket binds with its mode (the control socket the user's alone, 0600; the
-    /// lanes' the group's too, 0660); a socket a stopped daemon left is removed and bound
+    /// lane's the group's too, 0660); a socket a stopped daemon left is removed and bound
     /// again; a live one, and anything that is no socket, is the error and is left as it
-    /// was. Over the three sockets, each in each state its path can be in.
+    /// was. Over the two sockets, each in each state its path can be in.
     #[tokio::test]
     async fn a_socket_binds_over_only_what_a_stopped_daemon_left() {
         let dir = std::env::temp_dir().join(format!("voxl-listen-{}", std::process::id()));
@@ -182,10 +152,9 @@ mod tests {
                 .is_socket()
         };
         type Bind = fn(&Path) -> Result<(), Unbound>;
-        let sockets: [(&str, u32, Bind); 3] = [
+        let sockets: [(&str, u32, Bind); 2] = [
             ("control", 0o600, |p| control(p).map(drop)),
-            ("stream", 0o660, |p| stream(p).map(drop)),
-            ("datagram", 0o660, |p| datagram(p).map(drop)),
+            ("lane", 0o660, |p| lane(p).map(drop)),
         ];
         for (name, want, bind) in sockets {
             let path = folder.0.join(name);
@@ -196,16 +165,8 @@ mod tests {
             bind(&path).unwrap();
             assert!(is_socket(&path), "{name}");
             // A live socket of its kind there: refused, and left.
-            let live: Box<dyn std::any::Any> = match name {
-                "datagram" => {
-                    std::fs::remove_file(&path).unwrap();
-                    Box::new(std::os::unix::net::UnixDatagram::bind(&path).unwrap())
-                }
-                _ => {
-                    std::fs::remove_file(&path).unwrap();
-                    Box::new(std::os::unix::net::UnixListener::bind(&path).unwrap())
-                }
-            };
+            std::fs::remove_file(&path).unwrap();
+            let live = std::os::unix::net::UnixListener::bind(&path).unwrap();
             assert!(bind(&path).is_err(), "{name} bound over a live socket");
             assert!(is_socket(&path), "{name}");
             drop(live);

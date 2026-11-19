@@ -1,15 +1,14 @@
 //! A session's control connection: `voxl attach`'s, over ssh. The daemon mints the
 //! session's capability and sends it first, then the hello and the cursor; after that the
 //! stream carries the page's messages both ways (as the page writes and reads them, the
-//! relay handing them on) and, up, the reports of the frames sent on the lanes. When the
-//! connection closes, the session ends: its capability is forgotten and its lanes closed.
+//! relay handing them on). When the connection closes, the session ends: its capability is
+//! forgotten and its lane closed.
 
 use crate::event::{Bin, Button, ClipContent, InputEvent, KeyAct, MicMsg, Pixels, Press};
 use crate::hub::{Client, Hub, Out};
-use crate::lanes::wire::{Capability, Down, Framer, Up};
 use crate::session::sender::Sender;
+use crate::wire::{Capability, Down, Framer, Up};
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(target_os = "linux")]
 use tokio::net::UnixListener;
@@ -86,21 +85,14 @@ async fn session(
         return;
     };
     let (tx, rx) = mpsc::unbounded_channel::<Out>();
-    let sender = match Sender::new(capability, tx.clone(), Instant::now()) {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!("no session: no lane socket to size its buffer from: {e}");
-            return;
-        }
-    };
-    let client = d.hub.add_client(tx, sender);
+    let client = d.hub.add_client(tx, Sender::new(capability));
     log::info!("session {} opened", client.id);
     greet(&d.hub, &client);
     let writer = tokio::spawn(control_writer(rx, write));
     let why = read_control(&mut read, &d, &client).await;
-    // The session ends here, whatever ended it: its capability and lanes first, so no
+    // The session ends here, whatever ended it: its capability and lane first, so no
     // lane gets another byte, then its input, its microphone and its place in the hub.
-    client.lanes(Sender::close);
+    client.lane(Sender::close);
     writer.abort();
     send_input(&d.hub, InputEvent::ReleaseAll);
     send_mic(&d, MicMsg::Stop(client.id));
@@ -145,16 +137,8 @@ async fn control_writer(
         match &m {
             Out::Bin(b) => Down::Binary(b).encode(&mut out),
             Out::Text(t) => Down::Text(&t.json()).encode(&mut out),
-            Out::Attached { generation } => Down::Attached {
-                generation: *generation,
-            }
-            .encode(&mut out),
-            Out::Buffer(bytes) => Down::Buffer { bytes: *bytes }.encode(&mut out),
-            Out::Lost { generation } => Down::Lost {
-                generation: *generation,
-            }
-            .encode(&mut out),
-            // A recording's alone: a session's audio goes on its lanes.
+            Out::Attached => Down::Attached.encode(&mut out),
+            // A recording's alone: a session's audio goes on its lane.
             Out::Audio { .. } => continue,
         }
         if write.write_all(&out).await.is_err() {
@@ -170,9 +154,7 @@ enum Ended {
     Closed,
     Read(std::io::Error),
     /// It sent what is no control message.
-    Malformed(crate::lanes::wire::Malformed),
-    /// It reported what was never sent.
-    Report(super::sender::Broken),
+    Malformed(crate::wire::Malformed),
 }
 
 impl std::fmt::Display for Ended {
@@ -181,7 +163,6 @@ impl std::fmt::Display for Ended {
             Ended::Closed => write!(f, "its connection closed"),
             Ended::Read(e) => write!(f, "{e}"),
             Ended::Malformed(e) => write!(f, "a malformed control message: {e}"),
-            Ended::Report(e) => write!(f, "a report of no frame sent: {e:?}"),
         }
     }
 }
@@ -192,7 +173,7 @@ async fn read_control(
     d: &Daemon,
     c: &Arc<Client>,
 ) -> Ended {
-    let mut framer = Framer::control();
+    let mut framer = Framer::new();
     let mut buf = vec![0u8; 64 << 10];
     loop {
         let n = match read.read(&mut buf).await {
@@ -211,15 +192,13 @@ async fn read_control(
                 Ok(up) => up,
                 Err(e) => return Ended::Malformed(e),
             };
-            if let Err(e) = handle(d, c, up) {
-                return e;
-            }
+            handle(d, c, up);
         }
     }
 }
 
 /// Acts on one message from the relay.
-fn handle(d: &Daemon, c: &Arc<Client>, up: Up<'_>) -> Result<(), Ended> {
+fn handle(d: &Daemon, c: &Arc<Client>, up: Up<'_>) {
     match up {
         Up::Text(t) => handle_text(d, c, t),
         // A binary message is its type byte and what it carries; an empty one, or one of
@@ -233,29 +212,7 @@ fn handle(d: &Daemon, c: &Arc<Client>, up: Up<'_>) -> Result<(), Ended> {
             Some(Bin::Cursor | Bin::ClipImage) | None => {}
         },
         Up::Binary(_) => {}
-        Up::Report(report) => {
-            reported(&d.hub, c, &report, Instant::now()).map_err(Ended::Report)?
-        }
     }
-    Ok(())
-}
-
-/// A report from the relay at `now`: the block leaves its lane, each video update it decided
-/// goes to the encoder (a picture decoded may be predicted from; one missed may not) and to
-/// the client (a keyframe it started on that missed starts it again), and the capture loop
-/// looks again.
-pub(crate) fn reported(
-    hub: &Hub,
-    c: &Client,
-    report: &crate::lanes::wire::Report<'_>,
-    now: Instant,
-) -> Result<(), super::sender::Broken> {
-    for d in c.lanes(|s| s.reported(report, now))? {
-        hub.updates.decided(d.number, d.outcome);
-        c.decided(d.number, d.outcome);
-    }
-    hub.wake();
-    Ok(())
 }
 
 /// Hands `event` to the input thread. The thread ends only with the daemon, so an event
