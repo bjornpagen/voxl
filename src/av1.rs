@@ -269,6 +269,37 @@ const QUANTISER: u32 = 20;
 const PALETTE: c_int = 1;
 const INTRA_BLOCK_COPY: c_int = 0;
 
+/// libaom's rate-distortion cost tables are never refilled mid-frame: the coefficient, mode,
+/// motion vector and block-copy vector cost updates are all off (`AV1E_SET_COEFF_COST_UPD_FREQ`,
+/// `AV1E_SET_MODE_COST_UPD_FREQ`, `AV1E_SET_MV_COST_UPD_FREQ`, `AV1E_SET_DV_COST_UPD_FREQ`,
+/// each "- 3 = turn off" in aomcx.h). A realtime-only libaom build defaults them to off; the
+/// distros' full build, which the daemon links, defaults them to every superblock ("- 0 =
+/// update at SB level (default)"), about 1,440 refills a frame at 3024x1898.
+///
+/// @limitKind measured
+/// @owner the daemon's AV1 encoder
+/// @unit libaom controls, 0 (every superblock) to 3 (off)
+/// @scope every frame
+/// @evidence a profile and an A/B of the encoder as configured here, measured 2026-11-19, not
+/// in this repository
+/// @observed 2026-11-19
+/// @environment libaom 3.15.1 on an M2 Max laptop, 1 thread; speed 10, screen tune, palette
+/// on, intra block copy off, quantiser 20, lag 0, 64x64 superblocks, 8 tile columns, row
+/// threads
+/// @workload generated dark terminal pages at 3024x1898, 90 deltas each: typing, a pane's
+/// scroll, a whole-screen scroll
+/// @result refilling the cost tables at every superblock took 69% of a blinking cursor's
+/// frame. With the four off, CPU a frame fell from 30.8 to 8.6 ms typing (-72%), 43.3 to
+/// 20.5 ms for a pane's scroll (-53%), 49.5 to 27.8 ms for a whole-screen scroll (-44%);
+/// PSNR within 0.8 dB either way, the decoder's output identical to the encoder's
+/// reconstruction, and 0 to 5% more bytes
+/// @decision 3, off, for all four, set explicitly whatever the build's default
+/// @revalidate a libaom release, or a change of speed, tune or superblock. The server's
+/// libaom 3.13.1 has the controls: libaom 3.0.0 added the first two ("Coefficient and mode
+/// update can be turned off via AV1E_SET_{COEFF/MODE}_COST_UPD_FREQ"), the motion vector
+/// and block-copy vector ones followed
+const COST_UPDATES: c_int = 3;
+
 /// The sequence header's colour description: what the capture is. The X framebuffer is
 /// sRGB (BT.709 primaries, the sRGB transfer), converted to I420 by libyuv's ARGBToI420,
 /// BT.601's matrix at its studio range; the chroma's position, a 2x2 average, is none AV1
@@ -469,6 +500,26 @@ impl Context {
                 "intra block copy",
                 ffi::AV1E_SET_ENABLE_INTRABC,
                 INTRA_BLOCK_COPY,
+            )?;
+            e.control(
+                "coefficient cost updates",
+                ffi::AV1E_SET_COEFF_COST_UPD_FREQ,
+                COST_UPDATES,
+            )?;
+            e.control(
+                "mode cost updates",
+                ffi::AV1E_SET_MODE_COST_UPD_FREQ,
+                COST_UPDATES,
+            )?;
+            e.control(
+                "motion vector cost updates",
+                ffi::AV1E_SET_MV_COST_UPD_FREQ,
+                COST_UPDATES,
+            )?;
+            e.control(
+                "block copy vector cost updates",
+                ffi::AV1E_SET_DV_COST_UPD_FREQ,
+                COST_UPDATES,
             )?;
             e.control(
                 "primaries",
