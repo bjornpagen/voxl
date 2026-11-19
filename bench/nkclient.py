@@ -1,5 +1,5 @@
 """Native Neko benchmark client: logs in, signals over Neko's WebSocket API (v3) like its
-web client, receives the WebRTC video with aiortc (decoded by FFmpeg/libvpx) and reads
+web client, receives the WebRTC video with aiortc (decoded by FFmpeg) and reads
 the loadgen pixel marker from every decoded frame. Same JSON as nclient.py.
 DEBUG=1 prints signaling and connection states.
 Usage: rtcpy.sh nkclient.py <host:port> <secs> [markerX markerY]"""

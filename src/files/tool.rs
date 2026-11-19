@@ -71,42 +71,84 @@ const USAGE: &str = "usage: voxl files list --root DIR PATH
        voxl files get --root DIR PATH
        voxl files put --root DIR --bytes N FOLDER NAME [SUB]";
 
-/// The request `args` (after `files`) make, or what is wrong with them.
+/// What a run is asked to do: the first of its words that is no flag.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Verb {
+    List,
+    Get,
+    Put,
+}
+
+/// Each verb by its word.
+const VERBS: [(&str, Verb); 3] = [("list", Verb::List), ("get", Verb::Get), ("put", Verb::Put)];
+
+/// A flag a run takes: each is followed by its value.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Flag {
+    /// `--root`: the shared folder.
+    Root,
+    /// `--bytes`: an upload's length.
+    Bytes,
+}
+
+/// Each flag by its word.
+const FLAGS: [(&str, Flag); 2] = [("--root", Flag::Root), ("--bytes", Flag::Bytes)];
+
+/// The request `args` (after `files`) make, or what is wrong with them. A word that is
+/// none of [`FLAGS`] is one of the request's own words, its verb first.
 fn parse(args: &[String]) -> Result<Request, String> {
     let mut root = None;
     let mut len = None;
-    let mut rest = Vec::new();
+    let mut words = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        match a.as_str() {
-            "--root" => root = Some(it.next().ok_or("--root needs a folder")?),
-            "--bytes" => len = Some(it.next().ok_or("--bytes needs a number")?),
-            _ => rest.push(a.as_str()),
+        match FLAGS.iter().find(|(word, _)| word == a) {
+            Some((_, Flag::Root)) => root = Some(it.next().ok_or("--root needs a folder")?),
+            Some((_, Flag::Bytes)) => len = Some(it.next().ok_or("--bytes needs a number")?),
+            None => words.push(a.as_str()),
         }
     }
     let root = root.ok_or("--root is required")?;
     // The root as the daemon canonicalised it; canonical again here, so every path under
     // it compares with `starts_with`.
     let root = std::fs::canonicalize(root).map_err(|e| format!("--root {root}: {e}"))?;
-    match (rest.as_slice(), len) {
-        (["list", path], None) => Ok(Request::List {
+    let (verb, words) = words.split_first().ok_or("not a request")?;
+    let (_, verb) = VERBS
+        .iter()
+        .find(|(word, _)| word == verb)
+        .ok_or_else(|| format!("{verb}: not list, get or put"))?;
+    let bytes = |said: &str| {
+        said.parse()
+            .map_err(|_| format!("--bytes {said}: not a whole number"))
+    };
+    match (verb, words, len) {
+        (Verb::List, [path], None) => Ok(Request::List {
             root,
             path: path.to_string(),
         }),
-        (["get", path], None) => Ok(Request::Get {
+        (Verb::Get, [path], None) => Ok(Request::Get {
             root,
             path: path.to_string(),
         }),
-        (["put", folder, name, sub @ ..], Some(len)) if sub.len() <= 1 => Ok(Request::Put {
+        // No `sub` is the folder itself: the empty path under it.
+        (Verb::Put, [folder, name], Some(said)) => Ok(Request::Put {
             root,
-            len: len
-                .parse()
-                .map_err(|_| format!("--bytes {len}: not a whole number"))?,
+            len: bytes(said)?,
             folder: folder.to_string(),
             name: name.to_string(),
-            sub: sub.first().map_or(String::new(), |s| s.to_string()),
+            sub: String::new(),
         }),
-        _ => Err("not a request".into()),
+        (Verb::Put, [folder, name, sub], Some(said)) => Ok(Request::Put {
+            root,
+            len: bytes(said)?,
+            folder: folder.to_string(),
+            name: name.to_string(),
+            sub: sub.to_string(),
+        }),
+        (Verb::List | Verb::Get, [] | [_, _, ..], None | Some(_))
+        | (Verb::List | Verb::Get, [_], Some(_))
+        | (Verb::Put, [] | [_] | [_, _, _, _, ..], None | Some(_))
+        | (Verb::Put, [_, _] | [_, _, _], None) => Err("not a request".into()),
     }
 }
 
@@ -157,26 +199,57 @@ fn line(out: &mut impl Write, v: &serde_json::Value) -> Result<(), Fail> {
     writeln!(out, "{v}").map_err(Fail::Broken)
 }
 
-/// Resolves a page's path ("Downloads/report.pdf") under `root`. Absolute paths and `..`
-/// are refused; symlinks are followed only if they stay inside the root. `Missing::Allowed`:
-/// a path that does not exist yet is taken as it is.
-fn resolve(root: &Path, rel: &str, missing: Missing) -> Result<PathBuf, Refused> {
+/// A path under the root, as its components below it: the root itself is the empty path.
+/// Only [`resolve`] and [`put`] make one, of a path they found under the root, so a path
+/// outside it is none.
+struct Inside(PathBuf);
+
+impl Inside {
+    /// The canonical path `full`, below `root`; one that is not below it is refused.
+    fn of(root: &Path, full: &Path) -> Result<Inside, Refused> {
+        match full.strip_prefix(root) {
+            Ok(below) => Ok(Inside(below.to_path_buf())),
+            Err(_) => Err(Refused::new(403, "outside the shared folder")),
+        }
+    }
+
+    /// It, from the file system's root.
+    fn full(&self, root: &Path) -> PathBuf {
+        root.join(&self.0)
+    }
+
+    /// It as the page names it: from the root, with no leading separator.
+    fn page(&self) -> String {
+        self.0.to_string_lossy().into_owned()
+    }
+}
+
+/// A page's path ("Downloads/report.pdf") as the names under the root it walks: `.` parts
+/// are nothing, and an absolute path, `..` or a NUL is refused.
+fn relative(rel: &str) -> Result<PathBuf, Refused> {
     let bad = || Refused::new(400, "invalid path");
     if rel.contains('\0') {
         return Err(bad());
     }
-    let mut p = root.to_path_buf();
+    let mut below = PathBuf::new();
     for c in Path::new(rel).components() {
         match c {
-            Component::Normal(s) => p.push(s),
+            Component::Normal(s) => below.push(s),
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => return Err(bad()),
         }
     }
-    match (p.canonicalize(), missing) {
-        (Ok(c), _) if c.starts_with(root) => Ok(c),
-        (Ok(_), _) => Err(Refused::new(403, "outside the shared folder")),
-        (Err(_), Missing::Allowed) => Ok(p),
+    Ok(below)
+}
+
+/// Resolves a page's path under `root` ([`relative`]); symlinks are followed only if they
+/// stay inside the root. `Missing::Allowed`: a path that does not exist yet is taken as it
+/// is.
+fn resolve(root: &Path, rel: &str, missing: Missing) -> Result<Inside, Refused> {
+    let below = relative(rel)?;
+    match (root.join(&below).canonicalize(), missing) {
+        (Ok(c), Missing::Allowed | Missing::Refused) => Inside::of(root, &c),
+        (Err(_), Missing::Allowed) => Ok(Inside(below)),
         (Err(_), Missing::Refused) => Err(Refused::new(404, "not found")),
     }
 }
@@ -188,18 +261,12 @@ enum Missing {
     Refused,
 }
 
-fn rel(root: &Path, p: &Path) -> String {
-    p.strip_prefix(root)
-        .map(|r| r.to_string_lossy().into_owned())
-        .unwrap_or_default()
-}
-
 /// A folder's entries, hidden ones left out; a folder that does not exist is listed
 /// empty, as the upload folder is until something is uploaded.
 fn list(root: &Path, path: &str) -> Result<serde_json::Value, Fail> {
     let dir = resolve(root, path, Missing::Allowed)?;
     let mut entries = Vec::new();
-    match std::fs::read_dir(&dir) {
+    match std::fs::read_dir(dir.full(root)) {
         Ok(rd) => {
             for e in rd.filter_map(Result::ok) {
                 let name = e.file_name().to_string_lossy().into_owned();
@@ -218,13 +285,13 @@ fn list(root: &Path, path: &str) -> Result<serde_json::Value, Fail> {
                 if !md.is_dir() && !md.is_file() {
                     continue;
                 }
-                let mtime = md
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map_or(0, |d| d.as_millis() as u64);
+                // Linux keeps every file's modification time: one it cannot say is an entry
+                // it cannot read.
+                let Ok(modified) = md.modified() else {
+                    continue;
+                };
                 entries.push(serde_json::json!({
-                    "name": name, "dir": md.is_dir(), "size": md.len(), "mtime": mtime
+                    "name": name, "dir": md.is_dir(), "size": md.len(), "mtime": millis(modified)
                 }));
                 if entries.len() == ENTRIES_LISTED {
                     break;
@@ -234,15 +301,29 @@ fn list(root: &Path, path: &str) -> Result<serde_json::Value, Fail> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => return Err(Refused::new(404, "not a folder").into()),
     }
-    Ok(serde_json::json!({ "path": rel(root, &dir).trim_start_matches('/'), "entries": entries }))
+    Ok(serde_json::json!({ "path": dir.page(), "entries": entries }))
+}
+
+/// A time as the page's `Date` takes it: milliseconds since 1970 began, before it
+/// negative. Beyond the 292 million years either way an `i64` holds, it is held to the
+/// end.
+fn millis(t: std::time::SystemTime) -> i64 {
+    let held = |ms: u128| i64::try_from(ms).unwrap_or(i64::MAX);
+    match t.duration_since(UNIX_EPOCH) {
+        Ok(after) => held(after.as_millis()),
+        Err(before) => -held(before.duration().as_millis()),
+    }
 }
 
 /// A file's bytes after the line that names them, or a folder zipped as it is read.
 fn get(root: &Path, path: &str, out: &mut impl Write) -> Result<(), Fail> {
-    let path = resolve(root, path, Missing::Refused)?;
-    let name = path
-        .file_name()
-        .map_or_else(|| "Home".into(), |n| n.to_string_lossy().into_owned());
+    let inside = resolve(root, path, Missing::Refused)?;
+    // The root has no name of its own: the page calls it Home.
+    let name = match inside.0.file_name() {
+        Some(n) => n.to_string_lossy().into_owned(),
+        None => "Home".into(),
+    };
+    let path = inside.full(root);
     if path.is_dir() {
         line(
             out,
@@ -335,7 +416,7 @@ fn write_zip(dir: &Path, top: &str, out: &mut impl Write) -> zip::result::ZipRes
                 .extension()
                 .and_then(|x| x.to_str())
                 .is_some_and(|x| COMPRESSED.contains(&x.to_ascii_lowercase().as_str()));
-            let mut opts = base.large_file(md.len() >= u32::MAX as u64);
+            let mut opts = base.large_file(md.len() >= u64::from(u32::MAX));
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -348,7 +429,8 @@ fn write_zip(dir: &Path, top: &str, out: &mut impl Write) -> zip::result::ZipRes
                 opts.compression_method(zip::CompressionMethod::Deflated)
                     .compression_level(Some(1))
             };
-            if let Some(t) = md.modified().ok().and_then(zip_time) {
+            // An entry whose time zip cannot hold, or that has none, goes without one.
+            if let Ok(Some(t)) = md.modified().map(zip_time) {
                 opts = opts.last_modified_time(t);
             }
             z.start_file(rel, opts)?;
@@ -360,10 +442,10 @@ fn write_zip(dir: &Path, top: &str, out: &mut impl Write) -> zip::result::ZipRes
     Ok(())
 }
 
-/// A plain file name: no separators, no `.`/`..`, no control characters, at most 255
-/// bytes (the longest name Linux's and macOS's file systems take).
-fn clean_name(name: &str) -> Option<&str> {
-    let name = name.trim();
+/// A plain file name: text, with no separators, no `.`/`..`, no control characters, at
+/// most 255 bytes (the longest name Linux's and macOS's file systems take).
+fn clean_name(name: &std::ffi::OsStr) -> Option<&str> {
+    let name = name.to_str()?.trim();
     let ok = !name.is_empty()
         && name != "."
         && name != ".."
@@ -374,22 +456,22 @@ fn clean_name(name: &str) -> Option<&str> {
     ok.then_some(name)
 }
 
-/// `name`, or `name (1).ext`, `name (2).ext`, ... if taken.
-fn unique(dir: &Path, name: &str) -> PathBuf {
-    let p = dir.join(name);
-    if !p.exists() {
-        return p;
+/// `name`, or `name (1).ext`, `name (2).ext`, ... if taken in `dir`: the name chosen.
+fn unique(dir: &Path, name: &str) -> String {
+    if !dir.join(name).exists() {
+        return name.into();
     }
+    // A name's extension is after its last dot, unless that dot begins it (`.bashrc`).
     let (stem, ext) = match name.rfind('.') {
-        Some(i) if i > 0 => (&name[..i], &name[i..]),
-        _ => (name, ""),
+        Some(i @ 1..) => (&name[..i], &name[i..]),
+        Some(0) | None => (name, ""),
     };
     let mut n = 0u64;
     loop {
         n += 1;
-        let p = dir.join(format!("{stem} ({n}){ext}"));
-        if !p.exists() {
-            return p;
+        let chosen = format!("{stem} ({n}){ext}");
+        if !dir.join(&chosen).exists() {
+            return chosen;
         }
     }
 }
@@ -406,39 +488,30 @@ fn put(
     sub: &str,
     input: &mut impl Read,
 ) -> Result<serde_json::Value, Fail> {
-    let name = clean_name(name).ok_or_else(|| Refused::new(400, "invalid file name"))?;
+    let name = clean_name(name.as_ref()).ok_or_else(|| Refused::new(400, "invalid file name"))?;
     // The folder (the upload folder is made by the first upload) and `sub` inside it
     // ("Photos/2024") are made as needed, one level at a time from the root, each step
     // checked: a symlink on the way could lead outside the shared folder, and nothing may
-    // be made out there.
-    let mut dir = root.to_path_buf();
-    // A folder is a relative path, as `resolve` takes one: an absolute one or `..` is none.
-    if Path::new(folder)
-        .components()
-        .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
-    {
-        return Err(Refused::new(400, "invalid path").into());
-    }
-    for part in folder
-        .split('/')
-        .chain(sub.split('/'))
-        .filter(|p| !p.is_empty() && *p != ".")
-    {
-        let p = clean_name(part).ok_or_else(|| Refused::new(400, "invalid folder name"))?;
-        let next = dir.join(p);
+    // be made out there. Each is a relative path, as `resolve` takes one.
+    let mut inside = Inside(PathBuf::new());
+    for part in relative(folder)?.join(relative(sub)?).components() {
+        let p =
+            clean_name(part.as_os_str()).ok_or_else(|| Refused::new(400, "invalid folder name"))?;
+        let next = inside.full(root).join(p);
         if let Err(e) = std::fs::create_dir(&next) {
             if e.kind() != std::io::ErrorKind::AlreadyExists {
                 return Err(Refused::new(500, format!("cannot create the folder: {e}")).into());
             }
         }
-        dir = match std::fs::canonicalize(&next) {
-            Ok(c) if c.starts_with(root) && c.is_dir() => c,
-            Ok(c) if c.starts_with(root) => {
-                return Err(Refused::new(409, "a file is in the way of the folder").into())
-            }
-            _ => return Err(Refused::new(403, "outside the shared folder").into()),
+        inside = match std::fs::canonicalize(&next) {
+            Ok(c) => Inside::of(root, &c)?,
+            Err(_) => return Err(Refused::new(403, "outside the shared folder").into()),
         };
+        if !inside.full(root).is_dir() {
+            return Err(Refused::new(409, "a file is in the way of the folder").into());
+        }
     }
+    let dir = inside.full(root);
     let part = dir.join(format!(".{name}.{}.part", std::process::id()));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -454,12 +527,13 @@ fn put(
         }
     };
     drop(file);
-    let dest = unique(&dir, name);
-    if let Err(e) = std::fs::rename(&part, &dest) {
+    let chosen = unique(&dir, name);
+    if let Err(e) = std::fs::rename(&part, dir.join(&chosen)) {
         let _ = std::fs::remove_file(&part);
         return Err(Refused::new(500, format!("cannot save: {e}")).into());
     }
-    Ok(serde_json::json!({ "path": rel(root, &dest).trim_start_matches('/'), "size": written }))
+    let saved = Inside(inside.0.join(&chosen));
+    Ok(serde_json::json!({ "path": saved.page(), "size": written }))
 }
 
 /// Copies exactly `len` bytes of `input` to `file`: an input that ends before them, or
@@ -469,7 +543,11 @@ fn copy_exactly(input: &mut impl Read, file: &mut impl Write, len: u64) -> Resul
     let mut buf = [0u8; 64 << 10];
     let mut left = len;
     while left > 0 {
-        let want = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+        // More left than a `usize` holds is more than the buffer.
+        let want = match usize::try_from(left) {
+            Ok(left) => left.min(buf.len()),
+            Err(_) => buf.len(),
+        };
         let n = match input.read(&mut buf[..want]) {
             Ok(0) => return Err(interrupted()),
             Ok(n) => n,
@@ -588,7 +666,7 @@ mod tests {
     }
 
     /// No path a page sends reaches outside the root: `..`, absolute paths and a symlink
-    /// out are refused, for every request.
+    /// out are refused, for every request, and as an upload's folder or its subfolder.
     #[test]
     fn nothing_reaches_outside_the_root() {
         let root = Root::new("out");
@@ -613,8 +691,46 @@ mod tests {
             let args = ["put", "--bytes", "1", path, "n"];
             let (status, _) = run(&root, &args, b"x");
             assert_eq!(status, 1, "put into {path}");
+            let args = ["put", "--bytes", "1", ".", "n", path];
+            let (status, _) = run(&root, &args, b"x");
+            assert_eq!(status, 1, "put into the root's {path}");
         }
         assert_eq!(std::fs::read_dir(&outside.0).unwrap().count(), 1);
+    }
+
+    /// A time is the milliseconds since 1970 began, before it negative, and an entry is
+    /// listed with its own: over generated times either side of 1970, read back as they
+    /// were made, and a file set to one of them listed with it.
+    #[test]
+    fn a_time_is_its_milliseconds_since_1970_either_side() {
+        let root = Root::new("time");
+        let mut rng = crate::xorshift::Xorshift::new(0x510e_527f_ade6_82d1);
+        for i in 0..2_000u32 {
+            // Whole milliseconds, up to some 35 years either way.
+            let ms = rng.below(1 << 40);
+            let d = std::time::Duration::from_millis(ms);
+            let signed = i64::try_from(ms).unwrap();
+            assert_eq!(millis(UNIX_EPOCH + d), signed);
+            assert_eq!(millis(UNIX_EPOCH - d), -signed);
+            if i % 100 == 0 {
+                let name = format!("t{i}");
+                let file = std::fs::File::create(root.0.join(&name)).unwrap();
+                let (at, want) = match i % 200 {
+                    0 => (UNIX_EPOCH - d, -signed),
+                    1.. => (UNIX_EPOCH + d, signed),
+                };
+                file.set_modified(at).unwrap();
+                let listed = list(&root.0, "").unwrap();
+                let entry = listed["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["name"] == name.as_str())
+                    .cloned()
+                    .unwrap();
+                assert_eq!(entry["mtime"], want, "{name}");
+            }
+        }
     }
 
     /// The arguments are a request exactly: `--root` and a verb's own fields, `list` and
@@ -678,12 +794,16 @@ mod tests {
                     true,
                 ) => {
                     assert_eq!(verb, "put");
-                    assert_eq!(Some(len), bytes.and_then(|n| n.parse().ok()));
+                    assert_eq!(Some(Ok(len)), bytes.map(str::parse));
                     assert_eq!((folder.as_str(), name.as_str()), (fields[0], fields[1]));
-                    assert_eq!(sub, fields.get(2).copied().unwrap_or_default());
+                    let given = match fields[..] {
+                        [_, _, sub] => sub,
+                        [] | [_] | [_, _] | [_, _, _, _, ..] => "",
+                    };
+                    assert_eq!(sub, given);
                 }
                 (Err(_), false) => {}
-                (got, _) => panic!("{args:?}: {got:?}"),
+                (got @ Ok(_), false) | (got @ Err(_), true) => panic!("{args:?}: {got:?}"),
             }
         }
     }
@@ -729,7 +849,7 @@ mod tests {
                 let len = match rng.below(4) {
                     0 => 0,
                     1 => rng.below(100),
-                    _ => rng.below(150_000),
+                    2.. => rng.below(150_000),
                 } as usize;
                 let body: Vec<u8> = if rng.below(2) == 0 {
                     let byte = rng.below(256) as u8;

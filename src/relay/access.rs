@@ -206,7 +206,7 @@ mod tests {
             3 => (format!("app{}.localhost", rng.below(100)), false),
             4 => (format!("rebound{}.example", rng.below(100)), true),
             // Looks like an address, is a name.
-            _ => (
+            5.. => (
                 format!("{}.{}.example", rng.below(256), rng.below(256)),
                 true,
             ),
@@ -227,13 +227,13 @@ mod tests {
             let port: Option<u16> = match rng.below(3) {
                 0 => None,
                 1 => Some(6901),
-                _ => Some(rng.below(65536) as u16),
+                2.. => Some(rng.below(65536) as u16),
             };
             // A Host as a browser writes it, or one whose port is not a port.
             let (host, port_ok) = match (rng.below(8), port) {
-                (0, _) => (format!("{name}:x"), false),
-                (_, Some(p)) => (format!("{name}:{p}"), true),
-                (_, None) => (name.clone(), true),
+                (0, Some(_) | None) => (format!("{name}:x"), false),
+                (1.., Some(p)) => (format!("{name}:{p}"), true),
+                (1.., None) => (name.clone(), true),
             };
             let schemes = [("http", 80), ("ws", 80), ("https", 443), ("wss", 443)];
             let (scheme, default) = schemes[rng.below(4) as usize];
@@ -257,7 +257,7 @@ mod tests {
                 3 => (Some(format!("{scheme}://other.example")), false),
                 4 => (Some("null".to_string()), false),
                 5 => (Some(format!("file://{name}")), false),
-                _ => (Some("not text".to_string()), false),
+                6.. => (Some("not text".to_string()), false),
             };
             let origin_header = match origin.as_deref() {
                 None => Header::Absent,
@@ -267,7 +267,7 @@ mod tests {
             let (host_header, answered_if) = match rng.below(10) {
                 0 => (Header::Absent, origin.is_none()),
                 1 => (Header::NotText, false),
-                _ => (Header::Text(&host), port_ok && !rebindable && own),
+                2.. => (Header::Text(&host), port_ok && !rebindable && own),
             };
             let answered = admit(host_header, origin_header).is_ok();
             assert_eq!(

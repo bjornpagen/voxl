@@ -1,4 +1,4 @@
-// The worker: the socket to the relay, the VP9 decoder and the Opus decoder, off the page's
+// The worker: the socket to the relay, the AV1 decoder and the Opus decoder, off the page's
 // thread. What it decides is in two records: its session with the relay (session.ts), which
 // says when a frame was taken, and the screen (frames.ts), which holds one update at a time.
 // Here they are joined to the browser: a WebSocket, WebCodecs, the page and the counters.
@@ -127,7 +127,7 @@ function start(init: Init) {
 		},
 	});
 
-	// The screen arrives as one VP9 stream; each update's picture goes to the page as it is
+	// The screen arrives as one AV1 stream; each update's picture goes to the page as it is
 	// decoded.
 	const frames = new Frames<VideoDecoder, VideoFrame, Uint8Array>({
 		// Asked once, at the session's hello: a codec this browser cannot decode ends it.
@@ -159,8 +159,8 @@ function start(init: Init) {
 		// output", and "the underlying codec implementation MAY emit new outputs only when
 		// new inputs are provided" (W3C WebCodecs, VideoDecoderConfig and "Internal Pending
 		// Output"). Measured on 2026-11-19 in Chrome 157 on an M2 Max, configured as here:
-		// 60 of 60 pictures out before the next input, none held, for hardware VP9 and for
-		// software AV1 (Chromium's dav1d wrapper sets max_frame_delay 1 in low-delay mode).
+		// 60 of 60 pictures out before the next input, none held, for AV1 in software
+		// (Chromium's dav1d wrapper sets max_frame_delay 1 in low-delay mode).
 		// A decoder that kept a picture in would leave the session waiting, and
 		// `voxlStats.decoder` would read decoding since that update's arrival: flush() is no
 		// way out, since it makes the next update have to be a keyframe.

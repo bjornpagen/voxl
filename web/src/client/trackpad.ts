@@ -22,18 +22,33 @@ export function createPointerView(
 	/** Draws the dot, and says where its hot spot is. A hidden remote cursor still gets one,
 	 * or the pointer would be lost. */
 	function dot() {
-		if (drawn.s !== 'dot') {
-			drawn = { s: 'dot' };
-			ptr.classList.add('dot');
-			ptr.style.backgroundImage = '';
-			ptr.style.width = '';
-			ptr.style.height = '';
+		const hot = { hx: DOT / 2, hy: DOT / 2 };
+		switch (drawn.s) {
+			case 'dot':
+				return hot;
+			case 'nothing':
+			case 'image':
+				drawn = { s: 'dot' };
+				ptr.classList.add('dot');
+				ptr.style.backgroundImage = '';
+				ptr.style.width = '';
+				ptr.style.height = '';
+				return hot;
 		}
-		return { hx: DOT / 2, hy: DOT / 2 };
+	}
+	/** Whether the pointer is drawn as `img` already. */
+	function drawnAs(img: CursorImage): boolean {
+		switch (drawn.s) {
+			case 'image':
+				return drawn.url === img.url;
+			case 'nothing':
+			case 'dot':
+				return false;
+		}
 	}
 	/** Draws the cursor's image, and says where its hot spot is. */
 	function picture(img: CursorImage) {
-		if (drawn.s !== 'image' || drawn.url !== img.url) {
+		if (!drawnAs(img)) {
 			drawn = { s: 'image', url: img.url };
 			ptr.classList.remove('dot');
 			ptr.style.backgroundImage = `url(${img.url})`;

@@ -23,7 +23,8 @@
 	"desktopAudio": {
 		"sampleRate": 48000,
 		"channels": 2,
-		"frameSamples": 480
+		"frameSamples": 480,
+		"packets": 2
 	},
 	"microphone": {
 		"sampleRate": 48000,

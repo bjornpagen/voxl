@@ -6,12 +6,12 @@ edition = "2021"
 # The Rust that CI's Linux job builds with (nixpkgs 25.05), so clippy flags anything newer
 # on every platform.
 license = "MIT"
-description = "Low-latency desktop streaming for the browser: an X11 display as VP9, sent over a stream through a proxy and joined in the browser by a relay"
+description = "Low-latency desktop streaming for the browser: an X11 display as AV1, sent over a stream through a proxy and joined in the browser by a relay"
 repository = "https://github.com/bjornpagen/voxl"
 readme = "README.md"
 # Lets programs that embed voxl read DEP_VOXL_RPATH (see build.rs).
 links = "voxl"
-keywords = ["remote-desktop", "streaming", "x11", "vp9"]
+keywords = ["remote-desktop", "streaming", "x11", "av1"]
 categories = ["command-line-utilities", "multimedia::video"]
 # What `cargo publish` uploads: the sources build.rs and the server need, nothing from bench/.
 include = [

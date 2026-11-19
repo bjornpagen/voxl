@@ -45,9 +45,9 @@ pub enum Daemon {
 
 impl Runtime {
     pub fn parse(v: &str) -> Result<Runtime, String> {
-        match v {
-            "" => Err("--runtime \"\": not a folder's path".to_string()),
-            path => Ok(Runtime(path.to_string())),
+        match v.as_bytes() {
+            [] => Err("--runtime \"\": not a folder's path".to_string()),
+            [_, ..] => Ok(Runtime(v.to_string())),
         }
     }
 
@@ -109,7 +109,8 @@ impl Unopened {
     pub fn of(status: std::process::ExitStatus) -> Unopened {
         match status.code() {
             Some(SSH_FAILED) => Unopened::NoDoor,
-            Some(_) | None => Unopened::Exited(status),
+            // A code of its own, or none: a signal ended it.
+            Some(i32::MIN..SSH_FAILED | SSH_FAILED..) | None => Unopened::Exited(status),
         }
     }
 }
@@ -143,118 +144,95 @@ mod tests {
     use super::*;
     use crate::xorshift::Xorshift;
 
-    /// A POSIX shell reads every quoted argument back as the argument: over strings of
-    /// every byte a shell word can hold (no NUL), quotes, backslashes, `$`, backticks,
-    /// spaces and newlines among them. The oracle is `/bin/sh` itself.
-    #[test]
-    fn the_shell_reads_a_quoted_argument_as_itself() {
-        const SPECIAL: &[u8] = b"'\"\\$`!*?[]{}()<>|&;#~ \t\n-=%";
-        let mut rng = Xorshift::new(0xA0761D6478BD642F);
-        let args: Vec<String> = (0..200)
-            .map(|_| {
-                let bytes: Vec<u8> = (0..rng.below(24))
-                    .map(|_| match rng.below(3) {
-                        0 => SPECIAL[rng.below(SPECIAL.len() as u64) as usize],
-                        1 => b'a' + rng.below(26) as u8,
-                        _ => 1 + rng.below(127) as u8,
-                    })
-                    .collect();
-                String::from_utf8(bytes).unwrap()
-            })
-            .collect();
-        // One shell for all of them: each printed between NULs, which no argument holds.
-        let line: String = args
-            .iter()
-            .map(|a| format!("printf '%s\\0' {}\n", quote(a)))
-            .collect();
-        let out = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(line)
-            .output()
-            .unwrap();
-        assert!(out.status.success());
-        let read: Vec<String> = out
-            .stdout
-            .split(|&b| b == 0)
-            .map(|b| String::from_utf8(b.to_vec()).unwrap())
-            .collect();
-        assert_eq!(read[..args.len()], args[..]);
-        assert_eq!(read.len(), args.len() + 1);
+    /// The words a POSIX shell reads `line` as, for the shell language the relay writes:
+    /// written apart from `quote`, from the standard (XCU 2.2 Quoting, 2.6.5 Field
+    /// Splitting): an unquoted blank ends a word; a single quote begins a run that the next
+    /// single quote ends, every byte between taken as it is; an unquoted backslash takes the
+    /// byte after it as it is. Any other byte the shell treats specially, met unquoted, is a
+    /// quoting the relay must never write: the test fails on it.
+    fn shell_words(line: &str) -> Vec<String> {
+        let mut words = Vec::new();
+        let mut word: Option<String> = None;
+        let mut chars = line.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                ' ' | '\t' => words.extend(word.take()),
+                '\'' => {
+                    let w = word.get_or_insert_with(String::new);
+                    loop {
+                        match chars.next() {
+                            Some('\'') => break,
+                            Some(q) => w.push(q),
+                            None => panic!("{line:?}: a quote never closed"),
+                        }
+                    }
+                }
+                '\\' => match chars.next() {
+                    Some(e) => word.get_or_insert_with(String::new).push(e),
+                    None => panic!("{line:?}: a backslash at the end"),
+                },
+                'a'..='z' => word.get_or_insert_with(String::new).push(c),
+                special => panic!("{line:?}: {special:?} unquoted"),
+            }
+        }
+        words.extend(word);
+        words
     }
 
-    /// The server reads the attach the relay sends as the attach it means: over drawn
-    /// runtime folders (any non-empty string of what a command line holds: quotes, `$`,
-    /// spaces, newlines, a leading `--`, `=` and letters beyond ASCII) and none, the line
-    /// ssh hands the login shell, split by `/bin/sh` as that shell splits it, is `voxl
-    /// attach` with flags the daemon's own parser reads as that folder, or as its default
-    /// when none was named. The oracles are `/bin/sh` and the daemon's `parse_args`.
+    /// The server's login shell reads the line the relay sends as `voxl` and the arguments
+    /// it means, and the attach's flags as the daemon's parser reads them: over drawn
+    /// arguments of every byte a shell word can hold (no NUL; quotes, backslashes, `$`,
+    /// backticks, blanks and newlines among them, and letters beyond ASCII), and over drawn
+    /// runtime folders (a leading `--` and `=` too) and none. The oracles are the shell's
+    /// quoting as the standard states it (`shell_words`) and the daemon's `parse_args`.
     #[test]
-    fn attach_reaches_the_daemon_at_the_runtime_named() {
+    fn the_shell_reads_the_attach_the_relay_means() {
         const SPECIAL: &[char] = &[
-            '\'', '"', '\\', '$', '`', ' ', '\t', '\n', '-', '=', '/', 'é', '*',
+            '\'', '"', '\\', '$', '`', '!', '*', '?', '[', ']', '{', '}', '(', ')', '<', '>', '|',
+            '&', ';', '#', '~', ' ', '\t', '\n', '-', '=', '%', '/', 'é',
         ];
-        let mut rng = Xorshift::new(0x9E3779B97F4A7C15);
-        let daemons: Vec<Daemon> = (0..300)
-            .map(|i| {
-                if i % 5 == 0 {
-                    return Daemon::Default;
-                }
-                Daemon::In({
-                    let mut s: String = (0..1 + rng.below(16))
-                        .map(|_| match rng.below(3) {
-                            0 => SPECIAL[rng.below(SPECIAL.len() as u64) as usize],
-                            _ => char::from(b'a' + rng.below(26) as u8),
-                        })
-                        .collect();
+        let mut rng = Xorshift::new(0xA0761D6478BD642F);
+        let draw = |rng: &mut Xorshift, most: u64| -> String {
+            (0..rng.below(most))
+                .map(|_| match rng.below(3) {
+                    0 => SPECIAL[rng.below(SPECIAL.len() as u64) as usize],
+                    1 => char::from(b'a' + rng.below(26) as u8),
+                    2.. => char::from(1 + rng.below(127) as u8),
+                })
+                .collect()
+        };
+        for _ in 0..2_000 {
+            let args: Vec<String> = (0..rng.below(4)).map(|_| draw(&mut rng, 24)).collect();
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let read = shell_words(&line(&args));
+            assert_eq!(read[0], "voxl");
+            assert_eq!(read[1..], args[..]);
+        }
+        for i in 0..2_000u32 {
+            let daemon = match i % 5 {
+                0 => Daemon::Default,
+                1.. => {
+                    let mut s = String::from("x");
+                    s.push_str(&draw(&mut rng, 16));
                     if rng.below(6) == 0 {
                         s.insert_str(0, "--");
                     }
-                    Runtime::parse(&s).unwrap()
-                })
-            })
-            .collect();
-        let script: String = daemons
-            .iter()
-            .map(|r| {
-                let args = attach_args(r);
-                let args: Vec<&str> = args.iter().map(String::as_str).collect();
-                // The shell runs `voxl` as printf's arguments: each word between NULs, the
-                // command's end a SOH, which no drawn string holds.
-                format!(
-                    "set -- {}; printf '%s\\0' \"$@\"; printf '\\001'\n",
-                    line(&args)
-                )
-            })
-            .collect();
-        let out = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(script)
-            .output()
-            .unwrap();
-        assert!(out.status.success());
-        let commands: Vec<&[u8]> = out.stdout.split(|&b| b == 1).collect();
-        assert_eq!(commands.len(), daemons.len() + 1);
-        for (r, command) in daemons.iter().zip(commands) {
-            let words: Vec<String> = command
-                .split(|&b| b == 0)
-                .map(|w| String::from_utf8(w.to_vec()).unwrap())
-                .collect();
-            let (end, words) = words.split_last().unwrap();
-            assert_eq!(end, "");
-            assert_eq!(words[..2], ["voxl", "attach"], "{r:?}");
-            let read = crate::parse_args(words[2..].iter().cloned(), &[crate::RUNTIME.name])
-                .unwrap_or_else(|e| panic!("{r:?}: {e}"));
-            let folder = crate::folder((
-                crate::RUNTIME.name,
-                read.get(crate::RUNTIME.name)
-                    .map_or(crate::RUNTIME.default, String::as_str),
-            ))
-            .unwrap();
-            let want = match r {
-                Daemon::Default => crate::RUNTIME.default,
+                    Daemon::In(Runtime::parse(&s).unwrap())
+                }
+            };
+            let args = attach_args(&daemon);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let words = shell_words(&line(&args));
+            assert_eq!(words[..2], ["voxl", "attach"], "{daemon:?}");
+            let runtime = crate::Which::Runtime;
+            let mut read = crate::parse_args(words[2..].iter().cloned(), &[runtime.flag().name])
+                .unwrap_or_else(|e| panic!("{daemon:?}: {e}"));
+            let folder = crate::folder(crate::given(&mut read, runtime)).unwrap();
+            let want = match &daemon {
+                Daemon::Default => runtime.flag().default,
                 Daemon::In(runtime) => runtime.0.as_str(),
             };
-            assert_eq!(folder, std::path::PathBuf::from(want), "{r:?}");
+            assert_eq!(folder, std::path::PathBuf::from(want), "{daemon:?}");
         }
         assert_eq!(
             Runtime::parse(""),
@@ -263,28 +241,25 @@ mod tests {
     }
 
     /// An exit before the capability is NoDoor exactly when its status is ssh's own failure
-    /// (255, ssh(1)); every other code, and death by a signal, is an exit of its own. The
-    /// statuses are real ones, of `/bin/sh -c 'exit N'` and of a killed shell.
+    /// (255, ssh(1)); every other code, and death by any signal, is an exit of its own. The
+    /// statuses are made as `wait(2)` encodes them (`ExitStatusExt::from_raw`).
     #[test]
     fn only_ssh_s_own_failure_is_no_door() {
-        for code in 0..=255 {
-            let status = std::process::Command::new("/bin/sh")
-                .arg("-c")
-                .arg(format!("exit {code}"))
-                .status()
-                .unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        for code in 0..=u8::MAX {
+            let status = std::process::ExitStatus::from_raw(i32::from(code) << 8);
+            assert_eq!(status.code(), Some(i32::from(code)));
             let got = Unopened::of(status);
             match code {
                 255 => assert_eq!(got, Unopened::NoDoor),
-                _ => assert_eq!(got, Unopened::Exited(status), "exit {code}"),
+                0..=254 => assert_eq!(got, Unopened::Exited(status), "exit {code}"),
             }
         }
-        let killed = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg("kill -KILL $$")
-            .status()
-            .unwrap();
-        assert_eq!(Unopened::of(killed), Unopened::Exited(killed));
+        for signal in 1..32 {
+            let killed = std::process::ExitStatus::from_raw(signal);
+            assert_eq!(killed.signal(), Some(signal));
+            assert_eq!(Unopened::of(killed), Unopened::Exited(killed));
+        }
     }
 
     /// A destination is read exactly when ssh would take it as one destination word and
@@ -300,7 +275,7 @@ mod tests {
                 .map(|_| match rng.below(10) {
                     0 => '-',
                     1 => [' ', '\t', '\n', 'é', '\u{7f}'][rng.below(5) as usize],
-                    _ => char::from(b'!' + rng.below(94) as u8),
+                    2.. => char::from(b'!' + rng.below(94) as u8),
                 })
                 .collect();
             let word =

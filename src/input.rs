@@ -187,6 +187,9 @@ const SAFE_SCRATCH: &[u8] = &[
 
 const SHIFT_L: u32 = 0xffe1;
 
+/// X's keysym for no symbol: a level of a keycode that types nothing.
+const NO_SYMBOL: u32 = 0;
+
 /// Scroll units per wheel notch: the increment patches/xorg-server-xtest-scroll.patch
 /// gives the XTEST pointer's scroll axes (`SetScrollValuator(..., 120.0, ...)`), which is
 /// the unit of a detent hi-res wheels report in (libinput's `v120`: 120 a detent).
@@ -491,11 +494,15 @@ impl Injector {
     fn resolve(&mut self, keysym: u32) -> Option<(u8, Level)> {
         if let Some(&(kc, lvl)) = self.lookup.get(&keysym) {
             let row = self.row(kc);
-            let l0 = row[0];
-            let l1 = if row.len() > 1 { row[1] } else { 0 };
-            let shift_neutral = l1 == 0 || l0 == l1 || (0xfd00..0x10000).contains(&keysym);
+            // A keycode's symbol without Shift and with it; one it lacks is X's NoSymbol.
+            let (l0, l1) = match row {
+                [l0, l1, ..] => (*l0, *l1),
+                [l0] => (*l0, NO_SYMBOL),
+                [] => (NO_SYMBOL, NO_SYMBOL),
+            };
+            let shift_neutral = l1 == NO_SYMBOL || l0 == l1 || (0xfd00..0x10000).contains(&keysym);
             let level = match (shift_neutral, lvl) {
-                (true, _) => Level::Either,
+                (true, 0 | 1..) => Level::Either,
                 (false, 0) => Level::Plain,
                 (false, 1..) => Level::Shifted,
             };
@@ -745,93 +752,13 @@ mod tests {
     };
     const SHIFT: Held = Held::Modifier(SHIFT_L_KC);
 
-    fn event(held: Option<Held>, act: KeyAct, found: Option<Held>, shifts: &[u8]) -> Outcome {
-        key_event(held, act, || found, SHIFT_L_KC, shifts)
-    }
-
-    fn outcome(strokes: &[Stroke], held: Option<Held>) -> Outcome {
-        Outcome {
-            strokes: strokes.to_vec(),
-            held,
-        }
-    }
-
-    /// Every cell of the table: down, repeat and up, against a key that isn't held, a held
-    /// key and a held modifier.
-    #[test]
-    fn each_key_event_does_what_the_table_says() {
-        let down = KeyAct::Down;
-        let repeat = KeyAct::Repeat;
-        let up = KeyAct::Up;
-        assert_eq!(
-            event(None, down, Some(PLAIN), &[]),
-            outcome(&[Press(A)], Some(PLAIN))
-        );
-        assert_eq!(event(None, down, None, &[]), outcome(&[], None));
-        assert_eq!(
-            event(Some(PLAIN), down, None, &[]),
-            outcome(&[], Some(PLAIN))
-        );
-        assert_eq!(
-            event(Some(SHIFT), down, None, &[]),
-            outcome(&[], Some(SHIFT))
-        );
-        assert_eq!(event(None, repeat, None, &[]), outcome(&[], None));
-        assert_eq!(
-            event(Some(PLAIN), repeat, None, &[]),
-            outcome(&[Release(A), Press(A)], Some(PLAIN))
-        );
-        assert_eq!(
-            event(Some(SHIFT), repeat, None, &[SHIFT_L_KC]),
-            outcome(&[], Some(SHIFT))
-        );
-        assert_eq!(event(None, up, None, &[]), outcome(&[], None));
-        assert_eq!(
-            event(Some(PLAIN), up, None, &[]),
-            outcome(&[Release(A)], None)
-        );
-        assert_eq!(
-            event(Some(SHIFT), up, None, &[SHIFT_L_KC]),
-            outcome(&[Release(SHIFT_L_KC)], None)
-        );
-    }
-
-    /// A symbol's Shift is decided by the Shift keys held when it is pressed, so a repeat
-    /// after the viewer pressed or let go of Shift still types the same symbol.
-    #[test]
-    fn a_key_is_pressed_with_the_shift_its_symbol_needs() {
-        let either = Held::Key {
-            keycode: A,
-            level: Level::Either,
-        };
-        let shifts = [SHIFT_L_KC, SHIFT_R_KC];
-        assert_eq!(press(either, SHIFT_L_KC, &[]), [Press(A)]);
-        assert_eq!(press(either, SHIFT_L_KC, &shifts), [Press(A)]);
-        assert_eq!(press(PLAIN, SHIFT_L_KC, &[]), [Press(A)]);
-        assert_eq!(
-            press(PLAIN, SHIFT_L_KC, &shifts),
-            [
-                Release(SHIFT_L_KC),
-                Release(SHIFT_R_KC),
-                Press(A),
-                Press(SHIFT_L_KC),
-                Press(SHIFT_R_KC)
-            ]
-        );
-        assert_eq!(
-            press(SHIFTED, SHIFT_L_KC, &[]),
-            [Press(SHIFT_L_KC), Press(ONE), Release(SHIFT_L_KC)]
-        );
-        assert_eq!(press(SHIFTED, SHIFT_L_KC, &[SHIFT_R_KC]), [Press(ONE)]);
-        assert_eq!(press(SHIFT, SHIFT_L_KC, &[SHIFT_R_KC]), [Press(SHIFT_L_KC)]);
-    }
-
     /// Every sequence of up to six key events over 'a', '!' (shifted, on the '1' key) and
     /// Shift, carried out as `Injector::key` does. The oracle is a model with no `Held`
     /// in it: a key is held from a down until its up. After every event X's keys are
     /// valid (nothing pressed twice or released while up) and exactly the held keys are
-    /// down; and a key's own keycode is pressed once for a down of a key not held and
-    /// once for a repeat of a held key that isn't a modifier, never otherwise.
+    /// down; a key's own keycode is pressed once for a down of a key not held and once for
+    /// a repeat of a held key that isn't a modifier, never otherwise; and a symbol is
+    /// pressed with Shift down exactly when its level needs it.
     #[test]
     fn x_holds_exactly_what_the_viewer_holds_and_types_each_repeat_once() {
         const KEYS: [(u32, Held); 3] = [(0x61, PLAIN), (0x21, SHIFTED), (SHIFT_L, SHIFT)];
@@ -870,6 +797,20 @@ mod tests {
                         match s {
                             Press(kc) => {
                                 assert!(!st.x.contains(&kc), "{kc} pressed twice: {events:?}");
+                                // Its symbol is typed with the Shift its level needs.
+                                let shifted =
+                                    st.x.iter().any(|k| [SHIFT_L_KC, SHIFT_R_KC].contains(k));
+                                match key {
+                                    Held::Key { keycode, level } if keycode == kc => {
+                                        let right = match level {
+                                            Level::Either => true,
+                                            Level::Plain => !shifted,
+                                            Level::Shifted => shifted,
+                                        };
+                                        assert!(right, "{kc} typed shifted {shifted}: {events:?}");
+                                    }
+                                    Held::Key { .. } | Held::Modifier(_) => {}
+                                }
                                 st.x.push(kc);
                             }
                             Release(kc) => {
@@ -895,9 +836,10 @@ mod tests {
                     assert_eq!(got, want, "X's keys after {events:?}");
                     let typed = out.strokes.iter().filter(|&&s| s == Press(key.keycode()));
                     let once = match (act, key) {
-                        (KeyAct::Down, _) => !was_held,
+                        (KeyAct::Down, Held::Key { .. } | Held::Modifier(_)) => !was_held,
                         (KeyAct::Repeat, Held::Key { .. }) => was_held,
-                        (KeyAct::Repeat, Held::Modifier(_)) | (KeyAct::Up, _) => false,
+                        (KeyAct::Repeat, Held::Modifier(_))
+                        | (KeyAct::Up, Held::Key { .. } | Held::Modifier(_)) => false,
                     };
                     assert_eq!(typed.count(), usize::from(once), "{events:?}");
                     walk(&st, depth - 1, events, seen);

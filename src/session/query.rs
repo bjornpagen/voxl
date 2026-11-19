@@ -186,8 +186,7 @@ pub async fn answer(
             // The asker's stream closing ends it; anything it sends before is not read
             // for meaning.
             tokio::spawn(async move {
-                let mut sink = [0u8; 256];
-                while matches!(read.read(&mut sink).await, Ok(n) if n > 0) {}
+                drained(&mut read).await;
                 if stop.send(()).is_err() {
                     log::debug!("a recording ended before its asker's stream did");
                 }
@@ -256,6 +255,18 @@ pub enum Asked {
     Refused(String),
 }
 
+/// Reads `r` until it ends, making nothing of what it says: closed, or failed, which ends a
+/// stream for its reader as its close does.
+async fn drained(r: &mut (impl AsyncRead + Unpin)) {
+    let mut sink = [0u8; 256];
+    loop {
+        match r.read(&mut sink).await {
+            Ok(1..) => {}
+            Ok(0) | Err(_) => return,
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 /// Asks `query` on `socket`; for a recording until closed, `input` ending closes the
 /// asking side. The answer is copied to `output`.
@@ -269,8 +280,7 @@ pub async fn ask(
     to.write_all(&Opening::Query(query).bytes()).await?;
     let ends = match query {
         Query::Record(Recording::UntilClosed) => Some(tokio::spawn(async move {
-            let mut sink = [0u8; 256];
-            while matches!(input.read(&mut sink).await, Ok(n) if n > 0) {}
+            drained(&mut input).await;
             // A daemon that has already answered has closed its end.
             if let Err(e) = to.shutdown().await {
                 eprintln!("voxl: the end of the recording not told: {e}");

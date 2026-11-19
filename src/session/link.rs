@@ -2,9 +2,10 @@
 //! whether a capture may start, given the path the lane crosses.
 //!
 //! The daemon's socket says nothing of what arrived: the transport's flow-control window
-//! accepts megabytes past a hole in the stream. So the page says when it took each update,
-//! the relay says so on the control stream (`wire::Up::Took`), and what is on the way is
-//! exactly what was sent and no took has named yet ([`Outstanding`]).
+//! accepts megabytes past a hole in the stream. So the page says when it took each of the
+//! lane's frames (a video update or an Opus packet: both cross the same path and press the
+//! same window), the relay says so on the control stream (`wire::Up::Took`), and what is on
+//! the way is exactly what was sent and no took has named yet ([`Outstanding`]).
 //!
 //! A capture may start ([`Gate`], [`Outstanding::gate`]) when what is on the way is within
 //! what the path takes in its round trip and [`RESPONSE`], and no frame sent is later than
@@ -12,7 +13,7 @@
 //! here: whoever knows them says them ([`Path`]). Today that is `estimate`, which guesses
 //! them from the tooks.
 //!
-//! Every frame is coded whole, at one quality (`vp9`): the gate alone bounds what is in
+//! Every frame is coded whole, at one quality (`av1`): the gate alone bounds what is in
 //! flight, by holding the next capture, never by shrinking a frame.
 //!
 //! Everything here is a function of state and one event, with the time an argument:
@@ -21,7 +22,7 @@
 //! under it (`hub::Client`), so a later time less an earlier one is taken as it is.
 
 use super::estimate::Note;
-use crate::wire::Version;
+use crate::wire::Sequence;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -137,10 +138,10 @@ pub enum Gate {
     Late,
 }
 
-/// A frame sent on a lane and not yet told taken.
+/// A frame (a video update or an Opus packet) sent on a lane and not yet told taken.
 #[derive(Clone, Copy, Debug)]
 pub struct Sent {
-    pub version: Version,
+    pub sequence: Sequence,
     pub at: Instant,
     pub bytes: u64,
     /// What the estimator noted of it as it went, to read when it is told taken: nothing
@@ -173,21 +174,21 @@ pub struct Stats {
 }
 
 impl Outstanding {
-    /// A frame of `bytes`, named `version`, went onto the lane at `now`.
-    pub fn sent(&mut self, version: Version, bytes: u64, note: Note, now: Instant) {
+    /// A frame of `bytes`, named `sequence`, went onto the lane at `now`.
+    pub fn sent(&mut self, sequence: Sequence, bytes: u64, note: Note, now: Instant) {
         self.frames.push_back(Sent {
-            version,
+            sequence,
             at: now,
             bytes,
             note,
         });
     }
 
-    /// The page took the update named `version`, and so every update the lane carried
-    /// before it: they are on the way no longer. None if no frame on the way has that
+    /// The page took the frame named `sequence`, and so every frame the lane carried before
+    /// it: they are on the way no longer. None if no frame on the way has that
     /// name: a took of a lane since replaced, or of nothing ever sent, takes nothing.
-    pub fn took(&mut self, version: Version) -> Option<Taken> {
-        let at = self.frames.iter().position(|s| s.version == version)?;
+    pub fn took(&mut self, sequence: Sequence) -> Option<Taken> {
+        let at = self.frames.iter().position(|s| s.sequence == sequence)?;
         let named = self.frames[at];
         let bytes = self.frames.drain(..=at).map(|s| s.bytes).sum();
         Some(Taken { named, bytes })
@@ -245,7 +246,7 @@ impl Outstanding {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use crate::wire::Version;
+    use crate::wire::Sequence;
     use std::collections::VecDeque;
     use std::time::{Duration, Instant};
 
@@ -268,7 +269,7 @@ pub(crate) mod tests {
         /// Since when it has been busy without a pause.
         busy_from: Instant,
         /// The tooks to come, in order: when, and of which frame.
-        pub(crate) tooks: VecDeque<(Instant, Version)>,
+        pub(crate) tooks: VecDeque<(Instant, Sequence)>,
     }
 
     impl Simulated {
@@ -348,7 +349,7 @@ pub(crate) mod tests {
         /// A frame is given to it at `now`: its took is to come, at the time returned.
         pub(crate) fn send(
             &mut self,
-            version: Version,
+            sequence: Sequence,
             bytes: u64,
             jitter: Duration,
             now: Instant,
@@ -360,16 +361,17 @@ pub(crate) mod tests {
             let told = self.free + self.delay + jitter;
             let told = self.hole(told).map_or(told, |(_, ends)| ends);
             let told = self.tooks.back().map_or(told, |(last, _)| told.max(*last));
-            self.tooks.push_back((told, version));
+            self.tooks.push_back((told, sequence));
             told
         }
 
         /// The tooks due by `now` are told to `took`, each with its time, in order.
-        pub(crate) fn tell(&mut self, now: Instant, mut took: impl FnMut(Version, Instant)) {
-            while let Some((at, version)) = self.tooks.front().copied().filter(|(at, _)| *at <= now)
+        pub(crate) fn tell(&mut self, now: Instant, mut took: impl FnMut(Sequence, Instant)) {
+            while let Some((at, sequence)) =
+                self.tooks.front().copied().filter(|(at, _)| *at <= now)
             {
                 self.tooks.pop_front();
-                took(version, at);
+                took(sequence, at);
             }
         }
     }

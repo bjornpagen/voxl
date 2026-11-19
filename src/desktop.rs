@@ -18,12 +18,12 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
 use crate::event::{Bin, ClipContent};
-use crate::wire::MAX_DOWN_BINARY;
+use crate::wire::{Byte, MAX_DOWN_BINARY};
 use x11rb::errors::{ConnectionError, ReplyError};
 
 /// The largest clipboard image sent to the viewers: what a page's binary message carries
 /// (`MAX_DOWN_BINARY`) after the image's type byte.
-const MAX_IMAGE: usize = MAX_DOWN_BINARY - std::mem::size_of::<Bin>();
+const MAX_IMAGE: usize = MAX_DOWN_BINARY - std::mem::size_of::<u8>();
 
 /// Sets the remote CLIPBOARD and returns once the X server has registered us as owner,
 /// so a paste shortcut injected right afterwards sees the new contents.
@@ -63,6 +63,43 @@ struct Atoms {
     incr: u32,
     prop: u32,
     png: u32,
+}
+
+/// What a client asks the clipboard this thread owns to be converted to.
+#[derive(Clone, Copy)]
+enum Target {
+    /// The targets it can be converted to.
+    Targets,
+    /// One of [`Atoms::texts`].
+    Text,
+    Png,
+    /// Anything else, which this thread has none of.
+    Other,
+}
+
+impl Atoms {
+    /// The text targets a text is offered as, in the order offered.
+    fn texts(&self) -> [u32; 4] {
+        [
+            self.utf8,
+            u32::from(AtomEnum::STRING),
+            self.text,
+            self.text_plain,
+        ]
+    }
+
+    /// What `atom` asks for, as a requestor's target.
+    fn target(&self, atom: u32) -> Target {
+        if atom == self.targets {
+            Target::Targets
+        } else if self.texts().contains(&atom) {
+            Target::Text
+        } else if atom == self.png {
+            Target::Png
+        } else {
+            Target::Other
+        }
+    }
 }
 
 fn atom(c: &RustConnection, name: &str) -> Result<u32, String> {
@@ -222,8 +259,19 @@ impl Desktop {
         send_cursor(&self.conn, &self.hub)?;
         loop {
             let mut drain = [0u8; 64];
-            while matches!(read(wake_r, &mut drain), Ok(n) if n > 0) {}
-            while let Ok((content, done)) = rx.try_recv() {
+            // Emptied: the wakes are only that the viewers' clipboards are to be read.
+            loop {
+                match read(wake_r, &mut drain) {
+                    Ok(1..) | Err(nix::errno::Errno::EINTR) => {}
+                    Ok(0) | Err(nix::errno::Errno::EAGAIN) => break,
+                    Err(e) => return Err(ConnectionError::IoError(e.into())),
+                }
+            }
+            loop {
+                let (content, done) = match rx.try_recv() {
+                    Ok(set) => set,
+                    Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+                };
                 self.own(content)?;
                 if done.send(()).is_err() {
                     log::info!("a clipboard was set for an input thread that had gone");
@@ -331,9 +379,11 @@ impl Desktop {
                 conn.flush()?;
             }
             Ours::Asked(e) => {
-                let prop = match e.property {
-                    x11rb::NONE => e.target,
-                    p => p,
+                // A requestor that names no property (X's None, 0) is an old one: its
+                // target is the property (ICCCM 2.2).
+                let prop = match std::num::NonZeroU32::new(e.property) {
+                    Some(named) => named.get(),
+                    None => e.target,
                 };
                 let given = self.answer(&e, prop)?;
                 let notify = xproto::SelectionNotifyEvent {
@@ -367,41 +417,28 @@ impl Desktop {
         if e.selection != atoms.clipboard {
             return Ok(false);
         }
-        let text_targets = [
-            atoms.utf8,
-            atoms.text,
-            atoms.text_plain,
-            u32::from(AtomEnum::STRING),
-        ];
         let put8 = |target, bytes: &[u8]| {
             conn.change_property8(PropMode::REPLACE, e.requestor, prop, target, bytes)
         };
         let put_targets = |list: &[u32]| {
             conn.change_property32(PropMode::REPLACE, e.requestor, prop, AtomEnum::ATOM, list)
         };
-        match &self.owned {
-            Some(ClipContent::Text(_)) | Some(ClipContent::Image(_))
-                if e.target == atoms.targets =>
-            {
-                let list: &[u32] = match &self.owned {
-                    Some(ClipContent::Image(_)) => &[atoms.targets, atoms.png],
-                    _ => &[
-                        atoms.targets,
-                        atoms.utf8,
-                        u32::from(AtomEnum::STRING),
-                        atoms.text,
-                        atoms.text_plain,
-                    ],
-                };
-                put_targets(list)?;
+        match (&self.owned, atoms.target(e.target)) {
+            (Some(ClipContent::Image(_)), Target::Targets) => {
+                put_targets(&[atoms.targets, atoms.png])?;
                 Ok(true)
             }
-            Some(ClipContent::Text(text)) if text_targets.contains(&e.target) => {
+            (Some(ClipContent::Text(_)), Target::Targets) => {
+                let [a, b, c, d] = atoms.texts();
+                put_targets(&[atoms.targets, a, b, c, d])?;
+                Ok(true)
+            }
+            (Some(ClipContent::Text(text)), Target::Text) => {
                 put8(e.target, text.as_bytes())?;
                 Ok(true)
             }
             // An image longer than the X server's longest request is no property it takes.
-            Some(ClipContent::Image(png)) if e.target == atoms.png => match put8(atoms.png, png) {
+            (Some(ClipContent::Image(png)), Target::Png) => match put8(atoms.png, png) {
                 Ok(_) => Ok(true),
                 Err(ConnectionError::MaximumRequestLengthExceeded) => {
                     log::warn!(
@@ -412,7 +449,9 @@ impl Desktop {
                 }
                 Err(e) => Err(e),
             },
-            Some(_) | None => Ok(false),
+            (Some(ClipContent::Text(_)), Target::Png | Target::Other)
+            | (Some(ClipContent::Image(_)), Target::Text | Target::Other)
+            | (None, Target::Targets | Target::Text | Target::Png | Target::Other) => Ok(false),
         }
     }
 }
@@ -447,7 +486,7 @@ fn publish(hub: &Hub, atoms: &Atoms, target: u32, data: Vec<u8>, last_image: &mu
         }
         *last_image = Some(h);
         let mut msg = Vec::with_capacity(data.len() + 1);
-        msg.push(Bin::ClipImage as u8);
+        msg.push(Bin::ClipImage.byte());
         msg.extend_from_slice(&data);
         let b = Bytes::from(msg);
         hub.broadcast(|| Out::Bin(b.clone()));
@@ -475,28 +514,26 @@ fn send_cursor(conn: &RustConnection, hub: &Hub) -> Result<(), ConnectionError> 
     let Some(img) = said(conn.xfixes_get_cursor_image()?.reply()) else {
         return Ok(());
     };
-    let (w, h) = (img.width as usize, img.height as usize);
+    let (w, h) = (usize::from(img.width), usize::from(img.height));
     let mut msg = Vec::with_capacity(14 + w * h * 4);
-    msg.push(Bin::Cursor as u8);
+    msg.push(Bin::Cursor.byte());
     msg.push(0);
-    msg.extend_from_slice(&(w as u16).to_be_bytes());
-    msg.extend_from_slice(&(h as u16).to_be_bytes());
+    msg.extend_from_slice(&img.width.to_be_bytes());
+    msg.extend_from_slice(&img.height.to_be_bytes());
     msg.extend_from_slice(&img.xhot.to_be_bytes());
     msg.extend_from_slice(&img.yhot.to_be_bytes());
     msg.extend_from_slice(&img.cursor_serial.to_be_bytes());
     for &p in img.cursor_image.iter().take(w * h) {
-        let a = (p >> 24) & 0xff;
-        // Un-premultiplied; a transparent pixel's colour is none.
-        let un = |c: u32| match (c * 255 + a / 2).checked_div(a) {
-            Some(v) => v.min(255) as u8,
-            None => 0,
+        let [a, r, g, b] = p.to_be_bytes();
+        // Un-premultiplied, rounded, and held to a byte (a colour over its alpha is none a
+        // premultiplied pixel has); a transparent pixel's colour is none.
+        let un = |c: u8| match u32::from(a) {
+            0 => 0,
+            alpha @ 1.. => {
+                u8::try_from((u32::from(c) * 255 + alpha / 2) / alpha).unwrap_or(u8::MAX)
+            }
         };
-        msg.extend_from_slice(&[
-            un((p >> 16) & 0xff),
-            un((p >> 8) & 0xff),
-            un(p & 0xff),
-            a as u8,
-        ]);
+        msg.extend_from_slice(&[un(r), un(g), un(b), a]);
     }
     let b = Bytes::from(msg);
     *hub.cursor.lock() = Some(b.clone());

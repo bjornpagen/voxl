@@ -3,10 +3,10 @@
 //!
 //! The lane is one stream through the transport's proxy: the session's [`Capability`] (relay
 //! to daemon, the lane's first bytes and its only ones that way), then frames (daemon to
-//! relay, [`Frame`]): video updates, each after its [`Header`], which names it by its
-//! [`Version`], and Opus packets.
+//! relay, [`Frame`]): each named by its [`Sequence`], and each a message for the page, a
+//! video update (its [`Header`], then its picture) or an Opus packet.
 //! The control stream is the stdio of `voxl attach` over ssh: [`Down`] (daemon to relay) and
-//! [`Up`] (relay to daemon), which also tells the daemon each video update the page took:
+//! [`Up`] (relay to daemon), which also tells the daemon each lane message the page took:
 //! delivery is told, never read off the lane's socket, which accepts far more than arrives.
 //! A frame and a control message each go after their length ([`Framer`]). Numbers are
 //! big-endian, as the page's video header is.
@@ -37,9 +37,31 @@ pub const PREFIX: usize = std::mem::size_of::<u32>();
 /// A capability's bytes: 256 bits, the contract's capability (§2).
 pub const CAPABILITY: usize = 32;
 
-/// A video update's name: what the daemon numbered the frame, which the relay says back
-/// when the page took it ([`Up::Took`]). Names are matched, never ordered: a lane carries
-/// its updates in order, and a name is one frame's for the session's life.
+/// The Opus packets of desktop audio the page's player holds (`desktopAudio.packets` in
+/// web/src/wire.json, which the player reads; a test holds the two equal): what a lane
+/// keeps of the sound while its gate is not open. Sound older than that the page would drop
+/// on arrival, after it had waited ahead of the video on the lane.
+pub const PLAYER_PACKETS: usize = 2;
+
+/// A lane message's name: the session's count of the messages its lanes were sent, video
+/// and audio alike, which the relay says back when the page took the message
+/// ([`Up::Took`]). It is the one name a lane message has. Names are matched, never ordered:
+/// a lane carries its messages in order, and a name is one message's for the session's
+/// life (it wraps after 2^32 messages: 310 days of video at 60 a second and sound at 100).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Sequence(pub u32);
+
+impl Sequence {
+    /// The name of the message after this one.
+    pub fn next(self) -> Sequence {
+        Sequence(self.0.wrapping_add(1))
+    }
+}
+
+/// A coded picture's number: the capture it was coded from, counted for the daemon, which
+/// its header carries ([`Header::version`]). It names a picture, not a lane message: one
+/// picture goes to every viewer's lane and to a recording, as a message of a different
+/// [`Sequence`] on each, and nothing that tells delivery reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Version(pub u32);
 
@@ -117,11 +139,11 @@ impl Drop for Capability {
 }
 
 /// What a frame is. Its byte is the page's type byte of the same message (`bin.video` and
-/// `bin.audio` in web/src/wire.json), so a frame as the lane carries it is the page's message
-/// as it is, and the relay hands it on unchanged.
+/// `bin.audio` in web/src/wire.json), so a frame as the lane carries it is its name and then
+/// the page's message as it is, which the relay hands on unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Track {
-    /// One video update: its header ([`Header`]) and its VP9.
+    /// One video update: its header ([`Header`]) and its AV1 temporal unit.
     Video,
     /// One Opus packet.
     Audio,
@@ -151,19 +173,24 @@ impl Byte for Track {
     }
 }
 
-/// A frame on the lane, daemon to relay, after its length: its track's byte, then its bytes.
-/// The lane is a stream: every frame arrives whole, in the order sent.
+/// A frame on the lane, daemon to relay, after its length: its [`Sequence`], then the page's
+/// message as it is, its track's byte and then its bytes. The lane is a stream: every frame
+/// arrives whole, in the order sent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Frame<'a> {
+    pub sequence: Sequence,
     pub track: Track,
     pub bytes: &'a [u8],
+    /// The track's byte and `bytes`, as the frame carries them: the page's message.
+    page: &'a [u8],
 }
 
 impl<'a> Frame<'a> {
-    /// Appends the frame of `track` and `bytes` to `out`, after its length. Its track's byte
-    /// and `bytes` are at most [`MAX_MESSAGE`].
-    pub fn encode(track: Track, bytes: &[u8], out: &mut Vec<u8>) {
+    /// Appends the frame named `sequence` of `track` and `bytes` to `out`, after its
+    /// length. It is at most [`MAX_MESSAGE`].
+    pub fn encode(sequence: Sequence, track: Track, bytes: &[u8], out: &mut Vec<u8>) {
         let start = open(out);
+        out.extend_from_slice(&sequence.0.to_be_bytes());
         out.push(track.byte());
         out.extend_from_slice(bytes);
         close(out, start);
@@ -172,10 +199,20 @@ impl<'a> Frame<'a> {
     /// Reads one frame, as [`Framer::frame`] gives it (without its length).
     pub fn decode(b: &'a [u8]) -> Result<Frame<'a>, Malformed> {
         let mut r = Reader(b);
+        let sequence = Sequence(u32::from_be_bytes(*r.chunk()?));
+        let page = r.0;
         Ok(Frame {
+            sequence,
             track: r.member(Malformed::Track)?,
             bytes: r.rest(),
+            page,
         })
+    }
+
+    /// The page's message: the frame without its sequence, which the relay hands on as it
+    /// is.
+    pub fn page(&self) -> &'a [u8] {
+        self.page
     }
 }
 
@@ -203,8 +240,8 @@ impl Byte for Coding {
     }
 }
 
-/// What a video frame says before its VP9, on the lane: the daemon's encode loop writes it,
-/// and the recorder, the relay (which reads the version of each update it hands the page) and
+/// What a video frame says before its picture, on the lane: the daemon's encode loop writes
+/// it, and the recorder, the relay (which refuses a lane whose update is not one) and
 /// web/src/protocol.ts read it, each checking its reader against web/src/video-header.json.
 /// What a frame is (video or audio) the lane's [`Track`] says, as the page's type byte. Every
 /// update refers only to the keyframe before it on its lane and frames after that keyframe,
@@ -212,7 +249,7 @@ impl Byte for Coding {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Header {
     pub coding: Coding,
-    /// The frame's name, which the relay says back when the page took it.
+    /// The capture the picture was coded from.
     pub version: Version,
     pub pipe: Pipe,
 }
@@ -234,7 +271,7 @@ impl Pipe {
 }
 
 impl Header {
-    /// The VP9 starts this far into a frame.
+    /// The AV1 temporal unit starts this far into a frame.
     pub const LEN: usize = 9;
 
     /// Flags, then the version, then pipe, big-endian.
@@ -247,9 +284,9 @@ impl Header {
     }
 
     /// What a video frame's bytes `m` are ([`Frame::bytes`] of [`Track::Video`]). Bytes too
-    /// few for a header, and a flags byte with any bit set but the keyframe's, are refused:
-    /// the page's reader refuses the same (web/src/protocol.ts), so no reader takes a
-    /// header another does not.
+    /// few for a header, a flags byte with any bit set but the keyframe's, and a header with
+    /// no picture after it, are refused: the page's reader refuses the same
+    /// (web/src/protocol.ts), so no reader takes an update another does not.
     pub fn read(m: &[u8]) -> Result<Video<'_>, Malformed> {
         let Some((b, picture)) = m.split_first_chunk::<{ Header::LEN }>() else {
             return Err(Malformed::Truncated);
@@ -259,20 +296,19 @@ impl Header {
             version: Version(u32::from_be_bytes([b[1], b[2], b[3], b[4]])),
             pipe: Pipe(u32::from_be_bytes([b[5], b[6], b[7], b[8]])),
         };
-        Ok(match picture {
-            [] => Video::Empty(header),
-            [_, ..] => Video::Picture(header, picture),
-        })
+        match picture {
+            [] => Err(Malformed::NoPicture),
+            [_, ..] => Ok(Video { header, picture }),
+        }
     }
 }
 
-/// A video frame, read.
+/// A video update, read: its header, and the picture after it, never empty (the encode loop
+/// sends no update that coded nothing).
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Video<'a> {
-    /// Its header, and its VP9 after it.
-    Picture(Header, &'a [u8]),
-    /// A header with nothing after it. The encode loop sends no frame that coded nothing.
-    Empty(Header),
+pub struct Video<'a> {
+    pub header: Header,
+    pub picture: &'a [u8],
 }
 
 /// A control message from the daemon to the relay.
@@ -364,12 +400,12 @@ pub enum Up<'a> {
     Text(&'a str),
     /// A binary message from the page (the microphone, a clipboard image).
     Binary(&'a [u8]),
-    /// The page took a video update: the one named `version` is decoded and shown, and so is
-    /// every update the lane carried before it. The relay makes it of the page's own word
-    /// (`bin.took` in web/src/wire.json), which it never hands on as it came. Versions are
-    /// unique for a session, so a took of a lane since replaced names nothing the daemon
-    /// still waits for.
-    Took { version: Version },
+    /// The page took a lane message: the one named `sequence` is done with (an update decoded
+    /// and shown, a packet played into its ring), and so is every message the lane carried
+    /// before it. The relay makes it of the page's own word (`bin.took` in
+    /// web/src/wire.json), which it never hands on as it came. Sequences are unique for a
+    /// session, so a took of a lane since replaced names nothing the daemon still waits for.
+    Took { sequence: Sequence },
 }
 
 /// The first byte of a message from the relay to the daemon: which it is.
@@ -405,9 +441,9 @@ impl<'a> Up<'a> {
                 out.push(UpTag::Binary.byte());
                 out.extend_from_slice(b);
             }
-            Up::Took { version } => {
+            Up::Took { sequence } => {
                 out.push(UpTag::Took.byte());
-                out.extend_from_slice(&version.0.to_be_bytes());
+                out.extend_from_slice(&sequence.0.to_be_bytes());
             }
         }
         close(out, start);
@@ -421,7 +457,7 @@ impl<'a> Up<'a> {
             UpTag::Binary => Ok(Up::Binary(r.rest())),
             UpTag::Took => {
                 let took = Up::Took {
-                    version: Version(u32::from_be_bytes(*r.chunk()?)),
+                    sequence: Sequence(u32::from_be_bytes(*r.chunk()?)),
                 };
                 r.end()?;
                 Ok(took)
@@ -443,6 +479,8 @@ pub enum Malformed {
     Track(u8),
     /// A video header's flags with a bit no reader knows.
     Flags(u8),
+    /// A video header with no picture after it.
+    NoPicture,
     /// Text that is not UTF-8.
     Utf8,
     /// A framed length over [`MAX_MESSAGE`].
@@ -457,6 +495,7 @@ impl std::fmt::Display for Malformed {
             Malformed::Tag(t) => write!(f, "no message has tag {t}"),
             Malformed::Track(t) => write!(f, "no track has byte {t}"),
             Malformed::Flags(b) => write!(f, "a video header with flags {b:#04x}"),
+            Malformed::NoPicture => write!(f, "a video header with no picture after it"),
             Malformed::Utf8 => write!(f, "text that is not UTF-8"),
             Malformed::Long(n) => write!(f, "a message of {n} bytes, over the longest"),
         }
@@ -576,7 +615,7 @@ mod tests {
         let n = rng.below(3000) as usize;
         let data = bytes(rng, n);
         let mut out = Vec::new();
-        Frame::encode(track, &data, &mut out);
+        Frame::encode(Sequence(rng.next() as u32), track, &data, &mut out);
         out[PREFIX..].to_vec()
     }
 
@@ -604,7 +643,7 @@ mod tests {
         match UpTag::ALL[rng.below(3) as usize] {
             UpTag::Text => Up::Text("k,65,1").encode(&mut out),
             UpTag::Took => Up::Took {
-                version: Version(rng.next() as u32),
+                sequence: Sequence(rng.next() as u32),
             }
             .encode(&mut out),
             UpTag::Binary => Up::Binary(&{
@@ -652,7 +691,7 @@ mod tests {
         match kind {
             Kind::Frame => {
                 let f = Frame::decode(b)?;
-                Frame::encode(f.track, f.bytes, &mut out)
+                Frame::encode(f.sequence, f.track, f.bytes, &mut out)
             }
             Kind::Down => Down::decode(b)?.encode(&mut out),
             Kind::Up => Up::decode(b)?.encode(&mut out),
@@ -770,16 +809,44 @@ mod tests {
         assert_eq!(wire["bin"]["audio"], u64::from(Track::Audio.byte()));
     }
 
-    /// The relay's took reads back as the version it was written from, over generated
-    /// versions.
+    /// What a lane keeps of the sound while its gate is shut is what the page's player
+    /// holds: web/src/wire.json's `desktopAudio.packets`.
     #[test]
-    fn a_took_reads_back_as_its_version() {
+    fn a_lane_holds_the_sound_the_players_ring_holds() {
+        let wire: serde_json::Value =
+            serde_json::from_str(include_str!("../web/src/wire.json")).unwrap();
+        assert_eq!(wire["desktopAudio"]["packets"], PLAYER_PACKETS as u64);
+    }
+
+    /// The relay's took reads back as the sequence it was written from, over generated
+    /// sequences.
+    #[test]
+    fn a_took_reads_back_as_its_sequence() {
         let mut rng = Xorshift::new(0x2FFD_72DB_D01A_DFB7);
         for _ in 0..20_000 {
-            let version = Version(rng.next() as u32);
+            let sequence = Sequence(rng.next() as u32);
             let mut out = Vec::new();
-            Up::Took { version }.encode(&mut out);
-            assert_eq!(Up::decode(&out[PREFIX..]), Ok(Up::Took { version }));
+            Up::Took { sequence }.encode(&mut out);
+            assert_eq!(Up::decode(&out[PREFIX..]), Ok(Up::Took { sequence }));
+        }
+    }
+
+    /// A frame reads back as the sequence, track and bytes it was written from, and its
+    /// page message is exactly its track's byte and its bytes: what the relay hands the
+    /// page carries no sequence, over generated frames.
+    #[test]
+    fn a_frame_is_its_sequence_then_the_pages_message() {
+        let mut rng = Xorshift::new(0x7A1C_55E0_03D9_B2C4);
+        for _ in 0..20_000 {
+            let sequence = Sequence(rng.next() as u32);
+            let track = Track::ALL[rng.below(2) as usize];
+            let n = rng.below(300) as usize;
+            let data = bytes(&mut rng, n);
+            let mut out = Vec::new();
+            Frame::encode(sequence, track, &data, &mut out);
+            let f = Frame::decode(&out[PREFIX..]).expect("a frame written reads");
+            assert_eq!((f.sequence, f.track, f.bytes), (sequence, track, &data[..]));
+            assert_eq!(f.page(), [&[track.byte()][..], &data].concat());
         }
     }
 
@@ -804,17 +871,25 @@ mod tests {
             let header = random_header(&mut rng);
             let picture: Vec<u8> = (0..1 + rng.next() % 64).map(|_| rng.next() as u8).collect();
             let message = [&header.bytes()[..], &picture].concat();
-            assert_eq!(Header::read(&message), Ok(Video::Picture(header, &picture)));
+            assert_eq!(
+                Header::read(&message),
+                Ok(Video {
+                    header,
+                    picture: &picture
+                })
+            );
         }
     }
 
+    /// A header with no picture after it is no update, and fewer bytes than a header are
+    /// cut short.
     #[test]
-    fn a_header_alone_is_empty_and_less_is_cut_short() {
+    fn a_header_alone_is_refused_and_less_is_cut_short() {
         let mut rng = Xorshift::new(0x2545_f491_4f6c_dd1d);
         for _ in 0..100_000 {
             let header = random_header(&mut rng);
             let bytes = header.bytes();
-            assert_eq!(Header::read(&bytes), Ok(Video::Empty(header)));
+            assert_eq!(Header::read(&bytes), Err(Malformed::NoPicture));
             let cut = (rng.next() % Header::LEN as u64) as usize;
             assert_eq!(Header::read(&bytes[..cut]), Err(Malformed::Truncated));
         }
@@ -829,14 +904,10 @@ mod tests {
         for flags in 0..=u8::MAX {
             let mut bytes = random_header(&mut rng).bytes().to_vec();
             bytes[0] = flags;
-            bytes.extend((0..rng.below(5)).map(|_| rng.next() as u8));
+            bytes.extend((0..rng.range(1, 5)).map(|_| rng.next() as u8));
             match (flags, Header::read(&bytes)) {
-                (0, Ok(Video::Picture(h, _) | Video::Empty(h))) => {
-                    assert_eq!(h.coding, Coding::Delta)
-                }
-                (1, Ok(Video::Picture(h, _) | Video::Empty(h))) => {
-                    assert_eq!(h.coding, Coding::Key)
-                }
+                (0, Ok(v)) => assert_eq!(v.header.coding, Coding::Delta),
+                (1, Ok(v)) => assert_eq!(v.header.coding, Coding::Key),
                 (2.., Err(e)) => assert_eq!(e, Malformed::Flags(flags)),
                 (0 | 1, read @ Err(_)) | (2.., read @ Ok(_)) => {
                     panic!("flags {flags}: {read:?}")
@@ -901,13 +972,17 @@ mod tests {
             let message = [bytes, &picture].concat();
             assert_eq!(
                 Header::read(&message),
-                Ok(Video::Picture(header, &picture)),
+                Ok(Video {
+                    header,
+                    picture: &picture
+                }),
                 "{}",
                 c.header
             );
             let mut framed = Vec::new();
-            Frame::encode(Track::Video, &message, &mut framed);
-            assert_eq!(framed[PREFIX..], [&page[..], &picture].concat());
+            Frame::encode(Sequence(c.version), Track::Video, &message, &mut framed);
+            let frame = Frame::decode(&framed[PREFIX..]).expect("a frame written reads");
+            assert_eq!(frame.page(), [&page[..], &picture].concat());
         }
     }
 

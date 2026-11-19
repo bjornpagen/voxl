@@ -8,7 +8,9 @@ import wire from '../wire.json' with { type: 'json' };
 const FRAME = wire.desktopAudio.frameSamples;
 
 /**
- * The packets the ring holds, beside what the device takes at a time.
+ * The packets the ring holds, beside what the device takes at a time: wire.json's, since the
+ * daemon keeps no more than this of the sound while its lane's gate is shut (src/wire.rs's
+ * `PLAYER_PACKETS`).
  *
  * @limitKind derived, and measured against the player before it
  * @owner the page's desktop audio player
@@ -27,7 +29,7 @@ const FRAME = wire.desktopAudio.frameSamples;
  * @revalidate a change of the packet's length; a device that takes more than two packets
  * at a time; the sound on a real link, which this run did not have
  */
-const PACKETS = 2;
+const PACKETS = wire.desktopAudio.packets;
 
 class PcmPlayer extends AudioWorkletProcessor<PlayerOptions> {
 	/** The most waits: the packets, and what the device takes at a time (it renders that

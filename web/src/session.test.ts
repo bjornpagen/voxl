@@ -207,7 +207,7 @@ function run(seed: number) {
 		if (kind === 5) {
 			const hello = {
 				t: 'hello',
-				codec: `vp09.00.${10 + draw(52)}.08`,
+				codec: `av01.0.${String(draw(20)).padStart(2, '0')}M.08`,
 				files: { dir: text(), root: text() },
 				resize: { scale: (1 + draw(300)) / 100 },
 			} as const;

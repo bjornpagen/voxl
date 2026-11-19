@@ -34,10 +34,19 @@ function queued(t: Track, frame: VideoFrame): Queue {
 			t.writer
 				.write(frame)
 				.catch((e: unknown) => console.warn('[voxl] video track:', e))
-				.finally(() => {
+				// What it returns says only that every state of the queue has its case.
+				.finally((): 'done' => {
 					const q = t.queue;
 					t.queue = { s: 'idle' };
-					if (q.s === 'next') write(t, q.frame);
+					switch (q.s) {
+						case 'next':
+							write(t, q.frame);
+							return 'done';
+						// Nothing came behind it.
+						case 'idle':
+						case 'writing':
+							return 'done';
+					}
 				});
 			return { s: 'writing' };
 	}

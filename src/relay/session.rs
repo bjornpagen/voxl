@@ -3,7 +3,7 @@
 //! reconnects by itself.
 //!
 //! The control stream carries the page's messages up as they are, the daemon's down as they
-//! are, the lane's confirmation, and the relay's own word of each update the page took. The
+//! are, the lane's confirmation, and the relay's own word of each frame the page took. The
 //! lane is one stream through an HTTP CONNECT proxy, which carries every frame whole and in
 //! order: the screen's updates and the sound.
 //!
@@ -14,13 +14,14 @@
 //! the lane is open yet or not. What the page says goes up the control stream from the
 //! first, and what the daemon says goes to the page as it comes, whatever the lane is doing.
 //!
-//! **The hand-off.** The page is given one of the lane's frames at a time, as it is (a frame
-//! on the lane is the page's message), and the next only once the page has said it took the
-//! one before ([`TOOK`]); while the page holds one, the lane is not read. The page's socket
-//! cannot make the relay wait: what a browser lets arrive unread it queues where the daemon
-//! cannot see it (about a megabyte, measured), so the page says when it is done, and a page
-//! that falls behind backs up the lane. Each update the page takes is told to the daemon
-//! (`Up::Took`), which knows no delivery but that.
+//! **The hand-off.** The page is given one of the lane's frames at a time, its message as it
+//! is (a frame on the lane is its name, then the page's message), and the next only once the
+//! page has said it took the one before ([`TOOK`]); while the page holds one, the lane is not
+//! read. The page's socket cannot make the relay wait: what a browser lets arrive unread it
+//! queues where the daemon cannot see it (about a megabyte, measured), so the page says when
+//! it is done, and a page that falls behind backs up the lane. Each frame the page takes, a
+//! video update or an Opus packet, is told to the daemon by its name (`Up::Took`), which
+//! knows no delivery but that.
 //!
 //! **The hello comes first.** The hello crosses ssh and the first keyframe the lane, another
 //! transport, and either may arrive first; the page ends its session on an update before the
@@ -32,7 +33,7 @@
 
 use super::proxy::{self, ProxyError};
 use super::{files, ssh};
-use crate::wire::{self, Capability, Down, Frame, Framer, Header, Track, Up, Version, Video};
+use crate::wire::{self, Capability, Down, Frame, Framer, Header, Sequence, Track, Up};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::Response;
@@ -188,28 +189,19 @@ async fn run(socket: WebSocket, cfg: Arc<Config>) {
     }
 }
 
-/// What a frame of the lane is to the hand-off.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Given {
-    /// A video update: when the page takes it, the daemon is told its version.
-    Update { version: Version },
-    /// An Opus packet.
-    Packet,
-}
-
 /// The page's turn to be given a frame, sealed in its own module so that nothing else makes
 /// one: the page being given the session's hello makes it ([`hello`]), giving the page a
 /// frame spends it ([`Turn::give`]), and the page's word that it took the frame is the only
 /// thing that makes another ([`Untaken::taken`]). A turn is not copied, so a session holds
 /// at most one: while the session does not hold it, it is in the [`Hand`](super::Hand).
 mod turn {
-    use super::{End, Given, Message, Page};
+    use super::{End, Message, Page, Sequence};
 
     /// The page's turn, and the proof that the page has the session's hello.
     pub(super) struct Turn(());
 
-    /// A frame the page was given and has not said it took.
-    pub(super) struct Untaken(Given);
+    /// A frame the page was given and has not said it took: its name.
+    pub(super) struct Untaken(Sequence);
 
     /// Gives the page the session's hello, `text`: the one place a turn comes from nothing,
     /// and it is the session's only once the page's socket has taken the hello.
@@ -219,15 +211,15 @@ mod turn {
     }
 
     impl Turn {
-        /// The page is given a frame: the turn is spent on it.
-        pub(super) fn give(self, given: Given) -> Untaken {
-            Untaken(given)
+        /// The page is given the frame named `sequence`: the turn is spent on it.
+        pub(super) fn give(self, sequence: Sequence) -> Untaken {
+            Untaken(sequence)
         }
     }
 
     impl Untaken {
-        /// The page said it took the frame: what it was, and the turn for the next.
-        pub(super) fn taken(self) -> (Given, Turn) {
+        /// The page said it took the frame: its name, and the turn for the next.
+        pub(super) fn taken(self) -> (Sequence, Turn) {
             (self.0, Turn(()))
         }
     }
@@ -265,16 +257,16 @@ impl Hand {
         *self.slot.lock() = Slot::Given(untaken);
     }
 
-    /// The page said it took the frame it holds: what the frame was, and its turn comes
-    /// back. With no frame held, the page took nothing.
-    fn took(&self) -> Result<Given, End> {
+    /// The page said it took the frame it holds: the frame's name, and its turn comes back.
+    /// With no frame held, the page took nothing.
+    fn took(&self) -> Result<Sequence, End> {
         let mut slot = self.slot.lock();
         match std::mem::replace(&mut *slot, Slot::Empty) {
             Slot::Given(untaken) => {
-                let (given, turn) = untaken.taken();
+                let (sequence, turn) = untaken.taken();
                 *slot = Slot::Back(turn);
                 self.back.notify_one();
-                Ok(given)
+                Ok(sequence)
             }
             other @ (Slot::Empty | Slot::Back(_)) => {
                 *slot = other;
@@ -318,8 +310,7 @@ async fn upward(
             Some(Ok(Message::Text(t))) => Up::Text(t.as_str()).encode(&mut out),
             // The page's word: of the frame it holds.
             Some(Ok(Message::Binary(b))) if b.as_ref() == [TOOK] => match hand.took() {
-                Ok(Given::Update { version }) => Up::Took { version }.encode(&mut out),
-                Ok(Given::Packet) => continue,
+                Ok(sequence) => Up::Took { sequence }.encode(&mut out),
                 Err(end) => return end,
             },
             Some(Ok(Message::Binary(b))) => Up::Binary(&b).encode(&mut out),
@@ -402,29 +393,21 @@ impl<S: AsyncRead + Unpin> Open<S> {
         }
     }
 
-    /// The next whole frame, if one is in: what it is to the hand-off, and the page's
-    /// message, which is the frame as it is. An update is its header and a picture: one cut
-    /// short of either, or with flags no reader knows, is no frame.
-    fn frame(&mut self) -> Result<Option<(Given, Bytes)>, End> {
+    /// The next whole frame, if one is in: its name, and the page's message, which is the
+    /// frame as it is without its name. An update is its header and a picture: one cut short
+    /// of either, or with flags no reader knows, is no frame.
+    fn frame(&mut self) -> Result<Option<(Sequence, Bytes)>, End> {
         let Some(m) = self.framer.frame().map_err(End::Lane)? else {
             return Ok(None);
         };
-        let given = match Frame::decode(m).map_err(End::Lane)? {
-            Frame {
-                track: Track::Video,
-                bytes,
-            } => match Header::read(bytes).map_err(End::Lane)? {
-                Video::Picture(header, _) => Given::Update {
-                    version: header.version,
-                },
-                Video::Empty(_) => return Err(End::Lane(wire::Malformed::Truncated)),
-            },
-            Frame {
-                track: Track::Audio,
-                ..
-            } => Given::Packet,
-        };
-        Ok(Some((given, Bytes::copy_from_slice(m))))
+        let frame = Frame::decode(m).map_err(End::Lane)?;
+        match frame.track {
+            Track::Video => {
+                Header::read(frame.bytes).map_err(End::Lane)?;
+            }
+            Track::Audio => {}
+        }
+        Ok(Some((frame.sequence, Bytes::copy_from_slice(frame.page()))))
     }
 
     /// Reads what the lane has into its framer; or, at its end, says how it ended. Dropped
@@ -527,8 +510,8 @@ impl<'k, S: AsyncRead + AsyncWrite + Unpin> Lane<'k, S> {
         match self {
             Lane::Free { mut open, turn } => match open.frame()? {
                 None => Ok(Lane::Free { open, turn }),
-                Some((given, message)) => {
-                    hand.give(turn.give(given));
+                Some((sequence, message)) => {
+                    hand.give(turn.give(sequence));
                     page.send(Message::Binary(message)).await?;
                     Ok(Lane::Held { open })
                 }
@@ -818,8 +801,9 @@ struct Shared {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hub::{FilesConfig, Hello, Resize, ServerMessage, Settings, Startup};
+    use crate::hub::{FilesConfig, Hello, Resize, ServerMessage, Startup};
     use crate::session::control::Audio;
+    use crate::wire::Byte;
     use crate::xorshift::Xorshift;
     use tokio::io::DuplexStream;
     use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -836,18 +820,16 @@ mod tests {
                 .map(|_| ['/', 'a', 'é', '"', '\\', ' ', '7'][rng.below(7) as usize])
                 .collect();
             let hello = ServerMessage::Hello(Hello {
-                codec: Some(format!("vp09.00.{}.08", 10 + rng.below(52))),
-                settings: Settings {
-                    startup: Some(Startup {
-                        audio: [Audio::Sent, Audio::Off][rng.below(2) as usize],
-                        files: FilesConfig {
-                            root: root.clone(),
-                            dir: "Downloads".into(),
-                        },
-                        resize: Resize {
-                            scale: 0.5 + rng.below(8) as f64 / 4.0,
-                        },
-                    }),
+                codec: format!("av01.0.{:02}M.08", rng.below(20)),
+                startup: Startup {
+                    audio: [Audio::Sent, Audio::Off][rng.below(2) as usize],
+                    files: FilesConfig {
+                        root: root.clone(),
+                        dir: "Downloads".into(),
+                    },
+                    resize: Resize {
+                        scale: 0.5 + rng.below(8) as f64 / 4.0,
+                    },
                 },
             });
             match serde_json::from_str::<Greeting>(&hello.json()) {
@@ -1020,10 +1002,29 @@ mod tests {
     }
 
     /// A lane frame as the lane carries it, without its length.
-    fn frame(track: Track, bytes: &[u8]) -> Vec<u8> {
+    fn frame(sequence: Sequence, track: Track, bytes: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
-        Frame::encode(track, bytes, &mut out);
+        Frame::encode(sequence, track, bytes, &mut out);
         out.split_off(wire::PREFIX)
+    }
+
+    /// A frame the fake daemon writes on the lane: as the lane carries it, as the page is
+    /// to be given it, and its name, which the daemon is to be told when the page took it.
+    #[derive(Clone)]
+    struct Written {
+        lane: Vec<u8>,
+        page: Vec<u8>,
+        sequence: Sequence,
+    }
+
+    impl Written {
+        fn of(sequence: Sequence, track: Track, bytes: &[u8]) -> Written {
+            Written {
+                lane: frame(sequence, track, bytes),
+                page: [&[track.byte()][..], bytes].concat(),
+                sequence,
+            }
+        }
     }
 
     /// A control message as the control stream carries it, without its length.
@@ -1039,16 +1040,16 @@ mod tests {
         out
     }
 
-    /// A video update of `version` with a picture of `len` bytes, as the lane carries it.
-    fn update(rng: &mut Xorshift, coding: wire::Coding, version: Version, len: usize) -> Vec<u8> {
+    /// A video update of a picture of `len` bytes, its header and its picture.
+    fn update(rng: &mut Xorshift, coding: wire::Coding, len: usize) -> Vec<u8> {
         let header = Header {
             coding,
-            version,
+            version: wire::Version(rng.next() as u32),
             pipe: wire::Pipe::of(std::time::Duration::from_micros(rng.next() >> 40)),
         };
         let mut bytes = header.bytes().to_vec();
-        bytes.resize(Header::LEN + len, version.0 as u8);
-        frame(Track::Video, &bytes)
+        bytes.resize(Header::LEN + len, rng.next() as u8);
+        bytes
     }
 
     /// How a lane's frame of this place is coded: its first a keyframe, the rest deltas.
@@ -1062,8 +1063,8 @@ mod tests {
     /// A session's hello, as the daemon writes it.
     fn hello(rng: &mut Xorshift) -> String {
         format!(
-            "{{\"t\":\"hello\",\"codec\":\"vp09.00.{}.08\",\"audio\":true,\"files\":{{\"root\":\"/r\",\"dir\":\"d\"}}}}",
-            10 + rng.below(52)
+            "{{\"t\":\"hello\",\"codec\":\"av01.0.{:02}M.08\",\"audio\":true,\"files\":{{\"root\":\"/r\",\"dir\":\"d\"}}}}",
+            rng.below(20)
         )
     }
 
@@ -1123,8 +1124,8 @@ mod tests {
 
     /// What the fake daemon does once the lane is attached, in its order.
     enum Does {
-        /// Writes a frame on the lane: what the page is to be given, and what it is.
-        Frame(Vec<u8>, Given),
+        /// Writes a frame on the lane.
+        Frame(Written),
         /// Confirms the lane.
         Attach,
         /// Writes the session's hello on the control stream, once the relay has had every
@@ -1139,8 +1140,8 @@ mod tests {
 
     /// Everything the page is given and the daemon is told, over generated sessions. The
     /// proxy answers before the capability comes or after it, or only after the page has
-    /// the hello. The daemon writes updates of generated sizes and versions and Opus packets
-    /// on the lane, confirms each lane before its frames or among them, writes the hello on
+    /// the hello. The daemon writes updates of generated sizes and Opus packets on the lane,
+    /// each named the next of a sequence that starts anywhere and wraps, confirms each lane before its frames or among them, writes the hello on
     /// the control stream before the lane's first frames or after some of them, sends the
     /// page texts and binary messages, and ends the lane at drawn places, after which the
     /// relay asks for it again. The page takes each frame when the test lets it, and says
@@ -1153,10 +1154,11 @@ mod tests {
     /// - the page is given one frame at a time: while it holds one, nothing of the lane
     ///   comes, and while it holds its first, a lane with more to carry than its pipe, a
     ///   read and a frame hold has not been read through (the lane is not read);
-    /// - every frame reaches the page whole and as it is, in the lane's order, each once,
-    ///   and every control message as it is, in the control stream's order;
+    /// - every frame reaches the page whole, its message as it is without its name, in the
+    ///   lane's order, each once, and every control message as it is, in the control
+    ///   stream's order;
     /// - the daemon is told what the page said, as it said it, in order, and for the page's
-    ///   word after an update, that update's version; after a packet, nothing;
+    ///   word after a frame, update or packet alike, that frame's name;
     /// - a confirmed lane that ends is asked for again, and loses nothing it carried whole;
     /// - the session goes on until the page closes, and then ends for that.
     #[tokio::test(start_paused = true)]
@@ -1180,7 +1182,7 @@ mod tests {
             ][case % 3];
             starts[case % 3] += 1;
             let greeting = hello(&mut rng);
-            let mut version = (rng.next() >> rng.below(64)) as u32;
+            let mut sequence = Sequence((rng.next() >> rng.below(64)) as u32);
             let mut plan = vec![];
             let (mut attached_said, mut frames_on_lane) = (false, 0u64);
             // Where the hello goes among the daemon's doings: before the lane's frames, or
@@ -1217,33 +1219,24 @@ mod tests {
                 if rng.below(5) == 0 {
                     plan.push(Does::Tell(match rng.below(2) {
                         0 => Message::Text(format!("{{\"t\":\"clip\",\"d\":\"{i}\"}}").into()),
-                        _ => Message::Binary(vec![3, i as u8, 0].into()),
+                        1.. => Message::Binary(vec![3, i as u8, 0].into()),
                     }));
                 }
-                plan.push(match rng.below(3) {
+                sequence = sequence.next();
+                plan.push(Does::Frame(match rng.below(3) {
                     0 => {
                         let packet = vec![i as u8; rng.range(1, 300) as usize];
-                        Does::Frame(frame(Track::Audio, &packet), Given::Packet)
+                        Written::of(sequence, Track::Audio, &packet)
                     }
-                    _ => {
-                        version = version.wrapping_add(1 + rng.below(3) as u32);
+                    1.. => {
                         let len = match rng.below(4) {
                             0 => rng.range(1, UPDATE_MOST),
-                            _ => rng.range(1, 3_000),
+                            1.. => rng.range(1, 3_000),
                         } as usize;
-                        Does::Frame(
-                            update(
-                                &mut rng,
-                                first_or_later(frames_on_lane),
-                                Version(version),
-                                len,
-                            ),
-                            Given::Update {
-                                version: Version(version),
-                            },
-                        )
+                        let coding = first_or_later(frames_on_lane);
+                        Written::of(sequence, Track::Video, &update(&mut rng, coding, len))
                     }
-                });
+                }));
                 frames_on_lane += 1;
                 // A hello again, which only the page refuses: the relay makes no turn of it.
                 if met && rng.below(12) == 0 {
@@ -1257,10 +1250,10 @@ mod tests {
                     reopened += 1;
                 }
             }
-            let frames: Vec<(Vec<u8>, Given)> = plan
+            let frames: Vec<Written> = plan
                 .iter()
                 .filter_map(|d| match d {
-                    Does::Frame(frame, given) => Some((frame.clone(), *given)),
+                    Does::Frame(written) => Some(written.clone()),
                     Does::Attach | Does::Hello(_) | Does::Tell(_) | Does::EndLane => None,
                 })
                 .collect();
@@ -1276,7 +1269,7 @@ mod tests {
                     Does::Frame(..) | Does::Attach | Does::EndLane => None,
                 }))
                 .collect();
-            let size: usize = frames.iter().map(|(f, _)| f.len()).sum();
+            let size: usize = frames.iter().map(|f| f.lane.len()).sum();
 
             let Rig {
                 session,
@@ -1361,10 +1354,10 @@ mod tests {
                     let mut written = 0;
                     for (does, before) in plan.iter().zip(before.iter()) {
                         match does {
-                            Does::Frame(frame, _) => {
+                            Does::Frame(frame) => {
                                 went.1[BEGUN].fetch_add(1, Ordering::SeqCst);
                                 went.0.notify_waiters();
-                                lane.write_all(&framed(frame)).await.unwrap();
+                                lane.write_all(&framed(&frame.lane)).await.unwrap();
                                 written += 1;
                             }
                             Does::EndLane => {
@@ -1439,7 +1432,7 @@ mod tests {
                             expected_up.push(up(Up::Text(&text)));
                             says.send(Ok(Message::Text(text.into()))).unwrap();
                         }
-                        _ => {
+                        1.. => {
                             // The microphone, or the page's word with more after it,
                             // which is not the page's word.
                             let mut b = [vec![18], vec![TOOK, 0]][rng.below(2) as usize].clone();
@@ -1499,9 +1492,9 @@ mod tests {
                 let Message::Binary(m) = m else {
                     unreachable!("a lane's frame is binary")
                 };
-                let (frame, given) = &frames[got_frames];
+                let written = &frames[got_frames];
                 assert!(
-                    m[..] == frame[..],
+                    m[..] == written.page[..],
                     "case {case}: frame {got_frames} is not the lane's"
                 );
                 got_frames += 1;
@@ -1529,10 +1522,10 @@ mod tests {
                     held_back += 1;
                 }
                 says.send(Ok(Message::Binary(vec![TOOK].into()))).unwrap();
-                if let Given::Update { version } = given {
-                    expected_up.push(up(Up::Took { version: *version }));
-                    tooks += 1;
-                }
+                expected_up.push(up(Up::Took {
+                    sequence: written.sequence,
+                }));
+                tooks += 1;
                 say(&mut rng, &mut expected_up);
             }
             settle().await;
@@ -1577,9 +1570,9 @@ mod tests {
     /// drawn number of frames and then meet one fault. The proxy refusing the lane; a first
     /// message that is not the capability, or a second capability; a lane that ends before
     /// the daemon confirmed it; a confirmation of a lane already confirmed; the page's word
-    /// with nothing held; a frame of no track, an update shorter than its header, one with
-    /// no picture after it, one whose flags set a bit no reader knows, and a control message
-    /// of no tag, which are malformed; text for the page that is none of the daemon's
+    /// with nothing held; a frame shorter than its name, a frame of no track, an update
+    /// shorter than its header, one with no picture after it, one whose flags set a bit no
+    /// reader knows, and a control message of no tag, which are malformed; text for the page that is none of the daemon's
     /// messages; the control stream's end, before the capability and after it; and the
     /// page's closing, and its socket's failure.
     #[tokio::test(start_paused = true)]
@@ -1593,6 +1586,7 @@ mod tests {
             ConfirmedTwice,
             SecondCapability,
             Unheld,
+            Unnamed,
             NoTrack,
             ShortUpdate,
             NoPicture,
@@ -1603,7 +1597,7 @@ mod tests {
             PageClosed,
             PageLost,
         }
-        const FAULTS: [Fault; 16] = [
+        const FAULTS: [Fault; 17] = [
             Fault::ProxyRefused,
             Fault::NotTheCapability,
             Fault::EndedUnopened,
@@ -1611,6 +1605,7 @@ mod tests {
             Fault::ConfirmedTwice,
             Fault::SecondCapability,
             Fault::Unheld,
+            Fault::Unnamed,
             Fault::NoTrack,
             Fault::ShortUpdate,
             Fault::NoPicture,
@@ -1622,7 +1617,7 @@ mod tests {
             Fault::PageLost,
         ];
         let mut rng = Xorshift::new(0x1F83_D9AB_FB41_BD6B);
-        for case in 0..320 {
+        for case in 0..340 {
             let fault = FAULTS[case % FAULTS.len()];
             let Rig {
                 session,
@@ -1659,6 +1654,7 @@ mod tests {
                 | Fault::ConfirmedTwice
                 | Fault::SecondCapability
                 | Fault::Unheld
+                | Fault::Unnamed
                 | Fault::NoTrack
                 | Fault::ShortUpdate
                 | Fault::NoPicture
@@ -1690,13 +1686,14 @@ mod tests {
                     // The session goes well for some frames, each taken.
                     for i in 0..rng.below(4) {
                         let len = rng.range(1, 2000) as usize;
-                        let sent = update(&mut rng, first_or_later(i), Version(i as u32), len);
-                        lane.write_all(&framed(&sent)).await.unwrap();
+                        let bytes = update(&mut rng, first_or_later(i), len);
+                        let sent = Written::of(Sequence(i as u32), Track::Video, &bytes);
+                        lane.write_all(&framed(&sent.lane)).await.unwrap();
                         let got = tokio::time::timeout(HOUR, page.recv());
                         let Ok(Some(Message::Binary(m))) = got.await else {
                             panic!("case {case} ({fault:?}): frame {i} did not come");
                         };
-                        assert!(m[..] == sent[..], "case {case} ({fault:?}): frame {i}");
+                        assert!(m[..] == sent.page[..], "case {case} ({fault:?}): frame {i}");
                         says.send(Ok(Message::Binary(vec![TOOK].into()))).unwrap();
                     }
                     settle().await;
@@ -1708,11 +1705,12 @@ mod tests {
                     let (lane, control) = (kept.0.as_mut().unwrap(), kept.1.as_mut().unwrap());
                     let mut header = Header {
                         coding: wire::Coding::Delta,
-                        version: Version(9),
+                        version: wire::Version(9),
                         pipe: wire::Pipe::of(std::time::Duration::ZERO),
                     }
                     .bytes()
                     .to_vec();
+                    let named = Sequence(9);
                     match fault {
                         Fault::ProxyRefused | Fault::NotTheCapability | Fault::EndedUnopened => {
                             unreachable!("met before the capability")
@@ -1729,20 +1727,27 @@ mod tests {
                             let says = kept.2.as_ref().unwrap();
                             says.send(Ok(Message::Binary(vec![TOOK].into()))).unwrap()
                         }
-                        Fault::NoTrack => lane.write_all(&framed(&[9, 0, 0])).await.unwrap(),
+                        Fault::Unnamed => {
+                            let short = vec![0; rng.below(wire::PREFIX as u64) as usize];
+                            lane.write_all(&framed(&short)).await.unwrap()
+                        }
+                        Fault::NoTrack => {
+                            let none = [&named.0.to_be_bytes()[..], &[9, 0, 0]].concat();
+                            lane.write_all(&framed(&none)).await.unwrap()
+                        }
                         Fault::ShortUpdate => {
                             header.truncate(rng.below(Header::LEN as u64) as usize);
-                            let cut = frame(Track::Video, &header);
+                            let cut = frame(named, Track::Video, &header);
                             lane.write_all(&framed(&cut)).await.unwrap()
                         }
                         Fault::NoPicture => {
-                            let bare = frame(Track::Video, &header);
+                            let bare = frame(named, Track::Video, &header);
                             lane.write_all(&framed(&bare)).await.unwrap()
                         }
                         Fault::OtherFlags => {
                             header[0] = flags;
                             header.extend([7, 7, 7]);
-                            let odd = frame(Track::Video, &header);
+                            let odd = frame(named, Track::Video, &header);
                             lane.write_all(&framed(&odd)).await.unwrap()
                         }
                         Fault::NoTag => control.write_all(&framed(&[99, 1])).await.unwrap(),
@@ -1779,8 +1784,11 @@ mod tests {
                                 Fault::NoTrack => {
                                     matches!(end, End::Lane(wire::Malformed::Track(9)))
                                 }
-                                Fault::ShortUpdate | Fault::NoPicture => {
+                                Fault::Unnamed | Fault::ShortUpdate => {
                                     matches!(end, End::Lane(wire::Malformed::Truncated))
+                                }
+                                Fault::NoPicture => {
+                                    matches!(end, End::Lane(wire::Malformed::NoPicture))
                                 }
                                 Fault::OtherFlags => {
                                     matches!(end, End::Lane(wire::Malformed::Flags(f)) if f == flags)
@@ -1816,6 +1824,7 @@ mod tests {
                 | Fault::ConfirmedTwice
                 | Fault::SecondCapability
                 | Fault::Unheld
+                | Fault::Unnamed
                 | Fault::NoTrack
                 | Fault::ShortUpdate
                 | Fault::NoPicture

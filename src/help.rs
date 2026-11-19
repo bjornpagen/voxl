@@ -14,7 +14,7 @@ Usage: voxl [--flag=value]...
 Runs the daemon: streams the X display in $DISPLAY to the sessions that attach to it. A
 session is `voxl attach` run over ssh (its control stream) and the lane its relay opens
 through a proxy (video and audio); the daemon listens on unix sockets only. Flags take
---name=value or --name value; a flag alone is true.
+--name=value or --name value; a switch alone is true.
 
 Flags:
 ";
@@ -35,26 +35,33 @@ fn help(version: &str) -> String {
 /// The daemon's flags as `--help` lists them: each with what it is and its default.
 fn flags() -> String {
     crate::FLAGS
+        .map(crate::Which::flag)
         .iter()
         .map(|f| format!("  --{:<28}{} (default {})\n", f.name, f.says, f.default))
         .collect()
 }
 
-/// Which of the two the arguments ask for, if either. Help wins over version.
-#[derive(Debug, PartialEq)]
+/// Which of the two the arguments ask for, if either. Help wins over version: the order
+/// of the variants is which wins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Request {
     Help,
     Version,
 }
 
+/// The words that ask for either, each with what it asks for.
+const ASKS: [(&str, Request); 4] = [
+    ("-h", Request::Help),
+    ("--help", Request::Help),
+    ("-V", Request::Version),
+    ("--version", Request::Version),
+];
+
 fn request(args: &[String]) -> Option<Request> {
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        Some(Request::Help)
-    } else if args.iter().any(|a| a == "--version" || a == "-V") {
-        Some(Request::Version)
-    } else {
-        None
-    }
+    args.iter()
+        .filter_map(|a| ASKS.iter().find(|(word, _)| word == a))
+        .map(|(_, asks)| *asks)
+        .min()
 }
 
 #[cfg(target_os = "linux")]
@@ -107,7 +114,7 @@ mod tests {
                 .collect();
             let has = |w: &[&str]| args.iter().any(|a| w.contains(&a.as_str()));
             let want = match (has(&["-h", "--help"]), has(&["-V", "--version"])) {
-                (true, _) => Some(Request::Help),
+                (true, true | false) => Some(Request::Help),
                 (false, true) => Some(Request::Version),
                 (false, false) => None,
             };
@@ -120,7 +127,7 @@ mod tests {
     #[test]
     fn the_help_lists_every_flag_with_its_default() {
         let text = help("0");
-        for f in &crate::FLAGS {
+        for f in crate::FLAGS.map(crate::Which::flag) {
             let lines: Vec<&str> = text
                 .lines()
                 .filter(|l| l.trim_start().starts_with(&format!("--{} ", f.name)))

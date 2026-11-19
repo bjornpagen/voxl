@@ -26,9 +26,27 @@ pub struct Desktop {
 pub struct Log {
     /// `RUST_LOG`, else `info`: which records are logged.
     pub filter: String,
-    /// `RUST_LOG_STYLE`: whether they are coloured (`always`, `never`, `auto`); unset,
-    /// env_logger decides from the terminal.
-    pub style: Option<String>,
+    /// `RUST_LOG_STYLE`: whether they are coloured; unset, `auto` (env_logger decides from
+    /// the terminal), as env_logger's own default is.
+    pub style: env_logger::WriteStyle,
+}
+
+/// The words `RUST_LOG_STYLE` takes, each with what it is: env_logger's, which reads any
+/// other word as `auto`; here any other word is refused.
+const STYLES: [(&str, env_logger::WriteStyle); 3] = [
+    ("auto", env_logger::WriteStyle::Auto),
+    ("always", env_logger::WriteStyle::Always),
+    ("never", env_logger::WriteStyle::Never),
+];
+
+impl Log {
+    /// The logger it asks for.
+    pub fn logger(&self) -> env_logger::Logger {
+        env_logger::Builder::new()
+            .parse_filters(&self.filter)
+            .write_style(self.style)
+            .build()
+    }
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -71,15 +89,31 @@ impl Marker {
 
 impl Env {
     /// Reads every variable through `var`, which gives a variable's value if it is set:
-    /// `std::env::var_os` for voxl's own environment.
-    pub fn read(var: impl Fn(&str) -> Option<OsString>) -> Env {
-        let text = |name: &str| var(name).and_then(|v| v.into_string().ok());
-        Env {
-            log: Log {
-                filter: text("RUST_LOG").unwrap_or_else(|| "info".into()),
-                style: text("RUST_LOG_STYLE"),
+    /// `std::env::var_os` for voxl's own environment. A variable that is set to what it
+    /// cannot take (not text, or a style that is none of [`STYLES`]) is the error, the line
+    /// that says so.
+    pub fn read(var: impl Fn(&str) -> Option<OsString>) -> Result<Env, String> {
+        let text = |name: &str| match var(name) {
+            None => Ok(None),
+            Some(v) => match v.into_string() {
+                Ok(v) => Ok(Some(v)),
+                Err(v) => Err(format!("${name}={v:?}: not text")),
             },
-        }
+        };
+        let filter = match text("RUST_LOG")? {
+            Some(filter) => filter,
+            None => "info".into(),
+        };
+        let style = match text("RUST_LOG_STYLE")? {
+            None => env_logger::WriteStyle::Auto,
+            Some(word) => match STYLES.iter().find(|(known, _)| *known == word) {
+                Some((_, style)) => *style,
+                None => return Err(format!("$RUST_LOG_STYLE={word:?}: auto, always or never")),
+            },
+        };
+        Ok(Env {
+            log: Log { filter, style },
+        })
     }
 }
 
@@ -122,7 +156,7 @@ impl Debugging {
                 )
             })?),
         };
-        let var = |name: &str| var(name).and_then(|v| v.into_string().ok());
+        // Set to anything, even what is not text, is set.
         let set = |name| var(name).is_some();
         let debug = Debugging {
             direct_fb: !set("VOXL_NO_DIRECT_FB"),
@@ -151,7 +185,7 @@ mod tests {
                 x: whole(x)?,
                 y: whole(y)?,
             }),
-            _ => None,
+            [] | [_] | [_, _, _, ..] => None,
         }
     }
 
@@ -181,7 +215,10 @@ mod tests {
             match (marker(Some(at.into())), model(at)) {
                 (Ok(Some(m)), Some(want)) => assert_eq!(m, want, "{at:?}"),
                 (Err(e), None) => assert!(e.starts_with("VOXL_DEBUG_MARKER="), "{e}"),
-                (read, want) => panic!("{at:?}: read {read:?}, model {want:?}"),
+                (read @ (Ok(Some(_)) | Ok(None)), want @ None)
+                | (read @ (Ok(None) | Err(_)), want @ Some(_)) => {
+                    panic!("{at:?}: read {read:?}, model {want:?}")
+                }
             }
         }
         assert_eq!(marker(None), Ok(None));
@@ -242,7 +279,7 @@ mod tests {
                 match state(i) {
                     0 => None,
                     1 => Some(OsString::new()),
-                    _ => Some(OsString::from(format!("/{name}"))),
+                    2.. => Some(OsString::from(format!("/{name}"))),
                 }
             };
             match Desktop::read(value) {
@@ -259,11 +296,111 @@ mod tests {
             }
         }
         let bytes = OsString::from_vec(b":1\xff".to_vec());
-        let not_text = Desktop::read(|name| match name {
-            "DISPLAY" => Some(bytes.clone()),
-            "HOME" => Some("/x".into()),
-            _ => None,
+        let set = [("DISPLAY", bytes), ("HOME", "/x".into())];
+        let not_text = Desktop::read(|name| {
+            let (_, value) = set.iter().find(|(set, _)| *set == name)?;
+            Some(value.clone())
         });
         assert!(not_text.is_err_and(|e| e.contains("DISPLAY")));
+    }
+
+    /// The log's variables are read as they were set, and one set to what it cannot take is
+    /// the error naming it, never taken as unset: over generated values of `RUST_LOG` and
+    /// `RUST_LOG_STYLE`, each unset, text, or not text, the style a word of its roster or
+    /// near one.
+    #[test]
+    fn the_log_is_as_its_variables_say_or_refused() {
+        use std::os::unix::ffi::OsStringExt;
+        let mut rng = crate::xorshift::Xorshift::new(0x3c6e_f372_fe94_f82b);
+        let words = [
+            "auto",
+            "always",
+            "never",
+            "Always",
+            "",
+            "on",
+            "info",
+            "debug,voxl=trace",
+        ];
+        // What env_logger's documentation says each style word is.
+        const MODEL: [(&str, env_logger::WriteStyle); 3] = [
+            ("auto", env_logger::WriteStyle::Auto),
+            ("always", env_logger::WriteStyle::Always),
+            ("never", env_logger::WriteStyle::Never),
+        ];
+        let draw = |rng: &mut crate::xorshift::Xorshift| -> Option<OsString> {
+            match rng.below(3) {
+                0 => None,
+                1 => Some(words[rng.below(words.len() as u64) as usize].into()),
+                2.. => Some(OsString::from_vec(b"x\xff".to_vec())),
+            }
+        };
+        let (mut read, mut refused) = (0, 0);
+        for _ in 0..5_000 {
+            let (filter, style) = (draw(&mut rng), draw(&mut rng));
+            let set = [("RUST_LOG", &filter), ("RUST_LOG_STYLE", &style)];
+            let got = Env::read(|name| {
+                let (_, value) = set.iter().find(|(set, _)| *set == name)?;
+                (*value).clone()
+            });
+            let text = |v: &Option<OsString>| v.clone().map(OsString::into_string);
+            let want_filter = match text(&filter) {
+                None => Ok("info".to_string()),
+                Some(Ok(f)) => Ok(f),
+                Some(Err(_)) => Err("RUST_LOG"),
+            };
+            let want_style = match text(&style) {
+                None => Ok(env_logger::WriteStyle::Auto),
+                Some(Ok(w)) => match MODEL.iter().find(|(word, _)| *word == w) {
+                    Some((_, style)) => Ok(*style),
+                    None => Err("RUST_LOG_STYLE"),
+                },
+                Some(Err(_)) => Err("RUST_LOG_STYLE"),
+            };
+            match (got, want_filter, want_style) {
+                (Ok(env), Ok(filter), Ok(style)) => {
+                    assert_eq!((env.log.filter, env.log.style), (filter, style));
+                    read += 1;
+                }
+                (Err(e), Err(name), Ok(_) | Err(_)) | (Err(e), Ok(_), Err(name)) => {
+                    assert!(e.starts_with(&format!("${name}=")), "{e}");
+                    refused += 1;
+                }
+                (got @ Ok(_), filter @ Err(_), style @ (Ok(_) | Err(_)))
+                | (got @ Ok(_), filter @ Ok(_), style @ Err(_))
+                | (got @ Err(_), filter @ Ok(_), style @ Ok(_)) => {
+                    panic!("{filter:?} {style:?}: {:?}", got.map(|e| e.log.filter))
+                }
+            }
+        }
+        assert!(read > 1_000 && refused > 1_000, "{read} {refused}");
+    }
+
+    /// A debugging switch is on when its variable is set to anything, even what is not text,
+    /// and off when it is unset.
+    #[test]
+    fn a_switch_is_set_by_any_value() {
+        use std::os::unix::ffi::OsStringExt;
+        for value in [
+            None,
+            Some(OsString::new()),
+            Some("1".into()),
+            Some(OsString::from_vec(b"\xff".to_vec())),
+        ] {
+            let set = value.is_some();
+            let switches = [
+                "VOXL_NO_DIRECT_FB",
+                "VOXL_DEBUG_DAMAGE",
+                "VOXL_DEBUG_ENCODES",
+            ];
+            let d =
+                Debugging::read(|name| switches.contains(&name).then(|| value.clone()).flatten())
+                    .expect("no marker is asked for");
+            assert_eq!(
+                (d.direct_fb, d.damage, d.encodes),
+                (!set, set, set),
+                "{value:?}"
+            );
+        }
     }
 }

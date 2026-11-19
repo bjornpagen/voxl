@@ -79,14 +79,14 @@ is its log. CBR from 30 Mbps, with congestion control down to 2 Mbps.
 - `scroll.html`: the long page `scrolltarget.mjs` smooth-scrolls, with a marker drawn every frame.
 - `cpu.sh <pid> <secs>`, `srcfps.py` (true
   source frame rate from the Xvfb framebuffer), `measure.mjs` (in-browser unique FPS; `VIEWPORT=WxH`).
-- `inputtest.mjs`, `keytest.sh`: input and clipboard checks through the web client.
+- `keytest.sh`: input and clipboard checks through the web client.
 
 ## What is here
 
 Everything above runs against `voxl relay` on port 6902 (`env/voxl.sh` starts the daemon;
 the relay reaches it over ssh and the lane, as it reaches a real desktop):
-`nclient.py voxl` reads the relay's page socket, `measure.mjs`, `shot.mjs`,
-`inputtest.mjs` and `keytest.mjs` drive its page in Chromium, `keyhold.py` and `smoke.py`
+`nclient.py voxl` reads the relay's page socket, `measure.mjs`, `shot.mjs`
+and `keytest.mjs` drive its page in Chromium, `keyhold.py` and `smoke.py`
 talk to its socket as the page does. The other clients (`kclient.py`, `nkclient.py`,
 `mlclient.py`, `daytona_bench.py`) and `env/` scripts are the compared servers'. The
 Playwright feature tests and the macOS tests that drove voxl's old built-in server are

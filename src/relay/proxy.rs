@@ -243,7 +243,7 @@ mod tests {
                 2 => format!("{} ", rng.below(1000)),
                 3 => String::new(),
                 4 => rng.below(100_000).to_string(),
-                _ => rng.below(12_000).to_string(),
+                5.. => rng.below(12_000).to_string(),
             };
             let v = format!("{host}:{port}");
             let canonical = host == "localhost"
@@ -318,16 +318,18 @@ mod tests {
                     stream.read_exact(&mut first).await.unwrap();
                     assert_eq!(first, after);
                 }
-                (Err(ProxyError::Refused(s)), false, _) => {
+                (Err(ProxyError::Refused(s)), false, true | false) => {
                     assert_eq!(s, format!("HTTP/1.1 {status}"))
                 }
                 (Err(ProxyError::Answer), true, true) => {}
-                (got, ok, cut) => panic!(
+                (got @ Ok(_), true, true)
+                | (got @ Ok(_), false, true | false)
+                | (got @ Err(ProxyError::Io(_)), true | false, true | false)
+                | (got @ Err(ProxyError::Refused(_)), true, true | false)
+                | (got @ Err(ProxyError::Answer), false, true | false)
+                | (got @ Err(ProxyError::Answer), true, false) => panic!(
                     "{status} cut {cut}: {:?}",
-                    got.map(drop)
-                        .map_err(|e| e.to_string())
-                        .err()
-                        .unwrap_or_else(|| format!("ok {ok}"))
+                    got.map(drop).map_err(|e| e.to_string())
                 ),
             }
         }
@@ -366,7 +368,7 @@ mod tests {
                 }
                 Host::V6(Ipv6Addr::from(segs))
             }
-            _ => Host::Name(draw_name(rng)),
+            2.. => Host::Name(draw_name(rng)),
         };
         Endpoint {
             host,
@@ -405,7 +407,7 @@ mod tests {
                     v.remove(at);
                 }
                 2 if at < v.len() => v[at] = byte,
-                _ => v.truncate(at),
+                1.. => v.truncate(at),
             }
             let text = String::from_utf8(v).unwrap();
             match Endpoint::parse(&text) {

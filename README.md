@@ -3,7 +3,7 @@
 A fork of [tembo/voxl](https://github.com/tembo/voxl) that went its own way: it carries the desktop over one stream through an HTTP CONNECT proxy, and lets the transport under it do its job.
 
 Low-latency desktop streaming for the browser, written in Rust. voxl streams an X11
-display as VP9 to a small web client that decodes
+display as AV1 to a small web client that decodes
 with WebCodecs, with input, clipboard, audio, microphone, file and folder transfer and
 dynamic resolution. When the link slows, it skips screens rather than queue them, and ssh
 is the only way in.
@@ -13,7 +13,7 @@ is the only way in.
 On the machine with the desktop, run the daemon (it listens on unix sockets only):
 
 ```sh
-cargo install --git https://github.com/bjornpagen/voxl   # needs libvpx, libyuv, Opus, PulseAudio and esbuild (see Usage)
+cargo install --git https://github.com/bjornpagen/voxl   # needs libaom, libyuv, Opus, PulseAudio and esbuild (see Usage)
 DISPLAY=:1 voxl             # streams display :1 to the sessions that attach to it
 ```
 
@@ -136,7 +136,7 @@ frame being decoded. voxl's column is its best run of each test. To reproduce, s
 
 ## Usage
 
-Build (needs Rust, pkg-config, clang, libvpx, libyuv, libopus, libpulse and esbuild;
+Build (needs Rust, pkg-config, clang, libaom, libyuv, libopus, libpulse and esbuild;
 `nix-shell` provides them all):
 
 ```sh
@@ -240,7 +240,7 @@ ssh desktop voxl record > clip.mp4
 ssh desktop voxl stats
 ```
 
-A recording is the VP9 voxl already encodes, saved without encoding it again,
+A recording is the AV1 voxl already encodes, saved without encoding it again,
 so it costs almost no CPU. With `--audio-enabled`, it carries the desktop's sound as an
 Opus track beside the video, with the silences kept as gaps. It doesn't include the cursor (viewers draw it), and a restart
 of the stream (a resize) or five minutes ends it. Each command
@@ -295,8 +295,11 @@ desktops voxl is built for run on Xvfb (E2B's and Daytona's do too), and X11 let
 capture them without a permission prompt, with damage events that keep a still screen at
 no CPU. Wayland support is being worked on.
 
-**Does it use the GPU?** Not yet. voxl encodes VP9 on the CPU with libvpx. (The CPU table
-above was measured with the H.264 encoder voxl used before.)
+**Does it use the GPU?** Not to encode: voxl encodes AV1 on the CPU with libaom, in its
+realtime mode with the tools made for screens (palette coding), at one quantiser. The
+browser decodes it in hardware where the machine has an AV1 decoder (Apple M3 and later)
+and in software elsewhere, about a core while the whole screen moves. (The CPU table above
+was measured with the H.264 encoder voxl used before.)
 
-**What's the license?** voxl's code is MIT. It links libvpx, libyuv and Opus, each under a
+**What's the license?** voxl's code is MIT. It links libaom, libyuv and Opus, each under a
 BSD license.

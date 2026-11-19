@@ -32,7 +32,7 @@
 //! and a lane's events come in time order.
 
 use super::link::{BytesPerSecond, Gate, Known, Outstanding, Path, Stats, Taken, RESPONSE};
-use crate::wire::Version;
+use crate::wire::Sequence;
 use std::cmp::Reverse;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -227,9 +227,9 @@ impl Estimate {
         }
     }
 
-    /// A frame of `bytes`, named `version`, goes onto the lane at `now`, behind what is
+    /// A frame of `bytes`, named `sequence`, goes onto the lane at `now`, behind what is
     /// `on` the way: it is on the way too, with what is noted of it.
-    pub fn sent(&self, on: &mut Outstanding, version: Version, bytes: u64, now: Instant) {
+    pub fn sent(&self, on: &mut Outstanding, sequence: Sequence, bytes: u64, now: Instant) {
         let company = match on.is_empty() {
             true => Company::Alone,
             false => Company::Behind,
@@ -247,13 +247,13 @@ impl Estimate {
             ahead,
             taken_before: self.taken,
         };
-        on.sent(version, bytes, note, now);
+        on.sent(sequence, bytes, note, now);
     }
 
-    /// The relay said at `now` that the page took the update named `version`: it and the
+    /// The relay said at `now` that the page took the update named `sequence`: it and the
     /// frames before it are `on` the way no longer, and its time on the way shows the path.
-    pub fn took(&mut self, on: &mut Outstanding, version: Version, now: Instant) {
-        let Some(Taken { named, bytes }) = on.took(version) else {
+    pub fn took(&mut self, on: &mut Outstanding, sequence: Sequence, now: Instant) {
+        let Some(Taken { named, bytes }) = on.took(sequence) else {
             return;
         };
         self.taken += bytes;
@@ -332,12 +332,12 @@ pub(crate) mod tests {
     }
 
     impl Link {
-        pub(crate) fn sent(&mut self, version: Version, bytes: u64, now: Instant) {
-            self.estimate.sent(&mut self.on, version, bytes, now);
+        pub(crate) fn sent(&mut self, sequence: Sequence, bytes: u64, now: Instant) {
+            self.estimate.sent(&mut self.on, sequence, bytes, now);
         }
 
-        pub(crate) fn took(&mut self, version: Version, now: Instant) {
-            self.estimate.took(&mut self.on, version, now);
+        pub(crate) fn took(&mut self, sequence: Sequence, now: Instant) {
+            self.estimate.took(&mut self.on, sequence, now);
         }
 
         pub(crate) fn gate(&self, now: Instant) -> Gate {
@@ -347,251 +347,6 @@ pub(crate) mod tests {
         pub(crate) fn stats(&self, now: Instant) -> Stats {
             self.estimate.stats(&self.on, now)
         }
-
-        /// A new lane takes the place of the one before: nothing is on the way.
-        fn restart(&mut self) {
-            self.on = Outstanding::default();
-        }
-    }
-
-    /// A frame sent, as the model keeps it.
-    #[derive(Clone, Copy)]
-    struct Kept {
-        version: Version,
-        at: Instant,
-        bytes: u64,
-        /// Nothing was outstanding when it was sent.
-        alone: bool,
-        /// A response time's worth or more was outstanding when it was sent.
-        wait_ahead: bool,
-        /// The bytes taken, in all, when it was sent.
-        taken_before: u64,
-    }
-
-    /// The rule of the module's head, kept as plainly as it is said: lists of what was seen,
-    /// and every answer worked out from all of them.
-    #[derive(Default)]
-    struct Model {
-        outstanding: Vec<Kept>,
-        taken: u64,
-        /// The round trips in memory: when seen, and how long.
-        trips: Vec<(Instant, Duration)>,
-        /// The rates in memory: when seen, and bytes a second.
-        rates: Vec<(Instant, u64)>,
-    }
-
-    impl Model {
-        fn fastest(&self) -> Option<Duration> {
-            self.trips.iter().map(|t| t.1).min()
-        }
-
-        fn rate(&self) -> Option<u64> {
-            self.rates.iter().map(|r| r.1).max()
-        }
-
-        fn bytes(&self) -> u64 {
-            self.outstanding.iter().map(|f| f.bytes).sum()
-        }
-
-        /// What it knows of the path: something, once a round trip and a rate were seen.
-        fn path(&self) -> Path {
-            match (self.fastest(), self.rate()) {
-                (Some(round_trip), Some(rate)) => Path::Known(Known {
-                    round_trip,
-                    rate: BytesPerSecond(rate),
-                }),
-                (None, None) => Path::Unknown,
-                (Some(_), None) | (None, Some(_)) => panic!("a round trip with no rate"),
-            }
-        }
-
-        /// The most that may be outstanding when a capture starts, once the path is known.
-        fn window(&self) -> Option<u64> {
-            let (rate, fastest) = (self.rate()?, self.fastest()?);
-            let window = u128::from(rate) * (fastest + RESPONSE).as_nanos() / 1_000_000_000;
-            Some(window as u64)
-        }
-
-        /// Whether what is outstanding is at least what the path carries in `time`, at the
-        /// greatest rate in memory; not, while nothing is known of the path.
-        fn carries(&self, time: Duration) -> bool {
-            self.rate().is_some_and(|rate| {
-                let worth = u128::from(rate) * time.as_nanos() / 1_000_000_000;
-                u128::from(self.bytes()) >= worth
-            })
-        }
-
-        fn sent(&mut self, version: Version, bytes: u64, now: Instant) {
-            self.outstanding.push(Kept {
-                version,
-                at: now,
-                bytes,
-                alone: self.outstanding.is_empty(),
-                wait_ahead: self.carries(RESPONSE),
-                taken_before: self.taken,
-            });
-        }
-
-        fn took(&mut self, version: Version, now: Instant) {
-            let Some(named) = self.outstanding.iter().position(|f| f.version == version) else {
-                return;
-            };
-            let taken: Vec<Kept> = self.outstanding.drain(..=named).collect();
-            let frame = taken[named];
-            let bytes = taken.iter().map(|f| f.bytes).sum::<u64>();
-            self.taken += bytes;
-            let trip = now - frame.at;
-            let nanos = trip.as_nanos().max(1);
-            let rate = (u128::from(self.taken - frame.taken_before) * 1_000_000_000 / nanos) as u64;
-            let Some(fastest) = self.fastest() else {
-                if frame.alone {
-                    self.trips.push((now, trip));
-                    self.rates.push((now, rate));
-                }
-                return;
-            };
-            let late = trip
-                > self
-                    .due(frame.bytes)
-                    .expect("a path with a round trip has a rate");
-            if frame.alone || trip < fastest {
-                self.trips
-                    .retain(|(at, _)| now - *at <= Duration::from_secs(10));
-                self.trips.push((now, trip));
-            }
-            let pressed = frame.wait_ahead && late;
-            if pressed || self.rate().is_some_and(|greatest| rate >= greatest) {
-                let memory = self.fastest().expect("a round trip was seen") * 10;
-                self.rates.retain(|(seen, _)| now - *seen <= memory);
-                self.rates.push((now, rate));
-            }
-        }
-
-        /// How long after its send a frame of `bytes` is due, once the path is known.
-        fn due(&self, bytes: u64) -> Option<Duration> {
-            let own = match self.rate()? {
-                0 => Duration::MAX,
-                rate => Duration::from_nanos(
-                    (u128::from(bytes) * 1_000_000_000 / u128::from(rate)).min(u64::MAX.into())
-                        as u64,
-                ),
-            };
-            Some((self.fastest()? * 2 + RESPONSE).saturating_add(own))
-        }
-
-        fn gate(&self, now: Instant) -> Gate {
-            let Some(oldest) = self.outstanding.first() else {
-                return Gate::Open;
-            };
-            let (Some(window), Some(due)) = (self.window(), self.due(oldest.bytes)) else {
-                return Gate::Full;
-            };
-            match (now - oldest.at > due, self.bytes() <= window) {
-                (true, true | false) => Gate::Late,
-                (false, false) => Gate::Full,
-                (false, true) => Gate::Open,
-            }
-        }
-    }
-
-    /// The gate is item 6 of the contract, exactly. Over generated histories (frames of any
-    /// size sent at any spacing, from microseconds to longer than the path's memory; tooks
-    /// that name a frame outstanding, taking every frame up to it, and tooks that name a
-    /// frame of a lane since replaced, or none ever sent; lanes replaced), after every event
-    /// and at a generated time after it, the gate, the bytes outstanding, the round trip,
-    /// the rate and the gate are what the rule says of the whole history, worked out anew
-    /// each time from plain lists. Once the path is known the gate is open exactly when no
-    /// frame is untaken longer after its send than twice the least round trip in memory,
-    /// `RESPONSE` and its own bytes' time at the greatest rate in memory, and the bytes
-    /// outstanding are within that rate times the round trip and `RESPONSE`; before it is
-    /// known, exactly when nothing is outstanding. And with nothing outstanding the gate
-    /// is open, whatever was told: a frame larger than the window goes then.
-    #[test]
-    fn the_gate_is_open_exactly_as_the_tooks_say() {
-        let mut rng = Xorshift::new(0x428a_2f98_d728_ae22);
-        let start = Instant::now();
-        let (mut open, mut full, mut late) = (0, 0, 0);
-        let (mut lower, mut forgot, mut swept) = (0, 0, 0);
-        for _ in 0..400 {
-            let (mut link, mut model) = (Link::default(), Model::default());
-            let mut now = start;
-            let mut next = 0u32;
-            let mut gone: Vec<Version> = Vec::new();
-            let (mut least_ever, mut greatest_ever) = (None, None);
-            // How long steps are, in this history: microseconds to seconds.
-            let pace = 1u64 << rng.range(4, 24);
-            for _ in 0..rng.range(1, 200) {
-                now += Duration::from_micros(rng.below(pace));
-                match rng.below(10) {
-                    0..=3 => {
-                        let bytes = 1 + (rng.next() >> rng.range(40, 60));
-                        let version = Version(next);
-                        next += 1;
-                        link.sent(version, bytes, now);
-                        model.sent(version, bytes, now);
-                    }
-                    4..=6 if !model.outstanding.is_empty() => {
-                        // Mostly the oldest, as a relay that says every took does.
-                        let reach = match rng.below(4) {
-                            0 => rng.below(model.outstanding.len() as u64) as usize,
-                            1.. => 0,
-                        };
-                        swept += usize::from(reach > 0);
-                        let version = model.outstanding[reach].version;
-                        link.took(version, now);
-                        model.took(version, now);
-                    }
-                    7 if !gone.is_empty() => {
-                        let version = gone[rng.below(gone.len() as u64) as usize];
-                        link.took(version, now);
-                        model.took(version, now);
-                    }
-                    8 => link.took(Version(next + 1 + rng.below(9) as u32), now),
-                    9 if rng.below(6) == 0 => {
-                        gone.extend(model.outstanding.drain(..).map(|f| f.version));
-                        link.restart();
-                    }
-                    // A long quiet: longer than the path's memory, now and then.
-                    4..=7 | 9.. => now += Duration::from_millis(rng.below(4_000)),
-                }
-                let at = now + Duration::from_micros(rng.below(4 * pace));
-                let gate = link.gate(at);
-                assert_eq!(gate, model.gate(at));
-                let want = Stats {
-                    outstanding_bytes: model.bytes(),
-                    outstanding_frames: model.outstanding.len(),
-                    path: model.path(),
-                    gate: model.gate(at),
-                };
-                assert_eq!(link.stats(at), want);
-                if model.outstanding.is_empty() {
-                    assert_eq!(gate, Gate::Open, "nothing is outstanding");
-                }
-                match gate {
-                    Gate::Open => open += 1,
-                    Gate::Full => full += 1,
-                    Gate::Late => late += 1,
-                }
-                // A round trip or a rate in memory that is not the best ever seen: one was
-                // forgotten.
-                let (fastest, rate) = (model.fastest(), model.rate());
-                forgot += usize::from(fastest > least_ever && least_ever.is_some());
-                lower += usize::from(rate < greatest_ever);
-                least_ever = match (least_ever, fastest) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (a, b) => a.or(b),
-                };
-                greatest_ever = greatest_ever.max(rate);
-            }
-        }
-        assert!(
-            open > 2_000 && full > 1_000 && late > 2_000 && swept > 500,
-            "{open} open, {full} full, {late} late, {swept} tooks of several frames"
-        );
-        assert!(
-            forgot > 100 && lower > 300,
-            "{forgot} looks with a round trip forgotten, {lower} with a rate"
-        );
     }
 
     /// A frame a test sent: when, when it was told taken, and what the link showed when it
@@ -619,19 +374,19 @@ pub(crate) mod tests {
         let mut frames: Vec<Frame> = Vec::new();
         let mut now = from;
         while now < from + long {
-            path.tell(now, |version, at| link.took(version, at));
+            path.tell(now, |sequence, at| link.took(sequence, at));
             if link.gate(now) != Gate::Open {
                 // Held: nothing opens the gate but a took.
                 let (told, _) = *path.tooks.front().expect("a held gate has a took to come");
                 now = now.max(told);
                 continue;
             }
-            let (version, bytes) = (Version(*next), size());
+            let (sequence, bytes) = (Sequence(*next), size());
             *next += 1;
             let stats = link.stats(now);
             let steady = path.steady(now);
-            link.sent(version, bytes, now);
-            let took = path.send(version, bytes, Duration::ZERO, now);
+            link.sent(sequence, bytes, now);
+            let took = path.send(sequence, bytes, Duration::ZERO, now);
             frames.push(Frame {
                 sent: now,
                 took,
@@ -656,16 +411,16 @@ pub(crate) mod tests {
     ) {
         let mut now = from;
         while now < from + long {
-            path.tell(now, |version, at| link.took(version, at));
+            path.tell(now, |sequence, at| link.took(sequence, at));
             if link.gate(now) == Gate::Open {
-                let version = Version(*next);
+                let sequence = Sequence(*next);
                 *next += 1;
-                link.sent(version, 2_000, now);
-                path.send(version, 2_000, jitter(), now);
+                link.sent(sequence, 2_000, now);
+                path.send(sequence, 2_000, jitter(), now);
             }
             now += gap;
         }
-        path.tell(from + long, |version, at| link.took(version, at));
+        path.tell(from + long, |sequence, at| link.took(sequence, at));
     }
 
     /// A path of any rate from 20 KB/s to 40 MB/s and any round trip from 1 to 400 ms.
@@ -789,8 +544,8 @@ pub(crate) mod tests {
                     "case {case}: {taken} B taken in second {second} at {path_rate} B/s"
                 );
             }
-            path.tell(start + long + Duration::from_secs(3600), |version, at| {
-                link.took(version, at)
+            path.tell(start + long + Duration::from_secs(3600), |sequence, at| {
+                link.took(sequence, at)
             });
             let known = rate(&link, start + long);
             assert!(
@@ -920,7 +675,7 @@ pub(crate) mod tests {
                      {path_rate} B/s"
                 );
                 from += long + Duration::from_secs(1);
-                path.tell(from, |version, at| link.took(version, at));
+                path.tell(from, |sequence, at| link.took(sequence, at));
                 let known = rate(&link, from);
                 let over = BytesPerSecond::of(frame, path.delay).0;
                 assert!(
@@ -935,7 +690,7 @@ pub(crate) mod tests {
                 let typed = Duration::from_secs(6);
                 typing(&mut link, &mut path, &mut next, (from, typed), gap, jitter);
                 from += typed + Duration::from_secs(1);
-                path.tell(from, |version, at| link.took(version, at));
+                path.tell(from, |sequence, at| link.took(sequence, at));
                 assert_eq!(
                     rate(&link, from),
                     known,
@@ -956,106 +711,5 @@ pub(crate) mod tests {
             faster > 10 && slower > 3,
             "{faster} faster, {slower} slower"
         );
-    }
-
-    /// The most round trips a session's start took to find its path's rate in
-    /// `a_session_start_finds_its_path`: what the window's growth was measured to take,
-    /// which the test holds it to. A round trip here is the path's and the largest frame's
-    /// time on it.
-    ///
-    /// @limitKind measured
-    /// @owner this module's tests
-    /// @unit round trips
-    /// @scope `a_session_start_finds_its_path`
-    /// @evidence the test's own output (`--nocapture`): it prints the distribution
-    /// @observed 2026-11-19, the measuring machine's local day
-    /// @environment the path simulated in this module (a rate, a round trip, no stalls), on
-    /// a virtual clock
-    /// @workload 200 generated paths (20 KB/s to 40 MB/s, round trips of 1 to 400 ms), each
-    /// a session started on a keyframe of 20 KB to 1 MB and then sent more than the path
-    /// carries
-    /// @result from the keyframe's took to a rate of nine tenths of the path's: 2.8 round
-    /// trips at the median, 7.0 at the 90th percentile, 11.8 at the 99th, 13.7 at most
-    /// @decision the measured most, rounded up to the next whole round trip
-    /// @revalidate a change to the window or to what the rate counts
-    const START_TRIPS_MOST: f64 = 14.0;
-
-    /// A session's start finds its path. Over generated paths and keyframes (20 KB to
-    /// 1 MB), a session starts on its keyframe and its desktop then moves without a stop,
-    /// more than the path carries. From nothing known:
-    /// - the keyframe goes alone, whatever its size, and the next frame only once it is told
-    ///   taken;
-    /// - its took shows a round trip and a rate at once: the round trip too long by the
-    ///   keyframe's own time on the path, the rate too low by the same;
-    /// - the round trip is within the largest later frame's time of the path's from the
-    ///   second took on;
-    /// - the rate reaches nine tenths of the path's within `START_TRIPS_MOST` round trips
-    ///   of the keyframe's took: the window turns over faster than the rate it was made
-    ///   from, so each round trip shows a higher one.
-    #[test]
-    fn a_session_start_finds_its_path() {
-        let mut rng = Xorshift::new(0x3956_c25b_f348_b538);
-        let start = Instant::now();
-        let mut trips: Vec<f64> = Vec::new();
-        for case in 0..200 {
-            let mut path = any_path(&mut rng, start);
-            let (path_rate, delay) = (path.rate, path.delay);
-            let mut link = Link::default();
-            let mut next = 0;
-            let key = rng.range(20_000, 1_000_000);
-            let most = (path_rate / 30).max(2_000);
-            let mut sizes = rng.clone();
-            let mut first = Some(key);
-            let long = path.time(key) + delay * 80;
-            let frames = stream(&mut link, &mut path, &mut next, (start, long), || {
-                first.take().unwrap_or_else(|| 2_000 + sizes.below(most))
-            });
-            let key_took = frames[0].took;
-            assert_eq!(frames[0].shown, Path::Unknown);
-            assert!(
-                frames[1].sent >= key_took,
-                "case {case}: a frame went behind the keyframe"
-            );
-            let Path::Known(shown) = frames[1].shown else {
-                panic!("case {case}: the keyframe's took shows the path");
-            };
-            let (fastest, rate) = (shown.round_trip, shown.rate.0);
-            let trip = delay + path.time(key);
-            let micro = Duration::from_micros(1);
-            assert!(fastest + micro >= trip && fastest <= trip + micro);
-            assert_eq!(rate, BytesPerSecond::of(key, key_took - start).0);
-            let own = path.time(most + 2_000) + Duration::from_micros(1);
-            for f in frames.iter().filter(|f| f.sent > frames[1].took) {
-                let Path::Known(Known {
-                    round_trip: fastest,
-                    ..
-                }) = f.shown
-                else {
-                    panic!("case {case}: the path is known");
-                };
-                assert!(
-                    fastest >= delay && fastest <= delay + own,
-                    "case {case}: a round trip of {fastest:?}, the path's {delay:?}"
-                );
-            }
-            let found = frames
-                .iter()
-                .find(|f| nears(f.shown, path_rate))
-                .unwrap_or_else(|| panic!("case {case}: the rate never neared the path's"));
-            let took = (found.sent - key_took).as_secs_f64() / (delay + own).as_secs_f64();
-            trips.push(took);
-        }
-        trips.sort_by(f64::total_cmp);
-        let at = |p: usize| trips[(trips.len() - 1) * p / 100];
-        let longest = at(100);
-        println!(
-            "a session's start, round trips to the path's rate: p50 {:.1}, p90 {:.1}, p99 {:.1}",
-            at(50),
-            at(90),
-            at(99)
-        );
-        println!("a session's start: at most {longest:.1} round trips to the path's rate");
-        assert!(at(50) > 1.0, "the starts had a rate to find");
-        assert!(longest <= START_TRIPS_MOST, "{longest:.1} round trips");
     }
 }

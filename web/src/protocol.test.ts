@@ -182,7 +182,7 @@ function text(seed: number, draw: (n: number) => number) {
 	switch (KINDS[draw(KINDS.length)]) {
 		case 'hello': {
 			const files = { root: word(), dir: word() };
-			const codec = `vp09.00.${10 + draw(52)}.08`;
+			const codec = `av01.0.${String(draw(20)).padStart(2, '0')}M.08`;
 			const scale = (1 + draw(300)) / 100;
 			meant = {
 				t: 'hello',

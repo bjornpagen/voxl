@@ -54,12 +54,14 @@ struct Fill {
     asked: usize,
 }
 
-/// The bytes of `s`'s whole characters that fit in `room`.
+/// The bytes of `s`'s whole characters that fit in `room`: none at all, at least, which is
+/// where every string's first character begins.
 fn whole_chars(s: &str, room: usize) -> usize {
-    (1..=room.min(s.len()))
-        .rev()
-        .find(|&at| s.is_char_boundary(at))
-        .unwrap_or(0)
+    let mut at = room.min(s.len());
+    while !s.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
 }
 
 impl std::fmt::Write for Fill {
@@ -111,12 +113,12 @@ impl Line {
     }
 }
 
-// A line is queued in place, in a slot made when voxl starts: boxed, every line logged
-// would be an allocation.
-#[allow(clippy::large_enum_variant)]
-enum Msg {
-    Line(Line),
-    /// Write everything sent before this, then answer.
+/// What wakes the log thread: lines are queued (each line in place, in a slot of the line
+/// queue made when voxl starts, so no line logged is an allocation), or a thread waits for
+/// every line it queued to be written.
+enum Wake {
+    Lines,
+    /// Answer once every line queued before this is written (`Writer::run`).
     Flush(mpsc::SyncSender<()>),
 }
 
@@ -124,14 +126,17 @@ enum Msg {
 pub struct Logger {
     /// Which records are wanted (`RUST_LOG`), as the log thread's writer has it.
     writer: Arc<env_logger::Logger>,
-    queue: mpsc::SyncSender<Msg>,
+    lines: mpsc::SyncSender<Line>,
+    /// At most one wake waits: a line queued while one waits is written when it is read.
+    wake: mpsc::SyncSender<Wake>,
     dropped: Arc<AtomicU64>,
 }
 
 /// The log thread's side: writes each line as `env_logger` formats it.
 pub struct Writer {
     writer: Arc<env_logger::Logger>,
-    queue: mpsc::Receiver<Msg>,
+    lines: mpsc::Receiver<Line>,
+    wake: mpsc::Receiver<Wake>,
     dropped: Arc<AtomicU64>,
 }
 
@@ -139,16 +144,19 @@ pub struct Writer {
 fn queue(writer: env_logger::Logger, slots: usize) -> (Logger, Writer) {
     let writer = Arc::new(writer);
     let dropped = Arc::new(AtomicU64::new(0));
-    let (tx, rx) = mpsc::sync_channel(slots);
+    let (lines, queued) = mpsc::sync_channel(slots);
+    let (wake, woken) = mpsc::sync_channel(1);
     (
         Logger {
             writer: writer.clone(),
-            queue: tx,
+            lines,
+            wake,
             dropped: dropped.clone(),
         },
         Writer {
             writer,
-            queue: rx,
+            lines: queued,
+            wake: woken,
             dropped,
         },
     )
@@ -163,18 +171,26 @@ impl log::Log for Logger {
         if !self.writer.matches(record) {
             return;
         }
-        match self.queue.try_send(Msg::Line(Line::of(record))) {
+        match self.lines.try_send(Line::of(record)) {
             Ok(()) => {}
             Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
+        // A wake that waits already is read after this line was queued: the line is written
+        // then. A line dropped wakes the thread too, so its count is written even if the
+        // thread had read the count before this line found the queue full.
+        match self.wake.try_send(Wake::Lines) {
+            Ok(()) | Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {}
+        }
     }
 
-    /// Waits until every line logged before it is written.
+    /// Waits until every line logged before it is written. With the log thread gone there
+    /// is nothing to wait for.
     fn flush(&self) {
         let (done, written) = mpsc::sync_channel(1);
-        if self.queue.send(Msg::Flush(done)).is_ok() {
+        if self.wake.send(Wake::Flush(done)).is_ok() {
+            // Its answer, or the log thread gone: either way nothing is left to wait for.
             let _ = written.recv();
         }
     }
@@ -182,17 +198,29 @@ impl log::Log for Logger {
 
 impl Writer {
     /// Writes lines as they come, until the `Logger` is gone.
+    ///
+    /// Every line queued is followed by a wake, or by one already waiting, and the wakes are
+    /// read in order: so the lines a thread logged are written when the wake after them is
+    /// read, before a flush it asks for after them, and before the end, which comes only
+    /// once every wake is read.
     fn run(self) {
-        while let Ok(msg) = self.queue.recv() {
-            self.write(msg);
-            self.drain();
+        loop {
+            match self.wake.recv() {
+                Ok(Wake::Lines) => self.drain(),
+                // A flush whose thread has stopped waiting is answered to nobody.
+                Ok(Wake::Flush(done)) => match done.send(()) {
+                    Ok(()) | Err(mpsc::SendError(())) => {}
+                },
+                Err(mpsc::RecvError) => return,
+            }
         }
     }
 
     /// Writes every line queued now, then how many were dropped since the last count.
     fn drain(&self) {
-        while let Ok(msg) = self.queue.try_recv() {
-            self.write(msg);
+        // Until the queue is empty now (or every logger is gone and it is empty for good).
+        while let Ok(line) = self.lines.try_recv() {
+            self.write(line);
         }
         let dropped = self.dropped.swap(0, Ordering::Relaxed);
         if dropped > 0 {
@@ -208,19 +236,14 @@ impl Writer {
         }
     }
 
-    fn write(&self, msg: Msg) {
-        match msg {
-            Msg::Line(line) => self.writer.log(
-                &log::Record::builder()
-                    .level(line.level)
-                    .target(line.target())
-                    .args(format_args!("{}", line.message()))
-                    .build(),
-            ),
-            Msg::Flush(done) => {
-                let _ = done.send(());
-            }
-        }
+    fn write(&self, line: Line) {
+        self.writer.log(
+            &log::Record::builder()
+                .level(line.level)
+                .target(line.target())
+                .args(format_args!("{}", line.message()))
+                .build(),
+        );
     }
 }
 

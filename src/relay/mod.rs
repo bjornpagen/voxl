@@ -103,13 +103,11 @@ pub fn run(args: &[String]) -> ! {
             std::process::exit(2)
         }
     };
-    let env = crate::env::Env::read(|name| std::env::var_os(name));
-    let mut log = env_logger::Builder::new();
-    log.parse_filters(&env.log.filter);
-    if let Some(style) = &env.log.style {
-        log.parse_write_style(style);
-    }
-    crate::logging::init(log.build());
+    let env = crate::env::Env::read(|name| std::env::var_os(name)).unwrap_or_else(|e| {
+        eprintln!("voxl relay: {e}");
+        std::process::exit(2)
+    });
+    crate::logging::init(env.log.logger());
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -278,12 +276,12 @@ mod tests {
                         1 => dests[rng.below(dests.len() as u64) as usize].to_string(),
                         3 => runtimes[rng.below(runtimes.len() as u64) as usize].to_string(),
                         4 => places[rng.below(places.len() as u64) as usize].to_string(),
-                        _ => ports[rng.below(ports.len() as u64) as usize].to_string(),
+                        2 | 5.. => ports[rng.below(ports.len() as u64) as usize].to_string(),
                     };
                     given[f].push(v.clone());
                     words.push(match rng.below(2) {
                         0 => vec![format!("{name}={v}")],
-                        _ => vec![name.to_string(), v],
+                        1.. => vec![name.to_string(), v],
                     });
                 }
             }

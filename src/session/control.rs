@@ -1,7 +1,7 @@
 //! A session's control connection: `voxl attach`'s, over ssh. The daemon mints the
 //! session's capability and sends it first, then the hello and the cursor; after that the
 //! stream carries the page's messages both ways (as the page writes and reads them, the
-//! relay handing them on), and the relay's word of each video update the page took. When
+//! relay handing them on), and the relay's word of each lane frame the page took. When
 //! the connection closes, the session ends: its capability is forgotten and its lane
 //! closed.
 
@@ -218,10 +218,10 @@ fn handle(d: &Daemon, c: &Arc<Client>, up: Up<'_>) {
                 }
             }
         }
-        // Delivery, told: the session's link counts the update taken, which may open the
-        // capture gate.
-        Up::Took { version } => {
-            c.took(version);
+        // Delivery, told: the session's link counts the frame taken, which may open the
+        // gate.
+        Up::Took { sequence } => {
+            c.took(sequence);
             d.hub.wake();
         }
     }

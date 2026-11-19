@@ -20,13 +20,14 @@
 //
 // So the record relies on one property of the decoder: it puts out one picture for each
 // update given it, before any further input. The daemon's part holds: its encoder gives
-// each update one shown frame, with nothing reordered (src/vp9.rs's test). The decoder's
+// each update one shown frame, with nothing reordered (src/av1.rs's test). The decoder's
 // part is the browser's, and WebCodecs does not promise it (worker.ts quotes what it says).
 // Measured on 2026-11-19 in Chrome 157 on an M2 Max, with the decoder configured as
 // worker.ts configures it (`optimizeForLatency: true`, `hardwareAcceleration:
 // 'no-preference'`): 60 of 60 pictures came out before the next input was given, none held
-// back, for hardware VP9 and for software AV1 (Chromium's dav1d wrapper sets max_frame_delay
-// to 1 in low-delay mode).
+// back, for AV1 decoded in software (Chromium's dav1d wrapper sets max_frame_delay to 1 in
+// low-delay mode), on this Mac, which has no AV1 hardware; a Mac that has it (M3 and later)
+// is chosen by the browser, with no branch here.
 //
 // A decoder that keeps a picture in all the same leaves the record decoding, and the session
 // waiting, for good: the record neither ends the session nor takes the update. It is not

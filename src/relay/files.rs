@@ -247,16 +247,20 @@ pub async fn upload(
     };
     // Its length, so the server saves it only if all of it arrived: a body cut short ends
     // the server's stdin as a whole one would.
-    let length = match headers.get(header::CONTENT_LENGTH).map(|v| v.to_str()) {
-        None => return failed(StatusCode::LENGTH_REQUIRED, "an upload says its length"),
-        Some(Ok(v)) if v.parse::<u64>().is_ok() => v.to_string(),
-        Some(_) => {
+    let Some(said) = headers.get(header::CONTENT_LENGTH) else {
+        return failed(StatusCode::LENGTH_REQUIRED, "an upload says its length");
+    };
+    // Parsed once here, and written for the server as the number it is.
+    let length: u64 = match said.to_str().map(str::parse) {
+        Ok(Ok(length)) => length,
+        Ok(Err(_)) | Err(_) => {
             return failed(
                 StatusCode::BAD_REQUEST,
                 "an upload's length is not a whole number of bytes",
             )
         }
     };
+    let length = length.to_string();
     let Some(g) = grant(&files) else {
         return no_grant();
     };

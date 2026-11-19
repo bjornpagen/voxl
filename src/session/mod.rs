@@ -60,12 +60,16 @@ impl Runtime {
         let md = std::fs::symlink_metadata(&dir).map_err(|e| Untrusted::Unread(e.to_string()))?;
         // SAFETY: getuid has no failure and touches nothing.
         let me = unsafe { libc::getuid() };
-        match (md.is_dir(), md.uid(), md.mode()) {
-            (false, _, _) => Err(Untrusted::NotAFolder),
-            (true, uid, _) if uid != me => Err(Untrusted::NotOurs(uid)),
-            (true, _, mode) if mode & 0o002 != 0 => Err(Untrusted::OthersWrite(mode & 0o7777)),
-            (true, _, _) => Ok(Runtime(dir)),
+        if !md.is_dir() {
+            return Err(Untrusted::NotAFolder);
         }
+        if md.uid() != me {
+            return Err(Untrusted::NotOurs(md.uid()));
+        }
+        if md.mode() & 0o002 != 0 {
+            return Err(Untrusted::OthersWrite(md.mode() & 0o7777));
+        }
+        Ok(Runtime(dir))
     }
 
     /// The daemon's two sockets in it.

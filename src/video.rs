@@ -1,12 +1,19 @@
-//! Video pipeline: damage-driven capture -> I420 -> VP9 -> each session's lane, a capture
+//! Video pipeline: damage-driven capture -> I420 -> AV1 -> each session's lane, a capture
 //! held while a session's link says too much is on the way, or a frame late.
 //!
-//! One stream codes the screen for every viewer. It starts with a keyframe for the viewers
-//! it starts, and codes every later frame from the frames before it, which every viewer's
-//! lane carried in order; a keyframe is coded only for a viewer starting (`hub::Starts`).
-//! Every frame is coded whole, at one quality: a slow or stalled path lowers the frame rate,
-//! through the gate (`session::link`), and the screen as it then is goes next.
+//! One stream codes the screen for every viewer, from its shape's first watcher until the
+//! screen changes shape. It starts with a keyframe for the viewers it starts, and codes
+//! every later frame from the frames before it, which every viewer's lane carried in order;
+//! a keyframe is coded only for a viewer starting (`hub::Starts`). While nobody watches,
+//! nothing is captured and the encoder waits as it was: a viewer that comes back holding
+//! the stream's newest frame goes on with the next delta (`hub::Holds`). Kept so, libaom
+//! holds 202 MB resident for a 3024x1898 stream on 8 threads and 289 MB for 3840x2400 on
+//! 16 tile columns, after a minute of scrolling (libaom 3.15.1 configured as `av1::Encoder`
+//! configures it, on an M2 Max, 2026-11-19), against the daemon unit's 4 GB memory cap.
+//! Every frame is coded whole, at one quality: a slow or stalled path lowers the frame
+//! rate, through the gate (`session::link`), and the screen as it then is goes next.
 
+use crate::av1;
 #[cfg(target_os = "linux")]
 use crate::capture::Capturer;
 use crate::convert::I420;
@@ -19,7 +26,6 @@ use crate::hub::{Hub, Starts};
 use crate::hub::{Seen, Viewer};
 #[cfg(target_os = "linux")]
 use crate::session::link::Gate;
-use crate::vp9;
 use crate::wire::{Coding, Header, Pipe};
 use bytes::{BufMut, BytesMut};
 use std::sync::atomic::Ordering;
@@ -32,7 +38,7 @@ use std::time::{Duration, Instant};
 pub struct VideoConfig {
     /// The X display.
     pub display: String,
-    /// The cores the encoder may use: `vp9::Stream::new` derives its threads from them.
+    /// The cores the encoder may use: `av1::Stream::new` derives its threads from them.
     pub cores: std::num::NonZeroUsize,
     /// The threads that convert a capture to I420.
     pub convert_threads: usize,
@@ -93,11 +99,12 @@ pub struct Band {
     pub y1: u32,
 }
 
-/// What the viewers watching are sent: the encoder, on its thread. There is one only while
-/// somebody watches, and it starts with a keyframe. One picture goes round between the
-/// capture loop and the encoder (the loop holds where it is, `Buffer`), since a capture goes
-/// only to an idle encoder (`step`): a second, filled while the encoder codes the first,
-/// only queued a frame behind it, and converted every band twice, once into each.
+/// What the viewers watching are sent: the encoder, on its thread. There is one from the
+/// first time somebody watches a stream of this shape, and it starts with a keyframe. One
+/// picture goes round between the capture loop and the encoder (the loop holds where it
+/// is, `Buffer`), since a capture goes only to an idle encoder (`step`): a second, filled
+/// while the encoder codes the first, only queued a frame behind it, and converted every
+/// band twice, once into each.
 struct Stream {
     /// Dropped first (fields drop in order), which ends the encode loop once it has sent
     /// what it was given.
@@ -141,7 +148,7 @@ impl Stream {
     /// the whole screen) first.
     fn start(
         hub: &Arc<Hub>,
-        coded: vp9::Stream,
+        coded: av1::Stream,
         first: Job,
         debug: Debugging,
     ) -> Result<Self, String> {
@@ -203,16 +210,15 @@ pub fn spawn(
 
 #[cfg(target_os = "linux")]
 /// The capture of the screen as it is now, and how its stream is coded, for the viewers.
-fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<(Capturer, vp9::Stream), String> {
+fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<(Capturer, av1::Stream), String> {
     let cap = Capturer::new(&cfg.display, cfg.debug, cfg.convert_threads)?;
     let (w, h) = (cap.width, cap.height);
-    let shape = vp9::Shape {
+    let shape = av1::Shape {
         width: w,
         height: h,
-        fps: FRAMERATE,
     };
     let coded =
-        vp9::Stream::new(shape, cfg.cores).map_err(|e| format!("no VP9 level holds {:?}", e.0))?;
+        av1::Stream::new(shape, cfg.cores).map_err(|e| format!("no AV1 level holds {:?}", e.0))?;
     log::info!(
         "capturing {w}x{h} @ {FRAMERATE} fps as {}, {} threads",
         coded.codec(),
@@ -394,8 +400,8 @@ enum Buffer<B> {
 /// encoder has no buffer to capture into, and one at a running encoder nothing to start.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Encoder<S, B> {
-    /// None runs: nobody was watching, or the stream was just built. The next capture
-    /// starts one, on a keyframe of the whole screen.
+    /// None runs: the stream was just built, and nobody has watched it yet. The next
+    /// capture starts one, on a keyframe of the whole screen.
     Stopped(S),
     /// One runs, the loop's buffer home or with it.
     Running(Buffer<B>),
@@ -493,7 +499,7 @@ trait Capture {
     /// What changed since the last capture.
     fn damage(&mut self) -> &mut Damage;
     /// The rows damaged since the last take, if any were.
-    fn take_damage(&mut self) -> Result<Option<Band>, String>;
+    fn take_damage(&mut self) -> Option<Band>;
     /// Every row.
     fn full(&self) -> Band;
     /// The whole screen as BGRX, for a screenshot.
@@ -503,7 +509,7 @@ trait Capture {
     /// Converts rows [y0, y1) of the grabbed frame into `dst`, on the capturer's threads.
     fn convert(&self, dst: &mut I420, y0: usize, y1: usize) -> Result<(), String>;
     /// The grabbed frame as BGRX and its stride (the debug marker's probe).
-    fn bgrx(&self) -> Option<(&[u8], usize)>;
+    fn bgrx(&self) -> (&[u8], usize);
 }
 
 #[cfg(target_os = "linux")]
@@ -523,7 +529,7 @@ impl Capture for Capturer {
     fn damage(&mut self) -> &mut Damage {
         &mut self.damage
     }
-    fn take_damage(&mut self) -> Result<Option<Band>, String> {
+    fn take_damage(&mut self) -> Option<Band> {
         Capturer::take_damage(self)
     }
     fn full(&self) -> Band {
@@ -538,7 +544,7 @@ impl Capture for Capturer {
     fn convert(&self, dst: &mut I420, y0: usize, y1: usize) -> Result<(), String> {
         Capturer::convert(self, dst, y0, y1)
     }
-    fn bgrx(&self) -> Option<(&[u8], usize)> {
+    fn bgrx(&self) -> (&[u8], usize) {
         Capturer::bgrx(self)
     }
 }
@@ -577,7 +583,7 @@ pub(crate) fn rebuilds_for(
 #[cfg(target_os = "linux")]
 fn capture_loop(
     cap: &mut impl Capture,
-    coded: vp9::Stream,
+    coded: av1::Stream,
     cfg: VideoConfig,
     hub: Arc<Hub>,
     screen: &mut impl Resize,
@@ -603,8 +609,9 @@ fn capture_loop(
         }
         probe
     });
-    // The encoder, while somebody watches, and where the picture that goes round is. Every
-    // way out of the loop drops it, and with it waits for the encoder to send what it holds.
+    // The encoder, from the first time somebody watches, and where the picture that goes
+    // round is. Every way out of the loop drops it, and with it waits for the encoder to send
+    // what it holds.
     let mut stream: Option<(Stream, Buffer<Box<I420>>)> = None;
     // What the loop saw of each watching viewer when it last looked: kept, so that a look
     // allocates nothing once there is room for every viewer.
@@ -662,9 +669,9 @@ fn capture_loop(
         let now = Instant::now();
         hub.look_into(&mut seen);
         if seen.is_empty() {
-            // Nobody watches: a stream is dropped here, once its encoder has sent what it
-            // holds.
-            stream = None;
+            // Nobody watches: nothing is captured, and the encoder waits as it was, for a
+            // viewer that holds its newest frame to go on from (`hub::Holds`). What changes
+            // meanwhile is damage the next capture takes.
             Wait::Change.wait(cap, &hub)?;
             continue;
         }
@@ -733,7 +740,7 @@ fn capture_loop(
         hub.stats
             .damage_wait_us
             .fetch_add((t0 - origin).as_micros() as u64, Ordering::Relaxed);
-        let band = cap.take_damage()?;
+        let band = cap.take_damage();
         if let Some(b) = band {
             cap.grab(b)?;
         }
@@ -784,7 +791,7 @@ fn capture_loop(
 }
 
 /// A frame coded: what the encoder says it is, and its message, a header's room and then
-/// the VP9.
+/// the AV1 temporal unit.
 struct Coded {
     coding: Coding,
     message: BytesMut,
@@ -792,8 +799,8 @@ struct Coded {
 
 /// Codes each frame: the encoder, and what it puts out.
 struct Coder {
-    enc: vp9::Encoder,
-    /// What libvpx put out for the last frame: kept, so a frame allocates nothing.
+    enc: av1::Encoder,
+    /// What libaom put out for the last frame: kept, so a frame allocates nothing.
     out: Vec<u8>,
     arenas: Arenas,
     debug: bool,
@@ -802,35 +809,31 @@ struct Coder {
 impl Coder {
     /// The stream `coded`'s coder, and its first frame, `first`, a keyframe: a stream starts
     /// with the viewers it starts.
-    fn start(
-        coded: vp9::Stream,
-        first: &I420,
-        ms: i64,
-        debug: bool,
-    ) -> Result<(Coder, Coded), vp9::Failed> {
+    fn start(coded: av1::Stream, first: &I420, debug: bool) -> Result<(Coder, Coded), av1::Failed> {
+        let mut out = Vec::new();
+        let te = Instant::now();
+        let enc = av1::Encoder::start(&coded, &planes(first), &mut out)?;
         let mut coder = Coder {
-            enc: vp9::Encoder::new(&coded)?,
-            out: Vec::new(),
+            enc,
+            out,
             arenas: Arenas::new(),
             debug,
         };
-        let coded = coder.code(first, ms, Coding::Key)?;
+        let coded = coder.coded(Coding::Key, te);
         Ok((coder, coded))
     }
 
-    /// Codes `buf` at `ms`, a keyframe if `coding` asks for one: a header's room, then the
-    /// VP9, and what the encoder coded it as.
-    fn code(&mut self, buf: &I420, ms: i64, coding: Coding) -> Result<Coded, vp9::Failed> {
-        let planes = vp9::Planes {
-            y: &buf.y,
-            u: &buf.u,
-            v: &buf.v,
-            stride_y: buf.width,
-            stride_uv: buf.stride_uv(),
-        };
+    /// Codes `buf`, a keyframe if `coding` asks for one: a header's room, then the temporal
+    /// unit, and what the encoder coded it as.
+    fn code(&mut self, buf: &I420, coding: Coding) -> Result<Coded, av1::Failed> {
         self.out.clear();
         let te = Instant::now();
-        let coding = self.enc.encode(&planes, ms, coding, &mut self.out)?;
+        let coding = self.enc.encode(&planes(buf), coding, &mut self.out)?;
+        Ok(self.coded(coding, te))
+    }
+
+    /// What the encoder put out, begun at `te`, coded as `coding`: its message.
+    fn coded(&mut self, coding: Coding, te: Instant) -> Coded {
         if self.debug {
             match thread_cpu_us() {
                 Ok(cpu) => log::info!(
@@ -841,10 +844,21 @@ impl Coder {
                 Err(e) => log::error!("this thread's CPU time: {e}"),
             }
         }
-        Ok(Coded {
+        Coded {
             coding,
             message: self.arenas.message(&self.out),
-        })
+        }
+    }
+}
+
+/// `buf`'s planes, as the encoder reads them.
+fn planes(buf: &I420) -> av1::Planes<'_> {
+    av1::Planes {
+        y: &buf.y,
+        u: &buf.u,
+        v: &buf.v,
+        stride_y: buf.width,
+        stride_uv: buf.stride_uv(),
     }
 }
 
@@ -919,7 +933,7 @@ impl Drop for Woken {
 }
 
 fn encode_loop(
-    coded: vp9::Stream,
+    coded: av1::Stream,
     first: Job,
     rx: mpsc::Receiver<Job>,
     ret: mpsc::SyncSender<Box<I420>>,
@@ -932,20 +946,15 @@ fn encode_loop(
 }
 
 /// Codes `first`, then each frame the capture loop sends, and sends each to the viewers,
-/// until the capture loop is gone; a frame libvpx fails is the error, which ends the stream.
+/// until the capture loop is gone; a frame libaom fails is the error, which ends the stream.
 fn encode_frames(
-    coded: vp9::Stream,
+    coded: av1::Stream,
     first: Job,
     rx: mpsc::Receiver<Job>,
     ret: mpsc::SyncSender<Box<I420>>,
     hub: &Hub,
     debug: bool,
-) -> Result<(), vp9::Failed> {
-    // A frame's timestamp is its damage's time since the stream's first frame. The capture
-    // thread stamps every damage, in its order, after it took the damage the first frame
-    // went with: so no later frame's is earlier.
-    let epoch = first.damage;
-    let ms = |job: &Job| (job.damage - epoch).as_millis() as i64;
+) -> Result<(), av1::Failed> {
     // Kept from frame to frame, so a frame allocates nothing for it.
     let mut viewers = Vec::new();
     // A picture goes home only once its frame is on its viewers' lanes: the capture loop,
@@ -957,7 +966,8 @@ fn encode_frames(
         }
     };
     let t0 = Instant::now();
-    let (mut coder, out) = Coder::start(coded, &first.buf, ms(&first), debug)?;
+    let (mut coder, out) = Coder::start(coded, &first.buf, debug)?;
+    let configured = coder.enc.configuration().clone();
     let mut sent = |job: Job, coded: Coded, t0: Instant| {
         let Coded {
             coding,
@@ -977,10 +987,12 @@ fn encode_frames(
         hub.stats
             .bytes
             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        // The viewers a keyframe starts start on it, and are sent it.
+        // The stream's newest frame, before anyone is sent it; the viewers a keyframe
+        // starts start on it, and are sent it.
+        hub.coded(version);
         if let Plan::Key(starts) = &job.frame {
             hub.stats.keyframes.fetch_add(1, Ordering::Relaxed);
-            starts.started();
+            starts.started(version, &configured);
         }
         hub.clients_into(&mut viewers);
         for c in &viewers {
@@ -1008,7 +1020,7 @@ fn encode_frames(
             Plan::Key(_) => Coding::Key,
             Plan::Motion => Coding::Delta,
         };
-        let out = coder.code(&job.buf, ms(&job), coding)?;
+        let out = coder.code(&job.buf, coding)?;
         sent(job, out, t0);
     }
     Ok(())
@@ -1046,13 +1058,10 @@ impl MarkerProbe {
     }
 }
 
-/// What the bench loadgen's marker says on this capture: none unless `VOXL_DEBUG_MARKER`
-/// placed it where it fits and the capture has pixels to read it from.
-fn marker_reading(bgrx: Option<(&[u8], usize)>, probe: Option<MarkerProbe>) -> Option<u32> {
-    match (bgrx, probe) {
-        (Some((px, stride)), Some(at)) => Some(marker_probe(px, stride, at, "grab")),
-        (None, Some(_) | None) | (Some(_), None) => None,
-    }
+/// What the bench loadgen's marker says on this capture, its pixels `bgrx` and their
+/// stride: none unless `VOXL_DEBUG_MARKER` placed it where it fits.
+fn marker_reading((px, stride): (&[u8], usize), probe: Option<MarkerProbe>) -> Option<u32> {
+    probe.map(|at| marker_probe(px, stride, at, "grab"))
 }
 
 /// Debug: decode the bench loadgen marker at `at` and log its age.
@@ -1104,23 +1113,12 @@ pub(crate) mod tests {
     }
 
     /// The stream a test codes: `w` x `h` on one thread.
-    /// The level of a stream of `w` x `h`.
-    fn level(w: u32, h: u32) -> u8 {
-        let shape = vp9::Shape {
+    fn coded(w: u32, h: u32) -> av1::Stream {
+        let shape = av1::Shape {
             width: w,
             height: h,
-            fps: FRAMERATE,
         };
-        vp9::level(shape).unwrap()
-    }
-
-    fn coded(w: u32, h: u32) -> vp9::Stream {
-        let shape = vp9::Shape {
-            width: w,
-            height: h,
-            fps: FRAMERATE,
-        };
-        vp9::Stream::new(shape, std::num::NonZeroUsize::MIN).unwrap()
+        av1::Stream::new(shape, std::num::NonZeroUsize::MIN).unwrap()
     }
 
     /// The viewers of `hub` waiting to start, promised a keyframe, as the capture loop
@@ -1168,19 +1166,21 @@ pub(crate) mod tests {
         }
     }
 
-    /// A recording is an MP4 whose boxes parse and hold the frames recorded, and which
-    /// ffmpeg decodes: `ftyp`, then `moov`, then `mdat`, tiling the file; one track as large
-    /// as the screen, a `vp09` sample entry whose `vpcC` names the stream's level, a sample
-    /// table counting every frame the recorder took, one chunk inside `mdat`; and ffmpeg,
-    /// every error fatal, decodes exactly that many pictures of that size. Through the real
-    /// encode loop with the recorder as a viewer, over runs of 1 to 20 frames after the
-    /// keyframe that starts it.
+    /// A recording is an MP4 of the stream's own frames: `ftyp`, then `moov`, then `mdat`,
+    /// tiling the file; one track as large as the screen, an `av01` sample entry whose `av1C`
+    /// names the stream's level; a sample for every frame the recorder took, each, in order,
+    /// exactly the temporal unit a page beside it was sent without its temporal delimiter,
+    /// the first a sync sample. Through the real encode loop with the recorder as a viewer
+    /// beside a page, over generated sizes and runs of 1 to 20 frames after the keyframe that
+    /// starts it.
     #[tokio::test]
     async fn a_recording_is_an_mp4_of_its_frames() {
-        let (w, h) = (64u32, 64u32);
         let mut rng = Xorshift::new(0x1f83_d9ab_fb41_bd6b);
         for run in 0..6 {
-            let hub = Hub::new().unwrap();
+            let (w, h) = (2 * rng.range(32, 200) as u32, 2 * rng.range(32, 150) as u32);
+            let hub = Hub::new(crate::hub::tests::hello()).unwrap();
+            let page = viewer(&hub);
+            page.watch();
             let (stop, stopped) = tokio::sync::oneshot::channel();
             let recording = tokio::spawn({
                 let hub = hub.clone();
@@ -1189,7 +1189,7 @@ pub(crate) mod tests {
                     crate::record::record(&hub, until, Duration::from_secs(3600)).await
                 }
             });
-            while hub.clients.lock().is_empty() {
+            while hub.clients.lock().len() < 2 {
                 tokio::task::yield_now().await;
             }
             let first = job(w, h, Plan::Key(promised(&hub)), &mut rng);
@@ -1224,27 +1224,30 @@ pub(crate) mod tests {
                 (u32_at(tkhd, size), u32_at(tkhd, size + 4)),
                 (w << 16, h << 16)
             );
-            let stsd = inside(traks[0], &[b"mdia", b"minf", b"stbl", b"stsd"]).unwrap();
-            let entry = boxes(&stsd[8..]).unwrap();
-            assert_eq!(entry[0].0, *b"vp09");
-            // The visual sample entry's 78 bytes, then its boxes: `vpcC`, version 1, then
-            // profile 0, the level, and 8 bits.
-            let vpcc = inside(&entry[0].1[78..], &[b"vpcC"]).unwrap();
-            assert_eq!(&vpcc[..4], &[1, 0, 0, 0]);
-            assert_eq!((vpcc[4], vpcc[5], vpcc[6] >> 4), (0, level(w, h), 8));
-            let path: [&[u8; 4]; 4] = [b"mdia", b"minf", b"stbl", b"stsz"];
-            let stsz = inside(traks[0], &path).expect("a sample table");
+            let stbl = |name| inside(traks[0], &[b"mdia", b"minf", b"stbl", name]).unwrap();
+            let entry = boxes(&stbl(b"stsd")[8..]).unwrap();
+            assert_eq!(entry[0].0, *b"av01");
+            // The visual sample entry's 78 bytes, then its boxes: `av1C`, whose second byte
+            // is the Main profile and the level.
+            let av1c = inside(&entry[0].1[78..], &[b"av1C"]).unwrap();
+            let level = coded(w, h).codec()[7..9].parse::<u8>().unwrap();
+            assert_eq!(av1c[1], level, "run {run}");
+            // One sync sample, the first.
+            assert_eq!(&stbl(b"stss")[4..12], &[0, 0, 0, 1, 0, 0, 0, 1]);
+            let stsz = stbl(b"stsz");
             assert_eq!(u32_at(stsz, 8) as usize, n + 1, "samples against frames");
-            let stco = inside(traks[0], &[b"mdia", b"minf", b"stbl", b"stco"]).unwrap();
-            let at = u32_at(stco, 8) as usize;
+            let at = u32_at(stbl(b"stco"), 8) as usize;
             assert!(at >= mdat_at && at < mp4.len(), "a chunk outside mdat");
-            let file = std::env::temp_dir()
-                .join(format!("voxl-recording-{}-{run}.mp4", std::process::id()));
-            std::fs::write(&file, &mp4).unwrap();
-            let pictures = vp9::tests::decode(&file);
-            std::fs::remove_file(&file).unwrap();
-            let frame = (w * h * 3 / 2) as usize;
-            assert_eq!(pictures.unwrap().len(), (n + 1) * frame, "run {run}");
+            let sent = page.lane(|s| s.updates());
+            assert_eq!(sent.len(), n + 1);
+            let mut at = at;
+            for (f, update) in sent.iter().enumerate() {
+                let len = u32_at(stsz, 12 + 4 * f) as usize;
+                let unit = &update[Header::LEN..];
+                assert_eq!(&unit[..2], &av1::TEMPORAL_DELIMITER, "run {run}, frame {f}");
+                assert_eq!(mp4[at..at + len], unit[2..], "run {run}, sample {f}");
+                at += len;
+            }
         }
     }
 
@@ -1314,11 +1317,10 @@ pub(crate) mod tests {
                 edge += 1;
             }
             assert_eq!(
-                marker_reading(Some((&buf[..], stride)), probe),
+                marker_reading((&buf[..], stride), probe),
                 probe.map(|_| (painted & 0xff_ffff) as u32),
                 "{at:?} on {w}x{h} {painted:#x}"
             );
-            assert_eq!(marker_reading(None, probe), None);
         }
         assert!(
             fits > 300 && not > 300 && edge > 300,
@@ -1344,22 +1346,20 @@ pub(crate) mod tests {
         }
     }
 
-    /// Every viewer's lane carries a stream that decodes from the keyframe it starts on,
-    /// through the real encode loop, a replaced lane included: over generated runs, a viewer
+    /// Every viewer's lane carries the stream from the keyframe it starts on, through the
+    /// real encode loop, a replaced lane included: over generated runs, a viewer
     /// watches from the start, a second joins partway, and a third's lane is replaced partway
     /// (the relay reopened it) and again later; a keyframe is coded whenever one waits to
     /// start, as the capture loop codes one. The first viewer's lane is the whole stream.
-    /// Each lane's updates begin with a keyframe, and decode, by ffmpeg with every error
-    /// fatal, to exactly what the whole stream decodes them to.
+    /// Each lane's updates begin with a keyframe and are a run of the whole stream's, in its
+    /// order, none left out: what a viewer is sent refers only to what it was sent before.
     #[test]
-    fn every_lane_decodes_from_its_keyframe() {
+    fn every_lane_starts_on_a_keyframe_and_misses_nothing_after() {
         let (w, h) = (64u32, 64u32);
         let mut rng = Xorshift::new(0x510e_527f_ade6_82d1);
-        let dir = std::env::temp_dir().join(format!("voxl-video-gate-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
         let mut lanes_checked = 0;
         for case in 0..8 {
-            let hub = Hub::new().unwrap();
+            let hub = Hub::new(crate::hub::tests::hello()).unwrap();
             let whole = viewer(&hub);
             whole.watch();
             let moved = viewer(&hub);
@@ -1396,40 +1396,19 @@ pub(crate) mod tests {
             drop(s);
             lanes.push(updates(&moved));
             lanes.extend(joined.map(|b| updates(&b)));
-            let decode = |name: &str, frames: &[Vec<u8>]| {
-                let mut file = vp9::tests::ivf_header(w as usize, h as usize);
-                for (n, b) in frames.iter().enumerate() {
-                    vp9::tests::ivf_frame(&mut file, n as u64, &b[Header::LEN..]);
-                }
-                let path = dir.join(format!("{name}{case}.ivf"));
-                std::fs::write(&path, file).unwrap();
-                vp9::tests::decode(&path).unwrap_or_else(|e| panic!("case {case} {name}: {e}"))
-            };
-            let frame = (w * h * 3 / 2) as usize;
             let all = updates(&whole);
-            let truth = decode("whole", &all);
-            assert_eq!(truth.len(), all.len() * frame, "case {case}");
             for (l, got) in lanes.iter().enumerate() {
                 assert!(!got.is_empty(), "case {case}: lane {l} carried nothing");
                 assert!(
-                    matches!(
-                        Header::read(&got[0]),
-                        Ok(crate::wire::Video::Picture(h, _)) if h.coding == Coding::Key
-                    ),
+                    Header::read(&got[0]).is_ok_and(|v| v.header.coding == Coding::Key),
                     "case {case}: lane {l} starts on no keyframe"
                 );
                 // Where the lane's first update is in the whole stream: the same bytes.
                 let at = all.iter().position(|u| *u == got[0]).unwrap();
                 assert_eq!(got[..], all[at..at + got.len()], "case {case}: lane {l}");
-                let pictures = decode(&format!("lane{l}-"), got);
-                assert!(
-                    pictures[..] == truth[at * frame..(at + got.len()) * frame],
-                    "case {case}: lane {l}"
-                );
                 lanes_checked += 1;
             }
         }
-        std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(lanes_checked, 8 * 4);
     }
 
@@ -1443,7 +1422,7 @@ pub(crate) mod tests {
     /// a loop that sent nothing.
     #[test]
     fn a_viewer_that_joins_while_the_stream_is_rebuilt_starts_on_the_rebuilt_stream() {
-        let hub = Hub::new().unwrap();
+        let hub = Hub::new(crate::hub::tests::hello()).unwrap();
         let (w, h) = (64, 64);
         let page = viewer(&hub);
         page.watch();
@@ -1551,6 +1530,7 @@ pub(crate) mod tests {
         }
 
         /// Counts every allocation from now on, by every thread of the process.
+        #[cfg(target_os = "linux")]
         pub fn arm() {
             *seen() = Seen {
                 threads: [None; 32],
@@ -1561,6 +1541,7 @@ pub(crate) mod tests {
 
         /// Stops counting: what each thread allocated since `arm`, and how many
         /// allocations came from threads past the table.
+        #[cfg(target_os = "linux")]
         pub fn disarm() -> (Vec<Thread>, usize) {
             ARMED.store(false, Ordering::SeqCst);
             let seen = seen();
@@ -1593,6 +1574,7 @@ pub(crate) mod tests {
     /// they please: so `name` runs in a process of its own, the test binary started again
     /// with only that test selected. True in that process; in the first, starts it and
     /// checks that it ran the test and the test passed.
+    #[cfg(target_os = "linux")]
     pub(crate) fn in_a_process_of_its_own(name: &str) -> bool {
         const ALONE: &str = "VOXL_TEST_IN_A_PROCESS_OF_ITS_OWN";
         if std::env::var_os(ALONE).is_some() {
@@ -1675,6 +1657,8 @@ pub(crate) mod tests {
         canvas: Arc<Canvas>,
         damage: Damage,
         rows: crate::convert::Rows,
+        /// The frame the last grab read, as the X server's shared memory holds it.
+        frame: Vec<u8>,
     }
 
     #[cfg(target_os = "linux")]
@@ -1699,8 +1683,8 @@ pub(crate) mod tests {
         fn damage(&mut self) -> &mut Damage {
             &mut self.damage
         }
-        fn take_damage(&mut self) -> Result<Option<Band>, String> {
-            Ok(self.damage.take(self.canvas.h))
+        fn take_damage(&mut self) -> Option<Band> {
+            self.damage.take(self.canvas.h)
         }
         fn full(&self) -> Band {
             Band {
@@ -1709,18 +1693,18 @@ pub(crate) mod tests {
             }
         }
         fn grab(&mut self, _band: Band) -> Result<(), String> {
+            self.frame.copy_from_slice(&self.canvas.drawn.lock().bgrx);
             Ok(())
         }
         fn convert(&self, dst: &mut I420, y0: usize, y1: usize) -> Result<(), String> {
-            let d = self.canvas.drawn.lock();
             let stride = self.canvas.w as usize * 4;
-            self.rows.convert(&d.bgrx, stride, dst, y0, y1)
+            self.rows.convert(&self.frame, stride, dst, y0, y1)
         }
         fn snapshot(&mut self) -> Result<Vec<u8>, String> {
             Ok(self.canvas.drawn.lock().bgrx.clone())
         }
-        fn bgrx(&self) -> Option<(&[u8], usize)> {
-            None
+        fn bgrx(&self) -> (&[u8], usize) {
+            (&self.frame, self.canvas.w as usize * 4)
         }
     }
 
@@ -1826,7 +1810,7 @@ pub(crate) mod tests {
     /// stream keeps to its size; then 60 generated steps are counted. The test's own thread
     /// is the viewer, so it is not the stream's.
     ///
-    /// What it cannot see: libvpx and libyuv are C, and allocate with C's malloc, which the
+    /// What it cannot see: libaom and libyuv are C, and allocate with C's malloc, which the
     /// counting allocator does not count; nor what the X11 capturer does over its socket.
     #[cfg(target_os = "linux")]
     fn steady_state(name: &str, convert_threads: usize) -> Option<Counted> {
@@ -1842,7 +1826,7 @@ pub(crate) mod tests {
                 std::num::NonZeroUsize::new(4).unwrap(),
             )
         };
-        let hub = Hub::new().unwrap();
+        let hub = Hub::new(crate::hub::tests::hello()).unwrap();
         let client = viewer(&hub);
         client.watch();
         let canvas = Arc::new(Canvas {
@@ -1859,14 +1843,14 @@ pub(crate) mod tests {
             canvas: canvas.clone(),
             damage: Damage::Unreported,
             rows: crate::convert::Rows::new(cfg.convert_threads).unwrap(),
+            frame: vec![0; (w * h * 4) as usize],
         };
         let capture = {
             let (cfg, hub) = (cfg.clone(), hub.clone());
-            let coded = vp9::Stream::new(
-                vp9::Shape {
+            let coded = av1::Stream::new(
+                av1::Shape {
                     width: w,
                     height: h,
-                    fps: FRAMERATE,
                 },
                 cfg.cores,
             )
@@ -1893,18 +1877,11 @@ pub(crate) mod tests {
         impl Viewer {
             fn frame(&mut self) {
                 loop {
-                    let updates = updates(&self.client);
+                    let updates = self.client.lane(|s| s.delivered(Instant::now()));
                     if updates.is_empty() {
                         // Nothing yet: the stream's threads are coding it.
                         std::thread::yield_now();
                         continue;
-                    }
-                    for update in &updates {
-                        let Ok(crate::wire::Video::Picture(header, _)) = Header::read(update)
-                        else {
-                            panic!("the stream sends pictures");
-                        };
-                        self.client.took(header.version);
                     }
                     self.hub.wake();
                     self.frames += updates.len();
@@ -2264,18 +2241,22 @@ pub(crate) mod tests {
     /// daemon's encoder was measured to take a frame at this quality.
     ///
     /// @limitKind measured
-    /// @owner the daemon's VP9 encoder, as these tests simulate it
+    /// @owner the daemon's encoder, as these tests simulate it
     /// @unit milliseconds a frame
     /// @scope the simulated sessions of this module's tests
     /// @evidence the daemon's own encode timings on its server (its `encode_us_total` over
-    /// `encoded`, read by `voxl stats`), as reported with the task this change answers; not
-    /// measured again here
-    /// @observed 2026-11-18
-    /// @environment the daemon at this quality on its server, a 2912x1736 desktop
+    /// `encoded`, read by `voxl stats`) under its previous encoder; and the codec report's
+    /// §3 table for the server, libaom speed 10 at 8 threads, not measured again here
+    /// @observed 2026-11-18 and 2026-11-19
+    /// @environment the daemon at this quality on its server, a 2912x1736 desktop; libaom
+    /// 3.13.1 there at 3024x1896
     /// @workload scrolled text
-    /// @result 15 to 27 ms a frame
-    /// @decision the measured range, a frame's time drawn evenly from it
-    /// @revalidate `bench_hot_path` on the server's hardware; a change of encoder settings
+    /// @result 15 to 27 ms a frame before; libaom deltas 15.1 to 18.7 ms at the median, 21.9
+    /// to 33.0 ms at the 90th percentile, a forced keyframe 34.7 to 37.0 ms
+    /// @decision the first range, a frame's time drawn evenly from it: libaom's medians fall
+    /// inside it, so the session rates measured with it (`SHOWN_A_SECOND`,
+    /// `AFTER_A_PAUSE_A_SECOND`) stand
+    /// @revalidate `bench_hot_path` on the server's hardware under the daemon itself
     const CODING_MS: (u64, u64) = (15, 27);
 
     /// What a simulated session's viewer or its screen does, mid-session.
@@ -2318,9 +2299,10 @@ pub(crate) mod tests {
     /// goes next: a change drawn while another waits replaces it, and a keyframe holds both.
     ///
     /// Around `step`, the session does what the capture loop and the hub do: a stream ends
-    /// when its screen is resized or nobody watches, once its encoder has sent what it
-    /// holds, and the loop looks at nothing until then; a rebuilt stream starts its viewer
-    /// over; a viewer waiting to start is promised the next keyframe let go, and starts
+    /// when its screen is resized, once its encoder has sent what it holds, and the loop
+    /// looks at nothing until then; a rebuilt stream starts its viewer over; nobody watching
+    /// is looked at by nobody, and a viewer that comes back holding the newest frame goes on
+    /// from it; a viewer waiting to start is promised the next keyframe let go, and starts
     /// when that keyframe is coded, if it is still promised it.
     fn session(
         path: &mut Simulated,
@@ -2339,6 +2321,8 @@ pub(crate) mod tests {
         // The change waiting to be captured: when the first of it was drawn, and its bytes.
         let mut drawn: Option<(Instant, u64)> = None;
         let (mut viewer, mut sim) = (Viewer::Waiting, Sim::Stopped);
+        // The stream's newest frame, and the next frame's name.
+        let (mut head, mut versions) = (None, 0u32);
         // The stream is to end, and its viewer to start over on the one rebuilt.
         let (mut ending, mut rebuilt) = (false, false);
         // The gate has held a capture back since the last one went.
@@ -2358,30 +2342,36 @@ pub(crate) mod tests {
             while let Some((_, turn)) = turns.next_if(|(at, _)| *at <= now) {
                 match turn {
                     Turn::Resize => (ending, rebuilt) = (true, true),
-                    Turn::StopWatching => viewer = Viewer::NotWatching,
-                    Turn::Watch => viewer = Viewer::Waiting,
+                    Turn::StopWatching => viewer = crate::hub::stopped(viewer),
+                    Turn::Watch => viewer = crate::hub::watching(viewer, head),
                 }
             }
-            path.tell(now, |version, at| link.took(version, at));
+            path.tell(now, |sequence, at| link.took(sequence, at));
             if let Sim::Busy(frame) = sim {
                 if frame.done <= now {
                     sim = Sim::Idle;
-                    // The keyframe a viewer was promised starts it; only a viewer that has
-                    // started is sent a frame.
+                    // The frame is the stream's newest; the keyframe a viewer was promised
+                    // starts it; only a viewer that has started is sent a frame, and holds it.
+                    let version = crate::wire::Version(versions);
+                    versions += 1;
+                    head = Some(version);
                     viewer = match (viewer, frame.coding) {
-                        (Viewer::Promised, Coding::Key) => Viewer::Started,
+                        (Viewer::Promised, Coding::Key)
+                        | (Viewer::Started { .. }, Coding::Key | Coding::Delta) => {
+                            Viewer::Started { through: version }
+                        }
                         (Viewer::Promised, Coding::Delta)
-                        | (Viewer::NotWatching | Viewer::Waiting | Viewer::Started, _) => viewer,
+                        | (Viewer::NotWatching(_) | Viewer::Waiting, _) => viewer,
                     };
-                    if viewer == Viewer::Started {
+                    if let Viewer::Started { .. } = viewer {
                         let Work {
                             done, drawn, bytes, ..
                         } = frame;
                         let stats = link.stats(done);
-                        let version = crate::wire::Version(next);
+                        let sequence = crate::wire::Sequence(next);
                         next += 1;
-                        link.sent(version, bytes, done);
-                        let took = path.send(version, bytes, Duration::ZERO, done);
+                        link.sent(sequence, bytes, done);
+                        let took = path.send(sequence, bytes, Duration::ZERO, done);
                         shown.push(Shown {
                             drawn,
                             sent: done,
@@ -2397,19 +2387,16 @@ pub(crate) mod tests {
                     }
                 }
             }
-            // With nobody watching, the stream ends.
-            ending |= viewer == Viewer::NotWatching;
+            // With nobody watching, the stream waits as it was: only a resize ends it.
             let encoder = match (sim, ending) {
                 // The stream's end waits for its encoder: nothing looks meanwhile.
                 (Sim::Busy(_), true) => None,
                 (Sim::Stopped | Sim::Idle, true) => {
                     (sim, ending) = (Sim::Stopped, false);
-                    viewer = match (std::mem::take(&mut rebuilt), viewer) {
-                        (true, Viewer::Waiting | Viewer::Promised | Viewer::Started) => {
-                            Viewer::Waiting
-                        }
-                        (true, Viewer::NotWatching) | (false, _) => viewer,
-                    };
+                    if std::mem::take(&mut rebuilt) {
+                        viewer = crate::hub::restarted(viewer);
+                        head = None;
+                    }
                     Some(Encoder::Stopped(()))
                 }
                 (Sim::Stopped, false) => Some(Encoder::Stopped(())),
@@ -2418,7 +2405,9 @@ pub(crate) mod tests {
             };
             let key = match viewer {
                 Viewer::Waiting => Key::Wanted,
-                Viewer::NotWatching | Viewer::Promised | Viewer::Started => Key::NotWanted,
+                Viewer::NotWatching(_) | Viewer::Promised | Viewer::Started { .. } => {
+                    Key::NotWanted
+                }
             };
             let look = Look {
                 key,
@@ -2440,7 +2429,7 @@ pub(crate) mod tests {
             };
             // Nobody watching is looked at by nobody, as in the loop.
             let stepped = encoder
-                .filter(|_| viewer != Viewer::NotWatching)
+                .filter(|_| !matches!(viewer, Viewer::NotWatching(_)))
                 .map(|encoder| step(look, encoder));
             let wait = match stepped {
                 Some(Step::Start(()) | Step::Capture(())) => {
@@ -2857,145 +2846,6 @@ pub(crate) mod tests {
                     "{name}: a frame {lag:?} on the way once the rate followed"
                 );
             }
-        }
-    }
-
-    /// The hot path at production's shape, as a benchmark (`--ignored`, by name; wall
-    /// clock, not a test): one 3024x1898 page of text, coded and sent onto a session's lane
-    /// as the encode loop does, a capture a frame interval apart; the lane's socket takes
-    /// each frame once it is on the lane. Typing-sized updates (a glyph changed) and
-    /// scroll-sized ones (the page moved up 8 rows), 600 captures each, at each thread
-    /// count from one, doubling, to the count `vp9::Stream::new` derives for this machine's
-    /// cores and that count itself. Prints, per workload and thread count, the CPU each
-    /// second of screen takes, the bytes a frame, and percentiles of each capture's latency
-    /// from its job to its picture home, its frame on the lane: 60 frames a second needs the
-    /// p99 at or under 16.7 ms.
-    #[test]
-    #[ignore = "a benchmark: run by name with --ignored --nocapture"]
-    fn bench_hot_path() {
-        const W: usize = 3024;
-        const H: usize = 1898;
-        const CAPTURES: usize = 600;
-        /// Captures before allocations are counted: the stream's buffers grow to size.
-        const WARM: usize = 120;
-        // The process's CPU time.
-        let cpu = || {
-            // SAFETY: getrusage writes the struct it is given.
-            let mut u: libc::rusage = unsafe { std::mem::zeroed() };
-            unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) };
-            let t = |t: libc::timeval| Duration::new(t.tv_sec as u64, t.tv_usec as u32 * 1000);
-            t(u.ru_utime) + t(u.ru_stime)
-        };
-        if !in_a_process_of_its_own("video::tests::bench_hot_path") {
-            return;
-        }
-        let cores = std::thread::available_parallelism().unwrap();
-        let derived = vp9::Stream::new(
-            vp9::Shape {
-                width: W as u32,
-                height: H as u32,
-                fps: FRAMERATE,
-            },
-            cores,
-        )
-        .unwrap();
-        let mut counts: Vec<u32> = std::iter::successors(Some(1u32), |t| Some(t * 2))
-            .take_while(|&t| t < derived.threads)
-            .chain([derived.threads])
-            .collect();
-        counts.dedup();
-        println!(
-            "{} cores; {} derives {} threads",
-            cores,
-            derived.codec(),
-            derived.threads
-        );
-        let mut rng = Xorshift::new(0x0123_4567_89ab_cdef);
-        let page = vp9::tests::page(W, H + 8 * CAPTURES, &mut rng);
-        let workloads = counts
-            .into_iter()
-            .flat_map(|t| [("typing", false, t), ("scroll", true, t)]);
-        for (name, scroll, threads) in workloads {
-            let hub = Hub::new().unwrap();
-            let client = viewer(&hub);
-            client.watch();
-            let mut buf = Box::new(I420::new(W, H));
-            buf.y.copy_from_slice(&page[..W * H]);
-            let first = Job {
-                buf,
-                frame: Plan::Key(promised(&hub)),
-                damage: Instant::now(),
-                marker_ms: None,
-            };
-            let s = Stream::start(
-                &hub,
-                derived.on(threads),
-                first,
-                Debugging::read(|_| None).unwrap(),
-            )
-            .unwrap();
-            let mut buf = s.ret_rx.recv().unwrap();
-            let mut latencies = Vec::with_capacity(CAPTURES);
-            let mut bytes = 0;
-            // The test's socket reading the lane back: not the daemon's work.
-            let mut relay_us = 0;
-            let (wall, cpu0) = (Instant::now(), cpu());
-            for i in 1..=CAPTURES {
-                // Allocations counted past the warm-up: libvpx's own (C's malloc) are not.
-                if i == WARM {
-                    counting::arm();
-                }
-                match scroll {
-                    true => buf.y.copy_from_slice(&page[8 * i * W..(8 * i + H) * W]),
-                    false => {
-                        let (gx, gy) = (8 + (i * 9) % (W - 16), 900 + (i * 9 / W) * 20 % 600);
-                        for y in gy..gy + 12 {
-                            for x in gx..gx + 7 {
-                                buf.y[y * W + x] = buf.y[y * W + x].wrapping_add(97);
-                            }
-                        }
-                    }
-                }
-                let t0 = Instant::now();
-                s.job_tx
-                    .send(Job {
-                        buf,
-                        frame: Plan::Motion,
-                        damage: t0,
-                        marker_ms: None,
-                    })
-                    .unwrap();
-                buf = s.ret_rx.recv().unwrap();
-                latencies.push(t0.elapsed());
-                let relay0 = thread_cpu_us().unwrap();
-                bytes += updates(&client).iter().map(Vec::len).sum::<usize>();
-                relay_us += thread_cpu_us().unwrap() - relay0;
-                let next = t0 + Duration::from_micros(16_667);
-                std::thread::sleep(next.saturating_duration_since(Instant::now()));
-            }
-            let (counted, _) = counting::disarm();
-            let encoding = counted
-                .iter()
-                .filter(|t| t.name.starts_with(b"encode"))
-                .map(|t| t.allocations)
-                .sum::<usize>();
-            let (wall, used) = (wall.elapsed(), cpu() - cpu0);
-            let used = used - Duration::from_micros(relay_us as u64);
-            drop(s);
-            latencies.sort();
-            let at = |p: usize| latencies[(latencies.len() - 1) * p / 100];
-            println!(
-                "{name}, {threads} threads: {:.3} CPU s per screen s; {} B a frame; latency \
-                 p50 {:?} p90 {:?} p99 {:?} max {:?}; {:.2} allocations a capture on the \
-                 encode thread",
-                used.as_secs_f64() / wall.as_secs_f64(),
-                bytes / CAPTURES,
-                at(50),
-                at(90),
-                at(99),
-                at(100),
-                encoding as f64 / (CAPTURES - WARM) as f64,
-            );
         }
     }
 }

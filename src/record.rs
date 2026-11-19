@@ -1,7 +1,7 @@
 //! Screenshots and recordings, for agents and scripts: asked over the daemon's control
 //! socket by `voxl screenshot` and `voxl record` (run over ssh, as `voxl attach` is).
 //!
-//! A recording is the VP9 stream voxl already encodes, rewrapped as MP4: the recorder
+//! A recording is the AV1 stream voxl already encodes, rewrapped as MP4: the recorder
 //! joins as one more viewer, whose way out is the recording itself (`Sender::recording`),
 //! so it costs almost no CPU and bounds no real viewer. Like the stream, it holds frames
 //! only when the screen changes, and it doesn't include the cursor (viewers draw it).
@@ -9,9 +9,9 @@
 //! MP4 beside the video; where the desktop is silent, or has no audio, the track has a
 //! gap, or (with no sound at all) isn't there.
 
-use crate::hub::{Hub, Out};
+use crate::hub::{Hub, Out, Start};
 use crate::mp4;
-use crate::wire::{Header, Video};
+use crate::wire::{Coding, Header, Version};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
@@ -61,18 +61,11 @@ pub async fn screenshot(hub: &Hub) -> Result<Vec<u8>, String> {
         .map_err(|e| e.to_string())?
 }
 
-/// The picture a recording holds: none before its first keyframe, then that keyframe's
-/// size and the level of the stream that coded it.
+/// The stream a recording holds: none before it starts, then the one it started on, as the
+/// daemon told it (`hub::Watcher::Recording`) before its first frame, a keyframe.
 enum Picture {
     Before,
-    Since(Seen),
-}
-
-/// A recording's picture, as its first keyframe says it.
-struct Seen {
-    width: u32,
-    height: u32,
-    codec: mp4::Vp9,
+    Since(Arc<crate::av1::Configuration>),
 }
 
 /// Whether a recording goes on after a message.
@@ -92,16 +85,41 @@ pub enum Until {
 /// Records until `until`, `max` at the most: the MP4.
 pub async fn record(hub: &Arc<Hub>, until: Until, max: Duration) -> Result<Vec<u8>, String> {
     let (tx, rx) = mpsc::unbounded_channel();
-    let client = hub.add_recorder(tx);
-    let res = collect(rx, until, max).await;
+    let (starts_tx, starts) = mpsc::unbounded_channel();
+    let client = hub.add_recorder(tx, starts_tx);
+    let res = collect(rx, starts, until, max).await;
     hub.remove_client(client.id);
     res
 }
 
-/// The frames and audio on `rx` until `until`, `max`, or a keyframe of another size than the
-/// first's (the stream restarted at a new size): the MP4.
+/// The starts a recording was told and has not yet met the keyframe of, oldest first.
+struct Starts {
+    told: mpsc::UnboundedReceiver<Start>,
+    waiting: std::collections::VecDeque<Start>,
+}
+
+impl Starts {
+    /// The stream the keyframe named `version` starts the recording on, if it starts it:
+    /// its start was told before the keyframe was put on its way, so it is here by now. A
+    /// keyframe for other viewers starts nothing.
+    fn of(&mut self, version: Version) -> Option<Arc<crate::av1::Configuration>> {
+        // Empty, or its sender gone: every start told is in hand.
+        while let Ok(start) = self.told.try_recv() {
+            self.waiting.push_back(start);
+        }
+        let start = self.waiting.front().filter(|s| s.version == version)?;
+        let configured = start.configured.clone();
+        self.waiting.pop_front();
+        Some(configured)
+    }
+}
+
+/// The frames and audio on `rx` until `until`, `max`, or the start of another stream than
+/// the first's (the stream restarted at a new size), each start told on `starts` before its
+/// keyframe: the MP4.
 async fn collect(
     mut rx: mpsc::UnboundedReceiver<Out>,
+    starts: mpsc::UnboundedReceiver<Start>,
     until: Until,
     max: Duration,
 ) -> Result<Vec<u8>, String> {
@@ -128,56 +146,48 @@ async fn collect(
         frames: Vec::new(),
         audio: Vec::new(),
     };
-    // The picture's size and level, read at the first frame, a keyframe: a keyframe of
-    // another size (a restart) ends the recording before either could change.
+    // The stream the recording holds, told before its first frame: a keyframe that starts
+    // another (a restart) ends the recording before it is taken.
     let mut picture = Picture::Before;
+    let mut starts = Starts {
+        told: starts,
+        waiting: std::collections::VecDeque::new(),
+    };
     // One message: taken into the recording, or the recording's end.
     let mut take = |m: Out| -> Taken {
         match m {
             Out::Bin(b) => {
-                let (h, coded) = match Header::read(&b) {
-                    Ok(Video::Picture(h, coded)) => (h, coded),
-                    // Not a picture: the stream sends no empty frame, and a viewer's other
-                    // binary messages (a cursor's image) are no video frame.
-                    Ok(Video::Empty(_)) | Err(_) => return Taken::On,
+                // A viewer's other binary messages (a cursor's or the clipboard's image) begin
+                // with their own type byte, which no header's flags are.
+                let Ok(video) = Header::read(&b) else {
+                    return Taken::On;
                 };
-                match (&picture, crate::vp9::keyframe_size(coded)) {
-                    // A recording starts on a keyframe, as every viewer does.
+                let h = video.header;
+                let told = match h.coding {
+                    Coding::Key => starts.of(h.version),
+                    Coding::Delta => None,
+                };
+                match (&picture, told) {
+                    // Nothing is taken before the recording starts.
                     (Picture::Before, None) => return Taken::On,
-                    // The level the stream that coded it is at: its shape's.
-                    (Picture::Before, Some((width, height))) => {
-                        let shape = crate::vp9::Shape {
-                            width,
-                            height,
-                            fps: crate::video::FRAMERATE,
-                        };
-                        match crate::vp9::level(shape) {
-                            Ok(level) => {
-                                let codec = mp4::Vp9 { level };
-                                picture = Picture::Since(Seen {
-                                    width,
-                                    height,
-                                    codec,
-                                });
-                            }
-                            Err(e) => {
-                                log::error!("a recording of a keyframe of no level: {e:?}");
-                                return Taken::End;
-                            }
-                        }
-                    }
-                    (Picture::Since(seen), Some(size)) if size != (seen.width, seen.height) => {
-                        return Taken::End
-                    }
+                    (Picture::Before, Some(started)) => picture = Picture::Since(started),
+                    (Picture::Since(was), Some(started)) if **was != *started => return Taken::End,
                     (Picture::Since(_), Some(_) | None) => {}
                 }
+                let data = match crate::av1::undelimited(&b.slice(Header::LEN..)) {
+                    Ok(data) => data,
+                    Err(crate::av1::Undelimited) => {
+                        log::error!("a recording of a frame that is no temporal unit");
+                        return Taken::End;
+                    }
+                };
                 // Time the frame was captured: now, less the pipeline time in its header.
                 let ms = (start.elapsed().as_millis() as u64).saturating_sub(h.pipe.millis());
                 let ms = tracks.frames.last().map_or(ms, |l| ms.max(l.ms + 1));
                 tracks.frames.push(mp4::Frame {
                     ms,
                     coding: h.coding,
-                    data: b.slice(Header::LEN..),
+                    data,
                 });
                 Taken::On
             }
@@ -215,16 +225,11 @@ async fn collect(
         }
     }
     let end = start.elapsed().as_millis() as u64;
-    let seen = match picture {
+    let configured = match picture {
         Picture::Before => return Err("no frames were recorded".into()),
-        Picture::Since(seen) => seen,
+        Picture::Since(configured) => configured,
     };
-    let Seen {
-        width,
-        height,
-        codec,
-    } = seen;
-    tokio::task::spawn_blocking(move || mp4::write(&tracks, width, height, codec, end))
+    tokio::task::spawn_blocking(move || mp4::write(&tracks, &configured, end))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -234,35 +239,40 @@ mod tests {
     use super::*;
     use crate::hub::ServerMessage;
 
-    /// Video frame `id`: a keyframe of `w` x `h`, or a delta, and bytes standing for its
-    /// VP9 (a keyframe's uncompressed header as far as its size, then `id`).
-    fn video(id: u32, key: Option<(u16, u16)>) -> Out {
+    /// Video frame `id`, `coding`: its header, then bytes standing for its temporal unit
+    /// (the temporal delimiter, then `id`).
+    fn video(id: u32, coding: crate::wire::Coding) -> Out {
         let header = Header {
-            coding: match key {
-                Some(_) => crate::wire::Coding::Key,
-                None => crate::wire::Coding::Delta,
-            },
+            coding,
             version: crate::wire::Version(id),
             pipe: crate::wire::Pipe::of(Duration::ZERO),
         };
         let mut m = header.bytes().to_vec();
-        match key {
-            // Profile 0, a keyframe shown; the sync code; BT.601 at studio range; the size.
-            Some((w, h)) => {
-                m.extend_from_slice(&[0x82, 0x49, 0x83, 0x42]);
-                let size = u64::from(w - 1) << 16 | u64::from(h - 1);
-                // Four bits of colour, then 32 of size: 36 bits, in five bytes.
-                m.extend_from_slice(&(size << 4).to_be_bytes()[3..]);
-            }
-            None => m.extend_from_slice(&[0x86, 0x00]),
-        }
+        m.extend_from_slice(&crate::av1::TEMPORAL_DELIMITER);
         m.extend_from_slice(&id.to_be_bytes());
         Out::Bin(bytes::Bytes::from(m))
     }
 
+    /// Two streams' configurations, generated, and not the same.
+    fn streams(rng: &mut crate::xorshift::Xorshift) -> [Arc<crate::av1::Configuration>; 2] {
+        let one = crate::av1::tests::configuration(rng);
+        let other = std::iter::repeat_with(|| crate::av1::tests::configuration(rng))
+            .find(|c| *c != one)
+            .unwrap();
+        [Arc::new(one), Arc::new(other)]
+    }
+
+    /// The start of stream `configured` on the keyframe named `id`.
+    fn start(id: u32, configured: &Arc<crate::av1::Configuration>) -> Start {
+        Start {
+            version: Version(id),
+            configured: configured.clone(),
+        }
+    }
+
     /// A hub, whose hello a recording is told among its frames.
     fn hub() -> Arc<Hub> {
-        Hub::new().unwrap()
+        Hub::new(crate::hub::tests::hello()).unwrap()
     }
 
     /// The frames an MP4 holds: its sample count.
@@ -271,10 +281,10 @@ mod tests {
         u32::from_be_bytes(mp4[stsz + 12..stsz + 16].try_into().unwrap())
     }
 
-    /// A recording holds the frames from its first keyframe to the first keyframe of
-    /// another size (a capture restart), whatever else a viewer is told (a hello, a
-    /// clipboard that says anything, the microphone), and whatever keyframes of its own size
-    /// come (other viewers starting).
+    /// A recording holds the frames from the start of its stream to the start of another
+    /// (a capture restart), whatever else a viewer is told (a hello, a clipboard that says
+    /// anything, the microphone, the start of its own stream again), and whatever keyframes
+    /// come (other viewers starting): over generated runs of messages.
     #[tokio::test]
     async fn a_recording_ends_at_a_restart_and_nothing_else() {
         const CLIPS: [&str; 7] = [
@@ -288,21 +298,26 @@ mod tests {
         ];
         let hub = hub();
         let mut rng = crate::xorshift::Xorshift::new(0x9e37_79b9_7f4a_7c15);
+        let streams = streams(&mut rng);
         for _ in 0..2_000 {
             let (tx, rx) = mpsc::unbounded_channel();
+            let (starts_tx, starts) = mpsc::unbounded_channel();
             let (mut held, mut ended) = (0, false);
-            let mut first: Option<(u16, u16)> = None;
+            let mut first: Option<usize> = None;
             for id in 0..rng.next() % 12 {
                 let m = match rng.next() % 7 {
-                    0 | 1 => video(id as u32, None),
+                    0 => video(id as u32, crate::wire::Coding::Delta),
+                    1 => video(id as u32, crate::wire::Coding::Key),
                     2 => {
-                        let size = [(64, 64), (64, 64), (128, 96)][rng.below(3) as usize];
+                        let which = [0, 0, 1][rng.below(3) as usize];
                         match (first, ended) {
-                            (None, true | false) => first = Some(size),
-                            (Some(f), false) if f != size => ended = true,
+                            (None, true | false) => first = Some(which),
+                            (Some(f), false) if f != which => ended = true,
                             (Some(_), true | false) => {}
                         }
-                        video(id as u32, Some(size))
+                        // A start is told before the keyframe it starts on.
+                        starts_tx.send(start(id as u32, &streams[which])).unwrap();
+                        video(id as u32, crate::wire::Coding::Key)
                     }
                     3 => Out::Text(hub.hello()),
                     4 => Out::Text(ServerMessage::Clip {
@@ -320,7 +335,7 @@ mod tests {
             drop(tx);
             let (_keep, stop) = oneshot::channel();
             let until = Until::Stopped(stop);
-            let mp4 = collect(rx, until, Duration::from_secs(3600)).await;
+            let mp4 = collect(rx, starts, until, Duration::from_secs(3600)).await;
             match held {
                 0 => assert!(mp4.is_err()),
                 n => assert_eq!(samples(&mp4.unwrap()), n),
@@ -338,14 +353,18 @@ mod tests {
     #[tokio::test]
     async fn a_recording_carries_the_audio_on_the_clock_its_packets_say() {
         let mut rng = crate::xorshift::Xorshift::new(0x510e_527f_ade6_82d1);
+        let [stream, _] = streams(&mut rng);
         // Without audio; with audio and no silence; with silence.
         let mut reached = [0u32; 3];
         for _ in 0..1_000 {
             let (tx, rx) = mpsc::unbounded_channel();
-            tx.send(video(0, Some((64, 64)))).unwrap();
+            let (starts_tx, starts) = mpsc::unbounded_channel();
+            starts_tx.send(start(0, &stream)).unwrap();
+            tx.send(video(0, crate::wire::Coding::Key)).unwrap();
             let mut sent: Vec<(Vec<u8>, u32)> = Vec::new();
             for id in 1..1 + rng.next() % 12 {
-                tx.send(video(id as u32, None)).unwrap();
+                tx.send(video(id as u32, crate::wire::Coding::Delta))
+                    .unwrap();
             }
             for _ in 0..rng.next() % 13 {
                 let packet: Vec<u8> = (0..1 + rng.below(30))
@@ -359,7 +378,7 @@ mod tests {
                 .unwrap();
                 sent.push((packet, silent));
                 if rng.next() & 1 == 1 {
-                    tx.send(video(99, None)).unwrap();
+                    tx.send(video(99, crate::wire::Coding::Delta)).unwrap();
                 }
             }
             reached[match (sent.len(), sent.iter().any(|(_, s)| *s > 0)) {
@@ -370,7 +389,9 @@ mod tests {
             drop(tx);
             let (_keep, stop) = oneshot::channel();
             let until = Until::Stopped(stop);
-            let mp4 = collect(rx, until, Duration::from_secs(3600)).await.unwrap();
+            let mp4 = collect(rx, starts, until, Duration::from_secs(3600))
+                .await
+                .unwrap();
             let (tracks, _) = mp4::tests::read(&mp4);
             let Some(audio) = tracks.get(1) else {
                 // None kept: none sent, or all before the first frame.

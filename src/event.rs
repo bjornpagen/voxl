@@ -13,15 +13,25 @@ pub enum ClipContent {
     Image(Vec<u8>),
 }
 
-/// The first byte of a binary message the daemon sends the page: what it is. `bin` in
-/// web/src/wire.json, the page's copy, which a test checks against these.
+/// The first byte of a binary message the daemon sends the page: what it is (`wire::Byte`).
+/// `bin` in web/src/wire.json, the page's copy, which a test checks against these.
 #[derive(Clone, Copy, Debug, PartialEq)]
-#[repr(u8)]
 pub enum Bin {
     /// The cursor's image.
-    Cursor = 0x03,
+    Cursor,
     /// The desktop's clipboard image (PNG).
-    ClipImage = 0x04,
+    ClipImage,
+}
+
+impl crate::wire::Byte for Bin {
+    const ALL: &'static [Bin] = &[Bin::Cursor, Bin::ClipImage];
+
+    fn byte(self) -> u8 {
+        match self {
+            Bin::Cursor => 0x03,
+            Bin::ClipImage => 0x04,
+        }
+    }
 }
 
 /// The first byte of a binary message the page sends the daemon: what it is, read by
@@ -284,16 +294,29 @@ fn coalesce(events: impl Iterator<Item = InputEvent>) -> impl Iterator<Item = In
     let mut events = events.peekable();
     std::iter::from_fn(move || loop {
         let ev = events.next()?;
-        match ev {
-            InputEvent::Move { .. } if matches!(events.peek(), Some(InputEvent::Move { .. })) => {}
-            InputEvent::Move { .. }
-            | InputEvent::Button { .. }
+        let moves_on = match events.peek() {
+            Some(next) => next.moves(),
+            None => false,
+        };
+        match (ev.moves(), moves_on) {
+            (true, true) => {}
+            (true, false) | (false, true | false) => return Some(ev),
+        }
+    })
+}
+
+impl InputEvent {
+    /// Whether it moves the pointer.
+    fn moves(&self) -> bool {
+        match self {
+            InputEvent::Move { .. } => true,
+            InputEvent::Button { .. }
             | InputEvent::ScrollPx { .. }
             | InputEvent::Key { .. }
             | InputEvent::Clipboard(_)
-            | InputEvent::ReleaseAll => return Some(ev),
+            | InputEvent::ReleaseAll => false,
         }
-    })
+    }
 }
 
 #[cfg(test)]
@@ -439,7 +462,7 @@ mod tests {
         let wire: serde_json::Value =
             serde_json::from_str(include_str!("../web/src/wire.json")).unwrap();
         for (name, bin) in [("cursor", Bin::Cursor), ("clipImage", Bin::ClipImage)] {
-            assert_eq!(wire["bin"][name], bin as u8, "{name}");
+            assert_eq!(wire["bin"][name], bin.byte(), "{name}");
         }
         for (name, bin) in [
             ("clipImageUp", BinUp::ClipImage),

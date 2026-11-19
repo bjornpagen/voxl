@@ -54,30 +54,54 @@ const DECODED_MOST: usize = RATE as usize * 120 / 1000;
 /// audio that piles up while nothing records is at most this stale when something starts.
 const FIFO_BYTES: c_int = 4096;
 
-#[derive(Default)]
 pub struct Queue {
     samples: VecDeque<i16>,
-    playing: bool,
+    jitter: Jitter,
     dropped: usize,
     /// Times the jitter queue ran dry mid-stream (each one is an audible gap).
     underruns: usize,
 }
 
+/// Whether the queue plays what it holds.
+#[derive(Clone, Copy, PartialEq)]
+enum Jitter {
+    /// Not until it holds `PREFILL`: silence meanwhile.
+    Filling,
+    /// Until it runs dry.
+    Playing,
+}
+
+impl Queue {
+    /// An empty queue, filling.
+    const fn new() -> Queue {
+        Queue {
+            samples: VecDeque::new(),
+            jitter: Jitter::Filling,
+            dropped: 0,
+            underruns: 0,
+        }
+    }
+}
+
 /// The next frame to play: queued audio once the jitter buffer has filled, else silence.
 pub fn next_frame(queue: &Mutex<Queue>, frame: &mut [i16]) {
     let mut q = queue.lock();
-    if !q.playing && q.samples.len() >= PREFILL {
-        q.playing = true;
+    if q.jitter == Jitter::Filling && q.samples.len() >= PREFILL {
+        q.jitter = Jitter::Playing;
     }
     frame.fill(0);
-    if q.playing {
-        let n = q.samples.len().min(frame.len());
-        for (d, s) in frame.iter_mut().zip(q.samples.drain(..n)) {
-            *d = s;
-        }
-        if n < frame.len() {
-            q.playing = false; // ran dry: refill the jitter buffer first
-            q.underruns += 1;
+    match q.jitter {
+        Jitter::Filling => {}
+        Jitter::Playing => {
+            let n = q.samples.len().min(frame.len());
+            for (d, s) in frame.iter_mut().zip(q.samples.drain(..n)) {
+                *d = s;
+            }
+            if n < frame.len() {
+                // Ran dry: the jitter buffer fills again first.
+                q.jitter = Jitter::Filling;
+                q.underruns += 1;
+            }
         }
     }
 }
@@ -124,22 +148,25 @@ fn writer(fifo: &std::path::Path, queue: Arc<Mutex<Queue>>) -> nix::Result<()> {
             next = now;
         }
         next_frame(&queue, &mut frame);
-        if fd.is_none() {
-            fd = open_fifo(fifo)?;
-            if fd.is_some() {
-                log::info!("microphone: writing to {}", fifo.display());
-            }
+        let f = match &fd {
+            Some(f) => f,
+            None => match open_fifo(fifo)? {
+                Some(f) => {
+                    log::info!("microphone: writing to {}", fifo.display());
+                    fd.insert(f)
+                }
+                // No reader yet: nobody needs this frame.
+                None => continue,
+            },
+        };
+        for (b, s) in bytes.as_chunks_mut::<2>().0.iter_mut().zip(&frame) {
+            *b = s.to_le_bytes();
         }
-        if let Some(f) = &fd {
-            for (b, s) in bytes.as_chunks_mut::<2>().0.iter_mut().zip(&frame) {
-                *b = s.to_le_bytes();
-            }
-            match write(f, &bytes) {
-                Ok(_) | Err(Errno::EAGAIN) => {}
-                // The reader closed it: open it again when there is one.
-                Err(Errno::EPIPE) => fd = None,
-                Err(e) => return Err(e),
-            }
+        match write(f, &bytes) {
+            Ok(_) | Err(Errno::EAGAIN) => {}
+            // The reader closed it: open it again when there is one.
+            Err(Errno::EPIPE) => fd = None,
+            Err(e) => return Err(e),
         }
     }
 }
@@ -152,7 +179,7 @@ fn writer(fifo: &std::path::Path, queue: Arc<Mutex<Queue>>) -> nix::Result<()> {
 /// `module-pipe-source file=`), in the runtime folder.
 pub fn spawn(hub: Arc<Hub>, fifo: std::path::PathBuf) -> mpsc::Sender<MicMsg> {
     let (tx, rx) = mpsc::channel::<MicMsg>();
-    let queue = Arc::new(Mutex::new(Queue::default()));
+    let queue = Arc::new(Mutex::new(Queue::new()));
     let fatal = |what: &str, e: &dyn std::fmt::Display| -> ! {
         log::error!("microphone: {what}: {e}");
         crate::logging::exit(1)
@@ -201,7 +228,7 @@ pub fn spawn(hub: Arc<Hub>, fifo: std::path::PathBuf) -> mpsc::Sender<MicMsg> {
             let reset = || {
                 let mut q = queue.lock();
                 let stats = (q.dropped, q.underruns);
-                *q = Queue::default();
+                *q = Queue::new();
                 stats
             };
             while let Ok(m) = rx.recv() {

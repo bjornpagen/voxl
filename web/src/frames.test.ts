@@ -72,9 +72,9 @@ function random(seed: number) {
 
 /** Codecs the fake browser decodes; one it lacks (NotSupportedError, and its check says
  * unsupported); one it cannot configure. */
-const GOOD = ['vp09.00.10.08', 'vp09.00.41.08'];
-const LACKED = 'vp09.02.10.10';
-const INVALID = 'vp09.invalid';
+const GOOD = ['av01.0.13M.08', 'av01.0.08M.08'];
+const LACKED = 'av01.2.13M.12';
+const INVALID = 'av01.invalid';
 
 /** An update's bytes: an object of its own, so a decode names the update it was given. */
 interface Bytes {

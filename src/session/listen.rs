@@ -151,8 +151,8 @@ mod tests {
 
     /// Returns once nothing answers on the socket at `path`, whose listener this test has
     /// dropped. On macOS a socket is made close-on-exec only after it is made, so a child
-    /// another test starts between the two (ffmpeg, a test in a process of its own)
-    /// inherits the listener, and it answers until that child's exec closes it. That is
+    /// another test starts between the two (a test in a process of its own, the one child
+    /// a test starts) inherits the listener, and it answers until that child's exec closes it. That is
     /// this process's doing, not the daemon's: the test waits it out, on the one thing that
     /// ends it.
     fn unanswered(path: &Path) {

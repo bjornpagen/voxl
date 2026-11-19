@@ -1,16 +1,18 @@
-//! Minimal MP4 writer for recordings: the VP9 voxl already sends, rewrapped without
-//! re-encoding (VP9 in MP4 as the VP Codec ISO Media File Format Binding,
-//! https://www.webmproject.org/vp9/mp4/, places it: a `vp09` sample entry with a `vpcC`, each
-//! frame one sample), and the desktop's Opus packets as a second track. Frames arrive only when
+//! Minimal MP4 writer for recordings: the AV1 voxl already sends, rewrapped without
+//! re-encoding (AV1 in MP4 as the AV1 Codec ISO Media File Format Binding places it: an
+//! `av01` sample entry with an `av1C` carrying the sequence header OBU, each temporal unit
+//! one sample, without its temporal delimiter), and the desktop's Opus packets as a second
+//! track. Frames arrive only when
 //! the screen changes, so each sample lasts until the next one (variable frame rate);
 //! packets are sent only for sound, so the audio track has gaps, which its sample
 //! durations hold.
 
+use crate::av1::Configuration;
 use crate::sound::{DESKTOP, RATE};
 use crate::wire::Coding;
 
-/// One encoded frame: time since the recording started (ms), what it is coded as, the
-/// VP9 frame.
+/// One encoded frame: time since the recording started (ms), what it is coded as, its
+/// temporal unit without the temporal delimiter (`av1::delimited`).
 pub struct Frame {
     pub ms: u64,
     pub coding: Coding,
@@ -157,35 +159,29 @@ fn audio_trak(packets: &[&AudioPacket], lead_ms: u64, ms: u64, at: u32) -> Vec<u
     bx(b"trak", &[fbx(b"tkhd", 3, &tkhd), edts, mdia].concat())
 }
 
-/// What the `vpcC` of a VP9 stream says: the level it is coded at, times ten (profile 0 and
-/// 8 bits are voxl's one stream's).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Vp9 {
-    pub level: u8,
+/// The AV1 Codec Configuration Box of a stream `configured` so, its
+/// `AV1CodecConfigurationRecord` (aomediacodec.github.io/av1-isobmff: "unsigned int(1) marker
+/// = 1; unsigned int(7) version = 1; unsigned int(3) seq_profile; unsigned int(5)
+/// seq_level_idx_0; unsigned int(1) seq_tier_0; unsigned int(1) high_bitdepth; unsigned
+/// int(1) twelve_bit; unsigned int(1) monochrome; unsigned int(1) chroma_subsampling_x;
+/// unsigned int(1) chroma_subsampling_y; unsigned int(2) chroma_sample_position; unsigned
+/// int(3) reserved = 0; unsigned int(1) initial_presentation_delay_present; ... unsigned
+/// int(4) reserved = 0; unsigned int(8) configOBUs[];"): the Main profile (0) and the
+/// stream's level; the main tier, 8 bits, not monochrome, 4:2:0 ("if ( seq_profile == 0 ) {
+/// subsampling_x = 1 subsampling_y = 1", color_config), the chroma's position unknown (0),
+/// as `av1::Encoder` configures every stream; no initial presentation delay; then the
+/// sequence header OBU, which "SHALL be the first OBU".
+fn av1c(configured: &Configuration) -> Vec<u8> {
+    let mut b = vec![0x81, configured.level.index(), 0b0000_1100, 0];
+    b.extend_from_slice(&configured.sequence_header);
+    bx(b"av1C", &b)
 }
 
-/// The VP Codec Configuration Box of a stream at `level` (the binding's §2.2.3): version 1;
-/// profile 0; the level; 8 bits, 4:2:0 with chroma between luma rows (code 0), studio range;
-/// BT.709 primaries (code 1) and the sRGB transfer (code 13), as X11 draws the screen, and
-/// BT.601's matrix (code 6), as libyuv's ARGBToI420 converts it (ISO/IEC 23091-2's codes);
-/// no initialisation data, as VP9 has none.
-fn vpcc(Vp9 { level }: Vp9) -> Vec<u8> {
-    let mut b = vec![1, 0, 0, 0]; // version 1, flags 0
-    b.extend_from_slice(&[0, level, 8 << 4, 1, 13, 6]);
-    b.extend_from_slice(&0u16.to_be_bytes());
-    bx(b"vpcC", &b)
-}
-
-/// Writes `tracks` (the first frame must be a keyframe) of a VP9 stream `codec` as an MP4 of
-/// `width`x`height` lasting until `end_ms`. The movie begins at its first frame: audio
-/// before it is left out, and the audio after it keeps its place, silences and all.
-pub fn write(
-    tracks: &Tracks,
-    width: u32,
-    height: u32,
-    codec: Vp9,
-    end_ms: u64,
-) -> Result<Vec<u8>, String> {
+/// Writes `tracks` (the first frame must be a keyframe) of the AV1 stream `configured` as
+/// an MP4 lasting until `end_ms`. The movie begins at its first frame: audio before it is
+/// left out, and the audio after it keeps its place, silences and all.
+pub fn write(tracks: &Tracks, configured: &Configuration, end_ms: u64) -> Result<Vec<u8>, String> {
+    let (width, height) = (configured.shape.width, configured.shape.height);
     let frames = &tracks.frames;
     let first = frames.first().ok_or("no frames were recorded")?;
     match first.coding {
@@ -232,18 +228,18 @@ pub fn write(
         return Err("recording too large".into());
     }
 
-    // The visual sample entry (ISO/IEC 14496-12 §12.1.3), then its `vpcC`.
-    let mut vp09 = vec![0u8; 6];
-    vp09.extend_from_slice(&1u16.to_be_bytes()); // data reference index
-    vp09.extend_from_slice(&[0u8; 16]);
-    vp09.extend_from_slice(&(width as u16).to_be_bytes());
-    vp09.extend_from_slice(&(height as u16).to_be_bytes());
-    vp09.extend_from_slice(&u32s(&[0x48_0000, 0x48_0000, 0]));
-    vp09.extend_from_slice(&1u16.to_be_bytes()); // frame count
-    vp09.extend_from_slice(&[0u8; 32]); // compressor name
-    vp09.extend_from_slice(&[0, 0x18, 0xff, 0xff]); // depth, pre-defined
-    vp09.extend_from_slice(&vpcc(codec));
-    let stsd = fbx(b"stsd", 0, &[u32s(&[1]), bx(b"vp09", &vp09)].concat());
+    // The visual sample entry (ISO/IEC 14496-12 §12.1.3), then its `av1C`.
+    let mut av01 = vec![0u8; 6];
+    av01.extend_from_slice(&1u16.to_be_bytes()); // data reference index
+    av01.extend_from_slice(&[0u8; 16]);
+    av01.extend_from_slice(&(width as u16).to_be_bytes());
+    av01.extend_from_slice(&(height as u16).to_be_bytes());
+    av01.extend_from_slice(&u32s(&[0x48_0000, 0x48_0000, 0]));
+    av01.extend_from_slice(&1u16.to_be_bytes()); // frame count
+    av01.extend_from_slice(&[0u8; 32]); // compressor name
+    av01.extend_from_slice(&[0, 0x18, 0xff, 0xff]); // depth, pre-defined
+    av01.extend_from_slice(&av1c(configured));
+    let stsd = fbx(b"stsd", 0, &[u32s(&[1]), bx(b"av01", &av01)].concat());
 
     let stts = stts(&durations);
     let stss = fbx(
@@ -340,6 +336,13 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// Streams' configurations, generated.
+    fn configurations(rng: &mut Xorshift) -> Vec<Configuration> {
+        (0..4)
+            .map(|_| crate::av1::tests::configuration(rng))
+            .collect()
+    }
+
     /// The box `name` at its first place in `mp4`, and its payload after its 8-byte header.
     fn find<'a>(mp4: &'a [u8], name: &[u8; 4]) -> (usize, &'a [u8]) {
         let at = mp4.windows(4).position(|w| w == name).expect("the box") - 4;
@@ -349,12 +352,13 @@ pub(crate) mod tests {
 
     /// A recording is its frames as MP4 samples: the movie's header before its data, the
     /// chunk offset pointing at the first sample, and the data each frame as it is, in
-    /// order, one sample size each; a `vp09` entry whose `vpcC` names the level; the
-    /// keyframes the sync samples. Over generated recordings of a keyframe and 0 to 20
-    /// frames more, keyframes among them.
+    /// order, one sample size each; an `av01` entry whose `av1C` is the stream's record,
+    /// field by field, and carries its sequence header; the keyframes the sync samples. Over
+    /// generated recordings of a keyframe and 0 to 20 frames more, keyframes among them.
     #[test]
     fn a_recording_is_its_frames_as_samples() {
         let mut rng = Xorshift::new(0x9b05_688c_2b3e_6c1f);
+        let streams = configurations(&mut rng);
         for _ in 0..1_000 {
             let mut ms = 0;
             let mut frames = Vec::new();
@@ -384,8 +388,8 @@ pub(crate) mod tests {
                 frames,
                 audio: Vec::new(),
             };
-            let level = [10, 31, 41, 51, 62][rng.below(5) as usize];
-            let out = write(&tracks, 64, 32, Vp9 { level }, end).unwrap();
+            let configured = &streams[rng.below(4) as usize];
+            let out = write(&tracks, configured, end).unwrap();
             let (moov, _) = find(&out, b"moov");
             let (mdat, data) = find(&out, b"mdat");
             assert!(moov < mdat);
@@ -404,8 +408,34 @@ pub(crate) mod tests {
             assert_eq!(words(&stsz[12..]), want_sizes);
             let (_, stss) = find(&out, b"stss");
             assert_eq!(words(&stss[8..]), want_sync);
-            let (_, vpcc) = find(&out, b"vpcC");
-            assert_eq!(vpcc, &[1, 0, 0, 0, 0, level, 0x80, 1, 13, 6, 0, 0]);
+            // `AV1CodecConfigurationRecord`, field by field as AV1 in ISOBMFF lays it out:
+            // marker(1) version(7), seq_profile(3) seq_level_idx_0(5), seq_tier_0(1)
+            // high_bitdepth(1) twelve_bit(1) monochrome(1) chroma_subsampling_x(1)
+            // chroma_subsampling_y(1) chroma_sample_position(2), reserved(3)
+            // initial_presentation_delay_present(1) reserved(4), configOBUs.
+            let (_, av1c) = find(&out, b"av1C");
+            let bits =
+                |byte: usize, from: u32, n: u32| (av1c[byte] >> (8 - from - n)) & ((1 << n) - 1);
+            let fields = [
+                (bits(0, 0, 1), 1),
+                (bits(0, 1, 7), 1),
+                (bits(1, 0, 3), 0),
+                (bits(1, 3, 5), configured.level.index()),
+                (bits(2, 0, 1), 0),
+                (bits(2, 1, 1), 0),
+                (bits(2, 2, 1), 0),
+                (bits(2, 3, 1), 0),
+                (bits(2, 4, 1), 1),
+                (bits(2, 5, 1), 1),
+                (bits(2, 6, 2), 0),
+                (bits(3, 0, 3), 0),
+                (bits(3, 3, 1), 0),
+                (bits(3, 4, 4), 0),
+            ];
+            for (i, (got, want)) in fields.into_iter().enumerate() {
+                assert_eq!(got, want, "av1C field {i}");
+            }
+            assert_eq!(av1c[4..], configured.sequence_header[..]);
         }
     }
 
@@ -519,6 +549,7 @@ pub(crate) mod tests {
     #[test]
     fn a_recording_is_its_video_and_audio_on_one_timeline() {
         let mut rng = Xorshift::new(0x6a09_e667_f3bc_c908);
+        let streams = configurations(&mut rng);
         // No audio, all of it before the first frame, some of it, with a silence, without.
         let mut reached = [0u32; 5];
         for _ in 0..4_000 {
@@ -567,7 +598,7 @@ pub(crate) mod tests {
                 },
             }] += 1;
 
-            let out = write(&tracks, 64, 32, Vp9 { level: 10 }, end).unwrap();
+            let out = write(&tracks, &streams[rng.below(4) as usize], end).unwrap();
             let (read, movie_ms) = read(&out);
             assert_eq!(read.len(), 1 + usize::from(!want_audio.is_empty()));
 

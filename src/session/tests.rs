@@ -2,15 +2,15 @@
 //! still desktop sends nothing; a lane attaches only with its session's capability, and
 //! nothing else from a lane counts; a closed session's lane gets no byte more; a lane whose
 //! socket breaks holds no capture back; what the relay says the page took reaches the
-//! session's link, and a took of a lane since replaced counts for nothing; and the
-//! capability goes nowhere but the control stream.
+//! session's link, by each frame's name, and a took of a lane since replaced counts for
+//! nothing; and the capability goes nowhere but the control stream.
 
 use super::control::{connection, Daemon};
 use super::query::Opening;
 use crate::event::{BinUp, MicMsg};
 use crate::hub::Hub;
 use crate::wire::Byte;
-use crate::wire::{Capability, Down, Frame, Framer, Track, Up, Version};
+use crate::wire::{Capability, Down, Frame, Framer, Sequence, Track, Up};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -141,6 +141,20 @@ async fn open_lane(hub: &Arc<Hub>, bytes: &[u8]) -> UnixStream {
     relay
 }
 
+/// The next frame a lane carries, read with `framer`: its name, its track and its bytes.
+async fn next_frame(lane: &mut UnixStream, framer: &mut Framer) -> (Sequence, Track, Vec<u8>) {
+    loop {
+        if let Some(m) = framer.frame().unwrap() {
+            let f = Frame::decode(m).expect("a lane carries frames");
+            return (f.sequence, f.track, f.bytes.to_vec());
+        }
+        let mut buf = [0u8; 8192];
+        let n = lane.read(&mut buf).await.unwrap();
+        assert!(n > 0, "the lane ended");
+        framer.push(&buf[..n]);
+    }
+}
+
 /// Reads a lane until it ends: what it carried.
 async fn to_the_end(lane: &mut UnixStream) -> Vec<u8> {
     let mut all = Vec::new();
@@ -153,7 +167,7 @@ async fn to_the_end(lane: &mut UnixStream) -> Vec<u8> {
 /// listening. The daemon sends nothing it was not asked for, and no time wakes it.
 #[tokio::test(start_paused = true)]
 async fn a_still_desktop_sends_nothing_after_the_hello() {
-    let hub = Hub::new().unwrap();
+    let hub = Hub::new(crate::hub::tests::hello()).unwrap();
     let d = daemon(&hub);
     let mut relay = Relay::open(&d).await;
     let (c, _) = relay.greeted().await;
@@ -180,7 +194,7 @@ async fn a_still_desktop_sends_nothing_after_the_hello() {
 /// session's control stream, once.
 #[tokio::test]
 async fn a_wrong_or_stale_capability_is_refused() {
-    let hub = Hub::new().unwrap();
+    let hub = Hub::new(crate::hub::tests::hello()).unwrap();
     let d = daemon(&hub);
     let mut relay = Relay::open(&d).await;
     let (c, raw) = relay.greeted().await;
@@ -220,7 +234,7 @@ async fn a_wrong_or_stale_capability_is_refused() {
 /// sent after it make nothing; another lane attaching with its capability is refused.
 #[tokio::test]
 async fn after_the_close_no_lane_gets_a_byte() {
-    let hub = Hub::new().unwrap();
+    let hub = Hub::new(crate::hub::tests::hello()).unwrap();
     let d = daemon(&hub);
     let mut relay = Relay::open(&d).await;
     let (c, raw) = relay.greeted().await;
@@ -229,35 +243,21 @@ async fn after_the_close_no_lane_gets_a_byte() {
     let client = hub.clients.lock()[0].clone();
     for i in 0..5u8 {
         let frame = bytes::Bytes::from(vec![i; 3000]);
-        client.lane(|s| s.video(&frame, Version(i.into()), Instant::now()));
+        client.lane(|s| s.video(&frame, Instant::now()));
     }
     let mut framer = Framer::new();
-    let mut buf = [0u8; 4096];
-    let mut carried = 0;
-    while carried < 5 {
-        let n = lane.read(&mut buf).await.unwrap();
-        assert!(n > 0, "the lane ended before the close");
-        framer.push(&buf[..n]);
-        while let Some(m) = framer.frame().unwrap() {
-            let Ok(Frame {
-                track: Track::Video,
-                bytes,
-            }) = Frame::decode(m)
-            else {
-                panic!("a lane carries the updates");
-            };
-            assert_eq!(bytes[0], carried, "in order");
-            carried += 1;
-        }
+    for carried in 0..5 {
+        let (_, track, bytes) = next_frame(&mut lane, &mut framer).await;
+        assert_eq!((track, bytes[0]), (Track::Video, carried), "in order");
     }
     let frame = bytes::Bytes::from(vec![7u8; 3000]);
     drop(relay);
     while !hub.clients.lock().is_empty() {
         tokio::task::yield_now().await;
     }
-    for i in 5..10 {
-        client.lane(|s| s.video(&frame, Version(i), Instant::now()));
-        client.lane(|s| s.audio(&frame[..200], 0));
+    for _ in 5..10 {
+        client.lane(|s| s.video(&frame, Instant::now()));
+        client.lane(|s| s.audio(&frame[..200], 0, Instant::now()));
     }
     assert!(
         to_the_end(&mut lane).await.is_empty(),
@@ -343,7 +343,7 @@ async fn the_capability_reaches_nothing() {
 
     log::set_boxed_logger(Box::new(Lines)).unwrap();
     log::set_max_level(log::LevelFilter::Trace);
-    let hub = Hub::new().unwrap();
+    let hub = Hub::new(crate::hub::tests::hello()).unwrap();
     let d = daemon(&hub);
     let mut relay = Relay::open(&d).await;
     let (c, raw) = relay.greeted().await;
@@ -426,7 +426,7 @@ fn capture(hub: &Arc<Hub>, w: usize, h: usize, bgrx: Vec<u8>) {
 #[tokio::test]
 async fn a_query_never_mints_a_capability_or_reaches_a_lane() {
     use super::query::{Query, Recording};
-    let hub = Hub::new().unwrap();
+    let hub = Hub::new(crate::hub::tests::hello()).unwrap();
     capture(&hub, 4, 2, vec![9; 4 * 2 * 4]);
     let d = daemon(&hub);
     let mut relay = Relay::open(&d).await;
@@ -473,7 +473,7 @@ async fn a_screenshot_decodes_to_the_screen() {
     for _ in 0..8 {
         let (w, h) = (1 + rng.below(64) as usize, 1 + rng.below(48) as usize);
         let bgrx: Vec<u8> = (0..w * h * 4).map(|_| rng.below(256) as u8).collect();
-        let hub = Hub::new().unwrap();
+        let hub = Hub::new(crate::hub::tests::hello()).unwrap();
         capture(&hub, w, h, bgrx.clone());
         let d = daemon(&hub);
         let answer = query(&d, super::query::Query::Screenshot).await;
@@ -507,7 +507,7 @@ async fn a_burst_of_sizes_is_one_resize_to_the_last() {
             Ok((w, h))
         }
     }
-    let hub = Hub::new().unwrap();
+    let hub = Hub::new(crate::hub::tests::hello()).unwrap();
     let d = daemon(&hub);
     let mut relay = Relay::open(&d).await;
     relay.greeted().await;
@@ -614,7 +614,7 @@ async fn a_broken_lane_ends_and_the_next_attaches() {
     let mut rng = crate::xorshift::Xorshift::new(0x1f83_d9ab_5be0_cd19);
     let mut waited = 0;
     for _ in 0..30 {
-        let hub = Hub::new().unwrap();
+        let hub = Hub::new(crate::hub::tests::hello()).unwrap();
         let d = daemon(&hub);
         let mut relay = Relay::open(&d).await;
         let (c, _) = relay.greeted().await;
@@ -624,7 +624,7 @@ async fn a_broken_lane_ends_and_the_next_attaches() {
         let mut sent = 0u8;
         let mut send = |rng: &mut crate::xorshift::Xorshift| {
             let frame = bytes::Bytes::from(vec![sent; rng.range(1, 60_000) as usize]);
-            client.lane(|s| s.video(&frame, hub.next_version(), Instant::now()));
+            client.lane(|s| s.video(&frame, Instant::now()));
             sent = sent.wrapping_add(1);
             sent.wrapping_sub(1)
         };
@@ -672,58 +672,93 @@ async fn a_broken_lane_ends_and_the_next_attaches() {
     assert!(waited > 0, "no lane broke with updates waiting");
 }
 
-/// What the relay says the page took reaches the session's link, and a took of a lane since
-/// replaced counts for nothing. Over generated sessions through the real sockets: updates
-/// of generated sizes go onto a lane; the relay says some taken, each up to the one it
-/// names; the lane is replaced now and then, which drops what the old one was sent; and the
-/// relay goes on saying updates of the old lane taken. After every step what the link has
-/// outstanding is the model's: the current lane's updates not yet named, as many and of as
-/// many bytes.
+/// Every frame a lane carried, read with `framer` as far as it has come, with every task run
+/// as far as it goes: each its name, its track and its length.
+async fn carried(lane: &mut UnixStream, framer: &mut Framer) -> Vec<(Sequence, Track, u64)> {
+    let mut frames = Vec::new();
+    loop {
+        settle().await;
+        let mut buf = [0u8; 8192];
+        let mut read = 0;
+        while let Ok(n @ 1..) = lane.try_read(&mut buf) {
+            framer.push(&buf[..n]);
+            read += n;
+        }
+        while let Some(m) = framer.frame().unwrap() {
+            let f = Frame::decode(m).expect("a lane carries frames");
+            frames.push((f.sequence, f.track, f.bytes.len() as u64));
+        }
+        if read == 0 {
+            return frames;
+        }
+    }
+}
+
+/// What the relay says the page took reaches the session's link by each frame's name, video
+/// and audio alike, and a took of a lane since replaced counts for nothing. Over generated
+/// sessions through the real sockets: updates of generated sizes and Opus packets go onto a
+/// lane (a packet only while the gate is open); the relay reads each frame's name off the
+/// lane and says some taken, each up to the one it names; the lane is replaced now and then,
+/// which drops what the old one was sent; and the relay goes on saying frames of the old
+/// lane taken. After every step what the link has outstanding is the model's: the current
+/// lane's frames not yet named, as many and of as many bytes.
 #[tokio::test]
 async fn a_took_counts_for_the_lane_it_was_sent_on() {
     use crate::session::sender::Way;
     let mut rng = crate::xorshift::Xorshift::new(0x7137_449f_23ef_65cd);
-    let (mut stale, mut counted) = (0, 0);
+    let (mut stale, mut counted, mut sound) = (0, 0, 0);
     for _ in 0..40 {
-        let hub = Hub::new().unwrap();
+        let hub = Hub::new(crate::hub::tests::hello()).unwrap();
         let d = daemon(&hub);
         let mut relay = Relay::open(&d).await;
         let (c, _) = relay.greeted().await;
         let mut lane = open_lane(&hub, &attach(&c)).await;
+        let mut framer = Framer::new();
         assert_eq!(relay.next().await.0, Said::Attached);
         let client = hub.clients.lock()[0].clone();
-        // The model: the current lane's updates not yet taken, oldest first, each its
-        // version and bytes; every version ever sent on a lane before it.
-        let mut outstanding: Vec<(Version, u64)> = Vec::new();
-        let mut gone: Vec<Version> = Vec::new();
+        // The model: the current lane's frames not yet taken, oldest first, each its name
+        // and bytes; every name ever sent on a lane before it.
+        let mut outstanding: Vec<(Sequence, u64)> = Vec::new();
+        let mut gone: Vec<Sequence> = Vec::new();
         for _ in 0..rng.range(5, 40) {
-            match rng.below(5) {
+            match rng.below(6) {
                 0 | 1 => {
                     let frame = bytes::Bytes::from(vec![9u8; rng.range(1, 5_000) as usize]);
-                    let version = hub.next_version();
-                    client.lane(|s| s.video(&frame, version, Instant::now()));
-                    outstanding.push((version, frame.len() as u64));
+                    client.lane(|s| s.video(&frame, Instant::now()));
                 }
-                2 if !outstanding.is_empty() => {
-                    let upto = rng.below(outstanding.len() as u64) as usize;
-                    let version = outstanding[upto].0;
-                    relay.say(Up::Took { version }).await;
-                    outstanding.drain(..=upto);
-                    counted += 1;
+                2 => {
+                    let packet = vec![4u8; rng.range(1, 400) as usize];
+                    client.lane(|s| s.audio(&packet, 0, Instant::now()));
                 }
-                3 if !gone.is_empty() => {
-                    let version = gone[rng.below(gone.len() as u64) as usize];
-                    relay.say(Up::Took { version }).await;
-                    stale += 1;
-                }
-                4 => {
-                    gone.extend(outstanding.drain(..).map(|(v, _)| v));
+                3 => match outstanding.len() {
+                    0 => {}
+                    n @ 1.. => {
+                        let upto = rng.below(n as u64) as usize;
+                        let sequence = outstanding[upto].0;
+                        relay.say(Up::Took { sequence }).await;
+                        gone.extend(outstanding.drain(..=upto).map(|(name, _)| name));
+                        counted += 1;
+                    }
+                },
+                4 => match gone.len() {
+                    0 => {}
+                    n @ 1.. => {
+                        let sequence = gone[rng.below(n as u64) as usize];
+                        relay.say(Up::Took { sequence }).await;
+                        stale += 1;
+                    }
+                },
+                5.. => {
+                    gone.extend(outstanding.drain(..).map(|(name, _)| name));
                     lane = open_lane(&hub, &attach(&c)).await;
+                    framer = Framer::new();
                     assert_eq!(relay.next().await.0, Said::Attached);
                 }
-                2 | 3 | 5.. => {}
             }
-            settle().await;
+            for (name, track, bytes) in carried(&mut lane, &mut framer).await {
+                sound += usize::from(track == Track::Audio);
+                outstanding.push((name, bytes));
+            }
             let Way::Lane(stats) = client.lane(|s| s.stats(Instant::now())) else {
                 panic!("a session with a lane says its lane");
             };
@@ -734,8 +769,8 @@ async fn a_took_counts_for_the_lane_it_was_sent_on() {
         drop(lane);
     }
     assert!(
-        stale > 30 && counted > 30,
-        "{stale} stale, {counted} counted"
+        stale > 30 && counted > 30 && sound > 30,
+        "{stale} stale, {counted} counted, {sound} packets"
     );
 }
 
@@ -755,30 +790,29 @@ fn woken(hub: &Hub) -> bool {
 async fn a_took_wakes_the_capture_loop() {
     use crate::session::link::Gate;
     let mut rng = crate::xorshift::Xorshift::new(0x9b05_688c_2b3e_6c1f);
-    let hub = Hub::new().unwrap();
+    let hub = Hub::new(crate::hub::tests::hello()).unwrap();
     let d = daemon(&hub);
     let mut relay = Relay::open(&d).await;
     let (c, _) = relay.greeted().await;
-    let _lane = open_lane(&hub, &attach(&c)).await;
+    let mut lane = open_lane(&hub, &attach(&c)).await;
+    let mut framer = Framer::new();
     assert_eq!(relay.next().await.0, Said::Attached);
     let client = hub.clients.lock()[0].clone();
     for _ in 0..200 {
-        let sent: Vec<Version> = (0..rng.range(1, 6))
-            .map(|_| {
-                let frame = bytes::Bytes::from(vec![3u8; rng.range(1, 3_000) as usize]);
-                let version = hub.next_version();
-                client.lane(|s| s.video(&frame, version, Instant::now()));
-                version
-            })
-            .collect();
-        let last = *sent.last().expect("an update was sent");
+        let mut last = None;
+        for _ in 0..rng.range(1, 6) {
+            let frame = bytes::Bytes::from(vec![3u8; rng.range(1, 3_000) as usize]);
+            client.lane(|s| s.video(&frame, Instant::now()));
+            last = Some(next_frame(&mut lane, &mut framer).await.0);
+        }
+        let last = last.expect("an update was sent");
         settle().await;
         hub.drain_wake();
         assert!(!woken(&hub), "the loop was woken with nothing told");
         // A long time on: time alone opens nothing.
         let held = client.lane(|s| s.gate(Instant::now() + Duration::from_secs(3600)));
         assert!(matches!(held, Some(Gate::Full | Gate::Late)), "{held:?}");
-        relay.say(Up::Took { version: last }).await;
+        relay.say(Up::Took { sequence: last }).await;
         settle().await;
         assert!(woken(&hub), "a took woke nothing");
         let gate = client.lane(|s| s.gate(Instant::now()));
@@ -807,7 +841,7 @@ fn heard(m: MicMsg) -> (&'static str, u64, Vec<u8>) {
 async fn a_viewers_microphone_reaches_the_microphones_thread() {
     let mut rng = crate::xorshift::Xorshift::new(0x510e_527f_ade6_82d1);
     for _ in 0..100 {
-        let hub = Hub::new().unwrap();
+        let hub = Hub::new(crate::hub::tests::hello()).unwrap();
         let (d, mic) = daemon_heard(&hub);
         let mut relay = Relay::open(&d).await;
         relay.greeted().await;
@@ -868,7 +902,7 @@ async fn a_session_wants_audio_as_it_last_asked() {
     let mut rng = crate::xorshift::Xorshift::new(0x9b05_688c_2b3e_6c1f);
     for audio in [Audio::Sent, Audio::Off] {
         for _ in 0..50 {
-            let hub = Hub::new().unwrap();
+            let hub = Hub::new(crate::hub::tests::hello()).unwrap();
             let d = Arc::new(Daemon {
                 audio,
                 ..Arc::into_inner(daemon(&hub)).unwrap()

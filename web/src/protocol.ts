@@ -35,8 +35,8 @@ export interface FilesConfig {
  * page lays out from the pictures it decodes. */
 export interface Hello {
 	t: 'hello';
-	/** The stream's codec as WebCodecs names it (`vp09.PP.LL.DD`: VP9's profile, level and
-	 * bit depth, as the daemon configured its encoder). */
+	/** The stream's codec as WebCodecs names it (`av01.P.LLT.DD`: AV1's profile, level, tier
+	 * and bit depth, as the daemon configured its encoder). */
 	codec: string;
 	files: FilesConfig;
 	resize: Resize;
@@ -91,13 +91,14 @@ export const CODINGS = ['delta', 'key'] as const;
 export type Coding = (typeof CODINGS)[number];
 
 /** The header of a video message: its type byte, then the 9 bytes of the header src/wire.rs
- * defines (`Header`: flags, version, pipe), before the VP9 frame. Checked against
+ * defines (`Header`: flags, version, pipe), before the AV1 temporal unit. Checked against
  * video-header.json, as the server's reader and writer are: `node
  * web/src/video-header.test.ts`. */
 export interface VideoHeader {
 	coding: Coding;
-	/** The daemon's name for the update, by which the relay tells it what the page took.
-	 * The page reads it and makes nothing of it. */
+	/** The capture the picture was coded from, as the daemon numbers them. The page reads
+	 * it and makes nothing of it: what it took is told by the lane message's own name,
+	 * which the relay keeps and the page never sees. */
 	version: number;
 	/** Server-side pipeline time (capture to send), in 0.1 ms. */
 	pipe: number;
@@ -131,7 +132,7 @@ export type FromRelay =
 	/** A text message: the daemon's hello, clipboard or microphone word, or the relay's
 	 * word of why the session ends. */
 	| { readonly k: 'said'; readonly m: ServerMessage }
-	/** A video update: its header, and its VP9. */
+	/** A video update: its header, and its AV1 temporal unit. */
 	| {
 			readonly k: 'video';
 			readonly header: VideoHeader;

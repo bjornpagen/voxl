@@ -89,6 +89,13 @@ function liftOf(g: Gesture): Lift {
 	}
 }
 
+/** How long (ms) a first finger held still waits before it is something, by its mode: a
+ * right click in direct mode, a grab in trackpad mode. */
+const WAIT: Readonly<Record<Mode, number>> = {
+	direct: LONG_PRESS,
+	trackpad: HOLD,
+};
+
 /** What the fingers are doing. */
 type Gesture =
 	| { k: 'idle' }
@@ -108,6 +115,25 @@ type Gesture =
 	| { k: 'two'; onLift: Lift; startMid: P; startSpread: number }
 	| { k: 'scroll'; lastMid: P }
 	| { k: 'pinch' };
+
+/** One finger down, not moved enough to be anything yet. */
+type Pending = Extract<Gesture, { k: 'pending' }>;
+
+/** Whether the left button is held for `gesture`. */
+function holds(gesture: Gesture): boolean {
+	switch (gesture.k) {
+		case 'drag':
+			return true;
+		case 'idle':
+		case 'pending':
+		case 'slide':
+		case 'spent':
+		case 'two':
+		case 'scroll':
+		case 'pinch':
+			return false;
+	}
+}
 
 export function createGestures(out: (o: Out) => void) {
 	const fingers = new Map<number, P>();
@@ -193,34 +219,79 @@ export function createGestures(out: (o: Out) => void) {
 		to(cursor);
 	}
 
-	/** Measure two or more fingers from where they are now (one was added or lifted). */
-	function rebase() {
+	/** Measure two or more fingers from where they are now (one was added or lifted).
+	 * What it returns says only that every gesture has its case. */
+	function rebase(): 'measured' {
 		const m = mid(),
 			s = spread();
-		if (g.k === 'two') g = { ...g, startMid: m, startSpread: s };
-		else if (g.k === 'scroll') g = { k: 'scroll', lastMid: m };
-		else if (g.k === 'pinch')
-			out({ k: 'pinch-begin', x: m.x, y: m.y, spread: s });
+		switch (g.k) {
+			case 'two':
+				g = { ...g, startMid: m, startSpread: s };
+				return 'measured';
+			case 'scroll':
+				g = { k: 'scroll', lastMid: m };
+				return 'measured';
+			case 'pinch':
+				out({ k: 'pinch-begin', x: m.x, y: m.y, spread: s });
+				return 'measured';
+			// None of two fingers: nothing is measured from where they are.
+			case 'idle':
+			case 'pending':
+			case 'drag':
+			case 'slide':
+			case 'spent':
+				return 'measured';
+		}
 	}
 
 	/** When the finger has held still long enough: the time to `tick` at; none if
 	 * nothing waits on time. */
 	function due(): number | null {
-		if (g.k !== 'pending') return null;
-		return g.at.t + (g.mode === 'direct' ? LONG_PRESS : HOLD);
-	}
-	function tick(t: number) {
-		const d = due();
-		if (d === null || t < d || g.k !== 'pending') return;
-		if (g.mode === 'direct') {
-			out({ k: 'at', x: g.at.x, y: g.at.y });
-			click(3);
-			g = { k: 'spent' };
-		} else {
-			button(1, true);
-			g = { k: 'drag', mode: 'trackpad', last: { ...g.at, t: d } };
+		switch (g.k) {
+			case 'pending':
+				return g.at.t + WAIT[g.mode];
+			case 'idle':
+			case 'drag':
+			case 'slide':
+			case 'spent':
+			case 'two':
+			case 'scroll':
+			case 'pinch':
+				return null;
 		}
-		out({ k: 'buzz' });
+	}
+	/** Time has come to `t`. What it returns says only that every gesture has its case. */
+	function tick(t: number): 'ticked' {
+		switch (g.k) {
+			case 'pending': {
+				const d = g.at.t + WAIT[g.mode];
+				if (t >= d) {
+					g = heldStill(g, d);
+					out({ k: 'buzz' });
+				}
+				return 'ticked';
+			}
+			case 'idle':
+			case 'drag':
+			case 'slide':
+			case 'spent':
+			case 'two':
+			case 'scroll':
+			case 'pinch':
+				return 'ticked';
+		}
+	}
+	/** What a first finger held still until `d` makes of its gesture `p`. */
+	function heldStill(p: Pending, d: number): Gesture {
+		switch (p.mode) {
+			case 'direct':
+				out({ k: 'at', x: p.at.x, y: p.at.y });
+				click(3);
+				return { k: 'spent' };
+			case 'trackpad':
+				button(1, true);
+				return { k: 'drag', mode: 'trackpad', last: { ...p.at, t: d } };
+		}
 	}
 
 	function down(id: number, x: number, y: number, t: number) {
@@ -237,7 +308,7 @@ export function createGestures(out: (o: Out) => void) {
 		fingers.set(id, { x, y });
 		if (fingers.size === 2) {
 			const onLift = liftOf(g);
-			if (g.k === 'drag') button(1, false);
+			if (holds(g)) button(1, false);
 			g = { k: 'two', onLift, startMid: mid(), startSpread: spread() };
 		} else rebase();
 	}
@@ -248,50 +319,108 @@ export function createGestures(out: (o: Out) => void) {
 		tick(t);
 		p.x = x;
 		p.y = y;
-		if (fingers.size === 1) {
-			if (g.k === 'pending') {
-				const far = Math.hypot(x - g.at.x, y - g.at.y);
-				if (g.mode === 'direct' && far > SLOP) {
-					out({ k: 'at', x: g.at.x, y: g.at.y });
-					button(1, true);
-					out({ k: 'at', x, y });
-					g = { k: 'drag', mode: 'direct', last: { x, y, t } };
-				} else if (g.mode === 'trackpad' && far > STILL) {
-					const { at, from } = g;
-					g = { k: 'slide', at, from: { ...from }, far, last: { x, y, t } };
-					nudge(x - at.x, y - at.y, t - at.t);
+		if (fingers.size === 1) moveOne(x, y, t);
+		else moveTwo();
+	}
+
+	/** Two fingers or more moved. What it returns says only that every gesture has its
+	 * case. */
+	function moveTwo(): 'moved' {
+		switch (g.k) {
+			case 'two': {
+				// A pinch changes the fingers' gap faster than it moves their centroid
+				// (twice as fast with one finger still); a scroll moves them together.
+				const m = mid();
+				const moved = Math.hypot(m.x - g.startMid.x, m.y - g.startMid.y);
+				const gap = 2 * Math.abs(spread() - g.startSpread);
+				if (gap > SLOP && gap > moved) {
+					g = { k: 'pinch' };
+					rebase();
+					return pinching();
 				}
-			} else if (g.k === 'slide') {
+				if (moved > SLOP) return scrolling(g.startMid);
+				return 'moved';
+			}
+			case 'pinch':
+				return pinching();
+			case 'scroll':
+				return scrolling(g.lastMid);
+			// A gesture of one finger with more down, or one that has ended: nothing two
+			// fingers do.
+			case 'idle':
+			case 'pending':
+			case 'drag':
+			case 'slide':
+			case 'spent':
+				return 'moved';
+		}
+	}
+	/** The pinch goes on, measured from the fingers as they are. */
+	function pinching(): 'moved' {
+		const m = mid();
+		out({ k: 'pinch', x: m.x, y: m.y, spread: spread() });
+		return 'moved';
+	}
+	/** The scroll goes on, from the fingers' centroid at `last` to where it is. */
+	function scrolling(last: P): 'moved' {
+		const m = mid();
+		out({ k: 'pan', dx: m.x - last.x, dy: m.y - last.y });
+		g = { k: 'scroll', lastMid: m };
+		return 'moved';
+	}
+
+	/** The one finger down moved to `x`, `y` at `t`. What it returns says only that every
+	 * gesture and mode has its case. */
+	function moveOne(x: number, y: number, t: number): 'moved' {
+		switch (g.k) {
+			case 'pending':
+				g = movedPending(g, x, y, t);
+				return 'moved';
+			case 'slide': {
 				const { at, last } = g;
 				const far = Math.max(g.far, Math.hypot(x - at.x, y - at.y));
 				g = { ...g, far, last: { x, y, t } };
 				nudge(x - last.x, y - last.y, t - last.t);
-			} else if (g.k === 'drag') {
+				return 'moved';
+			}
+			case 'drag': {
 				const { mode: dragging, last } = g;
 				g = { k: 'drag', mode: dragging, last: { x, y, t } };
-				if (dragging === 'direct') out({ k: 'at', x, y });
-				else nudge(x - last.x, y - last.y, t - last.t);
+				switch (dragging) {
+					case 'direct':
+						out({ k: 'at', x, y });
+						return 'moved';
+					case 'trackpad':
+						nudge(x - last.x, y - last.y, t - last.t);
+						return 'moved';
+				}
 			}
-			return;
+			// The finger left of two, or one whose gesture has ended: it moves nothing.
+			case 'idle':
+			case 'spent':
+			case 'two':
+			case 'scroll':
+			case 'pinch':
+				return 'moved';
 		}
-		if (g.k === 'two') {
-			// A pinch changes the fingers' gap faster than it moves their centroid
-			// (twice as fast with one finger still); a scroll moves them together.
-			const m = mid();
-			const moved = Math.hypot(m.x - g.startMid.x, m.y - g.startMid.y);
-			const gap = 2 * Math.abs(spread() - g.startSpread);
-			if (gap > SLOP && gap > moved) {
-				g = { k: 'pinch' };
-				rebase();
-			} else if (moved > SLOP) g = { k: 'scroll', lastMid: g.startMid };
-		}
-		if (g.k === 'pinch') {
-			const m = mid();
-			out({ k: 'pinch', x: m.x, y: m.y, spread: spread() });
-		} else if (g.k === 'scroll') {
-			const m = mid();
-			out({ k: 'pan', dx: m.x - g.lastMid.x, dy: m.y - g.lastMid.y });
-			g = { k: 'scroll', lastMid: m };
+	}
+	/** What the first finger, pending as `p`, moving to `x`, `y` at `t` makes of it: a drag
+	 * or a slide once it has moved far enough for its mode, else still pending. */
+	function movedPending(p: Pending, x: number, y: number, t: number): Gesture {
+		const far = Math.hypot(x - p.at.x, y - p.at.y);
+		switch (p.mode) {
+			case 'direct':
+				if (far <= SLOP) return p;
+				out({ k: 'at', x: p.at.x, y: p.at.y });
+				button(1, true);
+				out({ k: 'at', x, y });
+				return { k: 'drag', mode: 'direct', last: { x, y, t } };
+			case 'trackpad': {
+				if (far <= STILL) return p;
+				const { at, from } = p;
+				nudge(x - at.x, y - at.y, t - at.t);
+				return { k: 'slide', at, from: { ...from }, far, last: { x, y, t } };
+			}
 		}
 	}
 
@@ -299,43 +428,74 @@ export function createGestures(out: (o: Out) => void) {
 		if (!fingers.has(id)) return;
 		tick(t);
 		fingers.delete(id);
-		if (g.k === 'pending') {
-			if (g.mode === 'direct') {
-				const { at } = g;
+		raised(t);
+		if (fingers.size === 0) g = { k: 'idle' };
+	}
+
+	/** A finger lifted at `t`, and those left are down. What it returns says only that
+	 * every gesture has its case. */
+	function raised(t: number): 'lifted' {
+		switch (g.k) {
+			case 'pending':
+				tapped(g, t);
+				click(1);
+				g = { k: 'spent' };
+				return 'lifted';
+			case 'slide':
+				// A tap that wobbled: undo the wobble and click where the pointer was.
+				if (g.far < SLOP && t - g.at.t < TAP_MS) {
+					cursor = g.from;
+					to(cursor);
+					click(1);
+				}
+				g = { k: 'spent' };
+				return 'lifted';
+			case 'drag':
+				button(1, false);
+				g = { k: 'spent' };
+				return 'lifted';
+			case 'two':
+				if (fingers.size >= 2) rebase();
+				else {
+					lifted(g.onLift);
+					g = { k: 'spent' };
+				}
+				return 'lifted';
+			case 'scroll':
+			case 'pinch':
+				if (fingers.size >= 2) rebase();
+				else g = { k: 'spent' };
+				return 'lifted';
+			// Nothing comes of it any more.
+			case 'idle':
+			case 'spent':
+				return 'lifted';
+		}
+	}
+	/** A first finger, pending as `p`, lifted at `t` taps: in direct mode the pointer goes
+	 * to the spot (the last tap's, if this one is near it in time and place); the trackpad
+	 * clicks where its pointer is. */
+	function tapped(p: Pending, t: number): 'tapped' {
+		switch (p.mode) {
+			case 'direct': {
+				const { at } = p;
 				const near =
 					t - lastTap.t < MULTI_TAP_MS &&
 					Math.hypot(at.x - lastTap.x, at.y - lastTap.y) < MULTI_TAP_PX;
 				const spot = near ? lastTap : at;
 				lastTap = { x: spot.x, y: spot.y, t };
 				out({ k: 'at', x: spot.x, y: spot.y });
+				return 'tapped';
 			}
-			click(1);
-			g = { k: 'spent' };
-		} else if (g.k === 'slide') {
-			// A tap that wobbled: undo the wobble and click where the pointer was.
-			if (g.far < SLOP && t - g.at.t < TAP_MS) {
-				cursor = g.from;
-				to(cursor);
-				click(1);
-			}
-			g = { k: 'spent' };
-		} else if (g.k === 'drag') {
-			button(1, false);
-			g = { k: 'spent' };
-		} else if (g.k === 'two' || g.k === 'scroll' || g.k === 'pinch') {
-			if (fingers.size >= 2) rebase();
-			else {
-				if (g.k === 'two') lifted(g.onLift);
-				g = { k: 'spent' };
-			}
+			case 'trackpad':
+				return 'tapped';
 		}
-		if (fingers.size === 0) g = { k: 'idle' };
 	}
 
 	function cancel(id: number, t: number) {
 		if (!fingers.has(id)) return;
 		tick(t);
-		if (g.k === 'drag') button(1, false);
+		if (holds(g)) button(1, false);
 		fingers.delete(id);
 		g = fingers.size ? { k: 'spent' } : { k: 'idle' };
 	}
