@@ -7,11 +7,13 @@
 //! durations hold.
 
 use crate::sound::{DESKTOP, RATE};
+use crate::wire::Coding;
 
-/// One encoded frame: time since the recording started (ms), keyframe, the VP9 frame.
+/// One encoded frame: time since the recording started (ms), what it is coded as, the
+/// VP9 frame.
 pub struct Frame {
     pub ms: u64,
-    pub key: bool,
+    pub coding: Coding,
     pub data: bytes::Bytes,
 }
 
@@ -65,6 +67,17 @@ fn u32s(v: &[u32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_be_bytes()).collect()
 }
 
+/// The time-to-sample box of samples that last `durations`: its runs of equal durations,
+/// each a count and the duration.
+fn stts(durations: &[u32]) -> Vec<u8> {
+    let runs: Vec<u32> = durations
+        .chunk_by(|a, b| a == b)
+        .flat_map(|run| [run.len() as u32, run[0]])
+        .collect();
+    let count = runs.len() as u32 / 2;
+    fbx(b"stts", 0, &[u32s(&[count]), u32s(&runs)].concat())
+}
+
 /// Identity transformation matrix of movie and track headers.
 const MATRIX: [u32; 9] = [0x10000, 0, 0, 0, 0x10000, 0, 0, 0, 0x4000_0000];
 
@@ -82,22 +95,7 @@ fn audio_trak(packets: &[&AudioPacket], lead_ms: u64, ms: u64, at: u32) -> Vec<u
             ticks(next - packets[i].ms)
         })
         .collect();
-    let mut stts: Vec<(u32, u32)> = Vec::new();
-    for &d in &durations {
-        match stts.last_mut() {
-            Some((c, last)) if *last == d => *c += 1,
-            _ => stts.push((1, d)),
-        }
-    }
-    let stts = fbx(
-        b"stts",
-        0,
-        &[
-            u32s(&[stts.len() as u32]),
-            stts.iter().flat_map(|&(c, d)| u32s(&[c, d])).collect(),
-        ]
-        .concat(),
-    );
+    let stts = stts(&durations);
     let sizes: Vec<u32> = packets.iter().map(|p| p.data.len() as u32).collect();
     let stsz = fbx(b"stsz", 0, &[u32s(&[0, n]), u32s(&sizes)].concat());
     let stsc = fbx(b"stsc", 0, &u32s(&[1, 1, n, 1]));
@@ -141,8 +139,9 @@ fn audio_trak(packets: &[&AudioPacket], lead_ms: u64, ms: u64, at: u32) -> Vec<u
     tkhd.extend_from_slice(&[0u8; 4]); // layer, alternate group
     tkhd.extend_from_slice(&[1, 0, 0, 0]); // volume 1.0, reserved
     tkhd.extend_from_slice(&u32s(&MATRIX));
-    tkhd.extend_from_slice(&u32s(&[0, 0])); // no picture
-                                            // The track's place in the movie: empty until its first packet, then the packets.
+    // No picture.
+    tkhd.extend_from_slice(&u32s(&[0, 0]));
+    // The track's place in the movie: empty until its first packet, then the packets.
     let mut edits = Vec::new();
     if lead_ms > 0 {
         edits.push((lead_ms as u32, -1i32));
@@ -189,8 +188,9 @@ pub fn write(
 ) -> Result<Vec<u8>, String> {
     let frames = &tracks.frames;
     let first = frames.first().ok_or("no frames were recorded")?;
-    if !first.key {
-        return Err("recording doesn't start with a keyframe".into());
+    match first.coding {
+        Coding::Key => {}
+        Coding::Delta => return Err("recording doesn't start with a keyframe".into()),
     }
 
     // Samples: each frame as it is, copied once, straight into the output, at the end.
@@ -203,13 +203,14 @@ pub fn write(
             None => end_ms,
         };
         durations.push(next.saturating_sub(f.ms).max(1) as u32);
-        if f.key {
-            sync.push(i as u32 + 1);
+        match f.coding {
+            Coding::Key => sync.push(i as u32 + 1),
+            Coding::Delta => {}
         }
     }
-    let total: u64 = durations.iter().map(|&d| d as u64).sum();
+    let total: u64 = durations.iter().map(|&d| u64::from(d)).sum();
     let n = frames.len() as u32;
-    let video_len: u64 = sizes.iter().map(|&s| s as u64).sum();
+    let video_len: u64 = sizes.iter().map(|&s| u64::from(s)).sum();
 
     // The audio from the first frame on, in order and apart by at least a packet.
     let audio: Vec<&AudioPacket> = tracks.audio.iter().filter(|p| p.ms >= first.ms).collect();
@@ -227,7 +228,7 @@ pub fn write(
     let mdat_len = video_len + audio_len;
 
     let ftyp = bx(b"ftyp", b"isom\0\0\x02\0isomiso2mp41");
-    if mdat_len + 8 > u32::MAX as u64 {
+    if mdat_len + 8 > u64::from(u32::MAX) {
         return Err("recording too large".into());
     }
 
@@ -244,23 +245,7 @@ pub fn write(
     vp09.extend_from_slice(&vpcc(codec));
     let stsd = fbx(b"stsd", 0, &[u32s(&[1]), bx(b"vp09", &vp09)].concat());
 
-    // Runs of equal durations.
-    let mut stts: Vec<(u32, u32)> = Vec::new();
-    for &d in &durations {
-        match stts.last_mut() {
-            Some((c, last)) if *last == d => *c += 1,
-            _ => stts.push((1, d)),
-        }
-    }
-    let stts = fbx(
-        b"stts",
-        0,
-        &[
-            u32s(&[stts.len() as u32]),
-            stts.iter().flat_map(|&(c, d)| u32s(&[c, d])).collect(),
-        ]
-        .concat(),
-    );
+    let stts = stts(&durations);
     let stss = fbx(
         b"stss",
         0,
@@ -377,15 +362,19 @@ pub(crate) mod tests {
                 (Vec::new(), Vec::new(), Vec::new());
             for i in 0..1 + rng.below(21) {
                 let data = frame(&mut rng);
-                let key = i == 0 || rng.below(8) == 0;
+                let coding = match i == 0 || rng.below(8) == 0 {
+                    true => Coding::Key,
+                    false => Coding::Delta,
+                };
                 want_sizes.push(data.len() as u32);
                 want_data.extend_from_slice(&data);
-                if key {
-                    want_sync.push(i as u32 + 1);
+                match coding {
+                    Coding::Key => want_sync.push(i as u32 + 1),
+                    Coding::Delta => {}
                 }
                 frames.push(Frame {
                     ms,
-                    key,
+                    coding,
                     data: data.into(),
                 });
                 ms += 1 + rng.below(100);
@@ -542,7 +531,10 @@ pub(crate) mod tests {
                 want_video.push((ms - first, sample.clone()));
                 frames.push(Frame {
                     ms,
-                    key: i == 0,
+                    coding: match i {
+                        0 => Coding::Key,
+                        1.. => Coding::Delta,
+                    },
                     data: sample.into(),
                 });
                 ms += 1 + rng.below(100);
@@ -564,12 +556,15 @@ pub(crate) mod tests {
             let tracks = Tracks { frames, audio };
             let want_audio: Vec<&AudioPacket> =
                 tracks.audio.iter().filter(|p| p.ms >= first).collect();
+            let gaps = want_audio.windows(2).any(|w| w[1].ms > w[0].ms + AUDIO_MS);
             reached[match (tracks.audio.len(), want_audio.len()) {
-                (0, _) => 0,
-                (_, 0) => 1,
-                (n, k) if n > k => 2,
-                _ if want_audio.windows(2).any(|w| w[1].ms > w[0].ms + AUDIO_MS) => 3,
-                _ => 4,
+                (0, 0..) => 0,
+                (1.., 0) => 1,
+                (n @ 1.., k @ 1..) => match (n > k, gaps) {
+                    (true, true | false) => 2,
+                    (false, true) => 3,
+                    (false, false) => 4,
+                },
             }] += 1;
 
             let out = write(&tracks, 64, 32, Vp9 { level: 10 }, end).unwrap();

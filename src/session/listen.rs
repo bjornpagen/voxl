@@ -9,7 +9,7 @@ use tokio::net::{UnixListener, UnixStream};
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Mode {
     /// The daemon's own user (`voxl attach` over ssh): 0600. The peer's uid is checked
-    /// as well (`own_user`), so a mode loosened by hand lets nobody else in.
+    /// as well (`peer`), so a mode loosened by hand lets nobody else in.
     User,
     /// The user and the socket's group, which the proxy's user is in: 0660.
     Group,
@@ -114,12 +114,26 @@ pub fn lane(path: &Path) -> Result<UnixListener, Unbound> {
     listener("lane", path, Mode::Group)
 }
 
-/// Whether the peer of a control connection runs as this process's user: `SO_PEERCRED`
-/// on Linux, `getpeereid` on macOS (tokio's `peer_cred`). One that cannot be told is not.
-pub fn own_user(s: &UnixStream) -> bool {
+/// Who the peer of a control connection runs as.
+pub enum Peer {
+    /// This process's user.
+    Ours,
+    /// Another user: its uid.
+    Theirs(u32),
+    /// Nobody can tell: why.
+    Untold(std::io::Error),
+}
+
+/// Who the peer of `s` runs as: `SO_PEERCRED` on Linux, `getpeereid` on macOS (tokio's
+/// `peer_cred`).
+pub fn peer(s: &UnixStream) -> Peer {
     // SAFETY: getuid has no failure and touches nothing.
     let me = unsafe { libc::getuid() };
-    s.peer_cred().is_ok_and(|c| c.uid() == me)
+    match s.peer_cred() {
+        Ok(c) if c.uid() == me => Peer::Ours,
+        Ok(c) => Peer::Theirs(c.uid()),
+        Err(e) => Peer::Untold(e),
+    }
 }
 
 #[cfg(test)]
@@ -132,6 +146,18 @@ mod tests {
     impl Drop for Folder {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    /// Returns once nothing answers on the socket at `path`, whose listener this test has
+    /// dropped. On macOS a socket is made close-on-exec only after it is made, so a child
+    /// another test starts between the two (ffmpeg, a test in a process of its own)
+    /// inherits the listener, and it answers until that child's exec closes it. That is
+    /// this process's doing, not the daemon's: the test waits it out, on the one thing that
+    /// ends it.
+    fn unanswered(path: &Path) {
+        while std::os::unix::net::UnixStream::connect(path).is_ok() {
+            std::thread::yield_now();
         }
     }
 
@@ -161,7 +187,8 @@ mod tests {
             // Nothing there: bound, with its mode; the socket stays when its listener goes.
             bind(&path).unwrap();
             assert_eq!(mode(&path), want, "{name}");
-            // What that left (nothing answers): removed and bound again.
+            // What that left, once nothing answers on it: removed and bound again.
+            unanswered(&path);
             bind(&path).unwrap();
             assert!(is_socket(&path), "{name}");
             // A live socket of its kind there: refused, and left.

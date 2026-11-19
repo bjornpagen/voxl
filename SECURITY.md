@@ -31,8 +31,8 @@ the tunnel the lane crosses encrypts it, and every other hop is on one machine. 
   A lane's first bytes must present it; a wrong or stale one gets the lane closed without
   a reply, and the daemon reads nothing else a lane sends. A lane that presents it replaces
   the session's lane before. The lane carries video and audio one way, from the daemon to
-  the relay:
-  input, clipboard, files and the microphone go only over ssh. The capability is never in
+  the relay: input, clipboard, files, the microphone and the relay's word of each update
+  the page took go only over ssh. The capability is never in
   argv, the environment, a file or a log line, is compared in constant time and zeroed
   when it drops, and both ends turn core dumps off. When the control stream closes, the
   capability is forgotten and the lane attached with it is dropped.

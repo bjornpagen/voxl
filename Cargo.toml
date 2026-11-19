@@ -103,6 +103,11 @@ serde_json = { version = "1", features = ["float_roundtrip"] }
 bindgen = "0.72"
 pkg-config = "0.3"
 
+# A match over an enum names every variant: no arm takes a variant added later unseen.
+[lints.clippy]
+wildcard_enum_match_arm = "deny"
+match_wildcard_for_single_variants = "deny"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

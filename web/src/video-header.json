@@ -1,20 +1,30 @@
 [
 	{
-		"header": "01 01 5e6f7081",
+		"header": "01 01 00000007 5e6f7081",
 		"picture": "82 49 83 42 00",
-		"key": true,
+		"coding": "key",
+		"version": 7,
 		"pipe": 1584361601
 	},
 	{
-		"header": "01 00 80000001",
+		"header": "01 00 80000001 80000001",
 		"picture": "86 00 40",
-		"key": false,
+		"coding": "delta",
+		"version": 2147483649,
 		"pipe": 2147483649
 	},
 	{
-		"header": "01 01 00000000",
+		"header": "01 01 00000000 00000000",
 		"picture": "82 49 83 42 00",
-		"key": true,
+		"coding": "key",
+		"version": 0,
 		"pipe": 0
+	},
+	{
+		"header": "01 00 ffffffff 00000001",
+		"picture": "86 00 40",
+		"coding": "delta",
+		"version": 4294967295,
+		"pipe": 1
 	}
 ]

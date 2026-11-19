@@ -24,12 +24,13 @@ pub enum Host {
     Name(String),
 }
 
-/// A whole number as written without sign or leading zero.
-fn whole(v: &str) -> Option<u64> {
+/// A port from 1 as written without sign or leading zero: its one spelling.
+fn port(v: &str) -> Option<NonZeroU16> {
     let digits = !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit());
-    let canonical = v == "0" || !v.starts_with('0');
-    // `parse` refuses a number past u64.
-    (digits && canonical).then(|| v.parse().ok())?
+    match v.parse::<NonZeroU16>() {
+        Ok(port) if digits && !v.starts_with('0') => Some(port),
+        Ok(_) | Err(_) => None,
+    }
 }
 
 impl Endpoint {
@@ -41,10 +42,7 @@ impl Endpoint {
             )
         };
         let (host, port) = v.rsplit_once(':').ok_or_else(bad)?;
-        let port = whole(port)
-            .and_then(|p| u16::try_from(p).ok())
-            .and_then(NonZeroU16::new)
-            .ok_or_else(bad)?;
+        let port = self::port(port).ok_or_else(bad)?;
         let host = match host.strip_prefix('[') {
             Some(rest) => {
                 let ip: Ipv6Addr = rest
@@ -170,8 +168,7 @@ impl Place {
     pub fn parse(v: &str) -> Result<Place, String> {
         let port = v
             .strip_prefix("localhost:")
-            .filter(|p| !p.starts_with('0') && p.bytes().all(|b| b.is_ascii_digit()))
-            .and_then(|p| p.parse::<std::num::NonZeroU16>().ok())
+            .and_then(port)
             .ok_or_else(|| format!("--place {v:?}: not localhost:<port>, as {DESTINATION}"))?;
         Ok(Place { port })
     }

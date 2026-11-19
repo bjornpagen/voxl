@@ -4,11 +4,12 @@
 //! and one lane, through a proxy, to `--place` on the server (the protocol's `localhost:6901`
 //! by default), for video and audio.
 //!
-//! **The lane.** One HTTP CONNECT stream through `--proxy` (naive over HTTP/2 or HTTP/3, or
-//! Hysteria 2's HTTP proxy): the transport delivers every byte, in order, and the relay gives
-//! the page each frame as it arrives, as it is, reading the next only once the page has taken
-//! it. A lane that ends after the daemon confirmed it (`Down::Attached`) opens again, and the
-//! daemon starts its viewer over on a keyframe; one that ends before is the daemon or the
+//! **The lane.** One stream through `--proxy`, an HTTP CONNECT proxy, asked for as the
+//! session begins: the transport delivers every byte, in order, and the relay gives
+//! the page each frame as it is, one at a time, reading the next only once the page has said
+//! it took the one before; each update the page took it tells the daemon on the control
+//! stream. A lane that ends after the daemon confirmed it (`Down::Attached`) opens again, and
+//! the daemon starts its viewer over on a keyframe; one that ends before is the daemon or the
 //! transport refusing it, and ends the session.
 
 mod access;
@@ -34,13 +35,16 @@ struct Flags {
     ssh: ssh::Destination,
     /// `--port`: the page's port on 127.0.0.1.
     port: u16,
-    /// `--runtime`: the folder of the daemon `voxl attach` reaches, on the server; when
-    /// not given, the daemon's default one.
-    runtime: Option<ssh::Runtime>,
+    /// `--runtime`: the folder of the daemon `voxl attach` reaches, on the server; not
+    /// given, the daemon in the server's default folder.
+    daemon: ssh::Daemon,
     /// `--place`: where the lane goes, as the server's proxy is asked for it; when not
     /// given, the protocol's.
     place: proxy::Place,
 }
+
+/// The relay's flags, every one it reads.
+const FLAGS: [&str; 5] = ["--proxy", "--ssh", "--port", "--runtime", "--place"];
 
 const USAGE: &str = "usage: voxl relay --proxy HOST:PORT --ssh DESTINATION --port PORT [--runtime DIR] [--place localhost:PORT]";
 
@@ -48,7 +52,8 @@ impl Flags {
     /// `--name value` or `--name=value`, each at most once, the three required ones
     /// exactly once, and nothing else.
     fn parse(args: &[String]) -> Result<Flags, String> {
-        let (mut proxy, mut ssh, mut port, mut runtime, mut place) = (None, None, None, None, None);
+        // What each flag was given, in `FLAGS`' order.
+        let mut given = FLAGS.map(|_| None);
         let mut it = args.iter();
         while let Some(a) = it.next() {
             let (name, value) = match a.split_once('=') {
@@ -60,29 +65,27 @@ impl Flags {
                         .clone(),
                 ),
             };
-            let slot = match name {
-                "--proxy" => &mut proxy,
-                "--ssh" => &mut ssh,
-                "--port" => &mut port,
-                "--runtime" => &mut runtime,
-                "--place" => &mut place,
-                _ => return Err(format!("{name}: not a flag of voxl relay")),
+            let Some(flag) = FLAGS.iter().position(|flag| *flag == name) else {
+                return Err(format!("{name}: not a flag of voxl relay"));
             };
-            if slot.replace(value).is_some() {
+            if given[flag].replace(value).is_some() {
                 return Err(format!("{name} is given twice"));
             }
         }
+        let [proxy, ssh, port, runtime, place] = given;
         let need = |v: Option<String>, name: &str| v.ok_or_else(|| format!("{name} is required"));
         let port = need(port, "--port")?;
         Ok(Flags {
             proxy: proxy::Endpoint::parse(&need(proxy, "--proxy")?)?,
             ssh: ssh::Destination::parse(&need(ssh, "--ssh")?)?,
             port: port
-                .parse()
-                .ok()
-                .filter(|&p| p != 0)
-                .ok_or_else(|| format!("--port {port}: not a port from 1 to 65535"))?,
-            runtime: runtime.as_deref().map(ssh::Runtime::parse).transpose()?,
+                .parse::<std::num::NonZeroU16>()
+                .map_err(|_| format!("--port {port}: not a port from 1 to 65535"))?
+                .get(),
+            daemon: match runtime {
+                Some(r) => ssh::Daemon::In(ssh::Runtime::parse(&r)?),
+                None => ssh::Daemon::Default,
+            },
             place: match place {
                 Some(p) => proxy::Place::parse(&p)?,
                 None => proxy::Place::protocol(),
@@ -93,10 +96,13 @@ impl Flags {
 
 /// Runs the relay with these flags (after `relay`) until it is stopped.
 pub fn run(args: &[String]) -> ! {
-    let flags = Flags::parse(args).unwrap_or_else(|e| {
-        eprintln!("voxl relay: {e}\n{USAGE}");
-        std::process::exit(2)
-    });
+    let flags = match Flags::parse(args) {
+        Ok(flags) => flags,
+        Err(e) => {
+            eprintln!("voxl relay: {e}\n{USAGE}");
+            std::process::exit(2)
+        }
+    };
     let env = crate::env::Env::read(|name| std::env::var_os(name));
     let mut log = env_logger::Builder::new();
     log.parse_filters(&env.log.filter);
@@ -131,7 +137,7 @@ async fn serve(flags: Flags) -> std::io::Result<()> {
     let sessions = Arc::new(session::Config {
         proxy: flags.proxy,
         ssh: flags.ssh,
-        runtime: flags.runtime,
+        daemon: flags.daemon,
         place: flags.place,
         files: files.clone(),
     });
@@ -312,8 +318,12 @@ mod tests {
                     assert_eq!(flags.ssh, ssh::Destination::parse(&given[1][0]).unwrap());
                     assert_eq!(flags.port.to_string(), given[2][0]);
                     assert_eq!(
-                        flags.runtime,
-                        given[3].first().map(|r| ssh::Runtime::parse(r).unwrap())
+                        flags.daemon,
+                        given[3]
+                            .first()
+                            .map_or(ssh::Daemon::Default, |r| ssh::Daemon::In(
+                                ssh::Runtime::parse(r).unwrap()
+                            ))
                     );
                     assert_eq!(
                         flags.place,

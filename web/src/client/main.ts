@@ -4,7 +4,7 @@ import { cmd } from '../protocol';
 import type { FromWorker, ToWorker } from '../protocol';
 import { Meter, type Stats } from '../stats';
 import type { App } from './app';
-import { el } from './app';
+import { el, textarea } from './app';
 import { createAudio } from './audio';
 import { createClipboard } from './clipboard';
 import { createCursor } from './cursor';
@@ -47,13 +47,13 @@ function main() {
 	const wsUrl = new URL('ws', location.href);
 	wsUrl.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
 	const worker = new Worker('worker.js');
-	const post = (m: ToWorker, transfer: Transferable[] = []) =>
+	const post = (m: ToWorker, transfer: Transferable[]) =>
 		worker.postMessage(m, transfer);
 	const app: App = {
 		worker,
 		post,
 		send: (d) => {
-			post({ t: 'send', d });
+			post({ t: 'send', d }, []);
 		},
 		sendBin: (type, bytes) => {
 			const msg = new Uint8Array(bytes.byteLength + 1);
@@ -62,7 +62,7 @@ function main() {
 			post({ t: 'sendBin', d: msg.buffer }, [msg.buffer]);
 		},
 		surface: el('surface'),
-		kbd: el<HTMLTextAreaElement>('kbd'),
+		kbd: textarea('kbd'),
 		tools: el('tools'),
 		// navigator.platform is deprecated and empty in some browsers; the user agent names
 		// Apple's platforms too.
@@ -96,37 +96,65 @@ function main() {
 	const resize = createResize(app);
 
 	const meter = new Meter(performance.now());
-	post({ t: 'init', url: wsUrl.href, counts: meter.counts });
+	post({ t: 'init', url: wsUrl.href, counts: meter.counts }, []);
 	/** What the decoder decodes, as the worker last said. */
-	let codec: string | null = null;
+	let decodes: { s: 'nothing' } | { s: 'codec'; codec: string } = {
+		s: 'nothing',
+	};
 	// Read by the bench tools (measure.mjs) and handy in the console: the worker's counters
 	// since the last read, as rates and means, computed when read.
 	Object.defineProperty(window, 'voxlStats', {
-		get: (): Stats => ({ ...meter.read(performance.now()), codec }),
+		get: (): Stats => ({
+			...meter.read(performance.now()),
+			codec: decodes.s === 'codec' ? decodes.codec : null,
+			decoder: meter.decoder(performance.timeOrigin + performance.now()),
+		}),
 	});
 
-	// Stop video when nobody can see it.
-	let videoOn: boolean | null = null;
-	function updateVisibility(force = false) {
+	// Stop video when nobody can see it. What the worker was last told of it: nothing yet
+	// (at the start, and when a session opens), or whether the picture is wanted.
+	let told: { s: 'nothing' } | { s: 'video'; on: boolean } = { s: 'nothing' };
+	function tellVideo() {
 		const on =
 			!document.hidden && window.innerWidth > 0 && window.innerHeight > 0;
-		if (on !== videoOn || force) {
-			videoOn = on;
-			post({ t: 'video', on });
-		}
+		if (told.s === 'video' && told.on === on) return;
+		told = { s: 'video', on };
+		post({ t: 'video', on }, []);
 	}
 	document.addEventListener('visibilitychange', () => {
-		updateVisibility();
+		tellVideo();
 		if (document.hidden) app.send(cmd.releaseAll);
 	});
 	window.addEventListener('resize', () => {
 		video.layout();
-		updateVisibility();
+		tellVideo();
 	});
-	updateVisibility();
+	tellVideo();
 
-	worker.addEventListener('message', (e: MessageEvent<FromWorker>) => {
-		const m = e.data;
+	/** Acts on the session's status, as `heard` does on every message. */
+	function status(m: Extract<FromWorker, { t: 'status' }>): 'heard' {
+		switch (m.s) {
+			case 'closed':
+				app.desk = { s: 'none' };
+				mic.stop();
+				resize.closed();
+				statusEl.style.display = '';
+				statusEl.classList.add('ended');
+				statusEl.textContent = `Ended: ${m.why}. Click to connect again.`;
+				return 'heard';
+			case 'open':
+				statusEl.classList.remove('ended');
+				statusEl.textContent = 'Connecting…';
+				// A new session has been told nothing.
+				told = { s: 'nothing' };
+				tellVideo();
+				return 'heard';
+		}
+	}
+
+	/** Acts on a message of the worker's. What it returns says only that the kind of
+	 * message has its case: one without a case does not compile. */
+	function heard(m: FromWorker): 'heard' {
 		switch (m.t) {
 			case 'frame': {
 				// The desktop is the size of the pictures it sends: a keyframe of another size
@@ -137,54 +165,46 @@ function main() {
 					video.layout();
 				}
 				video.present(m.frame);
-				break;
+				return 'heard';
 			}
-			case 'hello': {
+			case 'hello':
 				files.setup(m.files);
 				mic.setup();
 				resize.setup(m.resize);
 				statusEl.style.display = 'none';
-				break;
-			}
+				return 'heard';
 			case 'status':
-				if (m.s === 'closed') {
-					app.desk = { s: 'none' };
-					mic.stop();
-					resize.closed();
-					statusEl.style.display = '';
-					statusEl.classList.add('ended');
-					statusEl.textContent = `Ended: ${m.why}. Click to connect again.`;
-				}
-				if (m.s === 'open') {
-					statusEl.classList.remove('ended');
-					statusEl.textContent = 'Connecting…';
-					updateVisibility(true);
-				}
-				break;
+				return status(m);
 			case 'cursor':
 				cursor.set(m.buf);
-				break;
+				return 'heard';
 			case 'clip':
 				clipboard.onRemoteText(m.d);
-				break;
+				return 'heard';
 			case 'clipImage':
 				clipboard.onRemoteImage(m.buf);
-				break;
+				return 'heard';
 			case 'mic':
 				if (!m.on) mic.stop();
-				break;
-			case 'codec':
-				codec = m.codec;
-				break;
+				return 'heard';
+			case 'decodes':
+				decodes = { s: 'codec', codec: m.codec };
+				return 'heard';
+			case 'decodesNothing':
+				decodes = { s: 'nothing' };
+				return 'heard';
 			case 'log':
 				console.warn('[voxl]', m.s);
-				break;
+				return 'heard';
 		}
-	});
+	}
+	worker.addEventListener('message', (e: MessageEvent<FromWorker>) =>
+		heard(e.data)
+	);
 
 	// A session that ended is opened again when the viewer asks, never by itself.
 	statusEl.addEventListener('click', () => {
-		if (statusEl.classList.contains('ended')) post({ t: 'connect' });
+		if (statusEl.classList.contains('ended')) post({ t: 'connect' }, []);
 	});
 
 	// Autoplay may be allowed (iframe allow="autoplay"); try right away.

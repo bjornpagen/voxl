@@ -9,6 +9,11 @@ declare var MediaStreamTrackGenerator: {
 	new (init: { kind: 'video' | 'audio' }): MediaStreamTrackGenerator;
 };
 
+// WebCodecs' Opus encoder: what the encoder is tuned for (W3C Opus codec registration).
+interface OpusEncoderConfig {
+	application?: 'voip' | 'audio' | 'lowdelay';
+}
+
 // Keyboard Lock (Chromium): capture reserved shortcuts in fullscreen.
 interface Keyboard {
 	lock(keyCodes?: string[]): Promise<void>;

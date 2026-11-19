@@ -8,21 +8,29 @@ import type { App } from './app';
  */
 interface Track {
 	writer: WritableStreamDefaultWriter<VideoFrame>;
-	/** What waits behind the write in flight: nothing, no write in flight, or a frame. */
-	queue: { s: 'idle' } | { s: 'writing' } | { s: 'next'; frame: VideoFrame };
+	queue: Queue;
 }
 
+/** What waits behind the write in flight: no write in flight, a write with nothing behind
+ * it, or a frame. */
+type Queue =
+	| { s: 'idle' }
+	| { s: 'writing' }
+	| { s: 'next'; frame: VideoFrame };
+
 function write(t: Track, frame: VideoFrame) {
+	t.queue = queued(t, frame);
+}
+
+/** The queue once `frame` has come. */
+function queued(t: Track, frame: VideoFrame): Queue {
 	switch (t.queue.s) {
 		case 'next':
 			t.queue.frame.close();
-			t.queue = { s: 'next', frame };
-			return;
+			return { s: 'next', frame };
 		case 'writing':
-			t.queue = { s: 'next', frame };
-			return;
+			return { s: 'next', frame };
 		case 'idle':
-			t.queue = { s: 'writing' };
 			t.writer
 				.write(frame)
 				.catch((e: unknown) => console.warn('[voxl] video track:', e))
@@ -31,6 +39,7 @@ function write(t: Track, frame: VideoFrame) {
 					t.queue = { s: 'idle' };
 					if (q.s === 'next') write(t, q.frame);
 				});
+			return { s: 'writing' };
 	}
 }
 

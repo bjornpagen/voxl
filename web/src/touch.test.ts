@@ -18,6 +18,10 @@
 // exactly one click of the left button: in direct mode at the tap's point (or at the last
 // tap's, if that came soon and close), in trackpad mode at the pointer, where it was left,
 // even if the finger wobbled a few pixels.
+// A two-finger tap story, a first finger down (in trackpad mode now and then sliding the
+// pointer first), a second beside it, and both lifted without moving, makes exactly one
+// click of the right button when the first was a trackpad touch, still or sliding, and no
+// click at all when it was a direct touch.
 import {
 	createGestures,
 	HOLD,
@@ -33,6 +37,8 @@ import {
 } from './touch.ts';
 
 const RUNS = 20_000;
+/** The kinds of story a run tells, as often as each is listed. */
+const STORIES = ['tap', 'tap', 'twoFingerTap', 'chaos'] as const;
 /** A tap story lasts this long (ms), less than the time of a tap. */
 const TAP_STORY_MS = 150;
 if (TAP_STORY_MS >= TAP_MS) throw new Error('a tap story outlasts a tap');
@@ -61,6 +67,9 @@ const reached: Record<string, number> = {
 	scroll: 0,
 	pinch: 0,
 	'two finger right click': 0,
+	'two finger tap on a still trackpad touch': 0,
+	'two finger tap on a sliding trackpad touch': 0,
+	'two finger tap on a direct touch': 0,
 	'cancel while a button is held': 0,
 	'cancel with no button held': 0,
 	'tick delivered late': 0,
@@ -207,9 +216,12 @@ function run(seed: number) {
 		const start = now;
 		const pointer = mode === 'trackpad' ? centre() : null;
 		// Close to the last tap, now and then, so double-taps come up.
-		const near = prevTap !== null && mode === 'direct' && draw(2) === 0;
-		const px = near ? prevTap!.x + draw(2 * MULTI_TAP_PX) - MULTI_TAP_PX : x;
-		const py = near ? prevTap!.y + draw(2 * MULTI_TAP_PX) - MULTI_TAP_PX : y;
+		const near =
+			prevTap !== null && mode === 'direct' && draw(2) === 0 ? prevTap : null;
+		const px =
+			near === null ? x : near.x + draw(2 * MULTI_TAP_PX) - MULTI_TAP_PX;
+		const py =
+			near === null ? y : near.y + draw(2 * MULTI_TAP_PX) - MULTI_TAP_PX;
 		const batch = finger(id, px, py);
 		for (let i = draw(3); i > 0; i--) {
 			now += 1 + draw(30);
@@ -251,7 +263,7 @@ function run(seed: number) {
 			if (spot.x !== px || spot.y !== py) reach('direct tap at the last tap');
 		} else {
 			const at = batch[n - 3];
-			const c = pointer!;
+			const c = pointer ?? fail('a trackpad tap with no pointer drawn');
 			if (at.k !== 'to' || at.x !== c.x || at.y !== c.y)
 				fail(
 					`a trackpad tap did not click at the pointer: ${JSON.stringify(batch)}`
@@ -260,6 +272,40 @@ function run(seed: number) {
 				fail('a trackpad tap sent more than moves and a click');
 			reach(batch.length > 3 ? 'trackpad tap that wobbled' : 'trackpad tap');
 		}
+	}
+
+	/** A first finger down in `mode`, which `slides` the trackpad pointer first, then a
+	 * second beside it, and both lifted without moving, within the time of a tap. */
+	function twoFingerTapStory(mode: Mode, slides: boolean) {
+		const [first, second] = pick([
+			[0, 1],
+			[1, 2],
+			[2, 0],
+		] as const);
+		const x = 200 + draw(1600),
+			y = 200 + draw(800);
+		finger(first, x, y);
+		if (slides) {
+			now += 1 + draw(20);
+			moveTo(first, x + STILL + 1 + draw(SLOP), y);
+		}
+		now += 1 + draw(20);
+		finger(second, x + 40 + draw(100), y + draw(40));
+		now += 1 + draw(40);
+		const order = draw(2) ? [first, second] : [second, first];
+		const lifted = order.flatMap((id) => lift(id));
+		const want = mode === 'trackpad' ? '3v 3^' : '';
+		if (clicks(lifted) !== want)
+			fail(
+				`a two-finger tap on a ${slides ? 'sliding ' : ''}${mode} touch made clicks: ${clicks(lifted)}`
+			);
+		reach(
+			mode === 'direct'
+				? 'two finger tap on a direct touch'
+				: slides
+					? 'two finger tap on a sliding trackpad touch'
+					: 'two finger tap on a still trackpad touch'
+		);
 	}
 
 	/** Fingers go down, move, lift or are cancelled, and time passes, any way at all. */
@@ -273,7 +319,7 @@ function run(seed: number) {
 				finger(pick(free), draw(2000), draw(1200));
 			} else if (roll < 55 && ids.length) {
 				const id = pick(ids),
-					p = down.get(id)!;
+					p = down.get(id) ?? fail('a finger that is not down');
 				const far = pick([3, 15, 200]);
 				moveTo(
 					id,
@@ -299,24 +345,38 @@ function run(seed: number) {
 		}
 	}
 
+	/** Tells one story. What it returns says only that each kind has its case. */
+	function story(mode: Mode, kind: (typeof STORIES)[number]): 'told' {
+		switch (kind) {
+			case 'tap': {
+				if (mode === 'trackpad' && draw(2)) call('place', () => touch.place());
+				const wobble = mode === 'trackpad' && draw(2) === 0;
+				tapStory(
+					mode,
+					mode === 'direct' ? SLOP - 2 : wobble ? SLOP - 2 : STILL - 1
+				);
+				return 'told';
+			}
+			case 'twoFingerTap':
+				twoFingerTapStory(mode, mode === 'trackpad' && draw(2) === 0);
+				// Past the double-tap time of any tap before it, which the oracle forgets.
+				now += MULTI_TAP_MS + 1;
+				prevTap = null;
+				return 'told';
+			case 'chaos':
+				chaosStory();
+				now += MULTI_TAP_MS + 1;
+				prevTap = null;
+				return 'told';
+		}
+	}
+
 	for (let stories = 1 + draw(6); stories > 0; stories--) {
 		// A gap that may be short enough for a double-tap, or past every hold.
 		now += pick([1, 50, 300, MULTI_TAP_MS + 1, 2000]);
 		const mode = pick(['direct', 'trackpad'] as const);
 		touch.mode = mode;
-		if (draw(3)) {
-			if (mode === 'trackpad' && draw(2)) call('place', () => touch.place());
-			const wobble = mode === 'trackpad' && draw(2) === 0;
-			tapStory(
-				mode,
-				mode === 'direct' ? SLOP - 2 : wobble ? SLOP - 2 : STILL - 1
-			);
-		} else {
-			chaosStory();
-			// Past the double-tap time of any tap before it, which the oracle forgets.
-			now += MULTI_TAP_MS + 1;
-			prevTap = null;
-		}
+		story(mode, pick(STORIES));
 	}
 	if (held[1] || held[3] || down.size)
 		fail('the run ended with a finger or a button down');

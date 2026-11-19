@@ -2,6 +2,7 @@
 // latency. Cursor messages: type byte, pad, width, height, hot x, hot y (u16 each),
 // serial (u32), then RGBA.
 import type { App } from './app';
+import { context2d } from './app';
 
 // On-screen cursor size bounds in CSS pixels, applied to the image's longer side.
 // 24 is the standard pointer size (Xcursor's default), so a desktop scaled down
@@ -48,13 +49,11 @@ export function createCursor(app: App) {
 		const src = document.createElement('canvas');
 		src.width = w;
 		src.height = h;
-		src
-			.getContext('2d')!
-			.putImageData(
-				new ImageData(new Uint8ClampedArray(msg, 14, w * h * 4), w, h),
-				0,
-				0
-			);
+		context2d(src).putImageData(
+			new ImageData(new Uint8ClampedArray(msg, 14, w * h * 4), w, h),
+			0,
+			0
+		);
 		// Cursor images are in desktop pixels; show them at the on-screen scale, but
 		// never smaller than a normal pointer.
 		const dpr = window.devicePixelRatio;
@@ -69,7 +68,7 @@ export function createCursor(app: App) {
 			dph = Math.max(1, Math.round(ch * dpr));
 		scaled.width = dpw;
 		scaled.height = dph;
-		const cx = scaled.getContext('2d')!;
+		const cx = context2d(scaled);
 		cx.imageSmoothingQuality = 'high';
 		cx.clearRect(0, 0, dpw, dph);
 		cx.drawImage(src, 0, 0, dpw, dph);

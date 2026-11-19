@@ -223,8 +223,9 @@ for (let run = 0; run < RUNS; run++) {
 		drop();
 		const explicit = pressedMods();
 		if (pressedMods().size < lostBefore) reached.explicitDropped++;
-		const replaces = k.mod !== null && flag(k.mod) && !explicit.has(k.mod);
-		const inferredBefore = replaces && remoteMods().has(k.mod!);
+		const replaced =
+			k.mod !== null && flag(k.mod) && !explicit.has(k.mod) ? k.mod : null;
+		const inferredBefore = replaced !== null && remoteMods().has(replaced);
 		keys.keyDown(e, () => false);
 		if (!typed) {
 			reached.composingOrDead++;

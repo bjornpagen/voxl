@@ -7,7 +7,8 @@ export interface App {
 	send(command: string): void;
 	/** Send a binary message: `type` byte, then `bytes`. */
 	sendBin(type: number, bytes: Uint8Array): void;
-	post(m: ToWorker, transfer?: Transferable[]): void;
+	/** Posts the worker a message, handing over `transfer`. */
+	post(m: ToWorker, transfer: Transferable[]): void;
 	surface: HTMLElement;
 	/** Hidden textarea that receives keyboard, IME and paste input. */
 	kbd: HTMLTextAreaElement;
@@ -30,8 +31,44 @@ export type Desk =
 			readonly h: number;
 	  };
 
-export function el<T extends HTMLElement = HTMLElement>(id: string): T {
+/** The element of this id, which index.html has. */
+export function el(id: string): HTMLElement {
 	const e = document.getElementById(id);
-	if (!e) throw new Error(`voxl: #${id} is missing from index.html`);
-	return e as T;
+	if (e === null) throw new Error(`voxl: #${id} is missing from index.html`);
+	return e;
+}
+
+/** The input, the text area or the button of this id, which index.html has. */
+export function input(id: string): HTMLInputElement {
+	const e = el(id);
+	if (!(e instanceof HTMLInputElement))
+		throw new Error(`voxl: #${id} is not an input in index.html`);
+	return e;
+}
+export function textarea(id: string): HTMLTextAreaElement {
+	const e = el(id);
+	if (!(e instanceof HTMLTextAreaElement))
+		throw new Error(`voxl: #${id} is not a text area in index.html`);
+	return e;
+}
+export function button(id: string): HTMLButtonElement {
+	const e = el(id);
+	if (!(e instanceof HTMLButtonElement))
+		throw new Error(`voxl: #${id} is not a button in index.html`);
+	return e;
+}
+
+/** The one element `selector` names under `under`, in markup the page itself wrote. */
+export function part(under: ParentNode, selector: string): HTMLElement {
+	const e = under.querySelector(selector);
+	if (!(e instanceof HTMLElement))
+		throw new Error(`voxl: no ${selector} where the page wrote one`);
+	return e;
+}
+
+/** A canvas's 2D context, which a canvas that was given no other has. */
+export function context2d(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
+	const context = canvas.getContext('2d');
+	if (context === null) throw new Error('voxl: a canvas without a 2D context');
+	return context;
 }

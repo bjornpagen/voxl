@@ -5,8 +5,8 @@
 //! ever reads from a lane. A lane that opens with a capability no open session has is closed
 //! unanswered; a lane attached is never read again.
 
-use super::sender::{Phase, Queue};
-use crate::hub::Hub;
+use super::sender::{Next, Writer};
+use crate::hub::{Client, Hub};
 use crate::wire::{Capability, CAPABILITY};
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
@@ -28,7 +28,8 @@ pub async fn lanes(listener: UnixListener, hub: Arc<Hub>) {
 }
 
 /// A lane: the capability it presents, read into a buffer of that size and nothing more;
-/// then, attached, its writer.
+/// then, attached, its writer. When the lane ends the capture loop is woken, since a lane
+/// whose socket broke holds no capture back now.
 pub(super) async fn lane(stream: tokio::net::UnixStream, hub: Arc<Hub>) {
     let (mut read, write) = stream.into_split();
     let mut first = [0u8; CAPABILITY];
@@ -38,21 +39,16 @@ pub(super) async fn lane(stream: tokio::net::UnixStream, hub: Arc<Hub>) {
     let presented = Capability::presented(&first);
     // The capability is read; the buffer that held it is zeroed.
     zero(&mut first);
-    let queue = Queue::new(waker(&hub));
-    if hub.attach(&presented, queue.clone()) {
-        drop(read);
-        writer(queue, write).await;
+    let Some((session, writer)) = hub.attach(&presented) else {
+        return;
+    };
+    drop(read);
+    // The hub is not held for as long as the lane lasts: a lane may outlast it.
+    let hub = Arc::downgrade(&hub);
+    write_lane(&session, &writer, &write).await;
+    if let Some(hub) = hub.upgrade() {
+        hub.wake();
     }
-}
-
-/// What a lane's queue wakes when its gate opens: the hub's capture loop.
-fn waker(hub: &Arc<Hub>) -> super::sender::Wake {
-    let hub = Arc::downgrade(hub);
-    Arc::new(move || {
-        if let Some(hub) = hub.upgrade() {
-            hub.wake();
-        }
-    })
 }
 
 /// Zeroes bytes that held a capability.
@@ -64,69 +60,23 @@ fn zero(b: &mut [u8]) {
     }
 }
 
-/// What a writer does next.
-enum Next {
-    /// Write again: more waits, and the socket may take it.
-    Write,
-    /// Wait for the socket to take more bytes.
-    Writable,
-    /// Wait for a frame.
-    Idle,
-    /// Its lane ended: end.
-    End,
-}
-
-/// Writes a lane's queue, each framed frame after the one before, as fast as the socket takes
-/// them, until the lane ends. Bytes are written only under the queue's lock and only while the
-/// lane is open, so after `Queue::end` returns no byte more is written; a write that fails
-/// ends the lane. On Linux, where the daemon runs, the socket is given the least send buffer
-/// first ([`super::sender::SEND_BUFFER`]).
-pub(crate) async fn writer(queue: Arc<Queue>, socket: OwnedWriteHalf) {
-    #[cfg(target_os = "linux")]
-    if let Err(e) = nix::sys::socket::setsockopt(
-        &socket.as_ref(),
-        nix::sys::socket::sockopt::SndBuf,
-        &super::sender::SEND_BUFFER,
-    ) {
-        log::warn!("the lane socket's send buffer not set to the least: {e}");
-    }
+/// Writes `session`'s lane, each framed frame after the one before, as fast as the socket
+/// takes them, until the lane is the session's no longer. Each write is one step under the
+/// session's lock (`Sender::write`), so once the session has closed, or taken another
+/// lane, not one byte more is written; a write that fails ends the lane.
+async fn write_lane(session: &Client, writer: &Writer, socket: &OwnedWriteHalf) {
     loop {
-        let next = {
-            let mut w = queue.lock();
-            match (w.phase, w.messages.front()) {
-                (Phase::Ended, _) => Next::End,
-                (Phase::Open, None) => Next::Idle,
-                (Phase::Open, Some(m)) => {
-                    let len = m.len();
-                    match socket.try_write(&m[w.written..]) {
-                        Ok(n) if w.written + n == len => {
-                            w.sent();
-                            Next::Write
-                        }
-                        Ok(n) => {
-                            w.written += n;
-                            Next::Write
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Next::Writable,
-                        Err(_) => {
-                            w.end();
-                            Next::End
-                        }
-                    }
-                }
-            }
-        };
-        match next {
+        match session.lane(|s| s.write(writer, |bytes| socket.try_write(bytes))) {
             Next::Write => {}
             // The lane's end wakes it too, so a writer waiting on a full socket ends with it.
             Next::Writable => tokio::select! {
-                r = socket.writable() => if r.is_err() {
-                    queue.lock().end();
+                ready = socket.writable() => if ready.is_err() {
+                    session.lane(|s| s.lost(writer));
                     return;
                 },
-                () = queue.woken() => {}
+                () = writer.woken() => {}
             },
-            Next::Idle => queue.woken().await,
+            Next::Idle => writer.woken().await,
             Next::End => return,
         }
     }

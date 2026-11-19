@@ -50,10 +50,28 @@ enum Header<'a> {
 }
 
 /// A host as a `Host` header or an origin writes it: its lowercase name (an IPv6 address
-/// without the brackets) and its port, if one is written.
+/// without the brackets) and its port.
 struct Authority {
     name: String,
-    port: Option<u16>,
+    port: Port,
+}
+
+/// A host's port as it is written: a number, or left out, which means the default port of
+/// the scheme the host is reached by (RFC 6454 §4).
+#[derive(Clone, Copy)]
+enum Port {
+    Written(u16),
+    TheSchemes,
+}
+
+impl Port {
+    /// The port's number, where the scheme's default port is `default`.
+    fn number(self, default: u16) -> u16 {
+        match self {
+            Port::Written(port) => port,
+            Port::TheSchemes => default,
+        }
+    }
 }
 
 /// The default ports of the schemes an origin of the relay's page has: HTTP's 80 and
@@ -62,37 +80,49 @@ struct Authority {
 const HTTP_PORT: u16 = 80;
 const HTTPS_PORT: u16 = 443;
 
-/// Why a request with these `Host` and `Origin` headers is turned away, or `None` to
-/// answer it.
-fn refuse(host: Header<'_>, origin: Header<'_>) -> Option<Refused> {
+/// The schemes an origin of the relay's page has, each with its default port.
+const SCHEMES: [(&str, u16); 4] = [
+    ("http", HTTP_PORT),
+    ("ws", HTTP_PORT),
+    ("https", HTTPS_PORT),
+    ("wss", HTTPS_PORT),
+];
+
+/// Whether a request with these `Host` and `Origin` headers is answered, or why it is
+/// turned away.
+fn admit(host: Header<'_>, origin: Header<'_>) -> Result<(), Refused> {
     let host = match host {
         // Browsers always send a Host, so a request without one comes from another kind of
         // client, which sends no Origin either; one that does is not the relay's page.
         Header::Absent => {
             return match origin {
-                Header::Absent => None,
-                Header::Text(o) => Some(Refused::Origin(o.to_string())),
-                Header::NotText => Some(Refused::Origin("a value that is not text".into())),
+                Header::Absent => Ok(()),
+                Header::Text(o) => Err(Refused::Origin(o.to_string())),
+                Header::NotText => Err(Refused::Origin("a value that is not text".into())),
             }
         }
-        Header::NotText => return Some(Refused::Host("a value that is not text".into())),
+        Header::NotText => return Err(Refused::Host("a value that is not text".into())),
         Header::Text(h) => match authority(h) {
             Some(a) if host_allowed(&a.name) => a,
-            Some(a) => return Some(Refused::Host(a.name)),
-            None => return Some(Refused::Host(h.to_string())),
+            Some(a) => return Err(Refused::Host(a.name)),
+            None => return Err(Refused::Host(h.to_string())),
         },
     };
     let origin = match origin {
-        Header::Absent => return None,
-        Header::NotText => return Some(Refused::Origin("a value that is not text".into())),
+        Header::Absent => return Ok(()),
+        Header::NotText => return Err(Refused::Origin("a value that is not text".into())),
         Header::Text(o) => o.trim(),
     };
     // The relay's own page: the origin the browser loaded it from is the host it asks for,
-    // a port left out being the scheme's default (RFC 6454 §4).
-    let own = split_origin(&origin.to_ascii_lowercase()).is_some_and(|(o, default)| {
-        o.name == host.name && o.port.unwrap_or(default) == host.port.unwrap_or(default)
-    });
-    (!own).then(|| Refused::Origin(origin.to_string()))
+    // each port the one written or the origin's scheme's.
+    match split_origin(&origin.to_ascii_lowercase()) {
+        Some((o, default))
+            if o.name == host.name && o.port.number(default) == host.port.number(default) =>
+        {
+            Ok(())
+        }
+        Some(_) | None => Err(Refused::Origin(origin.to_string())),
+    }
 }
 
 /// Splits a `Host` value into its name and port; `None` for one whose port is not a port.
@@ -105,12 +135,13 @@ fn authority(v: &str) -> Option<Authority> {
         },
         None => match v.rsplit_once(':') {
             Some((n, p)) if !n.contains(':') => (n, Some(p)),
-            _ => (v, None),
+            Some(_) | None => (v, None),
         },
     };
-    let port = match port {
-        None => None,
-        Some(p) => Some(p.parse().ok()?),
+    let port = match port.map(str::parse) {
+        None => Port::TheSchemes,
+        Some(Ok(port)) => Port::Written(port),
+        Some(Err(_)) => return None,
     };
     Some(Authority {
         name: name.trim_end_matches('.').to_ascii_lowercase(),
@@ -122,12 +153,8 @@ fn authority(v: &str) -> Option<Authority> {
 /// http(s) or ws(s), such as the "null" of a sandboxed frame, or whose port is not a port.
 fn split_origin(v: &str) -> Option<(Authority, u16)> {
     let (scheme, rest) = v.split_once("://")?;
-    let default = match scheme {
-        "http" | "ws" => HTTP_PORT,
-        "https" | "wss" => HTTPS_PORT,
-        _ => return None,
-    };
-    Some((authority(rest)?, default))
+    let (_, default) = SCHEMES.iter().find(|(known, _)| *known == scheme)?;
+    Some((authority(rest)?, *default))
 }
 
 fn value(req: &Request, name: HeaderName) -> Header<'_> {
@@ -138,14 +165,15 @@ fn value(req: &Request, name: HeaderName) -> Header<'_> {
 }
 
 /// Middleware for every route: answers 403 instead of running the handler for a request
-/// [`refuse`] turns away.
+/// [`admit`] turns away.
 pub async fn check(req: Request, next: Next) -> Response {
     // HTTP/2 carries the host as the request's authority, not a Host header.
     let host = match (value(&req, header::HOST), req.uri().authority()) {
         (Header::Absent, Some(a)) => Header::Text(a.as_str()),
-        (host, _) => host,
+        (host @ Header::Absent, None) => host,
+        (host @ (Header::Text(_) | Header::NotText), Some(_) | None) => host,
     };
-    if let Some(why) = refuse(host, value(&req, header::ORIGIN)) {
+    if let Err(why) = admit(host, value(&req, header::ORIGIN)) {
         log::warn!("refused {} {}: {why}", req.method(), req.uri().path());
         return (StatusCode::FORBIDDEN, why.to_string()).into_response();
     }
@@ -241,7 +269,7 @@ mod tests {
                 1 => (Header::NotText, false),
                 _ => (Header::Text(&host), port_ok && !rebindable && own),
             };
-            let answered = refuse(host_header, origin_header).is_none();
+            let answered = admit(host_header, origin_header).is_ok();
             assert_eq!(
                 answered, answered_if,
                 "Host {host_header:?} Origin {origin_header:?}"

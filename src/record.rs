@@ -11,7 +11,7 @@
 
 use crate::hub::{Hub, Out};
 use crate::mp4;
-use crate::video::{Header, Video};
+use crate::wire::{Header, Video};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
@@ -61,6 +61,20 @@ pub async fn screenshot(hub: &Hub) -> Result<Vec<u8>, String> {
         .map_err(|e| e.to_string())?
 }
 
+/// The picture a recording holds: none before its first keyframe, then that keyframe's
+/// size and the level of the stream that coded it.
+enum Picture {
+    Before,
+    Since(Seen),
+}
+
+/// A recording's picture, as its first keyframe says it.
+struct Seen {
+    width: u32,
+    height: u32,
+    codec: mp4::Vp9,
+}
+
 /// Whether a recording goes on after a message.
 enum Taken {
     On,
@@ -79,7 +93,7 @@ pub enum Until {
 pub async fn record(hub: &Arc<Hub>, until: Until, max: Duration) -> Result<Vec<u8>, String> {
     let (tx, rx) = mpsc::unbounded_channel();
     let client = hub.add_recorder(tx);
-    let res = collect(hub, rx, until, max).await;
+    let res = collect(rx, until, max).await;
     hub.remove_client(client.id);
     res
 }
@@ -87,7 +101,6 @@ pub async fn record(hub: &Arc<Hub>, until: Until, max: Duration) -> Result<Vec<u
 /// The frames and audio on `rx` until `until`, `max`, or a keyframe of another size than the
 /// first's (the stream restarted at a new size): the MP4.
 async fn collect(
-    hub: &Hub,
     mut rx: mpsc::UnboundedReceiver<Out>,
     until: Until,
     max: Duration,
@@ -117,41 +130,53 @@ async fn collect(
     };
     // The picture's size and level, read at the first frame, a keyframe: a keyframe of
     // another size (a restart) ends the recording before either could change.
-    let mut size = (0, 0, mp4::Vp9 { level: 0 });
+    let mut picture = Picture::Before;
     // One message: taken into the recording, or the recording's end.
     let mut take = |m: Out| -> Taken {
         match m {
             Out::Bin(b) => {
-                let (h, picture) = match Header::read(&b) {
-                    Ok(Video::Picture(h, picture)) => (h, picture),
-                    // Not a picture: the stream sends no empty frame.
-                    Ok(Video::Empty(_)) | Err(crate::video::Short) => return Taken::On,
+                let (h, coded) = match Header::read(&b) {
+                    Ok(Video::Picture(h, coded)) => (h, coded),
+                    // Not a picture: the stream sends no empty frame, and a viewer's other
+                    // binary messages (a cursor's image) are no video frame.
+                    Ok(Video::Empty(_)) | Err(_) => return Taken::On,
                 };
-                match (tracks.frames.is_empty(), crate::vp9::keyframe_size(picture)) {
+                match (&picture, crate::vp9::keyframe_size(coded)) {
                     // A recording starts on a keyframe, as every viewer does.
-                    (true, None) => return Taken::On,
-                    (true, Some((w, h))) => {
-                        // A frame comes only from a built stream, which the hub holds.
-                        let Some(stream) = *hub.stream.lock() else {
-                            return Taken::On;
+                    (Picture::Before, None) => return Taken::On,
+                    // The level the stream that coded it is at: its shape's.
+                    (Picture::Before, Some((width, height))) => {
+                        let shape = crate::vp9::Shape {
+                            width,
+                            height,
+                            fps: crate::video::FRAMERATE,
                         };
-                        size = (
-                            w,
-                            h,
-                            mp4::Vp9 {
-                                level: stream.level(),
-                            },
-                        );
+                        match crate::vp9::level(shape) {
+                            Ok(level) => {
+                                let codec = mp4::Vp9 { level };
+                                picture = Picture::Since(Seen {
+                                    width,
+                                    height,
+                                    codec,
+                                });
+                            }
+                            Err(e) => {
+                                log::error!("a recording of a keyframe of no level: {e:?}");
+                                return Taken::End;
+                            }
+                        }
                     }
-                    (false, Some(wh)) if wh != (size.0, size.1) => return Taken::End,
-                    (false, _) => {}
+                    (Picture::Since(seen), Some(size)) if size != (seen.width, seen.height) => {
+                        return Taken::End
+                    }
+                    (Picture::Since(_), Some(_) | None) => {}
                 }
                 // Time the frame was captured: now, less the pipeline time in its header.
                 let ms = (start.elapsed().as_millis() as u64).saturating_sub(h.pipe.millis());
                 let ms = tracks.frames.last().map_or(ms, |l| ms.max(l.ms + 1));
                 tracks.frames.push(mp4::Frame {
                     ms,
-                    key: h.key,
+                    coding: h.coding,
                     data: b.slice(Header::LEN..),
                 });
                 Taken::On
@@ -190,7 +215,16 @@ async fn collect(
         }
     }
     let end = start.elapsed().as_millis() as u64;
-    tokio::task::spawn_blocking(move || mp4::write(&tracks, size.0, size.1, size.2, end))
+    let seen = match picture {
+        Picture::Before => return Err("no frames were recorded".into()),
+        Picture::Since(seen) => seen,
+    };
+    let Seen {
+        width,
+        height,
+        codec,
+    } = seen;
+    tokio::task::spawn_blocking(move || mp4::write(&tracks, width, height, codec, end))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -203,8 +237,15 @@ mod tests {
     /// Video frame `id`: a keyframe of `w` x `h`, or a delta, and bytes standing for its
     /// VP9 (a keyframe's uncompressed header as far as its size, then `id`).
     fn video(id: u32, key: Option<(u16, u16)>) -> Out {
-        let mut m = vec![u8::from(key.is_some())];
-        m.extend_from_slice(&[0; 4]);
+        let header = Header {
+            coding: match key {
+                Some(_) => crate::wire::Coding::Key,
+                None => crate::wire::Coding::Delta,
+            },
+            version: crate::wire::Version(id),
+            pipe: crate::wire::Pipe::of(Duration::ZERO),
+        };
+        let mut m = header.bytes().to_vec();
         match key {
             // Profile 0, a keyframe shown; the sync code; BT.601 at studio range; the size.
             Some((w, h)) => {
@@ -219,17 +260,9 @@ mod tests {
         Out::Bin(bytes::Bytes::from(m))
     }
 
-    /// A hub whose stream is built, as a recording's frames come only from one.
+    /// A hub, whose hello a recording is told among its frames.
     fn hub() -> Arc<Hub> {
-        let hub = Hub::new().unwrap();
-        let shape = crate::vp9::Shape {
-            width: 64,
-            height: 64,
-            fps: 60,
-        };
-        *hub.stream.lock() =
-            Some(crate::vp9::Stream::new(shape, std::num::NonZeroUsize::MIN).unwrap());
-        hub
+        Hub::new().unwrap()
     }
 
     /// The frames an MP4 holds: its sample count.
@@ -265,9 +298,9 @@ mod tests {
                     2 => {
                         let size = [(64, 64), (64, 64), (128, 96)][rng.below(3) as usize];
                         match (first, ended) {
-                            (None, _) => first = Some(size),
+                            (None, true | false) => first = Some(size),
                             (Some(f), false) if f != size => ended = true,
-                            (Some(_), _) => {}
+                            (Some(_), true | false) => {}
                         }
                         video(id as u32, Some(size))
                     }
@@ -275,7 +308,7 @@ mod tests {
                     4 => Out::Text(ServerMessage::Clip {
                         d: CLIPS[(rng.next() % CLIPS.len() as u64) as usize].into(),
                     }),
-                    _ => Out::Text(ServerMessage::Mic {
+                    5.. => Out::Text(ServerMessage::Mic {
                         on: rng.next() & 1 == 1,
                     }),
                 };
@@ -287,7 +320,7 @@ mod tests {
             drop(tx);
             let (_keep, stop) = oneshot::channel();
             let until = Until::Stopped(stop);
-            let mp4 = collect(&hub, rx, until, Duration::from_secs(3600)).await;
+            let mp4 = collect(rx, until, Duration::from_secs(3600)).await;
             match held {
                 0 => assert!(mp4.is_err()),
                 n => assert_eq!(samples(&mp4.unwrap()), n),
@@ -305,7 +338,6 @@ mod tests {
     #[tokio::test]
     async fn a_recording_carries_the_audio_on_the_clock_its_packets_say() {
         let mut rng = crate::xorshift::Xorshift::new(0x510e_527f_ade6_82d1);
-        let hub = hub();
         // Without audio; with audio and no silence; with silence.
         let mut reached = [0u32; 3];
         for _ in 0..1_000 {
@@ -331,16 +363,14 @@ mod tests {
                 }
             }
             reached[match (sent.len(), sent.iter().any(|(_, s)| *s > 0)) {
-                (0, _) => 0,
-                (_, false) => 1,
-                _ => 2,
+                (0, true | false) => 0,
+                (1.., false) => 1,
+                (1.., true) => 2,
             }] += 1;
             drop(tx);
             let (_keep, stop) = oneshot::channel();
             let until = Until::Stopped(stop);
-            let mp4 = collect(&hub, rx, until, Duration::from_secs(3600))
-                .await
-                .unwrap();
+            let mp4 = collect(rx, until, Duration::from_secs(3600)).await.unwrap();
             let (tracks, _) = mp4::tests::read(&mp4);
             let Some(audio) = tracks.get(1) else {
                 // None kept: none sent, or all before the first frame.

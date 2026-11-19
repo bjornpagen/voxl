@@ -5,7 +5,20 @@
 		"cursor": 3,
 		"clipImage": 4,
 		"clipImageUp": 17,
-		"micOpus": 18
+		"micOpus": 18,
+		"took": 19
+	},
+	"command": {
+		"move": "m",
+		"button": "b",
+		"scrollPx": "sp",
+		"key": "k",
+		"releaseAll": "r",
+		"clipboard": "c",
+		"video": "v",
+		"audio": "au",
+		"mic": "mi",
+		"resize": "sz"
 	},
 	"desktopAudio": {
 		"sampleRate": 48000,

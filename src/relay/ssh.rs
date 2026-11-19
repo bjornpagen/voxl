@@ -29,11 +29,19 @@ impl fmt::Display for Destination {
     }
 }
 
-/// The daemon's runtime folder on the server (`--runtime`), which `voxl attach` is given
-/// as it is: a path the daemon takes, any but none. Absent, attach goes to the daemon's
-/// default folder, as it does when not told one.
+/// A daemon's runtime folder on the server (`--runtime`), which `voxl attach` is given as
+/// it is: a path the daemon takes, any but none.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Runtime(String);
+
+/// Which daemon on the server `voxl attach` reaches: the one in the server's own default
+/// folder, which only the server's `voxl` knows, so attach is told nothing; or the one whose
+/// folder `--runtime` named.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Daemon {
+    Default,
+    In(Runtime),
+}
 
 impl Runtime {
     pub fn parse(v: &str) -> Result<Runtime, String> {
@@ -101,23 +109,24 @@ impl Unopened {
     pub fn of(status: std::process::ExitStatus) -> Unopened {
         match status.code() {
             Some(SSH_FAILED) => Unopened::NoDoor,
-            _ => Unopened::Exited(status),
+            Some(_) | None => Unopened::Exited(status),
         }
     }
 }
 
-/// `voxl attach`'s arguments, for the daemon at `runtime`.
-fn attach_args(runtime: Option<&Runtime>) -> Vec<String> {
-    let mut args = vec!["attach".to_string()];
-    args.extend(runtime.map(Runtime::flag));
-    args
+/// `voxl attach`'s arguments, for `daemon`.
+fn attach_args(daemon: &Daemon) -> Vec<String> {
+    match daemon {
+        Daemon::Default => vec!["attach".to_string()],
+        Daemon::In(runtime) => vec!["attach".to_string(), runtime.flag()],
+    }
 }
 
-/// `voxl attach` on the server, to the daemon at `runtime`: the session's control stream
-/// on its stdin and stdout. Its stderr is the relay's, so what ssh says (a key to touch, a
-/// host key) reaches the relay's log.
-pub fn attach(to: &Destination, runtime: Option<&Runtime>) -> std::io::Result<Child> {
-    let args = attach_args(runtime);
+/// `voxl attach` on the server, to `daemon`: the session's control stream on its stdin and
+/// stdout. Its stderr is the relay's, so what ssh says (a key to touch, a host key) reaches
+/// the relay's log.
+pub fn attach(to: &Destination, daemon: &Daemon) -> std::io::Result<Child> {
+    let args = attach_args(daemon);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     voxl(to, &args).stderr(Stdio::inherit()).spawn()
 }
@@ -185,9 +194,12 @@ mod tests {
             '\'', '"', '\\', '$', '`', ' ', '\t', '\n', '-', '=', '/', 'é', '*',
         ];
         let mut rng = Xorshift::new(0x9E3779B97F4A7C15);
-        let runtimes: Vec<Option<Runtime>> = (0..300)
+        let daemons: Vec<Daemon> = (0..300)
             .map(|i| {
-                (i % 5 != 0).then(|| {
+                if i % 5 == 0 {
+                    return Daemon::Default;
+                }
+                Daemon::In({
                     let mut s: String = (0..1 + rng.below(16))
                         .map(|_| match rng.below(3) {
                             0 => SPECIAL[rng.below(SPECIAL.len() as u64) as usize],
@@ -201,10 +213,10 @@ mod tests {
                 })
             })
             .collect();
-        let script: String = runtimes
+        let script: String = daemons
             .iter()
             .map(|r| {
-                let args = attach_args(r.as_ref());
+                let args = attach_args(r);
                 let args: Vec<&str> = args.iter().map(String::as_str).collect();
                 // The shell runs `voxl` as printf's arguments: each word between NULs, the
                 // command's end a SOH, which no drawn string holds.
@@ -221,8 +233,8 @@ mod tests {
             .unwrap();
         assert!(out.status.success());
         let commands: Vec<&[u8]> = out.stdout.split(|&b| b == 1).collect();
-        assert_eq!(commands.len(), runtimes.len() + 1);
-        for (r, command) in runtimes.iter().zip(commands) {
+        assert_eq!(commands.len(), daemons.len() + 1);
+        for (r, command) in daemons.iter().zip(commands) {
             let words: Vec<String> = command
                 .split(|&b| b == 0)
                 .map(|w| String::from_utf8(w.to_vec()).unwrap())
@@ -238,7 +250,10 @@ mod tests {
                     .map_or(crate::RUNTIME.default, String::as_str),
             ))
             .unwrap();
-            let want = r.as_ref().map_or(crate::RUNTIME.default, |r| r.0.as_str());
+            let want = match r {
+                Daemon::Default => crate::RUNTIME.default,
+                Daemon::In(runtime) => runtime.0.as_str(),
+            };
             assert_eq!(folder, std::path::PathBuf::from(want), "{r:?}");
         }
         assert_eq!(

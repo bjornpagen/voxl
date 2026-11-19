@@ -3,7 +3,7 @@
 // relay's /files HTTP API.
 import type { FilesConfig } from '../protocol';
 import type { App } from './app';
-import { el } from './app';
+import { el, input as inputOf, part } from './app';
 
 interface Entry {
 	name: string;
@@ -36,7 +36,9 @@ interface Upload {
 	sub: string;
 	dir: string;
 	row: HTMLElement;
-	group?: Group;
+	/** Whether it is a file of its own, with a row of its own, or one of a folder's, whose
+	 * row its group's is. */
+	of: { readonly s: 'itself' } | { readonly s: 'group'; readonly group: Group };
 }
 
 // Icons from the Tembo UI package's icon set (16px with 2px padding).
@@ -57,7 +59,8 @@ const ICON_CHEVRON = svg(
 
 const api = (op: string, q: Record<string, string>) =>
 	`files/${op}?${new URLSearchParams(q)}`;
-const label = (p: string) => (p ? p.split('/').pop()! : 'Home');
+const label = (p: string) =>
+	p === '' ? 'Home' : p.slice(p.lastIndexOf('/') + 1);
 const join = (a: string, b: string) => (a ? a + '/' : '') + b;
 const size = (n: number) =>
 	n < 1024
@@ -79,12 +82,23 @@ function when(t: number) {
 	});
 }
 
-function status(row: HTMLElement, text: string, cls?: 'done' | 'err') {
-	row.querySelector('.f-meta')!.textContent = text;
-	if (cls) row.classList.add(cls);
+/** A row says how its transfer goes. */
+function status(row: HTMLElement, text: string) {
+	part(row, '.f-meta').textContent = text;
 }
-const hasFiles = (e: DragEvent) =>
-	!!e.dataTransfer && [...e.dataTransfer.types].includes('Files');
+/** A row says how its transfer ended: done, or in error. */
+function ended(row: HTMLElement, text: string, how: 'done' | 'err') {
+	status(row, text);
+	row.classList.add(how);
+}
+/** What a drag carries, if it carries files: null for a drag of anything else, which is
+ * not the panel's. */
+function filesOf(e: DragEvent): DataTransfer | null {
+	const carried = e.dataTransfer;
+	return carried !== null && [...carried.types].includes('Files')
+		? carried
+		: null;
+}
 
 /** Every entry of a dropped folder: readEntries returns at most ~100 per call. */
 async function readAll(
@@ -98,10 +112,8 @@ async function readAll(
 
 /** All files under a dropped entry, with their folder paths relative to its parent. */
 async function walk(entry: FileSystemEntry): Promise<Picked[]> {
-	if (entry.isFile) {
-		const f = await new Promise<File>((res, rej) =>
-			(entry as FileSystemFileEntry).file(res, rej)
-		);
+	if (entry instanceof FileSystemFileEntry) {
+		const f = await new Promise<File>((res, rej) => entry.file(res, rej));
 		const sub = entry.fullPath
 			.split('/')
 			.filter(Boolean)
@@ -109,18 +121,74 @@ async function walk(entry: FileSystemEntry): Promise<Picked[]> {
 			.join('/');
 		return [{ f, sub }];
 	}
-	if (!entry.isDirectory) return [];
-	const children = await readAll(
-		(entry as FileSystemDirectoryEntry).createReader()
-	);
+	if (!(entry instanceof FileSystemDirectoryEntry)) return [];
+	const children = await readAll(entry.createReader());
 	return (await Promise.all(children.map(walk))).flat();
 }
 
 /** A request's answer: what was asked, or why not, in words for the panel. */
 type Answer<T> = { s: 'ok'; value: T } | { s: 'refused'; why: string };
 
-/** A request's answer from its status and body: a 200's JSON, or a refusal's `error`. */
-function answer<T>(code: number, body: string): Answer<T> {
+/** Where the panel is: nowhere before a hello names the folder to open, then the folder
+ * shown. */
+type At =
+	| { readonly s: 'unnamed' }
+	| { readonly s: 'named'; readonly path: string };
+
+/** JSON that is an object: its fields, as they came. */
+type Fields = Readonly<Record<string, unknown>>;
+const isFields = (v: unknown): v is Fields =>
+	typeof v === 'object' && v !== null;
+
+/** What the computer answers with that the page cannot read. */
+const unreadable = <T>(what: string): Answer<T> => ({
+	s: 'refused',
+	why: `The computer answered with ${what} the page cannot read.`,
+});
+
+/** A listing's entry, read; null for JSON that is none. */
+function readEntry(json: unknown): Entry | null {
+	if (!isFields(json)) return null;
+	const { name, dir, size: bytes, mtime } = json;
+	return typeof name === 'string' &&
+		typeof dir === 'boolean' &&
+		typeof bytes === 'number' &&
+		typeof mtime === 'number'
+		? { name, dir, size: bytes, mtime }
+		: null;
+}
+
+/** A folder's listing, as `voxl files list` writes it. */
+function readListing(json: unknown): Answer<Listing> {
+	if (!isFields(json) || typeof json.path !== 'string')
+		return unreadable('a listing');
+	if (!Array.isArray(json.entries)) return unreadable('a listing');
+	const entries: Entry[] = [];
+	for (const one of json.entries) {
+		const entry = readEntry(one);
+		if (entry === null) return unreadable('a listing');
+		entries.push(entry);
+	}
+	return { s: 'ok', value: { path: json.path, entries } };
+}
+
+/** Where an upload was saved, as `voxl files put` writes it. */
+interface Saved {
+	path: string;
+}
+function readSaved(json: unknown): Answer<Saved> {
+	return isFields(json) && typeof json.path === 'string'
+		? { s: 'ok', value: { path: json.path } }
+		: unreadable("an upload's place");
+}
+
+/** A request's answer from its status and body: a 200's JSON as `read` reads it, or a
+ * refusal's `error`. */
+function answer<T>(
+	code: number,
+	body: string,
+	read: (json: unknown) => Answer<T>
+): Answer<T> {
 	let json: unknown;
 	try {
 		json = JSON.parse(body);
@@ -130,16 +198,21 @@ function answer<T>(code: number, body: string): Answer<T> {
 			why: `The computer answered ${code} without JSON.`,
 		};
 	}
-	if (code === 200) return { s: 'ok', value: json as T };
-	const error =
-		typeof json === 'object' && json !== null && 'error' in json
-			? String(json.error)
-			: `Failed (${code})`;
-	return { s: 'refused', why: error };
+	if (code === 200) return read(json);
+	return {
+		s: 'refused',
+		why:
+			isFields(json) && 'error' in json
+				? String(json.error)
+				: `Failed (${code})`,
+	};
 }
 
 /** A fetch's answer; one that never reached the computer is refused too. */
-async function ask<T>(request: () => Promise<Response>): Promise<Answer<T>> {
+async function ask<T>(
+	request: () => Promise<Response>,
+	read: (json: unknown) => Answer<T>
+): Promise<Answer<T>> {
 	let r: Response;
 	try {
 		r = await request();
@@ -149,7 +222,7 @@ async function ask<T>(request: () => Promise<Response>): Promise<Answer<T>> {
 			why: 'The computer did not respond. Try again in a moment.',
 		};
 	}
-	return answer<T>(r.status, await r.text());
+	return answer(r.status, await r.text(), read);
 }
 
 /** The files a file input holds: it always holds a list, empty until something is picked. */
@@ -164,46 +237,52 @@ export function createFiles(app: App) {
 	const list = el('files-list');
 	const crumbs = el('files-crumbs');
 	const uploads = el('files-uploads');
-	const input = el<HTMLInputElement>('files-input');
-	const dirInput = el<HTMLInputElement>('files-input-dir');
+	const input = inputOf('files-input');
+	const dirInput = inputOf('files-input-dir');
 	const drop = el('drop');
 	const dropDir = el('drop-dir');
 	const uploadBtn = el('files-upload');
 	const uploadDirBtn = el('files-upload-dir');
 
-	/** Where the newest hello says the files are; none before the first hello. */
-	let cfg: FilesConfig | null = null;
-	/** The folder shown, relative to the shared root ('' is the root); none before the
-	 * first hello names the folder to open. */
-	let cwd: string | null = null;
-	/** Transfers wait for a hello to name the folder. */
-	const ready = () => cfg !== null;
-	/** The folder shown: the panel opens only after a hello named one. */
-	function here(): string {
-		if (cwd === null) throw new Error('voxl: the files panel before a hello');
-		return cwd;
+	/** The folder the panel is at, relative to the shared root ('' is the root): none
+	 * before the first hello names the folder to open. The panel opens, and transfers go,
+	 * only once there is one. */
+	let at: At = { s: 'unnamed' };
+	/** Does `act` at the folder the panel is at, if a hello has named one; before that
+	 * there is nowhere to act. */
+	function atFolder(act: (path: string) => void): At['s'] {
+		switch (at.s) {
+			case 'unnamed':
+				return at.s;
+			case 'named':
+				act(at.path);
+				return at.s;
+		}
 	}
 	let seq = 0;
 	let shown = '';
 
 	function empty(title: string, text: string) {
 		list.innerHTML = `<div class="f-empty">${ICON_DIR}<b></b><span></span></div>`;
-		list.querySelector('b')!.textContent = title;
-		list.querySelector('.f-empty span')!.textContent = text;
+		part(list, 'b').textContent = title;
+		part(list, '.f-empty span').textContent = text;
 	}
 
+	/** The first hello names the folder to open; a later one leaves the panel where it
+	 * is. */
 	function setup(f: FilesConfig) {
-		cfg = f;
 		app.tools.classList.add('files');
-		if (cwd === null) cwd = f.dir;
-		dropDir.textContent = label(cwd);
+		const path = at.s === 'named' ? at.path : f.dir;
+		at = { s: 'named', path };
+		dropDir.textContent = label(path);
 	}
 	function open() {
-		if (!cfg) return;
 		// Opening lists the folder as it is now: files that appeared while closed (a
 		// browser's downloads on the desktop) show then, or on Refresh.
-		panel.classList.add('open');
-		load(here());
+		atFolder((path) => {
+			panel.classList.add('open');
+			load(path);
+		});
 	}
 	/** Closing clears the uploads that finished; failed ones stay to be read. */
 	function close() {
@@ -211,22 +290,27 @@ export function createFiles(app: App) {
 		for (const row of uploads.querySelectorAll('.f-up.done')) row.remove();
 	}
 
-	async function load(path: string, quiet = false) {
+	/** Opens `path`: lists it, or says why it cannot be. */
+	const load = (path: string) =>
+		show(path, (why) => {
+			shown = '';
+			empty('Can’t open this folder', why);
+		});
+	/** Lists `path` again, as it is now; one that cannot be listed stays as it is shown. */
+	const refresh = (path: string) => show(path, () => {});
+	/** Lists `path`, the newest asking's answer the one shown: `refused` is told why not. */
+	async function show(path: string, refused: (why: string) => void) {
 		const n = ++seq;
-		const a = await ask<Listing>(() =>
-			fetch(api('list', { path }), { cache: 'no-store' })
+		const a = await ask(
+			() => fetch(api('list', { path }), { cache: 'no-store' }),
+			readListing
 		);
 		if (n !== seq) return;
-		if (a.s === 'refused') {
-			if (quiet) return;
-			shown = '';
-			empty('Can’t open this folder', a.why);
-			return;
-		}
+		if (a.s === 'refused') return refused(a.why);
 		const d = a.value;
-		cwd = d.path;
-		dropDir.textContent = label(cwd);
-		const key = cwd + '\n' + JSON.stringify(d.entries);
+		at = { s: 'named', path: d.path };
+		dropDir.textContent = label(d.path);
+		const key = d.path + '\n' + JSON.stringify(d.entries);
 		if (key !== shown) {
 			shown = key;
 			render(d.path, d.entries);
@@ -250,25 +334,21 @@ export function createFiles(app: App) {
 		const top = list.scrollTop;
 		list.innerHTML = '';
 		// Folders by name, then files newest first (downloads land at the top).
-		entries.sort(
-			(a, b) =>
-				Number(b.dir) - Number(a.dir) ||
-				(a.dir
-					? a.name.localeCompare(b.name)
-					: b.mtime - a.mtime || a.name.localeCompare(b.name))
-		);
+		entries.sort((a, b) => {
+			if (a.dir !== b.dir) return a.dir ? -1 : 1;
+			if (!a.dir && a.mtime !== b.mtime) return b.mtime - a.mtime;
+			return a.name.localeCompare(b.name);
+		});
 		if (!entries.length)
 			empty(
 				'No files yet',
-				ready()
-					? 'Drop files anywhere on the screen, or use Upload, to add them here.'
-					: 'Files in this folder will show up here.'
+				'Drop files anywhere on the screen, or use Upload, to add them here.'
 			);
 		for (const en of entries) {
 			const row = document.createElement('div');
 			row.className = 'f-row' + (en.dir ? ' dir' : '');
 			row.innerHTML = `<span class="f-ico">${en.dir ? ICON_DIR : ICON_FILE}</span><span class="f-name"></span><span class="f-meta"></span>`;
-			if (en.dir && ready()) {
+			if (en.dir) {
 				const b = document.createElement('button');
 				b.className = 'ib sm f-dl';
 				b.type = 'button';
@@ -279,21 +359,17 @@ export function createFiles(app: App) {
 					e.stopPropagation();
 					download(join(folder, en.name));
 				});
-				row.querySelector('.f-meta')!.before(b);
+				part(row, '.f-meta').before(b);
 			}
-			row.querySelector('.f-name')!.textContent = en.name;
-			row.querySelector('.f-meta')!.textContent = en.dir
+			part(row, '.f-name').textContent = en.name;
+			part(row, '.f-meta').textContent = en.dir
 				? when(en.mtime)
 				: `${size(en.size)} · ${when(en.mtime)}`;
-			row.title = en.dir
-				? `Open ${en.name}`
-				: ready()
-					? `Download ${en.name}`
-					: en.name;
+			row.title = en.dir ? `Open ${en.name}` : `Download ${en.name}`;
 			const path = join(folder, en.name);
-			if (en.dir) row.addEventListener('click', () => load(path));
-			else if (ready()) row.addEventListener('click', () => download(path));
-			else row.style.cursor = 'default';
+			row.addEventListener('click', () =>
+				en.dir ? load(path) : download(path)
+			);
 			list.append(row);
 		}
 		list.scrollTop = top;
@@ -313,37 +389,51 @@ export function createFiles(app: App) {
 	const queue: Upload[] = [];
 	let busy = false;
 	function upload(picked: Picked[]) {
-		if (!ready()) return;
+		atFolder((dir) => uploadTo(dir, picked));
+	}
+	function uploadTo(dir: string, picked: Picked[]) {
 		open();
 		const groups = new Map<string, Group>();
+		/** The group of the folder `top`, made at its first file. */
+		const groupOf = (top: string): Group => {
+			const made = groups.get(top);
+			if (made !== undefined) return made;
+			const group = {
+				name: top,
+				row: newRow(top),
+				files: 0,
+				bytes: 0,
+				done: 0,
+				sent: 0,
+				failed: 0,
+			};
+			groups.set(top, group);
+			return group;
+		};
 		for (const { f, sub } of picked) {
 			const top = sub.split('/')[0];
-			let group = top ? groups.get(top) : undefined;
-			if (top && !group) {
-				group = {
-					name: top,
-					row: newRow(top),
-					files: 0,
-					bytes: 0,
-					done: 0,
-					sent: 0,
-					failed: 0,
-				};
-				groups.set(top, group);
+			if (top === '') {
+				queue.push({
+					f,
+					sub,
+					dir,
+					row: newRow(f.name),
+					of: { s: 'itself' },
+				});
+				continue;
 			}
-			if (group) {
-				group.files++;
-				group.bytes += f.size;
-			}
+			const group = groupOf(top);
+			group.files++;
+			group.bytes += f.size;
 			queue.push({
 				f,
 				sub,
-				dir: here(),
-				row: group === undefined ? newRow(f.name) : group.row,
-				group,
+				dir,
+				row: group.row,
+				of: { s: 'group', group },
 			});
 		}
-		for (const g of groups.values()) groupStatus(g);
+		for (const g of groups.values()) groupStatus(g, 0);
 		pump();
 	}
 	function newRow(name: string) {
@@ -351,29 +441,29 @@ export function createFiles(app: App) {
 		row.className = 'f-up';
 		row.innerHTML =
 			'<div class="f-up-top"><span class="f-name"></span><span class="f-meta">Waiting…</span></div><div class="f-bar"><i></i></div>';
-		row.querySelector('.f-name')!.textContent = name;
+		part(row, '.f-name').textContent = name;
 		uploads.prepend(row);
 		return row;
 	}
-	function groupStatus(g: Group, current = 0) {
+	/** A group's row, with `current` bytes of the file now going sent. */
+	function groupStatus(g: Group, current: number) {
 		const pct = g.bytes ? ((g.sent + current) / g.bytes) * 100 : 100;
-		g.row.querySelector<HTMLElement>('.f-bar i')!.style.width = `${pct}%`;
+		part(g.row, '.f-bar i').style.width = `${pct}%`;
 		const n = `${g.done} of ${g.files} file${g.files === 1 ? '' : 's'}`;
 		status(g.row, `${n} · ${Math.floor(pct)}% of ${size(g.bytes)}`);
 	}
 	function groupFinished(g: Group, dir: string) {
 		if (g.done + g.failed < g.files) return;
-		if (g.failed)
-			status(g.row, `${g.failed} of ${g.files} files failed`, 'err');
-		else {
-			status(g.row, `Uploaded to ${label(dir)}`, 'done');
-		}
+		if (g.failed) ended(g.row, `${g.failed} of ${g.files} files failed`, 'err');
+		else ended(g.row, `Uploaded to ${label(dir)}`, 'done');
 	}
 	function pump() {
-		const u = busy ? undefined : queue.shift();
-		if (!u) return;
+		if (busy) return;
+		const u = queue.shift();
+		// An empty queue: nothing waits.
+		if (u === undefined) return;
 		busy = true;
-		const bar = u.row.querySelector<HTMLElement>('.f-bar i')!;
+		const bar = part(u.row, '.f-bar i');
 		const xhr = new XMLHttpRequest();
 		const finish = () => {
 			busy = false;
@@ -385,53 +475,82 @@ export function createFiles(app: App) {
 		// Required by the server: browsers only send custom headers cross-origin after a
 		// CORS preflight, which it never answers, so other sites can't upload.
 		xhr.setRequestHeader('X-Voxl-Upload', '1');
-		const g = u.group;
 		xhr.upload.addEventListener('progress', (e) => {
-			if (!e.lengthComputable) return;
-			if (g) return groupStatus(g, e.loaded);
-			bar.style.width = `${(e.loaded / e.total) * 100}%`;
-			status(
-				u.row,
-				`${Math.floor((e.loaded / e.total) * 100)}% of ${size(e.total)}`
-			);
+			if (e.lengthComputable) progressed(u, bar, e.loaded, e.total);
 		});
 		xhr.addEventListener('load', () => {
-			const a = answer<{ path: string; size: number }>(
-				xhr.status,
-				xhr.responseText
-			);
-			if (g) {
+			saved(u, answer(xhr.status, xhr.responseText, readSaved));
+			finish();
+		});
+		xhr.addEventListener('error', () => {
+			lost(u);
+			finish();
+		});
+		xhr.send(u.f);
+	}
+	/** `loaded` of `total` bytes of an upload are sent. */
+	function progressed(
+		u: Upload,
+		bar: HTMLElement,
+		loaded: number,
+		total: number
+	): 'shown' {
+		switch (u.of.s) {
+			case 'group':
+				groupStatus(u.of.group, loaded);
+				return 'shown';
+			case 'itself':
+				bar.style.width = `${(loaded / total) * 100}%`;
+				status(
+					u.row,
+					`${Math.floor((loaded / total) * 100)}% of ${size(total)}`
+				);
+				return 'shown';
+		}
+	}
+	/** An upload was answered: saved, or refused. */
+	function saved(u: Upload, a: Answer<Saved>): 'shown' {
+		if (a.s === 'ok' && at.s === 'named' && u.dir === at.path) refresh(u.dir);
+		switch (u.of.s) {
+			case 'group': {
+				const g = u.of.group;
 				if (a.s === 'ok') {
 					g.done++;
 					g.sent += u.f.size;
 				} else g.failed++;
-				groupStatus(g);
+				groupStatus(g, 0);
 				groupFinished(g, u.dir);
-				if (a.s === 'ok' && u.dir === cwd) load(u.dir, true);
-			} else if (a.s === 'ok') {
-				const saved = label(a.value.path);
-				if (saved !== u.f.name)
-					u.row.querySelector('.f-name')!.textContent = saved;
-				status(u.row, `Uploaded to ${label(u.dir)}`, 'done');
-				if (u.dir === cwd) load(u.dir, true);
-			} else status(u.row, a.why, 'err');
-			finish();
-		});
-		xhr.addEventListener('error', () => {
-			if (g) {
+				return 'shown';
+			}
+			case 'itself':
+				if (a.s === 'ok') {
+					const name = label(a.value.path);
+					if (name !== u.f.name) part(u.row, '.f-name').textContent = name;
+					ended(u.row, `Uploaded to ${label(u.dir)}`, 'done');
+				} else ended(u.row, a.why, 'err');
+				return 'shown';
+		}
+	}
+	/** An upload's connection was lost. */
+	function lost(u: Upload): 'shown' {
+		switch (u.of.s) {
+			case 'group': {
+				const g = u.of.group;
 				g.failed++;
 				groupFinished(g, u.dir);
-			} else status(u.row, 'Connection lost', 'err');
-			finish();
-		});
-		xhr.send(u.f);
+				return 'shown';
+			}
+			case 'itself':
+				ended(u.row, 'Connection lost', 'err');
+				return 'shown';
+		}
 	}
 
 	el('files-btn').addEventListener('click', () =>
 		panel.classList.contains('open') ? close() : open()
 	);
 	el('files-close').addEventListener('click', close);
-	el('files-refresh').addEventListener('click', () => load(here()));
+	el('files-refresh').addEventListener('click', () => atFolder(load));
 	uploadBtn.addEventListener('click', () => input.click());
 	uploadDirBtn.addEventListener('click', () => dirInput.click());
 	input.addEventListener('change', () => {
@@ -457,37 +576,42 @@ export function createFiles(app: App) {
 	// Always swallow dropped files: otherwise the browser navigates away to open them.
 	let depth = 0;
 	window.addEventListener('dragenter', (e) => {
-		if (!hasFiles(e)) return;
+		if (filesOf(e) === null) return;
 		e.preventDefault();
-		if (ready() && ++depth === 1) drop.classList.add('show');
+		if (at.s === 'named' && ++depth === 1) drop.classList.add('show');
 	});
 	window.addEventListener('dragover', (e) => {
-		if (!hasFiles(e)) return;
+		const carried = filesOf(e);
+		if (carried === null) return;
 		e.preventDefault();
-		e.dataTransfer!.dropEffect = ready() ? 'copy' : 'none';
+		carried.dropEffect = at.s === 'named' ? 'copy' : 'none';
 	});
 	window.addEventListener('dragleave', (e) => {
-		if (hasFiles(e) && --depth <= 0) {
+		if (filesOf(e) !== null && --depth <= 0) {
 			depth = 0;
 			drop.classList.remove('show');
 		}
 	});
 	window.addEventListener('drop', (e) => {
-		if (!hasFiles(e)) return;
+		const carried = filesOf(e);
+		if (carried === null) return;
 		e.preventDefault();
 		depth = 0;
 		drop.classList.remove('show');
-		if (!ready()) return;
+		if (at.s === 'named') dropped(carried);
+	});
+	/** Files and folders were dropped on the page. */
+	function dropped(carried: DataTransfer) {
 		// Entries must be taken during the event; the walk can finish afterwards.
 		const entries: FileSystemEntry[] = [];
 		const plain: Picked[] = [];
-		for (const it of e.dataTransfer!.items) {
+		for (const it of carried.items) {
 			if (it.kind !== 'file') continue;
-			const entry = it.webkitGetAsEntry?.();
-			if (entry?.isDirectory) entries.push(entry);
+			const entry = it.webkitGetAsEntry();
+			if (entry !== null && entry.isDirectory) entries.push(entry);
 			else {
 				const f = it.getAsFile();
-				if (f) plain.push({ f, sub: '' });
+				if (f !== null) plain.push({ f, sub: '' });
 			}
 		}
 		if (!entries.length) return upload(plain);
@@ -495,10 +619,10 @@ export function createFiles(app: App) {
 			(found) => upload([...plain, ...found.flat()]),
 			(err: unknown) => {
 				open();
-				status(newRow('Dropped folder'), `Can’t read it: ${err}`, 'err');
+				ended(newRow('Dropped folder'), `Can’t read it: ${err}`, 'err');
 			}
 		);
-	});
+	}
 
 	return { setup };
 }

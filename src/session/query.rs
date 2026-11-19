@@ -9,6 +9,7 @@
 //! then the connection closes.
 
 use super::control::Daemon;
+use crate::wire::Byte;
 use std::num::NonZeroU32;
 #[cfg(target_os = "linux")]
 use std::path::Path;
@@ -46,12 +47,45 @@ pub enum Recording {
     Seconds(NonZeroU32),
 }
 
-const SESSION: u8 = 1;
-const STATS: u8 = 2;
-const SCREENSHOT: u8 = 3;
-const RECORD: u8 = 4;
-const UNTIL_CLOSED: u8 = 0;
-const SECONDS: u8 = 1;
+/// An opening's first byte: what the connection is.
+#[derive(Clone, Copy)]
+enum Kind {
+    Session,
+    Stats,
+    Screenshot,
+    Record,
+}
+
+impl Byte for Kind {
+    const ALL: &'static [Kind] = &[Kind::Session, Kind::Stats, Kind::Screenshot, Kind::Record];
+
+    fn byte(self) -> u8 {
+        match self {
+            Kind::Session => 1,
+            Kind::Stats => 2,
+            Kind::Screenshot => 3,
+            Kind::Record => 4,
+        }
+    }
+}
+
+/// A recording's second byte: what ends it.
+#[derive(Clone, Copy)]
+enum Ends {
+    UntilClosed,
+    Seconds,
+}
+
+impl Byte for Ends {
+    const ALL: &'static [Ends] = &[Ends::UntilClosed, Ends::Seconds];
+
+    fn byte(self) -> u8 {
+        match self {
+            Ends::UntilClosed => 0,
+            Ends::Seconds => 1,
+        }
+    }
+}
 
 /// Why bytes are no opening.
 #[derive(Debug, PartialEq)]
@@ -70,12 +104,14 @@ impl Opening {
     /// Its bytes, as its asker writes them.
     pub fn bytes(self) -> Vec<u8> {
         match self {
-            Opening::Session => vec![SESSION],
-            Opening::Query(Query::Stats) => vec![STATS],
-            Opening::Query(Query::Screenshot) => vec![SCREENSHOT],
-            Opening::Query(Query::Record(Recording::UntilClosed)) => vec![RECORD, UNTIL_CLOSED],
+            Opening::Session => vec![Kind::Session.byte()],
+            Opening::Query(Query::Stats) => vec![Kind::Stats.byte()],
+            Opening::Query(Query::Screenshot) => vec![Kind::Screenshot.byte()],
+            Opening::Query(Query::Record(Recording::UntilClosed)) => {
+                vec![Kind::Record.byte(), Ends::UntilClosed.byte()]
+            }
             Opening::Query(Query::Record(Recording::Seconds(s))) => {
-                let mut b = vec![RECORD, SECONDS];
+                let mut b = vec![Kind::Record.byte(), Ends::Seconds.byte()];
                 b.extend_from_slice(&s.get().to_be_bytes());
                 b
             }
@@ -89,30 +125,47 @@ impl Opening {
             r.read_exact(&mut b).await.map_err(|_| NoOpening::Ended)?;
             Ok(b[0])
         };
-        match byte().await? {
-            SESSION => Ok(Opening::Session),
-            STATS => Ok(Opening::Query(Query::Stats)),
-            SCREENSHOT => Ok(Opening::Query(Query::Screenshot)),
-            RECORD => match byte().await? {
-                UNTIL_CLOSED => Ok(Opening::Query(Query::Record(Recording::UntilClosed))),
-                SECONDS => {
-                    let mut s = [0u8; 4];
-                    for b in s.iter_mut() {
-                        *b = byte().await?;
+        let kind = byte().await?;
+        match Kind::of(kind).ok_or(NoOpening::Tag(kind))? {
+            Kind::Session => Ok(Opening::Session),
+            Kind::Stats => Ok(Opening::Query(Query::Stats)),
+            Kind::Screenshot => Ok(Opening::Query(Query::Screenshot)),
+            Kind::Record => {
+                let ends = byte().await?;
+                match Ends::of(ends).ok_or(NoOpening::Recording(ends))? {
+                    Ends::UntilClosed => Ok(Opening::Query(Query::Record(Recording::UntilClosed))),
+                    Ends::Seconds => {
+                        let mut s = [0u8; 4];
+                        for b in s.iter_mut() {
+                            *b = byte().await?;
+                        }
+                        NonZeroU32::new(u32::from_be_bytes(s))
+                            .map(|s| Opening::Query(Query::Record(Recording::Seconds(s))))
+                            .ok_or(NoOpening::NoSeconds)
                     }
-                    NonZeroU32::new(u32::from_be_bytes(s))
-                        .map(|s| Opening::Query(Query::Record(Recording::Seconds(s))))
-                        .ok_or(NoOpening::NoSeconds)
                 }
-                t => Err(NoOpening::Recording(t)),
-            },
-            t => Err(NoOpening::Tag(t)),
+            }
         }
     }
 }
 
-const ANSWERED: u8 = 0;
-const REFUSED: u8 = 1;
+/// An answer's first byte: whether the query was answered, or why not follows.
+#[derive(Clone, Copy)]
+enum Answer {
+    Answered,
+    Refused,
+}
+
+impl Byte for Answer {
+    const ALL: &'static [Answer] = &[Answer::Answered, Answer::Refused];
+
+    fn byte(self) -> u8 {
+        match self {
+            Answer::Answered => 0,
+            Answer::Refused => 1,
+        }
+    }
+}
 
 /// Answers `query` on its connection, then closes it.
 pub async fn answer(
@@ -144,8 +197,8 @@ pub async fn answer(
         }
     };
     let (tag, body) = match answer {
-        Ok(body) => (ANSWERED, body),
-        Err(why) => (REFUSED, why.into_bytes()),
+        Ok(body) => (Answer::Answered.byte(), body),
+        Err(why) => (Answer::Refused.byte(), why.into_bytes()),
     };
     let written = async {
         write.write_all(&[tag]).await?;
@@ -227,13 +280,18 @@ pub async fn ask(
     };
     let mut tag = [0u8; 1];
     from.read_exact(&mut tag).await?;
-    let asked = match tag[0] {
-        ANSWERED => {
+    let [tag] = tag;
+    let answer = Answer::of(tag).ok_or_else(|| {
+        let what = format!("an answer that begins with {tag}: no answer does");
+        std::io::Error::new(std::io::ErrorKind::InvalidData, what)
+    })?;
+    let asked = match answer {
+        Answer::Answered => {
             tokio::io::copy(&mut from, &mut output).await?;
             output.flush().await?;
             Asked::Answered
         }
-        _ => {
+        Answer::Refused => {
             let mut why = Vec::new();
             from.read_to_end(&mut why).await?;
             Asked::Refused(String::from_utf8_lossy(&why).into_owned())

@@ -7,7 +7,7 @@ import { cmd } from '../protocol';
 import { createGestures } from '../touch';
 import type { Out } from '../touch';
 import type { App } from './app';
-import { el } from './app';
+import { button } from './app';
 import type { Cursor } from './cursor';
 import { createPointerView } from './trackpad';
 import type { Zoom } from './zoom';
@@ -31,39 +31,42 @@ interface Hooks {
 
 export function createTouch(app: App, hooks: Hooks) {
 	const { zoom } = hooks;
-	const btn = el<HTMLButtonElement>('tp-btn');
+	const btn = button('tp-btn');
 	const view = createPointerView(app, hooks.cursor, zoom);
 	const machine = createGestures(apply);
 	let timer: ReturnType<typeof setTimeout> | undefined;
 
-	function apply(o: Out) {
+	/** Does what the gestures say. What it returns says only that everything they say has
+	 * its case. */
+	function apply(o: Out): 'done' {
 		switch (o.k) {
 			case 'at':
 				hooks.moveTo(o.x, o.y);
-				break;
+				return 'done';
 			case 'to':
 				hooks.moveToDesk(o.x, o.y);
 				follow(o);
-				break;
+				return 'done';
 			case 'button':
 				app.send(cmd.button(o.n, o.down));
-				break;
+				return 'done';
 			case 'pan': {
 				// The content follows the fingers: a zoomed-in view moves, then the desktop scrolls.
 				const [rx, ry] = zoom.pan(o.dx, o.dy);
 				const k = hooks.deskPerPx();
 				if (k !== null) hooks.queueScroll(-rx * k, -ry * k);
-				break;
+				return 'done';
 			}
 			case 'pinch-begin':
 				zoom.begin(o.x, o.y, o.spread);
-				break;
+				return 'done';
 			case 'pinch':
 				zoom.pinch(o.x, o.y, o.spread);
-				break;
+				return 'done';
 			case 'buzz':
-				navigator.vibrate?.(10);
-				break;
+				// Not every browser can buzz.
+				if ('vibrate' in navigator) navigator.vibrate(10);
+				return 'done';
 		}
 	}
 

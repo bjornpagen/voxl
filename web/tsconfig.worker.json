@@ -1,7 +1,8 @@
 {
-	// The decode/socket worker, and the checks of its header reader, its record of the
-	// screen, the page's meter of its counters, the keys and the touch gestures (run by
-	// node, which wants the .ts extension and reads the fixture as JSON).
+	// The decode/socket worker, and the checks of its reader of the relay's messages, its
+	// records of its session and of the screen, the page's meter of its counters, the audio
+	// player's ring, the keys and the touch gestures (run by node, which wants the .ts
+	// extension and reads the fixture as JSON).
 	"extends": "./tsconfig.base.json",
 	"compilerOptions": {
 		"lib": ["ES2022", "WebWorker"],
@@ -12,8 +13,11 @@
 		"src/protocol.ts",
 		"src/wire.json",
 		"src/video-header.test.ts",
+		"src/protocol.test.ts",
+		"src/session.test.ts",
 		"src/frames.test.ts",
 		"src/stats.test.ts",
+		"src/ring.test.ts",
 		"src/keys.ts",
 		"src/keyboard.test.ts",
 		"src/touch.test.ts"

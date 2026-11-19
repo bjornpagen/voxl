@@ -1,15 +1,15 @@
 // Toolbar (top right, on hover; bottom right and always visible when a touchscreen is the
 // main pointer): on-screen keyboard, trackpad mode, files, microphone and fullscreen buttons.
 import type { App } from './app';
-import { el } from './app';
+import { button } from './app';
 
 /** Why the browser refused fullscreen (it needs a user gesture). */
 const fullscreen = (e: unknown) => console.warn('[voxl] fullscreen', e);
 
 export function setupToolbar(app: App, onFullscreenChange: () => void) {
 	const { tools, kbd } = app;
-	const kbBtn = el<HTMLButtonElement>('kb-btn');
-	const fsBtn = el<HTMLButtonElement>('fs-btn');
+	const kbBtn = button('kb-btn');
+	const fsBtn = button('fs-btn');
 
 	// Any touchscreen gets the touch buttons (keyboard, trackpad mode). One that is the main
 	// pointer (a phone, a tablet) keeps the toolbar always visible; with a mouse as well (a
@@ -18,9 +18,8 @@ export function setupToolbar(app: App, onFullscreenChange: () => void) {
 	if (matchMedia('(pointer: coarse)').matches)
 		tools.classList.add('touch-first', 'show');
 	else
-		for (const type of ['pointermove', 'pointerdown'])
-			document.addEventListener(type, (e) => {
-				const p = e as PointerEvent;
+		for (const type of ['pointermove', 'pointerdown'] as const)
+			document.addEventListener(type, (p) => {
 				const r = tools.getBoundingClientRect();
 				tools.classList.toggle(
 					'show',

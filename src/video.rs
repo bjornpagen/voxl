@@ -1,10 +1,11 @@
 //! Video pipeline: damage-driven capture -> I420 -> VP9 -> each session's lane, a capture
-//! held while anything waits for a session's lane socket.
+//! held while a session's link says too much is on the way, or a frame late.
 //!
 //! One stream codes the screen for every viewer. It starts with a keyframe for the viewers
 //! it starts, and codes every later frame from the frames before it, which every viewer's
 //! lane carried in order; a keyframe is coded only for a viewer starting (`hub::Starts`).
-//! Every frame is coded at one quality: a slow link lowers the frame rate, through the gate.
+//! Every frame is coded whole, at one quality: a slow or stalled path lowers the frame rate,
+//! through the gate (`session::link`), and the screen as it then is goes next.
 
 #[cfg(target_os = "linux")]
 use crate::capture::Capturer;
@@ -16,14 +17,17 @@ use crate::hub::wait_any;
 use crate::hub::Waitable;
 use crate::hub::{Hub, Starts};
 use crate::hub::{Seen, Viewer};
+#[cfg(target_os = "linux")]
+use crate::session::link::Gate;
 use crate::vp9;
+use crate::wire::{Coding, Header, Pipe};
 use bytes::{BufMut, BytesMut};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // read by the Linux-only capture loop
+#[cfg(target_os = "linux")]
 #[derive(Clone)]
 pub struct VideoConfig {
     /// The X display.
@@ -60,80 +64,6 @@ impl VideoConfig {
     }
 }
 
-/// What a video frame says before its VP9, on the lane: the encode loop writes it, and
-/// the recorder, the relay (which hands it to the page) and web/src/protocol.ts read it,
-/// each checking its reader against web/src/video-header.json. What a frame is (video or
-/// audio) the lane's `Track` says, as the page's type byte. Every update refers only to the
-/// keyframe before it on its lane and frames after that keyframe, all of which the lane
-/// carried before it.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Header {
-    /// The frame is a keyframe.
-    pub key: bool,
-    pub pipe: Pipe,
-}
-
-/// Capture to send, as a video frame carries it: in tenths of a millisecond, at most
-/// `u32::MAX` of them (119 hours).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Pipe(u32);
-
-impl Pipe {
-    pub fn of(d: Duration) -> Pipe {
-        Pipe((d.as_micros() / 100).min(u32::MAX as u128) as u32)
-    }
-
-    /// In whole milliseconds, rounded down.
-    pub fn millis(self) -> u64 {
-        self.0 as u64 / 10
-    }
-}
-
-impl Header {
-    /// The VP9 starts this far into a frame.
-    pub const LEN: usize = 5;
-    /// The flags byte's one bit.
-    const KEY: u8 = 1;
-
-    /// Flags, then pipe, big-endian.
-    pub fn bytes(&self) -> [u8; Header::LEN] {
-        let mut b = [0; Header::LEN];
-        b[0] = if self.key { Header::KEY } else { 0 };
-        b[1..5].copy_from_slice(&self.pipe.0.to_be_bytes());
-        b
-    }
-
-    /// What frame `m` is to a reader of video: the recorder, and the fixture's check of
-    /// the writer.
-    pub fn read(m: &[u8]) -> Result<Video<'_>, Short> {
-        match m.split_first_chunk::<{ Header::LEN }>() {
-            None => Err(Short),
-            Some((b, [])) => Ok(Video::Empty(Header::of(b))),
-            Some((b, picture)) => Ok(Video::Picture(Header::of(b), picture)),
-        }
-    }
-
-    fn of(b: &[u8; Header::LEN]) -> Header {
-        Header {
-            key: b[0] & Header::KEY != 0,
-            pipe: Pipe(u32::from_be_bytes([b[1], b[2], b[3], b[4]])),
-        }
-    }
-}
-
-/// A video frame, read.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Video<'a> {
-    /// Its header, and its VP9 after it.
-    Picture(Header, &'a [u8]),
-    /// A header with nothing after it. The encode loop sends no frame that coded nothing.
-    Empty(Header),
-}
-
-/// Bytes too few for a video frame's header.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Short;
-
 /// What a capture is sent as.
 enum Plan<S> {
     /// A keyframe, for the viewers it starts: the only way one is made.
@@ -163,33 +93,17 @@ pub struct Band {
     pub y1: u32,
 }
 
-#[cfg(target_os = "linux")]
-fn union(a: Option<Band>, b: Band) -> Band {
-    match a {
-        None => b,
-        Some(a) => Band {
-            y0: a.y0.min(b.y0),
-            y1: a.y1.max(b.y1),
-        },
-    }
-}
-
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // read by the Linux-only capture loop
-/// What the viewers watching are sent: the encoder, and the buffer captures are converted
-/// into for it. There is one only while somebody watches, and it starts with a keyframe.
-///
-/// One buffer, since a capture goes only to an idle encoder (`step`): a second, filled
-/// while the encoder codes the first, only queued a frame behind it, and converted every
-/// band twice, once into each.
+/// What the viewers watching are sent: the encoder, on its thread. There is one only while
+/// somebody watches, and it starts with a keyframe. One picture goes round between the
+/// capture loop and the encoder (the loop holds where it is, `Buffer`), since a capture goes
+/// only to an idle encoder (`step`): a second, filled while the encoder codes the first,
+/// only queued a frame behind it, and converted every band twice, once into each.
 struct Stream {
     /// Dropped first (fields drop in order), which ends the encode loop once it has sent
     /// what it was given.
     job_tx: mpsc::SyncSender<Job>,
-    /// The buffer back from the encoder, once its frame is on its viewers' lanes.
+    /// The picture back from the encoder, once its frame is on its viewers' lanes.
     ret_rx: mpsc::Receiver<Box<I420>>,
-    buf: Buffer<Box<I420>>,
-    /// The rows that changed on screen since the buffer was last converted into.
-    pending: Option<Band>,
     /// Dropped last: waits until the encode loop has stopped.
     _encode: Stopped,
 }
@@ -242,31 +156,25 @@ impl Stream {
         Ok(Stream {
             job_tx,
             ret_rx,
-            buf: Buffer::Away,
-            pending: None,
             _encode: encode,
         })
     }
 }
 
 #[cfg(target_os = "linux")]
-/// Runs the pipeline. With a `Screen` (dynamic resolution), the capture loop gives a
-/// client's size request to the screen; only if the screen's size really changes does
-/// the loop end: the encoder drains, the pipeline is rebuilt at the new size, and clients
-/// get a keyframe of it.
+/// Runs the pipeline. The capture loop gives a client's size request to `screen`; only if
+/// the screen's size really changes does the loop end: the encoder drains, the pipeline is
+/// rebuilt at the new size, and clients get a keyframe of it.
 pub fn spawn(
     cfg: VideoConfig,
     hub: Arc<Hub>,
-    mut screen: Option<crate::screen::Screen>,
+    mut screen: crate::screen::Screen,
 ) -> Result<(), String> {
-    if let Some(s) = &screen {
-        *hub.resize_max.lock() = Some(s.max());
-    }
     let (mut cap, mut coded) = build(&cfg, &hub)?;
     std::thread::Builder::new()
         .name("capture".into())
         .spawn(move || loop {
-            let looped = capture_loop(&mut cap, coded, cfg.clone(), hub.clone(), screen.as_mut());
+            let looped = capture_loop(&mut cap, coded, cfg.clone(), hub.clone(), &mut screen);
             if let Err(e) = looped {
                 match cap.geometry_changed() {
                     Ok(true) => log::info!("capture geometry changed: {e}"),
@@ -305,9 +213,6 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<(Capturer, vp9::Stream), S
     };
     let coded =
         vp9::Stream::new(shape, cfg.cores).map_err(|e| format!("no VP9 level holds {:?}", e.0))?;
-    *hub.stream.lock() = Some(coded);
-    // A desktop that cannot be resized declares its one size's codec, at its first build.
-    hub.codec.get_or_init(|| coded.codec());
     log::info!(
         "capturing {w}x{h} @ {FRAMERATE} fps as {}, {} threads",
         coded.codec(),
@@ -318,25 +223,24 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<(Capturer, vp9::Stream), S
     Ok((cap, coded))
 }
 
-/// Whether the sessions' lanes let a capture go: open while nothing waits for any viewer's
-/// lane socket.
+/// Whether the viewers' links let a capture start: open while every one's does.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Gated {
     Open,
-    /// Held by a viewer whose lane socket has not yet taken what waits for it: only the
-    /// socket taking it, the lane ending, or a viewer coming or going can open the gate, and
-    /// each of those wakes the hub.
+    /// Held by a viewer whose link is full or late: only an update told taken, a lane
+    /// ending, or a viewer coming or going can open the gate, and each of those wakes the
+    /// hub.
     Held,
 }
 
 impl Gated {
     #[cfg(target_os = "linux")]
-    /// What the look at the viewers saw of their lanes: held by any whose bytes wait. A
-    /// recording bounds nothing.
+    /// What the look at the viewers saw of their links: held by any that is not open. A
+    /// recording holds nothing.
     fn of(seen: &[(Arc<crate::hub::Client>, Seen)]) -> Gated {
-        match seen.iter().any(|(_, v)| v.waits) {
-            true => Gated::Held,
-            false => Gated::Open,
+        match seen.iter().all(|(_, v)| v.gate == Gate::Open) {
+            true => Gated::Open,
+            false => Gated::Held,
         }
     }
 }
@@ -347,18 +251,23 @@ impl Gated {
 /// little early waits a whole interval; at 0.7, up to 86 captures a second.
 const MIN_INTERVAL_SHARE: f64 = 0.85;
 
-/// What the capture loop does next.
+/// What the capture loop does next. A frame is coded only for a `Start` or a `Capture`:
+/// both come from `step` alone, which lets neither go while a viewer's link holds the gate.
 #[derive(Debug, PartialEq)]
-enum Step<B> {
-    /// Wait, the buffer where it was.
-    Wait(Wait, Buffer<B>),
+enum Step<S, B> {
+    /// Wait, the encoder as it was.
+    Wait(Wait, Encoder<S, B>),
+    /// Start a stream, with what a stopped encoder held: capture the whole screen, its
+    /// first keyframe.
+    Start(S),
     /// Capture into the buffer that was home.
     Capture(B),
 }
 
 /// What the capture loop waits for before it looks again. Damage wakes it through the
-/// capturer; the hub's waker, through a viewer's command, a lane emptying or ending, a viewer
-/// leaving, a screenshot or recording asked for, or a buffer coming home from the encoder.
+/// capturer; the hub's waker, through a viewer's command, an update told taken, a lane
+/// ending, a viewer leaving, a screenshot or recording asked for, or a buffer coming home
+/// from the encoder.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Wait {
     /// Damage or a wake: nothing is due.
@@ -366,9 +275,9 @@ enum Wait {
     /// The rest of the least interval since the last capture, or a wake: damage that comes
     /// meanwhile goes with the capture it holds back.
     Interval { rest: Duration },
-    /// The lanes: a socket taking what waits, a lane ending, a viewer going (a wake), or
-    /// damage to take in. No time: a capture held by the lanes waits for what they answer,
-    /// and with nothing answered nothing goes.
+    /// The links: an update told taken, a lane ending, a viewer going (a wake), or damage
+    /// to take in. No time: a link opens only when it is told something, and with nothing
+    /// told nothing goes.
     Gate,
     /// A buffer back from the encoder, which wakes the waker as it hands it back; damage
     /// waits for the capture this leads to.
@@ -479,8 +388,22 @@ enum Buffer<B> {
     Away,
 }
 
-/// What the capture loop knows when it looks, while a stream runs.
-struct Look<B> {
+/// The encoder, as the capture loop holds it when it looks: what a stream is started with
+/// (nothing, in the loop: a start makes its own buffer), or where the running stream's
+/// buffer is. The loop knows which it holds, and says so in the types: a look at a stopped
+/// encoder has no buffer to capture into, and one at a running encoder nothing to start.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Encoder<S, B> {
+    /// None runs: nobody was watching, or the stream was just built. The next capture
+    /// starts one, on a keyframe of the whole screen.
+    Stopped(S),
+    /// One runs, the loop's buffer home or with it.
+    Running(Buffer<B>),
+}
+
+/// What the capture loop knows when it looks, with somebody watching.
+#[derive(Clone, Copy)]
+struct Look {
     key: Key,
     damage: Damage,
     now: Instant,
@@ -489,12 +412,12 @@ struct Look<B> {
     /// The least time between two captures.
     min_interval: Duration,
     gate: Gated,
-    buffer: Buffer<B>,
 }
 
-/// What the loop does next, from what it knows. A capture takes the buffer, so one is
-/// made only when it is home; a wait leaves it where it was.
-fn step<B>(look: Look<B>) -> Step<B> {
+/// What the loop does next, from what it knows: the one place a capture is let go, the
+/// first of a stream as any other. A capture takes the buffer, so one is made only when it
+/// is home; a wait leaves the encoder as it was.
+fn step<S, B>(look: Look, encoder: Encoder<S, B>) -> Step<S, B> {
     let Look {
         key,
         damage,
@@ -502,27 +425,39 @@ fn step<B>(look: Look<B>) -> Step<B> {
         captured,
         min_interval,
         gate,
-        buffer,
     } = look;
-    // Nothing moved and nobody waits to start: nothing to capture.
-    if let (Damage::None, Key::NotWanted) = (damage, key) {
-        return Step::Wait(Wait::Change, buffer);
+    match (key, damage, &encoder) {
+        // Nobody waits to start, and nothing moved, or no stream runs to show it on (what
+        // moves meanwhile is in the whole screen the next stream starts with): nothing
+        // to capture.
+        (Key::NotWanted, Damage::None, Encoder::Stopped(_) | Encoder::Running(_))
+        | (Key::NotWanted, Damage::Unreported | Damage::Rows { .. }, Encoder::Stopped(_)) => {
+            return Step::Wait(Wait::Change, encoder);
+        }
+        (
+            Key::Wanted,
+            Damage::None | Damage::Unreported | Damage::Rows { .. },
+            Encoder::Stopped(_) | Encoder::Running(_),
+        )
+        | (Key::NotWanted, Damage::Unreported | Damage::Rows { .. }, Encoder::Running(_)) => {}
     }
-    let since = now.saturating_duration_since(captured);
+    // The loop reads `now` after the capture it stamped `captured`: on one thread, in order.
+    let since = now - captured;
     if since < min_interval {
         let rest = min_interval - since;
-        return Step::Wait(Wait::Interval { rest }, buffer);
+        return Step::Wait(Wait::Interval { rest }, encoder);
     }
-    // A capture goes once every lane is empty.
+    // A capture goes once every viewer's link lets one.
     if gate == Gated::Held {
-        return Step::Wait(Wait::Gate, buffer);
+        return Step::Wait(Wait::Gate, encoder);
     }
-    // A capture goes only to an idle encoder. One made while it codes the frame before
-    // would wait for it, a whole encode older by the time it is coded; made once it is
-    // done, it holds what changed meanwhile, and goes at once.
-    match buffer {
-        Buffer::Home(buf) => Step::Capture(buf),
-        Buffer::Away => Step::Wait(Wait::Buffer, Buffer::Away),
+    match encoder {
+        Encoder::Stopped(with) => Step::Start(with),
+        // A capture goes only to an idle encoder. One made while it codes the frame before
+        // would wait for it, a whole encode older by the time it is coded; made once it is
+        // done, it holds what changed meanwhile, and goes at once.
+        Encoder::Running(Buffer::Home(buf)) => Step::Capture(buf),
+        Encoder::Running(Buffer::Away) => Step::Wait(Wait::Buffer, encoder),
     }
 }
 
@@ -537,7 +472,7 @@ enum Planned<S> {
 /// `starts` if a keyframe was wanted and promised to any; else what moved, if anything did.
 fn plan<S>(starts: Option<S>, band: Option<Band>) -> Planned<S> {
     match (starts, band) {
-        (Some(s), _) => Planned::Send(Plan::Key(s)),
+        (Some(s), Some(_) | None) => Planned::Send(Plan::Key(s)),
         (None, Some(_)) => Planned::Send(Plan::Motion),
         (None, None) => Planned::Empty,
     }
@@ -622,9 +557,9 @@ impl Resize for crate::screen::Screen {
 }
 
 /// A size asked for, given to the screen: whether the stream, at `streamed`, is rebuilt.
-/// Only a screen whose size really changed rebuilds it and says hello to the viewers; an
-/// ask the screen refuses, or one for the size it has, changes nothing: a rebuild for
-/// either would restart every viewer's stream and say hello for nothing.
+/// Only a screen whose size really changed rebuilds it; an ask the screen refuses, or one
+/// for the size it has, changes nothing: a rebuild for either would start every viewer's
+/// stream over, on a keyframe of the whole screen, for nothing.
 pub(crate) fn rebuilds_for(
     screen: &mut impl Resize,
     (w, h): (u32, u32),
@@ -645,7 +580,7 @@ fn capture_loop(
     coded: vp9::Stream,
     cfg: VideoConfig,
     hub: Arc<Hub>,
-    mut screen: Option<&mut crate::screen::Screen>,
+    screen: &mut impl Resize,
 ) -> Result<(), String> {
     let (w, h) = cap.size();
     let (w, h) = (w as usize, h as usize);
@@ -668,9 +603,9 @@ fn capture_loop(
         }
         probe
     });
-    // The encoder, while somebody watches. Every way out of the loop drops it, and with it
-    // waits for the encoder to send what it holds.
-    let mut stream: Option<Stream> = None;
+    // The encoder, while somebody watches, and where the picture that goes round is. Every
+    // way out of the loop drops it, and with it waits for the encoder to send what it holds.
+    let mut stream: Option<(Stream, Buffer<Box<I420>>)> = None;
     // What the loop saw of each watching viewer when it last looked: kept, so that a look
     // allocates nothing once there is room for every viewer.
     let mut seen: Vec<(Arc<crate::hub::Client>, Seen)> = Vec::new();
@@ -685,8 +620,8 @@ fn capture_loop(
             return Ok(());
         }
         let asked = hub.resize_req.lock().take();
-        if let (Some(s), Some(want)) = (screen.as_deref_mut(), asked) {
-            if rebuilds_for(s, want, cap.size()) {
+        if let Some(want) = asked {
+            if rebuilds_for(screen, want, cap.size()) {
                 return Ok(());
             }
         }
@@ -712,10 +647,10 @@ fn capture_loop(
         }
         // The encoder holds the sender for as long as it runs: once it is gone, no buffer
         // will come back to wake the loop.
-        if let Some(s) = stream.as_mut() {
+        if let Some((s, home)) = stream.as_mut() {
             loop {
                 match s.ret_rx.try_recv() {
-                    Ok(buf) => s.buf = Buffer::Home(buf),
+                    Ok(buf) => *home = Buffer::Home(buf),
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => return Err("encoder gone".into()),
                 }
@@ -733,52 +668,61 @@ fn capture_loop(
             Wait::Change.wait(cap, &hub)?;
             continue;
         }
-        let key = Key::of(&seen);
-        let Some(s) = stream.as_mut() else {
-            // No stream: one starts with a keyframe of the whole screen, for the viewers
-            // waiting to start, and with nobody waiting there is nothing to send.
-            let starts = match key {
-                Key::Wanted => hub.promise(&seen),
-                Key::NotWanted => None,
-            };
-            let Some(starts) = starts else {
-                Wait::Change.wait(cap, &hub)?;
-                continue;
-            };
-            let (cw, ch) = cap.size();
-            cap.grab(cap.full())?;
-            // The whole screen is grabbed: it holds what was drawn while nobody watched, so
-            // that damage is taken with it.
-            cap.damage().take(ch);
-            let t0 = Instant::now();
-            let mut buf = Box::new(I420::new(cw as usize, ch as usize));
-            cap.convert(&mut buf, 0, ch as usize)?;
-            hub.stats.captured.fetch_add(1, Ordering::Relaxed);
-            captured = t0;
-            let first = Job {
-                buf,
-                frame: Plan::Key(starts),
-                damage: t0,
-                marker_ms: None,
-            };
-            stream = Some(Stream::start(&hub, coded, first, cfg.debug)?);
-            continue;
-        };
         let look = Look {
-            key,
+            key: Key::of(&seen),
             damage: *cap.damage(),
             now,
             captured,
             min_interval,
             gate: Gated::of(&seen),
-            buffer: std::mem::replace(&mut s.buf, Buffer::Away),
         };
-        let mut buf = match step(look) {
-            Step::Wait(wait, buffer) => {
-                s.buf = buffer;
+        // What the look promises its keyframe to, if it wants one: asked once a capture
+        // is let go.
+        let promise = || match look.key {
+            Key::Wanted => hub.promise(&seen),
+            Key::NotWanted => None,
+        };
+        // The one decision, for a stream to start as for one that runs: nothing below
+        // captures but what `step` let go.
+        let Some((s, picture)) = stream.as_mut() else {
+            match step(look, Encoder::<(), std::convert::Infallible>::Stopped(())) {
+                Step::Wait(wait, _) => wait.wait(cap, &hub)?,
+                Step::Capture(never) => match never {},
+                // A viewer that has left since the look is promised nothing: with nobody
+                // to start, the next look sees who is there.
+                Step::Start(()) => {
+                    if let Some(starts) = promise() {
+                        let (cw, ch) = cap.size();
+                        cap.grab(cap.full())?;
+                        // The whole screen is grabbed: it holds what was drawn while
+                        // nobody watched, so that damage is taken with it.
+                        cap.damage().take(ch);
+                        let t0 = Instant::now();
+                        let mut buf = Box::new(I420::new(cw as usize, ch as usize));
+                        cap.convert(&mut buf, 0, ch as usize)?;
+                        hub.stats.captured.fetch_add(1, Ordering::Relaxed);
+                        captured = t0;
+                        let first = Job {
+                            buf,
+                            frame: Plan::Key(starts),
+                            damage: t0,
+                            marker_ms: None,
+                        };
+                        let started = Stream::start(&hub, coded, first, cfg.debug)?;
+                        stream = Some((started, Buffer::Away));
+                    }
+                }
+            }
+            continue;
+        };
+        let home = std::mem::replace(picture, Buffer::Away);
+        let mut buf = match step(look, Encoder::<std::convert::Infallible, _>::Running(home)) {
+            Step::Wait(wait, Encoder::Running(buffer)) => {
+                *picture = buffer;
                 wait.wait(cap, &hub)?;
                 continue;
             }
+            Step::Wait(_, Encoder::Stopped(never)) | Step::Start(never) => match never {},
             Step::Capture(buf) => buf,
         };
         let t0 = Instant::now();
@@ -805,24 +749,16 @@ fn capture_loop(
         let marker_ms = marker_reading(cap.bgrx(), probe);
         // What this capture is sent as, decided once; with nothing to send, the buffer
         // goes back home.
-        let starts = match key {
-            Key::Wanted => hub.promise(&seen),
-            Key::NotWanted => None,
-        };
-        let frame = match plan(starts, band) {
+        let frame = match plan(promise(), band) {
             Planned::Send(frame) => frame,
             Planned::Empty => {
-                s.buf = Buffer::Home(buf);
+                *picture = Buffer::Home(buf);
                 continue;
             }
         };
-        let todo = match (s.pending.take(), band) {
-            (p, Some(b)) => Some(union(p, b)),
-            (p, None) => p,
-        };
-        if let Some(t) = todo {
+        if let Some(b) = band {
             let pic: &mut I420 = &mut buf;
-            cap.convert(pic, t.y0 as usize, t.y1 as usize)?;
+            cap.convert(pic, b.y0 as usize, b.y1 as usize)?;
         }
         let t2 = Instant::now();
         hub.stats
@@ -847,6 +783,13 @@ fn capture_loop(
     }
 }
 
+/// A frame coded: what the encoder says it is, and its message, a header's room and then
+/// the VP9.
+struct Coded {
+    coding: Coding,
+    message: BytesMut,
+}
+
 /// Codes each frame: the encoder, and what it puts out.
 struct Coder {
     enc: vp9::Encoder,
@@ -864,19 +807,20 @@ impl Coder {
         first: &I420,
         ms: i64,
         debug: bool,
-    ) -> Result<(Coder, BytesMut), vp9::Failed> {
+    ) -> Result<(Coder, Coded), vp9::Failed> {
         let mut coder = Coder {
             enc: vp9::Encoder::new(&coded)?,
             out: Vec::new(),
             arenas: Arenas::new(),
             debug,
         };
-        let coded = coder.code(first, ms, vp9::Coding::Key)?;
+        let coded = coder.code(first, ms, Coding::Key)?;
         Ok((coder, coded))
     }
 
-    /// Codes `buf` at `ms` as `coding`: a header's room, then the VP9.
-    fn code(&mut self, buf: &I420, ms: i64, coding: vp9::Coding) -> Result<BytesMut, vp9::Failed> {
+    /// Codes `buf` at `ms`, a keyframe if `coding` asks for one: a header's room, then the
+    /// VP9, and what the encoder coded it as.
+    fn code(&mut self, buf: &I420, ms: i64, coding: Coding) -> Result<Coded, vp9::Failed> {
         let planes = vp9::Planes {
             y: &buf.y,
             u: &buf.u,
@@ -886,7 +830,7 @@ impl Coder {
         };
         self.out.clear();
         let te = Instant::now();
-        self.enc.encode(&planes, ms, coding, &mut self.out)?;
+        let coding = self.enc.encode(&planes, ms, coding, &mut self.out)?;
         if self.debug {
             match thread_cpu_us() {
                 Ok(cpu) => log::info!(
@@ -897,7 +841,10 @@ impl Coder {
                 Err(e) => log::error!("this thread's CPU time: {e}"),
             }
         }
-        Ok(self.arenas.message(&self.out))
+        Ok(Coded {
+            coding,
+            message: self.arenas.message(&self.out),
+        })
     }
 }
 
@@ -994,8 +941,11 @@ fn encode_frames(
     hub: &Hub,
     debug: bool,
 ) -> Result<(), vp9::Failed> {
-    let epoch = Instant::now();
-    let ms = |job: &Job| job.damage.saturating_duration_since(epoch).as_millis() as i64;
+    // A frame's timestamp is its damage's time since the stream's first frame. The capture
+    // thread stamps every damage, in its order, after it took the damage the first frame
+    // went with: so no later frame's is earlier.
+    let epoch = first.damage;
+    let ms = |job: &Job| (job.damage - epoch).as_millis() as i64;
     // Kept from frame to frame, so a frame allocates nothing for it.
     let mut viewers = Vec::new();
     // A picture goes home only once its frame is on its viewers' lanes: the capture loop,
@@ -1008,10 +958,16 @@ fn encode_frames(
     };
     let t0 = Instant::now();
     let (mut coder, out) = Coder::start(coded, &first.buf, ms(&first), debug)?;
-    let mut sent = |job: Job, mut bytes: BytesMut, t0: Instant| {
+    let mut sent = |job: Job, coded: Coded, t0: Instant| {
+        let Coded {
+            coding,
+            message: mut bytes,
+        } = coded;
         let enc_us = t0.elapsed().as_micros() as u64;
+        let version = hub.next_version();
         let header = Header {
-            key: matches!(job.frame, Plan::Key(_)),
+            coding,
+            version,
             pipe: Pipe::of(job.damage.elapsed()),
         };
         bytes[..Header::LEN].copy_from_slice(&header.bytes());
@@ -1028,7 +984,7 @@ fn encode_frames(
         }
         hub.clients_into(&mut viewers);
         for c in &viewers {
-            c.takes(&bytes);
+            c.takes(&bytes, version);
         }
         home(job.buf);
         // What the viewers were sent is on their lanes now: dropped here, its arena is
@@ -1049,8 +1005,8 @@ fn encode_frames(
     while let Ok(job) = rx.recv() {
         let t0 = Instant::now();
         let coding = match job.frame {
-            Plan::Key(_) => vp9::Coding::Key,
-            Plan::Motion => vp9::Coding::Delta,
+            Plan::Key(_) => Coding::Key,
+            Plan::Motion => Coding::Delta,
         };
         let out = coder.code(&job.buf, ms(&job), coding)?;
         sent(job, out, t0);
@@ -1095,7 +1051,7 @@ impl MarkerProbe {
 fn marker_reading(bgrx: Option<(&[u8], usize)>, probe: Option<MarkerProbe>) -> Option<u32> {
     match (bgrx, probe) {
         (Some((px, stride)), Some(at)) => Some(marker_probe(px, stride, at, "grab")),
-        _ => None,
+        (None, Some(_) | None) | (Some(_), None) => None,
     }
 }
 
@@ -1128,17 +1084,36 @@ fn marker_age(ms: u32) -> Result<i64, std::time::SystemTimeError> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::session::sender::{Queue, Sender};
+    use crate::session::estimate::tests::Link;
+    use crate::session::link::tests::Simulated;
+    use crate::session::link::{Gate, Path};
+    use crate::session::sender::Sender;
     use crate::xorshift::Xorshift;
 
-    /// A session of `hub` with a lane, which no writer drains, and the lane's queue.
-    fn viewer(hub: &Hub) -> (Arc<crate::hub::Client>, Arc<Queue>) {
-        let (sender, queue) = Sender::with_lane();
+    /// A session of `hub` with a lane, which no writer drains: a test reads what it holds
+    /// (`updates`).
+    fn viewer(hub: &Hub) -> Arc<crate::hub::Client> {
+        let (sender, _writer) = Sender::with_lane();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        (hub.add_client(tx, sender), queue)
+        hub.add_client(tx, sender)
+    }
+
+    /// The video updates `c`'s lane holds, in order, taken off it as its socket would.
+    fn updates(c: &crate::hub::Client) -> Vec<Vec<u8>> {
+        c.lane(|s| s.updates())
     }
 
     /// The stream a test codes: `w` x `h` on one thread.
+    /// The level of a stream of `w` x `h`.
+    fn level(w: u32, h: u32) -> u8 {
+        let shape = vp9::Shape {
+            width: w,
+            height: h,
+            fps: FRAMERATE,
+        };
+        vp9::level(shape).unwrap()
+    }
+
     fn coded(w: u32, h: u32) -> vp9::Stream {
         let shape = vp9::Shape {
             width: w,
@@ -1189,7 +1164,7 @@ pub(crate) mod tests {
         let (_, body) = boxes(b)?.into_iter().find(|(n, _)| n == *first)?;
         match rest {
             [] => Some(body),
-            _ => inside(body, rest),
+            [_, ..] => inside(body, rest),
         }
     }
 
@@ -1206,7 +1181,6 @@ pub(crate) mod tests {
         let mut rng = Xorshift::new(0x1f83_d9ab_fb41_bd6b);
         for run in 0..6 {
             let hub = Hub::new().unwrap();
-            *hub.stream.lock() = Some(coded(w, h));
             let (stop, stopped) = tokio::sync::oneshot::channel();
             let recording = tokio::spawn({
                 let hub = hub.clone();
@@ -1257,10 +1231,7 @@ pub(crate) mod tests {
             // profile 0, the level, and 8 bits.
             let vpcc = inside(&entry[0].1[78..], &[b"vpcC"]).unwrap();
             assert_eq!(&vpcc[..4], &[1, 0, 0, 0]);
-            assert_eq!(
-                (vpcc[4], vpcc[5], vpcc[6] >> 4),
-                (0, coded(w, h).level(), 8)
-            );
+            assert_eq!((vpcc[4], vpcc[5], vpcc[6] >> 4), (0, level(w, h), 8));
             let path: [&[u8; 4]; 4] = [b"mdia", b"minf", b"stbl", b"stsz"];
             let stsz = inside(traks[0], &path).expect("a sample table");
             assert_eq!(u32_at(stsz, 8) as usize, n + 1, "samples against frames");
@@ -1307,7 +1278,7 @@ pub(crate) mod tests {
                 0..=2 => room.saturating_sub(4) + next() % 8,
                 3..=5 => next() % (room + 8),
                 6 => usize::MAX - next() % 600,
-                _ => next(),
+                7.. => next(),
             };
             let at = Marker {
                 x: place(w.saturating_sub(468)),
@@ -1324,7 +1295,7 @@ pub(crate) mod tests {
             let painted = match next() % 4 {
                 0 => next() & !0xff_ffff,
                 1 => next() | 0xff_ffff,
-                _ => next(),
+                2.. => next(),
             } & 0xff_ffff_ffff;
             for (b, &i) in centres.iter().enumerate() {
                 let r = next() as u8 % 127;
@@ -1389,9 +1360,9 @@ pub(crate) mod tests {
         let mut lanes_checked = 0;
         for case in 0..8 {
             let hub = Hub::new().unwrap();
-            let (whole, whole_lane) = viewer(&hub);
+            let whole = viewer(&hub);
             whole.watch();
-            let (moved, first_lane) = viewer(&hub);
+            let moved = viewer(&hub);
             moved.watch();
             let first = job(w, h, Plan::Key(promised(&hub)), &mut rng);
             let s = Stream::start(&hub, coded(w, h), first, Debugging::read(|_| None).unwrap())
@@ -1399,21 +1370,19 @@ pub(crate) mod tests {
             s.ret_rx.recv().unwrap();
             let (join, reopen) = (rng.range(5, 50), rng.range(5, 40));
             let again = reopen + rng.range(1, 20);
-            // Each lane's updates, as its socket took them; the lane `moved` has now.
+            // Each lane's updates, as its socket took them.
             let mut lanes: Vec<Vec<Vec<u8>>> = Vec::new();
-            let mut moving = first_lane;
             let mut joined = None;
             for f in 0..60 {
                 if f == join {
-                    let (b, lane) = viewer(&hub);
+                    let b = viewer(&hub);
                     b.watch();
-                    joined = Some((b, lane));
+                    joined = Some(b);
                 }
                 if f == reopen || f == again {
                     // The socket took what the lane held before it broke.
-                    lanes.push(moving.updates());
-                    moving = Queue::new(Arc::new(|| {}));
-                    assert!(moved.attach(moving.clone()));
+                    lanes.push(updates(&moved));
+                    moved.attach().expect("an open session takes a lane");
                 }
                 let mut seen = Vec::new();
                 hub.look_into(&mut seen);
@@ -1425,8 +1394,8 @@ pub(crate) mod tests {
                 s.ret_rx.recv().unwrap();
             }
             drop(s);
-            lanes.push(moving.updates());
-            lanes.extend(joined.map(|(_, lane)| lane.updates()));
+            lanes.push(updates(&moved));
+            lanes.extend(joined.map(|b| updates(&b)));
             let decode = |name: &str, frames: &[Vec<u8>]| {
                 let mut file = vp9::tests::ivf_header(w as usize, h as usize);
                 for (n, b) in frames.iter().enumerate() {
@@ -1437,12 +1406,18 @@ pub(crate) mod tests {
                 vp9::tests::decode(&path).unwrap_or_else(|e| panic!("case {case} {name}: {e}"))
             };
             let frame = (w * h * 3 / 2) as usize;
-            let all = whole_lane.updates();
+            let all = updates(&whole);
             let truth = decode("whole", &all);
             assert_eq!(truth.len(), all.len() * frame, "case {case}");
             for (l, got) in lanes.iter().enumerate() {
                 assert!(!got.is_empty(), "case {case}: lane {l} carried nothing");
-                assert_eq!(got[0][0] & 1, 1, "case {case}: lane {l} starts on a delta");
+                assert!(
+                    matches!(
+                        Header::read(&got[0]),
+                        Ok(crate::wire::Video::Picture(h, _)) if h.coding == Coding::Key
+                    ),
+                    "case {case}: lane {l} starts on no keyframe"
+                );
                 // Where the lane's first update is in the whole stream: the same bytes.
                 let at = all.iter().position(|u| *u == got[0]).unwrap();
                 assert_eq!(got[..], all[at..at + got.len()], "case {case}: lane {l}");
@@ -1460,36 +1435,33 @@ pub(crate) mod tests {
 
     /// A viewer that joins while the stream is rebuilt (a resize, a display switch)
     /// starts on the rebuilt stream: no frame of the old stream reaches its lanes, whose
-    /// decoder would take it as the start of the stream its hello then resets. Steps, the
-    /// loops' own: a page joins and the capture loop plans its keyframe; a resize ends the
-    /// capture loop, and the real encode loop sends that keyframe while a second page has
-    /// just joined; then `build`'s `restart_clients` says hello. The first page's lane has
-    /// the keyframe, so the test is of the stream, not of a loop that sent nothing.
+    /// decoder would take it as the start of the stream the rebuilt one then replaces.
+    /// Steps, the loops' own: a page joins and the capture loop plans its keyframe; a
+    /// resize ends the capture loop, and the real encode loop sends that keyframe while a
+    /// second page has just joined; then `build`'s `restart_clients` starts every viewer
+    /// over. The first page's lane has the keyframe, so the test is of the stream, not of
+    /// a loop that sent nothing.
     #[test]
     fn a_viewer_that_joins_while_the_stream_is_rebuilt_starts_on_the_rebuilt_stream() {
         let hub = Hub::new().unwrap();
         let (w, h) = (64, 64);
-        let (page, page_lane) = viewer(&hub);
+        let page = viewer(&hub);
         page.watch();
         let mut rng = Xorshift::new(0x6a09_e667_f3bc_c908);
         let first = job(w, h, Plan::Key(promised(&hub)), &mut rng);
         // A resize ends the capture loop, and a second page joins, before the encode loop
         // has coded that keyframe.
-        let (second, second_lane) = viewer(&hub);
+        let second = viewer(&hub);
         second.watch();
         let s =
             Stream::start(&hub, coded(w, h), first, Debugging::read(|_| None).unwrap()).unwrap();
         drop(s);
-        // build(): the rebuilt stream's hello.
+        // build(): every viewer starts over, on the rebuilt stream.
         hub.restart_clients();
-        assert_eq!(
-            page_lane.updates().len(),
-            1,
-            "the first page had no keyframe"
-        );
+        assert_eq!(updates(&page).len(), 1, "the first page had no keyframe");
         assert!(
-            second_lane.updates().is_empty(),
-            "the second page's lane had a frame of the old stream before its hello"
+            updates(&second).is_empty(),
+            "the second page's lane had a frame of the old stream"
         );
     }
 
@@ -1848,8 +1820,8 @@ pub(crate) mod tests {
     /// draws on (a `Canvas`, captured by a `Drawing` that keeps damage as the X11 capturer
     /// does, so no X server is needed), at the defaults, with one viewer: the stream it
     /// makes for that viewer is the one a real viewer gets. The test draws text scrolling
-    /// through rows of any height, and lets the screen go still until its pass goes when
-    /// one is due; and plays the viewer's socket, taking each frame off its lane. First each
+    /// through rows of any height, and plays the viewer: its socket, taking each frame off
+    /// its lane, and its relay, saying each taken. First each
     /// kind of step goes through 24 times, which brings every buffer the
     /// stream keeps to its size; then 60 generated steps are counted. The test's own thread
     /// is the viewer, so it is not the stream's.
@@ -1871,9 +1843,8 @@ pub(crate) mod tests {
             )
         };
         let hub = Hub::new().unwrap();
-        let (client, lane) = viewer(&hub);
+        let client = viewer(&hub);
         client.watch();
-        drop(client);
         let canvas = Arc::new(Canvas {
             w,
             h,
@@ -1900,31 +1871,52 @@ pub(crate) mod tests {
                 cfg.cores,
             )
             .unwrap();
+            // Nothing asks this test's screen for a size: it keeps the one it has.
+            struct Kept((u32, u32));
+            impl Resize for Kept {
+                fn resize(&mut self, _: u32, _: u32) -> Result<(u32, u32), String> {
+                    Ok(self.0)
+                }
+            }
             std::thread::Builder::new()
                 .name("capture".into())
-                .spawn(move || capture_loop(&mut drawing, coded, cfg, hub, None))
+                .spawn(move || capture_loop(&mut drawing, coded, cfg, hub, &mut Kept((w, h))))
                 .unwrap()
         };
-        // The viewer: it takes frames off its lane until there is one, as its socket does.
+        // The viewer: it takes frames off its lane until there is one, as its socket does,
+        // and says each taken, as its relay does.
         struct Viewer {
-            lane: Arc<Queue>,
+            hub: Arc<Hub>,
+            client: Arc<crate::hub::Client>,
             frames: usize,
         }
         impl Viewer {
             fn frame(&mut self) {
                 loop {
-                    let updates = self.lane.updates().len();
-                    if updates == 0 {
+                    let updates = updates(&self.client);
+                    if updates.is_empty() {
                         // Nothing yet: the stream's threads are coding it.
                         std::thread::yield_now();
                         continue;
                     }
-                    self.frames += updates;
+                    for update in &updates {
+                        let Ok(crate::wire::Video::Picture(header, _)) = Header::read(update)
+                        else {
+                            panic!("the stream sends pictures");
+                        };
+                        self.client.took(header.version);
+                    }
+                    self.hub.wake();
+                    self.frames += updates.len();
                     return;
                 }
             }
         }
-        let mut viewer = Viewer { lane, frames: 0 };
+        let mut viewer = Viewer {
+            hub: hub.clone(),
+            client,
+            frames: 0,
+        };
         let mut rng = Xorshift::new(0x2545F4914F6CDD1D);
         let mut next = move |n: u64| rng.below(n);
         // Text scrolls: a line, a block of lines, the whole screen.
@@ -1933,7 +1925,7 @@ pub(crate) mod tests {
             let y1 = match next(3) {
                 0 => (y0 + 48).min(h),
                 1 => y0 + 1 + next((h - y0) as u64) as u32,
-                _ => h,
+                2.. => h,
             };
             canvas.draw(y0, y1, n);
             viewer.frame();
@@ -1999,52 +1991,43 @@ pub(crate) mod tests {
     }
 
     /// One look, as the capture loop reads it: the capturer's damage, whether a viewer
-    /// waits to start, the last capture, the pacing, the gate, whether the buffer is home, and
-    /// the area the damage comes to when taken.
+    /// waits to start, the last capture, the pacing, the gate, the encoder (none running,
+    /// or one with the buffer home or away), and the area the damage comes to when taken.
     #[derive(Clone, Copy)]
     struct StepCase {
         damage: Damage,
-        want_key: bool,
+        key: Key,
         now: Instant,
         captured: Instant,
         min_interval: Duration,
         gate: Gated,
-        home: bool,
+        encoder: Encoder<(), ()>,
         band: Option<Band>,
     }
 
     impl StepCase {
-        fn buffer(&self) -> Buffer<()> {
-            match self.home {
-                true => Buffer::Home(()),
-                false => Buffer::Away,
-            }
-        }
-        fn look(&self) -> Look<()> {
+        fn look(&self) -> Look {
             Look {
-                key: match self.want_key {
-                    true => Key::Wanted,
-                    false => Key::NotWanted,
-                },
+                key: self.key,
                 damage: self.damage,
                 now: self.now,
                 captured: self.captured,
                 min_interval: self.min_interval,
                 gate: self.gate,
-                buffer: self.buffer(),
             }
         }
     }
 
     /// How many looks `each_case` makes: four frame rates, three damages, seven times since
-    /// the last capture, the gate open or held, and 8 ways for the rest.
-    const CASES: usize = 4 * 3 * 7 * 2 * 8;
+    /// the last capture, the gate open or held, the encoder's three states, and 4 ways for
+    /// the rest.
+    const CASES: usize = 4 * 3 * 7 * 2 * 3 * 4;
 
     /// Every look over a discretised domain: each state the capturer's damage takes; four
     /// frame rates, at seven times since the last capture, either side of the least interval
-    /// and its rounding to whole milliseconds; a viewer waiting to start or not; the lanes
-    /// empty (the gate open) or not; the buffer home or out; damage that came to an area or
-    /// to none.
+    /// and its rounding to whole milliseconds; a viewer waiting to start or not; the gate
+    /// open or held; no stream running, or one with the buffer home or out; damage that
+    /// came to an area or to none.
     fn each_case(mut check: impl FnMut(StepCase)) -> usize {
         let ns = Duration::from_nanos;
         let us = Duration::from_micros;
@@ -2058,6 +2041,11 @@ pub(crate) mod tests {
                 y0: 16,
                 y1: 48,
             },
+        ];
+        let encoders = [
+            Encoder::Stopped(()),
+            Encoder::Running(Buffer::Home(())),
+            Encoder::Running(Buffer::Away),
         ];
         let mut cases = 0;
         for fps in [1, 30, 60, 144] {
@@ -2076,20 +2064,21 @@ pub(crate) mod tests {
                 .into_iter()
                 .flat_map(|d| sinces.map(move |s| (d, s)))
             {
-                for (gate, case) in [Gated::Open, Gated::Held]
+                for (gate, encoder, case) in [Gated::Open, Gated::Held]
                     .into_iter()
-                    .flat_map(|g| (0..8).map(move |c| (g, c)))
+                    .flat_map(|g| encoders.map(move |e| (g, e)))
+                    .flat_map(|(g, e)| (0..4).map(move |c| (g, e, c)))
                 {
                     let bit = |i: u32| case >> i & 1 == 1;
                     check(StepCase {
                         damage,
-                        want_key: bit(0),
+                        key: [Key::NotWanted, Key::Wanted][usize::from(bit(0))],
                         now,
                         captured: now - since,
                         min_interval,
                         gate,
-                        home: bit(1),
-                        band: bit(2).then_some(Band { y0: 16, y1: 48 }),
+                        encoder,
+                        band: bit(1).then_some(Band { y0: 16, y1: 48 }),
                     });
                     cases += 1;
                 }
@@ -2098,28 +2087,31 @@ pub(crate) mod tests {
         cases
     }
 
-    /// A look waits for the first of these that holds it, and only for that, else it
-    /// captures if the encoder is idle, or waits for the buffer to come home: a still screen
-    /// (nothing damaged, nobody waiting to start), for a change; the rest of the least
-    /// interval since the last capture; bytes waiting for a lane's socket, with no time.
-    /// Checked over every look of `each_case`.
+    /// A look waits for the first of these that holds it, and only for that: a still screen
+    /// (nobody waiting to start, and nothing damaged or no stream running to show it on),
+    /// for a change; the rest of the least interval since the last capture; a viewer's link
+    /// that holds the gate, with no time. Else it starts a stream if none runs, captures
+    /// if the encoder is idle, or waits for the buffer to come home. So no stream starts,
+    /// and no capture goes, while the gate is held. Checked over every look of `each_case`.
     #[test]
     fn a_capture_waits_only_for_what_holds_it() {
         let cases = each_case(|c| {
-            let got = step(c.look());
-            let still = c.damage == Damage::None && !c.want_key;
+            let got = step(c.look(), c.encoder);
+            let nothing = c.damage == Damage::None || c.encoder == Encoder::Stopped(());
+            let still = nothing && c.key == Key::NotWanted;
             let since = c.now - c.captured;
             let early = (since < c.min_interval).then(|| c.min_interval - since);
-            // A wait leaves the buffer where it was; a capture takes it.
-            let wait = |w| Step::Wait(w, c.buffer());
-            let want = match (still, early, c.gate, c.home) {
+            // A wait leaves the encoder as it was; a capture takes the buffer.
+            let wait = |w| Step::Wait(w, c.encoder);
+            let want = match (still, early, c.gate, c.encoder) {
                 (true, _, _, _) => wait(Wait::Change),
                 (false, Some(rest), _, _) => wait(Wait::Interval { rest }),
                 (false, None, Gated::Held, _) => wait(Wait::Gate),
-                (false, None, Gated::Open, false) => wait(Wait::Buffer),
-                (false, None, Gated::Open, true) => Step::Capture(()),
+                (false, None, Gated::Open, Encoder::Running(Buffer::Away)) => wait(Wait::Buffer),
+                (false, None, Gated::Open, Encoder::Running(Buffer::Home(()))) => Step::Capture(()),
+                (false, None, Gated::Open, Encoder::Stopped(())) => Step::Start(()),
             };
-            assert_eq!(got, want, "still {still}, early {early:?}, home {}", c.home);
+            assert_eq!(got, want, "still {still}, early {early:?}, {:?}", c.encoder);
         });
         assert_eq!(cases, CASES);
     }
@@ -2133,7 +2125,7 @@ pub(crate) mod tests {
     fn a_wait_wakes_on_what_it_waits_for() {
         let mut waits = 0;
         each_case(|c| {
-            let Step::Wait(wait, _) = step(c.look()) else {
+            let Step::Wait(wait, _) = step(c.look(), c.encoder) else {
                 return;
             };
             waits += 1;
@@ -2158,10 +2150,11 @@ pub(crate) mod tests {
         let mut cases = 0;
         each_case(|c| {
             for promised in [false, true] {
-                let starts = (c.want_key && promised).then_some(());
-                let shown = format!("key {}, band {:?}, {promised}", c.want_key, c.band);
+                let wanted = c.key == Key::Wanted;
+                let starts = (wanted && promised).then_some(());
+                let shown = format!("{:?}, band {:?}, {promised}", c.key, c.band);
                 match plan(starts, c.band) {
-                    Planned::Send(Plan::Key(())) => assert!(c.want_key && promised, "{shown}"),
+                    Planned::Send(Plan::Key(())) => assert!(wanted && promised, "{shown}"),
                     Planned::Send(Plan::Motion) => {
                         assert!(starts.is_none() && c.band.is_some(), "{shown}")
                     }
@@ -2175,9 +2168,9 @@ pub(crate) mod tests {
 
     /// The capturer's damage, against what was drawn: over every sequence of five events
     /// from a new capturer (rows drawn at three places, a take), damage is due exactly when
-    /// the capturer is new or something was drawn since the last take; it has rows exactly when rows were drawn, stamped with the first of them,
-    /// spanning them all; and a take returns those rows widened to even rows
-    /// within the picture, and leaves nothing.
+    /// the capturer is new or something was drawn since the last take; it has rows exactly
+    /// when rows were drawn, stamped with the first of them, spanning them all; and a take
+    /// returns those rows widened to even rows within the picture, and leaves nothing.
     #[test]
     fn damage_is_what_was_drawn_since_the_take() {
         let t0 = Instant::now();
@@ -2201,7 +2194,7 @@ pub(crate) mod tests {
                         });
                         due = true;
                     }
-                    _ => {
+                    3.. => {
                         let band = damage.take(height).map(|b| (b.y0, b.y1));
                         let want = drawn.map(|(_, a, b)| (a & !1, ((b + 1) & !1).min(height)));
                         assert_eq!(band, want, "sequence {seq}, event {i}");
@@ -2219,103 +2212,651 @@ pub(crate) mod tests {
         }
     }
 
-    /// The tests' generator, drawing the header's values.
-    struct Rng(Xorshift);
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            self.0.next()
-        }
-        /// A number of any size: a random one, shifted right by a random amount.
-        fn any(&mut self) -> u64 {
-            let shift = self.next() % 64;
-            self.next() >> shift
-        }
+    /// A frame a simulated session showed: when its change was drawn (a keyframe with no
+    /// change behind it, when it was let go), when it was sent and told taken, its bytes,
+    /// what the link knew of the path when it was sent, and how long the path was silent
+    /// while it was on the way.
+    struct Shown {
+        drawn: Instant,
+        sent: Instant,
+        took: Instant,
+        bytes: u64,
+        path: Path,
+        silent: Duration,
+        /// A keyframe is the whole screen, and starts its viewer.
+        coding: Coding,
+        /// The bytes sent before it and not yet told taken, when it was sent.
+        ahead: u64,
+        /// What the link let be on the way when its capture was let go: its window, or
+        /// nothing while it knew nothing of the path.
+        allowed: u64,
+        /// The gate held its capture back, at a look before the one that let it go.
+        held: bool,
     }
 
-    fn random_header(rng: &mut Rng) -> Header {
-        Header {
-            key: rng.next() & 1 == 1,
-            pipe: Pipe(rng.any() as u32),
+    impl Shown {
+        /// The round trip the link knew when it was sent, once it knew the path.
+        fn fastest(&self) -> Option<Duration> {
+            match self.path {
+                Path::Known(known) => Some(known.round_trip),
+                Path::Unknown => None,
+            }
         }
-    }
 
-    #[test]
-    fn a_header_reads_back_as_it_was_written() {
-        let mut rng = Rng(Xorshift::new(0x9e37_79b9_7f4a_7c15));
-        for _ in 0..100_000 {
-            let header = random_header(&mut rng);
-            let picture: Vec<u8> = (0..1 + rng.next() % 64).map(|_| rng.next() as u8).collect();
-            let message = [&header.bytes()[..], &picture].concat();
-            assert_eq!(Header::read(&message), Ok(Video::Picture(header, &picture)));
-        }
-    }
-
-    #[test]
-    fn a_header_alone_is_empty_and_less_is_short() {
-        let mut rng = Rng(Xorshift::new(0x2545_f491_4f6c_dd1d));
-        for _ in 0..100_000 {
-            let header = random_header(&mut rng);
-            let bytes = header.bytes();
-            assert_eq!(Header::read(&bytes), Ok(Video::Empty(header)));
-            let cut = (rng.next() % Header::LEN as u64) as usize;
-            assert_eq!(Header::read(&bytes[..cut]), Err(Short));
-        }
-    }
-
-    #[test]
-    fn a_pipe_is_whole_tenths_of_a_millisecond() {
-        let mut rng = Rng(Xorshift::new(0x6a09_e667_f3bc_c908));
-        let tenth = Duration::from_micros(100);
-        for _ in 0..100_000 {
-            let d = Duration::from_nanos(rng.any());
-            let Pipe(p) = Pipe::of(d);
-            // As many whole tenths as fit, or as many as a header holds.
-            assert!(tenth * p <= d, "{d:?} as {p}");
-            if p < u32::MAX {
-                assert!(d < tenth * (p + 1), "{d:?} as {p}");
+        /// The rate the link knew when it was sent, in bytes a second.
+        fn rate(&self) -> Option<u64> {
+            match self.path {
+                Path::Known(known) => Some(known.rate.0),
+                Path::Unknown => None,
             }
         }
     }
 
-    /// One case of web/src/video-header.json.
-    #[derive(serde::Deserialize)]
-    struct Case {
-        header: String,
-        picture: String,
-        key: bool,
-        pipe: u32,
+    /// What a simulated path changes to, mid-session.
+    #[derive(Clone, Copy)]
+    enum Change {
+        RoundTrip(Duration),
+        /// Bytes a second.
+        Rate(u64),
     }
 
-    fn hex(s: &str) -> Vec<u8> {
-        let digits: String = s.split_whitespace().collect();
-        (0..digits.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&digits[i..i + 2], 16).unwrap())
-            .collect()
+    /// The least and the most a simulated frame takes to code, in milliseconds: what the
+    /// daemon's encoder was measured to take a frame at this quality.
+    ///
+    /// @limitKind measured
+    /// @owner the daemon's VP9 encoder, as these tests simulate it
+    /// @unit milliseconds a frame
+    /// @scope the simulated sessions of this module's tests
+    /// @evidence the daemon's own encode timings on its server (its `encode_us_total` over
+    /// `encoded`, read by `voxl stats`), as reported with the task this change answers; not
+    /// measured again here
+    /// @observed 2026-11-18
+    /// @environment the daemon at this quality on its server, a 2912x1736 desktop
+    /// @workload scrolled text
+    /// @result 15 to 27 ms a frame
+    /// @decision the measured range, a frame's time drawn evenly from it
+    /// @revalidate `bench_hot_path` on the server's hardware; a change of encoder settings
+    const CODING_MS: (u64, u64) = (15, 27);
+
+    /// What a simulated session's viewer or its screen does, mid-session.
+    #[derive(Clone, Copy, Debug)]
+    enum Turn {
+        /// The screen changes size: the stream is rebuilt, and the viewer starts over.
+        Resize,
+        /// `v,0`.
+        StopWatching,
+        /// `v,1`.
+        Watch,
     }
 
-    /// The page messages web/src/protocol.ts checks its reader against carry what the
-    /// daemon writes and reads: each is the relay's one page-type byte, then the header.
-    #[test]
-    fn the_header_is_what_the_fixture_says() {
-        let cases: Vec<Case> =
-            serde_json::from_str(include_str!("../web/src/video-header.json")).unwrap();
-        for c in cases {
-            let header = Header {
-                key: c.key,
-                pipe: Pipe(c.pipe),
+    /// A frame at a simulated encoder: when it is coded, and what `Shown` says of it that
+    /// its capture decided.
+    #[derive(Clone, Copy)]
+    struct Work {
+        done: Instant,
+        drawn: Instant,
+        bytes: u64,
+        coding: Coding,
+        allowed: u64,
+        held: bool,
+    }
+
+    /// A simulated session's stream: none, or one whose encoder is idle or codes a frame.
+    #[derive(Clone, Copy)]
+    enum Sim {
+        Stopped,
+        Idle,
+        Busy(Work),
+    }
+
+    /// A session over `path`, on a virtual clock, from `start`: one viewer, with a lane,
+    /// who watches from the first. Its desktop draws the changes of `draws` (when, and the
+    /// bytes the screen then codes to; a whole screen, a keyframe, codes to `whole`); the
+    /// capture loop's own decision (`step`) says what to do at each look, with the gate the
+    /// session's link gives; a capture is coded for a time within `CODING_MS` and sent if
+    /// its viewer has started, and the path says each frame taken. The screen as it is
+    /// goes next: a change drawn while another waits replaces it, and a keyframe holds both.
+    ///
+    /// Around `step`, the session does what the capture loop and the hub do: a stream ends
+    /// when its screen is resized or nobody watches, once its encoder has sent what it
+    /// holds, and the loop looks at nothing until then; a rebuilt stream starts its viewer
+    /// over; a viewer waiting to start is promised the next keyframe let go, and starts
+    /// when that keyframe is coded, if it is still promised it.
+    fn session(
+        path: &mut Simulated,
+        (start, whole): (Instant, u64),
+        draws: &[(Instant, u64)],
+        // The path changes: when, and to what.
+        change: Option<(Instant, Change)>,
+        turns: &[(Instant, Turn)],
+        end: Instant,
+    ) -> Vec<Shown> {
+        let interval = Duration::from_secs_f64(1.0 / f64::from(FRAMERATE));
+        let min_interval = interval.mul_f64(MIN_INTERVAL_SHARE);
+        let mut link = Link::default();
+        let (mut shown, mut next) = (Vec::new(), 0u32);
+        let mut coding_times = Xorshift::new(0x1b87_3593_cc9e_2d51);
+        // The change waiting to be captured: when the first of it was drawn, and its bytes.
+        let mut drawn: Option<(Instant, u64)> = None;
+        let (mut viewer, mut sim) = (Viewer::Waiting, Sim::Stopped);
+        // The stream is to end, and its viewer to start over on the one rebuilt.
+        let (mut ending, mut rebuilt) = (false, false);
+        // The gate has held a capture back since the last one went.
+        let mut held = false;
+        let mut draws = draws.iter().copied().peekable();
+        let mut turns = turns.iter().copied().peekable();
+        let (mut now, mut captured) = (start, start - interval);
+        while now < end {
+            match change.filter(|(at, _)| *at <= now) {
+                Some((_, Change::RoundTrip(delay))) => path.delay = delay,
+                Some((_, Change::Rate(rate))) => path.rate = rate,
+                None => {}
+            }
+            while let Some((at, bytes)) = draws.next_if(|(at, _)| *at <= now) {
+                drawn = Some((drawn.map_or(at, |(first, _)| first), bytes));
+            }
+            while let Some((_, turn)) = turns.next_if(|(at, _)| *at <= now) {
+                match turn {
+                    Turn::Resize => (ending, rebuilt) = (true, true),
+                    Turn::StopWatching => viewer = Viewer::NotWatching,
+                    Turn::Watch => viewer = Viewer::Waiting,
+                }
+            }
+            path.tell(now, |version, at| link.took(version, at));
+            if let Sim::Busy(frame) = sim {
+                if frame.done <= now {
+                    sim = Sim::Idle;
+                    // The keyframe a viewer was promised starts it; only a viewer that has
+                    // started is sent a frame.
+                    viewer = match (viewer, frame.coding) {
+                        (Viewer::Promised, Coding::Key) => Viewer::Started,
+                        (Viewer::Promised, Coding::Delta)
+                        | (Viewer::NotWatching | Viewer::Waiting | Viewer::Started, _) => viewer,
+                    };
+                    if viewer == Viewer::Started {
+                        let Work {
+                            done, drawn, bytes, ..
+                        } = frame;
+                        let stats = link.stats(done);
+                        let version = crate::wire::Version(next);
+                        next += 1;
+                        link.sent(version, bytes, done);
+                        let took = path.send(version, bytes, Duration::ZERO, done);
+                        shown.push(Shown {
+                            drawn,
+                            sent: done,
+                            took,
+                            bytes,
+                            path: stats.path,
+                            silent: path.silent(done, took),
+                            coding: frame.coding,
+                            ahead: stats.outstanding_bytes,
+                            allowed: frame.allowed,
+                            held: frame.held,
+                        });
+                    }
+                }
+            }
+            // With nobody watching, the stream ends.
+            ending |= viewer == Viewer::NotWatching;
+            let encoder = match (sim, ending) {
+                // The stream's end waits for its encoder: nothing looks meanwhile.
+                (Sim::Busy(_), true) => None,
+                (Sim::Stopped | Sim::Idle, true) => {
+                    (sim, ending) = (Sim::Stopped, false);
+                    viewer = match (std::mem::take(&mut rebuilt), viewer) {
+                        (true, Viewer::Waiting | Viewer::Promised | Viewer::Started) => {
+                            Viewer::Waiting
+                        }
+                        (true, Viewer::NotWatching) | (false, _) => viewer,
+                    };
+                    Some(Encoder::Stopped(()))
+                }
+                (Sim::Stopped, false) => Some(Encoder::Stopped(())),
+                (Sim::Idle, false) => Some(Encoder::Running(Buffer::Home(()))),
+                (Sim::Busy(_), false) => Some(Encoder::Running(Buffer::Away)),
             };
-            let page = hex(&c.header);
-            let bytes = &page[1..];
-            assert_eq!(header.bytes().to_vec(), bytes, "{}", c.header);
-            let picture = hex(&c.picture);
-            let message = [bytes, &picture].concat();
-            assert_eq!(
-                Header::read(&message),
-                Ok(Video::Picture(header, &picture)),
-                "{}",
-                c.header
+            let key = match viewer {
+                Viewer::Waiting => Key::Wanted,
+                Viewer::NotWatching | Viewer::Promised | Viewer::Started => Key::NotWanted,
+            };
+            let look = Look {
+                key,
+                damage: match drawn {
+                    Some((first, _)) => Damage::Rows {
+                        first,
+                        y0: 0,
+                        y1: 2,
+                    },
+                    None => Damage::None,
+                },
+                now,
+                captured,
+                min_interval,
+                gate: match link.gate(now) {
+                    Gate::Open => Gated::Open,
+                    Gate::Full | Gate::Late => Gated::Held,
+                },
+            };
+            // Nobody watching is looked at by nobody, as in the loop.
+            let stepped = encoder
+                .filter(|_| viewer != Viewer::NotWatching)
+                .map(|encoder| step(look, encoder));
+            let wait = match stepped {
+                Some(Step::Start(()) | Step::Capture(())) => {
+                    // A keyframe is the whole screen, and holds what was drawn; a frame
+                    // that is not one is what was drawn.
+                    let (first, bytes) = match (key, drawn.take()) {
+                        (Key::Wanted, drawn) => (drawn.map_or(now, |(first, _)| first), whole),
+                        (Key::NotWanted, Some(drawn)) => drawn,
+                        (Key::NotWanted, None) => panic!("a capture with nothing to show"),
+                    };
+                    if key == Key::Wanted {
+                        viewer = Viewer::Promised;
+                    }
+                    captured = now;
+                    let (least, most) = CODING_MS;
+                    let takes = Duration::from_millis(coding_times.range(least, most + 1));
+                    sim = Sim::Busy(Work {
+                        done: now + takes,
+                        drawn: first,
+                        bytes,
+                        coding: match key {
+                            Key::Wanted => Coding::Key,
+                            Key::NotWanted => Coding::Delta,
+                        },
+                        allowed: match link.stats(now).path {
+                            Path::Known(known) => known.window(),
+                            Path::Unknown => 0,
+                        },
+                        held: std::mem::take(&mut held),
+                    });
+                    None
+                }
+                Some(Step::Wait(Wait::Interval { rest }, _)) => Some(now + rest),
+                Some(Step::Wait(Wait::Gate, _)) => {
+                    held = true;
+                    None
+                }
+                Some(Step::Wait(Wait::Change | Wait::Buffer, _)) | None => None,
+            };
+            // The next thing that can change a look: a change drawn, a turn, a took, the
+            // encoder done, the interval over, the path changed.
+            let events = [
+                draws.peek().map(|(at, _)| *at),
+                turns.peek().map(|(at, _)| *at),
+                path.tooks.front().map(|(at, _)| *at),
+                match sim {
+                    Sim::Busy(frame) => Some(frame.done),
+                    Sim::Stopped | Sim::Idle => None,
+                },
+                wait,
+                change.map(|(at, _)| at),
+            ];
+            match events.into_iter().flatten().filter(|at| *at > now).min() {
+                Some(at) => now = at,
+                None => break,
+            }
+        }
+        shown
+    }
+
+    /// A value at a percentile of `values`, which it sorts.
+    fn percentile(values: &mut [Duration], p: usize) -> Duration {
+        values.sort();
+        values[(values.len() - 1) * p / 100]
+    }
+
+    /// What the sessions of `sessions_over_the_measured_paths` were measured to show, which
+    /// the test holds them to: the least frames a second of each, in the order the test
+    /// runs them (the hotspot's scroll, typing, and typing with whole screens; then the
+    /// office-like path's).
+    ///
+    /// @limitKind measured
+    /// @owner this module's tests
+    /// @unit frames a second, over a session of 30 s
+    /// @scope `sessions_over_the_measured_paths`
+    /// @evidence the test's own output (`--nocapture`): it prints every session's frames a
+    /// second and the percentiles of its frames' time on the way
+    /// @observed 2026-11-19, the measuring machine's local day
+    /// @environment the path simulated in `session::link`'s tests, on a virtual clock, as
+    /// the two paths were measured: one of 1,860 KB/s and a round trip of 236 ms that goes
+    /// silent both ways for 0.43 s every 1.8 s; one of 2,400 KB/s, no silences, whose round
+    /// trip steps from 106 to 243 ms halfway
+    /// @workload a keyframe of 400 KB, then for 30 s: a scroll (a frame of 20 to 25 KB wanted
+    /// every sixtieth of a second), typing (2 KB every 120 ms), and typing with a whole
+    /// screen of 400 KB every 5 s; a frame coded in 15 to 27 ms (`CODING_MS`), which alone
+    /// leaves a scroll 47.6 frames a second
+    /// @result frames a second, and a frame's time from its send to its took at the median,
+    /// the 90th percentile and the most. The silent path: scroll 36.70 (249, 638, 679 ms),
+    /// of the 36.2 its silences leave of 47.6; typing 8.03 (237, 604, 615 ms); with whole
+    /// screens 7.43 (237, 604, 881 ms). The other: scroll 45.57 (251, 253, 273 ms), the
+    /// same before its round trip steps as after; typing 8.03 (244, 244, 273 ms); with
+    /// whole screens 7.83 (244, 244, 410 ms)
+    /// @decision each measured rate less a hundredth of a frame a second: a floor, not a
+    /// goal
+    /// @revalidate a change to the link's gate or estimators, or to the capture decision
+    const SHOWN_A_SECOND: [f64; 6] = [36.69, 8.02, 7.42, 45.56, 8.02, 7.82];
+
+    /// Sessions over the two paths as they were measured, the capture loop's own decision
+    /// driving them: a scroll, typing, and typing with whole-screen changes, each after a
+    /// keyframe. With the path's own word as the oracle:
+    /// - every frame is told taken within twice the round trip the link knew when it was
+    ///   sent, the response time, its own bytes' time on the path, and the time the path
+    ///   was silent while it was on the way: no frame waits behind more than a window;
+    /// - each session shows no fewer frames a second than it was measured to
+    ///   (`SHOWN_A_SECOND`): the path's silences cost the frames drawn during them and no
+    ///   others, and a round trip grown longer costs none.
+    #[test]
+    fn sessions_over_the_measured_paths() {
+        use crate::session::link::RESPONSE;
+        let start = Instant::now();
+        let secs = Duration::from_secs_f64;
+        let long = 30.0;
+        let end = start + secs(long);
+        let mut rng = Xorshift::new(0x0fc1_9dc6_8b8c_d5b5);
+        // Each starts on a keyframe, a whole screen; then its changes from a second on.
+        let key = (start, 400_000u64);
+        let every = |gap: f64, bytes: &mut dyn FnMut() -> u64| -> Vec<(Instant, u64)> {
+            let n = ((long - 1.0) / gap) as u32;
+            (0..n)
+                .map(|i| (start + secs(1.0 + f64::from(i) * gap), bytes()))
+                .collect()
+        };
+        let scroll = every(1.0 / 60.0, &mut || 20_000 + rng.below(5_000));
+        let typing = every(0.12, &mut || 2_000);
+        let mut screens = typing.clone();
+        screens.extend((1..6).map(|i| (start + secs(f64::from(i) * 5.0 + 0.05), 400_000)));
+        screens.sort();
+        let silences = Some((secs(1.8), secs(0.43)));
+        let longer = Change::RoundTrip(Duration::from_millis(243));
+        let step = Some((start + secs(long / 2.0), longer));
+        let paths = [
+            ("hotspot", 1_860_000, 236, silences, None),
+            ("office", 2_400_000, 106, None, step),
+        ];
+        let works = [
+            ("scroll", &scroll),
+            ("typing", &typing),
+            ("typing and whole screens", &screens),
+        ];
+        let mut least = SHOWN_A_SECOND.into_iter();
+        for (name, rate, delay, holes, step_to) in paths {
+            for (work, draws) in works {
+                let mut path = Simulated::new(rate, Duration::from_millis(delay), start);
+                path.holes = holes;
+                let mut shown = session(&mut path, key, draws, step_to, &[], end);
+                shown.retain(|f| f.took <= end);
+                let mut steady = 0;
+                for f in &shown {
+                    let Some(fastest) = f.fastest() else {
+                        continue;
+                    };
+                    let (lag, own) = (f.took - f.sent, path.time(f.bytes));
+                    let grown = match step_to {
+                        Some((_, Change::RoundTrip(to))) => to,
+                        Some((_, Change::Rate(_))) | None => Duration::ZERO,
+                    };
+                    assert!(
+                        lag <= fastest * 2 + RESPONSE + own + f.silent + grown,
+                        "{name}, {work}: a frame {lag:?} on the way, the round trip {fastest:?}"
+                    );
+                    steady += usize::from(lag <= fastest + RESPONSE + own + f.silent);
+                }
+                let a_second = shown.len() as f64 / long;
+                let mut on_the_way: Vec<Duration> = shown.iter().map(|f| f.took - f.sent).collect();
+                let mut seen: Vec<Duration> = shown.iter().map(|f| f.took - f.drawn).collect();
+                let lowest = shown
+                    .iter()
+                    .filter(|f| f.sent > start + secs(3.0))
+                    .filter_map(|f| f.rate())
+                    .min();
+                println!(
+                    "{name}, {work}: {a_second:.2} frames a second; sent to taken p50 {:?}, p90 \
+                     {:?}, most {:?}; drawn to taken p50 {:?}, p90 {:?}, most {:?}; {steady} of \
+                     {} within the steady bound; the least rate after 3 s {lowest:?}",
+                    percentile(&mut on_the_way, 50),
+                    percentile(&mut on_the_way, 90),
+                    percentile(&mut on_the_way, 100),
+                    percentile(&mut seen, 50),
+                    percentile(&mut seen, 90),
+                    percentile(&mut seen, 100),
+                    shown.len(),
+                );
+                let floor = least.next().expect("a floor for every session");
+                assert!(
+                    a_second >= floor,
+                    "{name}, {work}: {a_second:.1} frames a second"
+                );
+            }
+        }
+    }
+
+    /// No frame is coded but one the gate let go, a stream's first as any other. Over
+    /// generated sessions on generated paths that stall (silent both ways for seconds at
+    /// a time), a scroll running throughout, with resizes, `v,0` then `v,1`, and `v,1`
+    /// again, most of them while the path is stalled: whenever a frame is sent, what was
+    /// sent before it and not yet told taken is no more than the link allowed on the way
+    /// when its capture was let go (its window; nothing, while it knew nothing of the
+    /// path). So what is on the way is never more than that and the one frame let go,
+    /// however many streams start meanwhile. The sessions are held to have started streams
+    /// that the gate held back, and streams that it did not.
+    #[test]
+    fn a_stream_starts_only_when_the_gate_lets_it() {
+        let mut rng = Xorshift::new(0x3c6e_f372_fe94_f82b);
+        let start = Instant::now();
+        let secs = Duration::from_secs_f64;
+        let long = 20.0;
+        let (mut starts, mut held) = (0, 0);
+        for case in 0..60 {
+            let rate = 300_000 + rng.below(6_000_000);
+            let mut path = Simulated::new(rate, Duration::from_millis(rng.range(5, 300)), start);
+            // Silent for one to three seconds, every four to six.
+            let (period, silence) = (rng.range(4_000, 6_000), rng.range(1_000, 3_000));
+            path.holes = Some((
+                Duration::from_millis(period),
+                Duration::from_millis(silence),
+            ));
+            let whole = 100_000 + rng.below(400_000);
+            let draws: Vec<(Instant, u64)> = (0..(long * 60.0) as u32)
+                .map(|i| (start + secs(f64::from(i) / 60.0), 5_000 + rng.below(20_000)))
+                .collect();
+            // Three turns in four fall in a silence of the path.
+            let mut turns: Vec<(Instant, Turn)> = Vec::new();
+            for _ in 0..rng.range(10, 40) {
+                let at = match rng.below(4) {
+                    0 => rng.below((long * 1000.0) as u64),
+                    1.. => period * rng.range(1, 4) + rng.below(silence),
+                };
+                let at = start + Duration::from_millis(at);
+                match rng.below(8) {
+                    0..4 => turns.push((at, Turn::Resize)),
+                    4..7 => {
+                        let back = at + Duration::from_millis(rng.range(1, 800));
+                        turns.extend([(at, Turn::StopWatching), (back, Turn::Watch)]);
+                    }
+                    7.. => turns.push((at, Turn::Watch)),
+                }
+            }
+            turns.sort_by_key(|(at, _)| *at);
+            let end = start + secs(long);
+            let shown = session(&mut path, (start, whole), &draws, None, &turns, end);
+            for f in &shown {
+                assert!(
+                    f.ahead <= f.allowed,
+                    "case {case}: a frame of {} went behind {} on the way, {} allowed",
+                    f.bytes,
+                    f.ahead,
+                    f.allowed
+                );
+            }
+            let keys = shown.iter().filter(|f| f.coding == Coding::Key);
+            starts += keys.clone().count();
+            held += keys.filter(|f| f.held).count();
+        }
+        assert!(
+            held > 100 && starts - held > 100,
+            "{starts} keyframes, {held} of them held by the gate"
+        );
+    }
+
+    /// The most round trips the link's rate took to come within a tenth of a path's that
+    /// fell to a third in the middle of a scroll, in `a_pause_a_silence_and_a_slower_path`:
+    /// what the rate's memory was measured to take, which the test holds it to.
+    ///
+    /// @limitKind measured
+    /// @owner this module's tests
+    /// @unit round trips of the path, a frame's own time on it included
+    /// @scope `a_pause_a_silence_and_a_slower_path`
+    /// @evidence the test's own output (`--nocapture`): it prints the round trips, and the
+    /// longest a frame was on the way meanwhile
+    /// @observed 2026-11-19, the measuring machine's local day
+    /// @environment the two measured paths as `sessions_over_the_measured_paths` simulates
+    /// them, on a virtual clock
+    /// @workload a keyframe of 400 KB, then a scroll (a frame of 20 to 25 KB wanted every
+    /// sixtieth of a second) for 20 s; the path's rate falls to a third 8 s in
+    /// @result 15.1 round trips on the silent path, 8.5 on the other: the ten of the rate's
+    /// memory, and the time the frames already on the way took to show the fall. Meanwhile
+    /// a frame was on the way for up to 0.96 s on the silent path (a silence of 0.43 s
+    /// among it) and 0.39 s on the other, against 0.61 s and 0.34 s for a frame the window
+    /// lets go at the path's true rate: what was sent into a window three times too wide
+    /// @decision the measured most, rounded up to the next whole round trip
+    /// @revalidate a change to the link's rate, its memory or what presses a path
+    const FOLLOWS_WITHIN_TRIPS: f64 = 16.0;
+
+    /// The fewest frames a second a scroll showed in its first round trip after a pause, in
+    /// `a_pause_a_silence_and_a_slower_path`.
+    ///
+    /// @limitKind measured
+    /// @owner this module's tests
+    /// @unit frames a second, over the scroll's first round trip
+    /// @scope `a_pause_a_silence_and_a_slower_path`
+    /// @evidence the test's own output (`--nocapture`): it prints each
+    /// @observed 2026-11-19, the measuring machine's local day
+    /// @environment the two measured paths as `sessions_over_the_measured_paths` simulates
+    /// them, on a virtual clock
+    /// @workload a keyframe of 400 KB, a scroll for 4 s, a still screen or typing for 5 s,
+    /// then the scroll again
+    /// @result the silent path: 44 after a still screen, 44 after typing; the other path:
+    /// 52 and 43; of the 47.6 a second that a frame coded in 15 to 27 ms leaves a scroll.
+    /// The rate the link held through each pause was the rate the first scroll left
+    /// (1,600 and 1,606 KB/s on the silent path, 1,467 KB/s on the other)
+    /// @decision the measured least, rounded down to a whole frame a second
+    /// @revalidate a change to the link's rate, its memory or what presses a path
+    const AFTER_A_PAUSE_A_SECOND: f64 = 42.0;
+
+    /// A pause does not forget the path, a silence is not a rate, and a path grown slower
+    /// is still followed. Over the two measured paths, the capture loop's own decision
+    /// driving each session:
+    /// - a scroll, then five seconds of a still screen or of typing (which on the silent
+    ///   path meets its silences), then a scroll again: the link's rate is never lower in
+    ///   the pause or at the second scroll's start than the first scroll left it, and the
+    ///   second scroll shows no fewer than `AFTER_A_PAUSE_A_SECOND` frames a second in its
+    ///   first round trip, of the 47.6 its coding time leaves it;
+    /// - a scroll under which the path's rate falls to a third: the link's rate is within
+    ///   a tenth of the fallen rate within `FOLLOWS_WITHIN_TRIPS` round trips, and from
+    ///   then on every frame is on the way no longer than a frame the window lets go can
+    ///   be, with the silence it met.
+    #[test]
+    fn a_pause_a_silence_and_a_slower_path() {
+        use crate::session::link::RESPONSE;
+        let start = Instant::now();
+        let secs = Duration::from_secs_f64;
+        let mut rng = Xorshift::new(0x0fc1_9dc6_8b8c_d5b5);
+        let key = (start, 400_000u64);
+        let scroll = |from: f64, to: f64, rng: &mut Xorshift| -> Vec<(Instant, u64)> {
+            let n = ((to - from) * 60.0) as u32;
+            (0..n)
+                .map(|i| {
+                    (
+                        start + secs(from + f64::from(i) / 60.0),
+                        20_000 + rng.below(5_000),
+                    )
+                })
+                .collect()
+        };
+        let silences = Some((secs(1.8), secs(0.43)));
+        for (name, rate, delay, holes) in [
+            ("the silent path", 1_860_000u64, 236, silences),
+            ("the other", 2_400_000, 106, None),
+        ] {
+            let delay = Duration::from_millis(delay);
+            let path = || {
+                let mut path = Simulated::new(rate, delay, start);
+                path.holes = holes;
+                path
+            };
+            // A round trip, a frame's own time on the path included.
+            let trip = delay + path().time(25_000);
+            let a_second = |shown: &[Shown], from: Instant| {
+                let sent = shown
+                    .iter()
+                    .filter(|f| f.sent >= from && f.sent < from + trip);
+                sent.count() as f64 / trip.as_secs_f64()
+            };
+            for pause in ["a still screen", "typing"] {
+                let (paused, again) = (start + secs(4.5), start + secs(9.5));
+                let mut draws = scroll(0.6, 4.5, &mut rng);
+                if pause == "typing" {
+                    draws.extend((1..41).map(|i| (paused + secs(f64::from(i) * 0.12), 2_000)));
+                }
+                draws.extend(scroll(9.5, 14.5, &mut rng));
+                let shown = session(&mut path(), key, &draws, None, &[], again + secs(5.0));
+                let rates = |from: Instant, to: Instant| {
+                    let sent = shown.iter().filter(move |f| f.sent >= from && f.sent < to);
+                    sent.filter_map(|f| f.rate())
+                };
+                let left = rates(start, paused)
+                    .next_back()
+                    .expect("the first scroll showed a rate");
+                let least = rates(paused, again + trip)
+                    .min()
+                    .expect("the second scroll began");
+                assert!(
+                    least >= left,
+                    "{name}, {pause}: the rate fell from {left} to {least}"
+                );
+                let first = a_second(&shown, again);
+                println!(
+                    "{name}, a scroll after 5 s of {pause}: {first:.0} frames a second in its \
+                     first round trip, the rate {left} B/s before and {least} at the least since"
+                );
+                assert!(
+                    first >= AFTER_A_PAUSE_A_SECOND,
+                    "{name}, {pause}: {first:.0} frames a second"
+                );
+            }
+            let fell = start + secs(8.0);
+            let draws = scroll(0.6, 20.0, &mut rng);
+            let (mut path, third) = (path(), rate / 3);
+            let change = Some((fell, Change::Rate(third)));
+            let shown = session(&mut path, key, &draws, change, &[], start + secs(20.0));
+            let followed = shown
+                .iter()
+                .find(|f| f.sent > fell && f.rate().is_some_and(|r| r <= third / 10 * 11))
+                .map(|f| f.sent)
+                .unwrap_or_else(|| panic!("{name}: the rate never followed the path's"));
+            let trips = (followed - fell).as_secs_f64() / trip.as_secs_f64();
+            let meanwhile = shown
+                .iter()
+                .filter(|f| f.sent > fell - trip && f.sent < followed);
+            let longest = meanwhile.map(|f| f.took - f.sent).max();
+            println!(
+                "{name}, its rate falls to a third under a scroll: followed in {trips:.1} round \
+                 trips; a frame on the way for up to {longest:?} meanwhile"
             );
+            assert!(
+                trips <= FOLLOWS_WITHIN_TRIPS,
+                "{name}: {trips:.1} round trips"
+            );
+            for f in shown.iter().filter(|f| f.sent > followed + trip * 2) {
+                let fastest = f.fastest().expect("the path is known");
+                let (lag, own) = (f.took - f.sent, path.time(f.bytes));
+                assert!(
+                    lag <= fastest * 2 + RESPONSE + own + f.silent,
+                    "{name}: a frame {lag:?} on the way once the rate followed"
+                );
+            }
         }
     }
 
@@ -2376,9 +2917,8 @@ pub(crate) mod tests {
             .flat_map(|t| [("typing", false, t), ("scroll", true, t)]);
         for (name, scroll, threads) in workloads {
             let hub = Hub::new().unwrap();
-            let (client, lane) = viewer(&hub);
+            let client = viewer(&hub);
             client.watch();
-            drop(client);
             let mut buf = Box::new(I420::new(W, H));
             buf.y.copy_from_slice(&page[..W * H]);
             let first = Job {
@@ -2428,7 +2968,7 @@ pub(crate) mod tests {
                 buf = s.ret_rx.recv().unwrap();
                 latencies.push(t0.elapsed());
                 let relay0 = thread_cpu_us().unwrap();
-                bytes += lane.updates().iter().map(Vec::len).sum::<usize>();
+                bytes += updates(&client).iter().map(Vec::len).sum::<usize>();
                 relay_us += thread_cpu_us().unwrap() - relay0;
                 let next = t0 + Duration::from_micros(16_667);
                 std::thread::sleep(next.saturating_duration_since(Instant::now()));

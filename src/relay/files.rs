@@ -96,15 +96,17 @@ async fn reason(mut child: Child) -> String {
     let mut err = Vec::new();
     let read = match child.stderr.take() {
         Some(e) => e.take(CHUNK as u64).read_to_end(&mut err).await.map(drop),
-        None => Ok(()),
+        None => Err(std::io::Error::other("ssh gave no stderr")),
     };
     let status = child.wait().await;
     let line = String::from_utf8_lossy(&err);
-    match (line.lines().next(), read, status) {
-        (Some(l), _, _) if !l.trim().is_empty() => l.trim().to_string(),
-        (_, Err(e), _) => format!("the server's voxl files said why, unread: {e}"),
-        (_, Ok(()), Ok(s)) => format!("the server's voxl files ended: {s}"),
-        (_, Ok(()), Err(e)) => format!("the server's voxl files: {e}"),
+    match line.lines().map(str::trim).find(|l| !l.is_empty()) {
+        Some(said) => said.to_string(),
+        None => match (read, status) {
+            (Err(e), Ok(_) | Err(_)) => format!("the server's voxl files said why, unread: {e}"),
+            (Ok(()), Ok(s)) => format!("the server's voxl files ended: {s}"),
+            (Ok(()), Err(e)) => format!("the server's voxl files: {e}"),
+        },
     }
 }
 
@@ -129,22 +131,29 @@ async fn first(files: &Files, args: &[&str], stdin: Option<Body>) -> First {
         Ok(c) => c,
         Err(e) => return First::Refused(failed(StatusCode::BAD_GATEWAY, &format!("ssh: {e}"))),
     };
-    let input = child.stdin.take();
-    // The body goes to the server while it answers.
-    tokio::spawn(async move {
-        let (Some(body), Some(mut pipe)) = (stdin, input) else {
-            return;
-        };
-        let mut chunks = body.into_data_stream();
-        while let Some(Ok(chunk)) = chunks.next().await {
-            if pipe.write_all(&chunk).await.is_err() {
-                return;
-            }
-        }
-    });
-    let Some(stdout) = child.stdout.take() else {
-        return First::Refused(failed(StatusCode::BAD_GATEWAY, "ssh gave no stdout"));
+    let (Some(mut pipe), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        return First::Refused(failed(
+            StatusCode::BAD_GATEWAY,
+            "ssh gave no stdin or stdout",
+        ));
     };
+    match stdin {
+        // The body goes to the server while it answers. One that breaks off, or a server
+        // that stops reading, ends the server's stdin short of the length it was told, which
+        // it refuses, and its refusal is the answer.
+        Some(body) => {
+            tokio::spawn(async move {
+                let mut chunks = body.into_data_stream();
+                while let Some(Ok(chunk)) = chunks.next().await {
+                    if pipe.write_all(&chunk).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+        // Nothing to send: the server's stdin ends at once.
+        None => drop(pipe),
+    }
     let mut out = BufReader::new(stdout);
     let mut line = Vec::new();
     let read = (&mut out)
@@ -194,7 +203,7 @@ async fn whole(files: &Files, args: &[&str], stdin: Option<Body>) -> Response {
             line,
         )
             .into_response(),
-        _ => failed(StatusCode::BAD_GATEWAY, &reason(child).await),
+        Ok(_) | Err(_) => failed(StatusCode::BAD_GATEWAY, &reason(child).await),
     }
 }
 
@@ -215,7 +224,9 @@ pub async fn list(State(files): State<Arc<Files>>, Query(q): Q) -> Response {
     let Some(g) = grant(&files) else {
         return no_grant();
     };
-    let path = q.get("path").map_or("", String::as_str);
+    let Some(path) = q.get("path") else {
+        return failed(StatusCode::BAD_REQUEST, "a listing names its folder");
+    };
     whole(&files, &["list", "--root", &g.root, path], None).await
 }
 
@@ -271,7 +282,9 @@ pub async fn download(State(files): State<Arc<Files>>, Query(q): Q) -> Response 
     let Some(g) = grant(&files) else {
         return no_grant();
     };
-    let path = q.get("path").map_or("", String::as_str);
+    let Some(path) = q.get("path") else {
+        return failed(StatusCode::BAD_REQUEST, "a download names its file");
+    };
     let (line, out, child) = match first(&files, &["get", "--root", &g.root, path], None).await {
         First::Answer(line, out, child) => (line, out, child),
         First::Refused(r) => return r,
@@ -288,7 +301,7 @@ pub async fn download(State(files): State<Arc<Files>>, Query(q): Q) -> Response 
         match out.read(&mut buf).await {
             Ok(0) => match child.wait().await {
                 Ok(s) if s.success() => None,
-                _ => Some((Err(std::io::Error::other(reason(child).await)), None)),
+                Ok(_) | Err(_) => Some((Err(std::io::Error::other(reason(child).await)), None)),
             },
             Ok(n) => {
                 buf.truncate(n);
@@ -328,7 +341,7 @@ fn disposition(name: &str) -> String {
     let mut encoded = String::new();
     for b in name.bytes() {
         match b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
-            true => encoded.push(b as char),
+            true => encoded.push(char::from(b)),
             false => encoded.push_str(&format!("%{b:02X}")),
         }
     }

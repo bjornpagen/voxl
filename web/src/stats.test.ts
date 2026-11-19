@@ -3,14 +3,19 @@
 // The meter is made at a drawn time and its counters handed to the fake worker as the page
 // hands them in `init` (a structured clone, which shares the memory). Between reads, at
 // drawn times, the worker counts what it did as the real one does (Atomics.add): updates
-// arrived (each with its bytes and the server's capture-to-send time), updates shown (each
-// with its arrival-to-shown time). The first interval adds amounts up to
+// arrived (each with its bytes and the server's capture-to-send time), updates decoded (each
+// with its time from arrival to out of the decoder). The first interval adds amounts up to
 // 2^32 - 1, so later intervals wrap the totals.
+//
+// The worker also says when it gives the decoder an update (the update's arrival, in
+// fractional ms on the shared clock, which crosses multiples of 2^32 ms) and when that
+// update is out of it.
 //
 // What it checks are the fake's own facts: each read reports what the worker did since the
 // read before it (or the meter's making), and nothing else: the counts it made, over the
-// time it took, and the means of what it timed, none where it timed nothing.
-import { Count, Meter, type Rates } from './stats.ts';
+// time it took, and the means of what it timed, none where it timed nothing; and the
+// decoder reads as idle, or as decoding since the whole ms the update inside it arrived.
+import { Count, holds, Meter, type Decoder, type Rates } from './stats.ts';
 
 const RUNS = 20_000;
 /** Reads in a run. */
@@ -28,6 +33,9 @@ function random(seed: number) {
 	};
 }
 
+/** What the fake worker does, one event at a time. */
+const EVENTS = ['arrived', 'shown', 'decoder'] as const;
+
 /** What the fake worker did in an interval, summed as plain numbers. */
 interface Did {
 	shown: number;
@@ -43,6 +51,9 @@ const reached = {
 	shownAndArrived: 0,
 	arrivedNotShown: 0,
 	wrapped: 0,
+	decoderIdle: 0,
+	decoding: 0,
+	decodingAcrossAWrap: 0,
 };
 
 function run(seed: number) {
@@ -55,6 +66,11 @@ function run(seed: number) {
 	const worker = structuredClone(meter.counts);
 	/** The totals as the oracle keeps them, unbounded. */
 	let bytesTotal = 0;
+	/** The wall clock (ms), which often starts just under a multiple of 2^32, and when the
+	 * update inside the decoder went in: null while it holds none. */
+	let wall =
+		(400 + draw(8)) * 2 ** 32 - (draw(2) ? draw(20_000) : draw(2 ** 32));
+	let inside: number | null = null;
 	for (let r = 0; r < READS; r++) {
 		const did: Did = {
 			shown: 0,
@@ -78,27 +94,42 @@ function run(seed: number) {
 			// Events one at a time, interleaved as the worker meets them.
 			const events = draw(4) === 0 ? 0 : draw(300);
 			for (let e = 0; e < events; e++) {
-				switch (draw(2)) {
-					case 0: {
-						const bytes = 15 + draw(400_000);
-						const pipe = draw(2000);
-						Atomics.add(worker, Count.Bytes, bytes);
-						Atomics.add(worker, Count.Updates, 1);
-						Atomics.add(worker, Count.PipeTenths, pipe);
-						did.arrived++;
-						did.bytes += bytes;
-						did.pipeTenths += pipe;
-						break;
+				wall += draw(50);
+				const event = EVENTS[draw(EVENTS.length)];
+				// What it returns says only that each event has its case.
+				((): 'done' => {
+					switch (event) {
+						case 'arrived': {
+							const bytes = 15 + draw(400_000);
+							const pipe = draw(2000);
+							Atomics.add(worker, Count.Bytes, bytes);
+							Atomics.add(worker, Count.Updates, 1);
+							Atomics.add(worker, Count.PipeTenths, pipe);
+							did.arrived++;
+							did.bytes += bytes;
+							did.pipeTenths += pipe;
+							return 'done';
+						}
+						case 'shown': {
+							const us = draw(200_000);
+							Atomics.add(worker, Count.Frames, 1);
+							Atomics.add(worker, Count.DecodeUs, us);
+							did.shown++;
+							did.decodeUs += us;
+							return 'done';
+						}
+						// The decoder is given an update, or the one inside it comes out.
+						case 'decoder':
+							if (inside === null) {
+								inside = wall + draw(1000) / 1000;
+								holds(worker, { s: 'decoding', since: inside });
+							} else {
+								holds(worker, { s: 'idle' });
+								inside = null;
+							}
+							return 'done';
 					}
-					case 1: {
-						const us = draw(200_000);
-						Atomics.add(worker, Count.Frames, 1);
-						Atomics.add(worker, Count.DecodeUs, us);
-						did.shown++;
-						did.decodeUs += us;
-						break;
-					}
-				}
+				})();
 			}
 		}
 		const before = bytesTotal;
@@ -126,6 +157,24 @@ function run(seed: number) {
 		if (got !== JSON.stringify(expected))
 			fail(
 				`read ${r}: ${got}, not ${JSON.stringify(expected)} (did ${JSON.stringify(did)} in ${seconds} s)`
+			);
+		// The decoder's state is what is so at the read, not a rate: idle, or decoding
+		// since the update inside arrived.
+		wall += 1 + draw(100_000);
+		const decoder: Decoder =
+			inside === null
+				? { s: 'idle' }
+				: { s: 'decoding', since: Math.floor(inside) };
+		if (inside === null) reached.decoderIdle++;
+		else {
+			reached.decoding++;
+			if (Math.floor(inside / 2 ** 32) !== Math.floor(wall / 2 ** 32))
+				reached.decodingAcrossAWrap++;
+		}
+		const read = JSON.stringify(meter.decoder(wall + draw(1000) / 1000));
+		if (read !== JSON.stringify(decoder))
+			fail(
+				`read ${r}: the decoder reads ${read}, not ${JSON.stringify(decoder)}`
 			);
 	}
 }

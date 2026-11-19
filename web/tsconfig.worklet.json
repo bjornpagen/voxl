@@ -4,6 +4,7 @@
 	"compilerOptions": { "lib": ["ES2022", "WebWorker"] },
 	"include": [
 		"src/worklets",
+		"src/ring.ts",
 		"src/protocol.ts",
 		"src/wire.json",
 		"src/types/worklet.d.ts"

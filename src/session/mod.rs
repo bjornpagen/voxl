@@ -1,12 +1,15 @@
 //! The daemon's sessions: one for each `voxl attach`, which is a viewer's relay come over
 //! ssh. A session is its control connection (the ssh channel: hello, input, clipboard,
-//! cursor, microphone) and the lane the relay attaches to it through a proxy, which carries
-//! video and audio one way. The daemon serves no network port: the control socket and the
-//! lane socket are unix sockets, reached only through ssh and the proxy on this machine.
+//! cursor, microphone, and the word of each video update the page took) and the lane the
+//! relay attaches to it through a proxy, which carries video and audio one way. The daemon
+//! serves no network port: the control socket and the lane socket are unix sockets,
+//! reached only through ssh and the proxy on this machine.
 
 pub mod attach;
 pub mod control;
+pub mod estimate;
 pub(crate) mod lane;
+pub mod link;
 mod listen;
 pub mod query;
 pub mod sender;
@@ -18,10 +21,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 /// The folder everything the daemon opens by name is in (`--runtime`): its two sockets,
-/// the microphone's FIFO and the keymap's scratch file, each by a fixed name. The host makes it at boot (a
-/// tmpfiles.d rule, setgid to the group the proxy's user is in); the daemon and its
-/// subcommands take it only if it is a folder of this user's that nobody else may write
-/// in, so no other user can put a socket or a FIFO of theirs where these are looked for.
+/// the microphone's FIFO and the keymap's scratch file, each by a fixed name. The host
+/// makes it at boot (a tmpfiles.d rule, setgid to the group the proxy's user is in); the
+/// daemon and its subcommands take it only if it is a folder of this user's that nobody
+/// else may write in, so no other user can put a socket or a FIFO of theirs where these
+/// are looked for.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Runtime(PathBuf);
 

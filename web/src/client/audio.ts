@@ -1,6 +1,7 @@
 // Desktop audio: the worker decodes Opus and posts PCM straight to the player worklet
 // over a MessageChannel, so audio never waits on the main thread.
 import { DESKTOP_AUDIO } from '../protocol';
+import type { PlayerOptions } from '../protocol';
 import type { App } from './app';
 
 /** Desktop audio's player: not started, starting, playing through `ac`, or unavailable
@@ -17,17 +18,24 @@ const resume = (ac: AudioContext) =>
 export function createAudio(app: App) {
 	let player: Player = { s: 'idle' };
 
-	/** Starts (or resumes) playback; browsers only allow it after a user gesture. */
-	async function start() {
+	/** Starts (or resumes) playback; browsers only allow it after a user gesture. What it
+	 * resolves to says only that every state of the player has its case. */
+	async function start(): Promise<'asked'> {
 		switch (player.s) {
 			case 'playing':
 				if (player.ac.state === 'suspended') await resume(player.ac);
-				return;
+				return 'asked';
 			case 'starting':
 			case 'unavailable':
-				return;
+				return 'asked';
 			case 'idle':
+				await begin();
+				return 'asked';
 		}
+	}
+
+	/** Makes the player, from idle. */
+	async function begin() {
 		player = { s: 'starting' };
 		const ac = new AudioContext({
 			latencyHint: 'interactive',
@@ -40,8 +48,15 @@ export function createAudio(app: App) {
 			player = { s: 'unavailable' };
 			return;
 		}
+		// What the device takes at a time is the context's base latency, in frames: Chrome
+		// renders that many back to back for each of the device's callbacks (measured:
+		// 256 frames of base latency, 187.5 batches of render quanta a second at 48 kHz).
+		const options: PlayerOptions = {
+			deviceFrames: Math.round(ac.baseLatency * ac.sampleRate),
+		};
 		const node = new AudioWorkletNode(ac, 'pcm-player', {
 			outputChannelCount: [2],
+			processorOptions: options,
 		});
 		node.connect(ac.destination);
 		const ch = new MessageChannel();

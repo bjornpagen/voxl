@@ -6,7 +6,13 @@ import { createTouch } from './touch';
 import type { Zoom } from './zoom';
 
 /** DOM button -> X button (left, middle, right, back, forward). */
-const BUTTONS = [1, 2, 3, 8, 9];
+const BUTTONS = new Map([
+	[0, 1],
+	[1, 2],
+	[2, 3],
+	[3, 8],
+	[4, 9],
+]);
 
 export function setupPointer(
 	app: App,
@@ -29,19 +35,22 @@ export function setupPointer(
 	/** A DOM button pressed or released, as the desktop's; a button the desktop has no
 	 * number for (a pen's eraser) presses nothing. */
 	function button(dom: number, down: boolean) {
-		const x = BUTTONS[dom];
+		const x = BUTTONS.get(dom);
 		if (x !== undefined) send(cmd.button(x, down));
 	}
 	let lastMove = '';
-	function move(p: { clientX: number; clientY: number }, force = false) {
+	/** The pointer is at `p`: the desktop is told, if that is somewhere new. */
+	function move(p: { clientX: number; clientY: number }) {
 		const desk = app.desk;
 		// No desktop, no place on it to move to.
 		if (desk.s === 'none') return;
 		const s = cmd.move(...toDesk(p, desk.w, desk.h));
-		if (s !== lastMove || force) {
-			lastMove = s;
-			send(s);
-		}
+		if (s !== lastMove) place(s);
+	}
+	/** The desktop is told where the pointer is, whatever it was told last. */
+	function place(s: string) {
+		lastMove = s;
+		send(s);
 	}
 
 	// Scroll is sent in desktop pixels, batched per frame; the server turns it into
@@ -57,7 +66,7 @@ export function setupPointer(
 		requestAnimationFrame(() => {
 			queued = false;
 			if (Math.abs(sx) < 0.5 && Math.abs(sy) < 0.5) return;
-			send(cmd.scroll(sx, sy));
+			send(cmd.scrollPx(sx, sy));
 			sx = 0;
 			sy = 0;
 		});
@@ -69,7 +78,11 @@ export function setupPointer(
 			: null;
 
 	const touch = createTouch(app, {
-		moveTo: (x, y) => move({ clientX: x, clientY: y }, true),
+		moveTo: (x, y) => {
+			const desk = app.desk;
+			if (desk.s === 'none') return;
+			place(cmd.move(...toDesk({ clientX: x, clientY: y }, desk.w, desk.h)));
+		},
 		moveToDesk(x, y) {
 			lastMove = cmd.move(Math.round(x), Math.round(y));
 			send(lastMove);

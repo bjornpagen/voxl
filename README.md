@@ -1,6 +1,6 @@
 # voxl
 
-A fork of [tembo/voxl](https://github.com/tembo/voxl) that went its own way: it carries the desktop over one stream through a proxy (a QUIC stream under Hysteria 2 or naive over HTTP/3, TCP under naive over HTTP/2), and lets the transport do its job.
+A fork of [tembo/voxl](https://github.com/tembo/voxl) that went its own way: it carries the desktop over one stream through an HTTP CONNECT proxy, and lets the transport under it do its job.
 
 Low-latency desktop streaming for the browser, written in Rust. voxl streams an X11
 display as VP9 to a small web client that decodes
@@ -39,9 +39,10 @@ browser page --WebSocket, 127.0.0.1--> voxl relay (the viewer's machine)
   for each page that connects, runs a session.
 - **The control stream** is `ssh <host> voxl attach`: whatever ssh's own configuration
   makes of the host (its keys, its master connection) is the door. It carries everything
-  but the picture and the sound: the hello, input, clipboard, cursor images and the
-  microphone. `voxl attach` only joins ssh's stdio to the daemon's control socket, which
-  takes connections from the daemon's own user and no one else.
+  but the picture and the sound: the hello, input, clipboard, cursor images, the
+  microphone, and the relay's word of each update the page took. `voxl attach` only joins
+  ssh's stdio to the daemon's control socket, which takes connections from the daemon's
+  own user and no one else.
 - **The lane** is one HTTP CONNECT stream through the proxy, whose server end reaches the
   daemon's lane socket at `localhost:6901`. It carries video and audio, interleaved, one
   way, from the daemon to the relay. Each session's daemon makes a 256-bit capability and
@@ -49,12 +50,21 @@ browser page --WebSocket, 127.0.0.1--> voxl relay (the viewer's machine)
   daemon reads nothing else a lane sends. The capability dies with the control stream, and
   the lane attached with it is dropped. voxl itself encrypts nothing: the tunnel encrypts
   the wire, and every other hop is on one machine.
-- **The rate is the transport's.** The daemon writes to the lane only what its socket
-  accepts, and the relay reads the next frame only once the page has taken the one before,
-  so nothing queues anywhere but in the transport's window. A screen is captured only
-  while none of the daemon's bytes wait for the lane's socket: a slow link or a slow page
-  lowers the frame rate, and the newest screen goes next. voxl runs no congestion control
-  of its own, and codes every frame at one quality.
+- **Delivery is told, never inferred.** The relay gives the page one frame at a time, and
+  the next only once the page says it took the one before: it is done with that message,
+  an update decoded and its picture handed to the video track, an Opus packet handed to
+  the audio decoder. So the page holds at
+  most one undecoded update, and nothing queues in the browser, whose socket would
+  otherwise hold about a megabyte where no one sees it. The relay tells the daemon each
+  update the page took, on the control stream, and that is all the daemon knows of
+  delivery: its socket accepts far more than has arrived. A screen is captured only while
+  what was sent and not yet taken is within what the path carries in its round trip and
+  the response time (a tenth of a second), and no frame is late: none sent has gone
+  untaken longer than twice the round trip, plus the response time, plus its own bytes'
+  time at the path's rate. Until the transport states the path, its round trip and rate
+  are estimated from the page's tooks, and before the first took any frame not yet taken
+  is late. A slow link or a slow page lowers the frame rate, and the newest screen goes
+  next. Every frame is coded whole, at one quality.
 - **The stream.** A viewer starts on a keyframe, and every frame after it refers to the
   frames before it, which the lane carried in order. Keyframes are sent only when a viewer
   starts, which a lane that reopens or a resize also is. The desktop's size is the
@@ -243,10 +253,10 @@ takes `--runtime DIR`, as `voxl attach` does, for a daemon whose runtime folder 
 forward error correction, and on a real path most loss turned out to be its own
 congestion: repair added load, which added loss. A stream through a QUIC or TCP transport
 leaves loss and pacing to the transport, which is built for them, and voxl keeps lag down
-at the source instead: it captures a screen only once the last one is on its way, so a
-slow link lowers the frame rate rather than queueing old screens. The page still talks to
-one WebSocket, on 127.0.0.1, and the browser decodes each update the moment it arrives
-with WebCodecs.
+at the source instead: it captures a screen only while the page has taken what was sent
+before, as fast as the link has been delivering, so a slow link lowers the frame rate
+rather than queueing old screens. The page still talks to one WebSocket, on 127.0.0.1,
+takes one update at a time and decodes it the moment it arrives with WebCodecs.
 
 **How is it different from Moonlight and Sunshine?** They're for playing games on your
 own GPU machine through the Moonlight app, and for that they're the better fit. voxl was

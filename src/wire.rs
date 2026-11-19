@@ -3,10 +3,13 @@
 //!
 //! The lane is one stream through the transport's proxy: the session's [`Capability`] (relay
 //! to daemon, the lane's first bytes and its only ones that way), then frames (daemon to
-//! relay, [`Frame`]).
+//! relay, [`Frame`]): video updates, each after its [`Header`], which names it by its
+//! [`Version`], and Opus packets.
 //! The control stream is the stdio of `voxl attach` over ssh: [`Down`] (daemon to relay) and
-//! [`Up`] (relay to daemon). A frame and a control message each go after their length
-//! ([`Framer`]). Numbers are big-endian, as the page's video header is.
+//! [`Up`] (relay to daemon), which also tells the daemon each video update the page took:
+//! delivery is told, never read off the lane's socket, which accepts far more than arrives.
+//! A frame and a control message each go after their length ([`Framer`]). Numbers are
+//! big-endian, as the page's video header is.
 //!
 //! Reading never panics and never allocates by a length it read: every reader checks a
 //! length against the bytes in hand and against [`MAX_MESSAGE`] first, and returns a
@@ -33,6 +36,12 @@ pub const PREFIX: usize = std::mem::size_of::<u32>();
 
 /// A capability's bytes: 256 bits, the contract's capability (§2).
 pub const CAPABILITY: usize = 32;
+
+/// A video update's name: what the daemon numbered the frame, which the relay says back
+/// when the page took it ([`Up::Took`]). Names are matched, never ordered: a lane carries
+/// its updates in order, and a name is one frame's for the session's life.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Version(pub u32);
 
 /// The capability that lets a lane attach to a session: 32 random bytes the daemon mints
 /// per control connection and forgets when it closes.
@@ -112,20 +121,32 @@ impl Drop for Capability {
 /// as it is, and the relay hands it on unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Track {
-    /// One video update: its header (`video::Header`) and its VP9.
+    /// One video update: its header ([`Header`]) and its VP9.
     Video,
     /// One Opus packet.
     Audio,
 }
 
-const VIDEO: u8 = 1;
-const AUDIO: u8 = 2;
+/// A closed vocabulary of one byte on the wire: its members, and the byte each is. A byte
+/// is read by looking it up here, so a byte that is no member's is no member.
+pub(crate) trait Byte: Copy + 'static {
+    const ALL: &'static [Self];
 
-impl Track {
+    fn byte(self) -> u8;
+
+    /// The member `byte` is, if it is one.
+    fn of(byte: u8) -> Option<Self> {
+        Self::ALL.iter().copied().find(|b| b.byte() == byte)
+    }
+}
+
+impl Byte for Track {
+    const ALL: &'static [Track] = &[Track::Video, Track::Audio];
+
     fn byte(self) -> u8 {
         match self {
-            Track::Video => VIDEO,
-            Track::Audio => AUDIO,
+            Track::Video => 1,
+            Track::Audio => 2,
         }
     }
 }
@@ -151,16 +172,107 @@ impl<'a> Frame<'a> {
     /// Reads one frame, as [`Framer::frame`] gives it (without its length).
     pub fn decode(b: &'a [u8]) -> Result<Frame<'a>, Malformed> {
         let mut r = Reader(b);
-        let track = match r.u8()? {
-            VIDEO => Track::Video,
-            AUDIO => Track::Audio,
-            t => return Err(Malformed::Track(t)),
-        };
         Ok(Frame {
-            track,
+            track: r.member(Malformed::Track)?,
             bytes: r.rest(),
         })
     }
+}
+
+/// What a video frame is coded as: what the encoder says of each frame it puts out, and the
+/// frame's header carries in its flags byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(test, derive(serde::Deserialize), serde(rename_all = "snake_case"))]
+pub enum Coding {
+    /// From nothing: a viewer starts on it.
+    Key,
+    /// From the frames before it.
+    Delta,
+}
+
+/// Its flags byte: the keyframe's bit, and no other. A byte with any other bit set is no
+/// coding's.
+impl Byte for Coding {
+    const ALL: &'static [Coding] = &[Coding::Key, Coding::Delta];
+
+    fn byte(self) -> u8 {
+        match self {
+            Coding::Key => 1,
+            Coding::Delta => 0,
+        }
+    }
+}
+
+/// What a video frame says before its VP9, on the lane: the daemon's encode loop writes it,
+/// and the recorder, the relay (which reads the version of each update it hands the page) and
+/// web/src/protocol.ts read it, each checking its reader against web/src/video-header.json.
+/// What a frame is (video or audio) the lane's [`Track`] says, as the page's type byte. Every
+/// update refers only to the keyframe before it on its lane and frames after that keyframe,
+/// all of which the lane carried before it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Header {
+    pub coding: Coding,
+    /// The frame's name, which the relay says back when the page took it.
+    pub version: Version,
+    pub pipe: Pipe,
+}
+
+/// Capture to send, as a video frame carries it: in tenths of a millisecond, at most
+/// `u32::MAX` of them (119 hours).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pipe(u32);
+
+impl Pipe {
+    pub fn of(d: std::time::Duration) -> Pipe {
+        Pipe((d.as_micros() / 100).min(u128::from(u32::MAX)) as u32)
+    }
+
+    /// In whole milliseconds, rounded down.
+    pub fn millis(self) -> u64 {
+        u64::from(self.0) / 10
+    }
+}
+
+impl Header {
+    /// The VP9 starts this far into a frame.
+    pub const LEN: usize = 9;
+
+    /// Flags, then the version, then pipe, big-endian.
+    pub fn bytes(&self) -> [u8; Header::LEN] {
+        let mut b = [0; Header::LEN];
+        b[0] = self.coding.byte();
+        b[1..5].copy_from_slice(&self.version.0.to_be_bytes());
+        b[5..9].copy_from_slice(&self.pipe.0.to_be_bytes());
+        b
+    }
+
+    /// What a video frame's bytes `m` are ([`Frame::bytes`] of [`Track::Video`]). Bytes too
+    /// few for a header, and a flags byte with any bit set but the keyframe's, are refused:
+    /// the page's reader refuses the same (web/src/protocol.ts), so no reader takes a
+    /// header another does not.
+    pub fn read(m: &[u8]) -> Result<Video<'_>, Malformed> {
+        let Some((b, picture)) = m.split_first_chunk::<{ Header::LEN }>() else {
+            return Err(Malformed::Truncated);
+        };
+        let header = Header {
+            coding: Coding::of(b[0]).ok_or(Malformed::Flags(b[0]))?,
+            version: Version(u32::from_be_bytes([b[1], b[2], b[3], b[4]])),
+            pipe: Pipe(u32::from_be_bytes([b[5], b[6], b[7], b[8]])),
+        };
+        Ok(match picture {
+            [] => Video::Empty(header),
+            [_, ..] => Video::Picture(header, picture),
+        })
+    }
+}
+
+/// A video frame, read.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Video<'a> {
+    /// Its header, and its VP9 after it.
+    Picture(Header, &'a [u8]),
+    /// A header with nothing after it. The encode loop sends no frame that coded nothing.
+    Empty(Header),
 }
 
 /// A control message from the daemon to the relay.
@@ -177,10 +289,32 @@ pub enum Down<'a> {
     Binary(&'a [u8]),
 }
 
-const D_CAPABILITY: u8 = 1;
-const D_ATTACHED: u8 = 2;
-const D_TEXT: u8 = 3;
-const D_BINARY: u8 = 4;
+/// The first byte of a message from the daemon to the relay: which it is.
+#[derive(Clone, Copy)]
+enum DownTag {
+    Capability,
+    Attached,
+    Text,
+    Binary,
+}
+
+impl Byte for DownTag {
+    const ALL: &'static [DownTag] = &[
+        DownTag::Capability,
+        DownTag::Attached,
+        DownTag::Text,
+        DownTag::Binary,
+    ];
+
+    fn byte(self) -> u8 {
+        match self {
+            DownTag::Capability => 1,
+            DownTag::Attached => 2,
+            DownTag::Text => 3,
+            DownTag::Binary => 4,
+        }
+    }
+}
 
 impl<'a> Down<'a> {
     /// Appends the message to `out`, after its length.
@@ -188,16 +322,16 @@ impl<'a> Down<'a> {
         let start = open(out);
         match self {
             Down::Capability(c) => {
-                out.push(D_CAPABILITY);
+                out.push(DownTag::Capability.byte());
                 out.extend_from_slice(c.0);
             }
-            Down::Attached => out.push(D_ATTACHED),
+            Down::Attached => out.push(DownTag::Attached.byte()),
             Down::Text(t) => {
-                out.push(D_TEXT);
+                out.push(DownTag::Text.byte());
                 out.extend_from_slice(t.as_bytes());
             }
             Down::Binary(b) => {
-                out.push(D_BINARY);
+                out.push(DownTag::Binary.byte());
                 out.extend_from_slice(b);
             }
         }
@@ -207,19 +341,19 @@ impl<'a> Down<'a> {
     /// Reads one message, as [`Framer::frame`] gives it (without its length).
     pub fn decode(b: &'a [u8]) -> Result<Down<'a>, Malformed> {
         let mut r = Reader(b);
-        let d = match r.u8()? {
-            D_CAPABILITY => {
-                let bytes = <&[u8; CAPABILITY]>::try_from(r.bytes(CAPABILITY)?)
-                    .map_err(|_| Malformed::Truncated)?;
-                Down::Capability(CapabilityRef(bytes))
+        match r.member::<DownTag>(Malformed::Tag)? {
+            DownTag::Capability => {
+                let capability = Down::Capability(CapabilityRef(r.chunk()?));
+                r.end()?;
+                Ok(capability)
             }
-            D_ATTACHED => Down::Attached,
-            D_TEXT => return text(r.rest()).map(Down::Text),
-            D_BINARY => return Ok(Down::Binary(r.rest())),
-            t => return Err(Malformed::Tag(t)),
-        };
-        r.end()?;
-        Ok(d)
+            DownTag::Attached => {
+                r.end()?;
+                Ok(Down::Attached)
+            }
+            DownTag::Text => text(r.rest()).map(Down::Text),
+            DownTag::Binary => Ok(Down::Binary(r.rest())),
+        }
     }
 }
 
@@ -230,10 +364,33 @@ pub enum Up<'a> {
     Text(&'a str),
     /// A binary message from the page (the microphone, a clipboard image).
     Binary(&'a [u8]),
+    /// The page took a video update: the one named `version` is decoded and shown, and so is
+    /// every update the lane carried before it. The relay makes it of the page's own word
+    /// (`bin.took` in web/src/wire.json), which it never hands on as it came. Versions are
+    /// unique for a session, so a took of a lane since replaced names nothing the daemon
+    /// still waits for.
+    Took { version: Version },
 }
 
-const U_TEXT: u8 = 1;
-const U_BINARY: u8 = 2;
+/// The first byte of a message from the relay to the daemon: which it is.
+#[derive(Clone, Copy)]
+enum UpTag {
+    Text,
+    Binary,
+    Took,
+}
+
+impl Byte for UpTag {
+    const ALL: &'static [UpTag] = &[UpTag::Text, UpTag::Binary, UpTag::Took];
+
+    fn byte(self) -> u8 {
+        match self {
+            UpTag::Text => 1,
+            UpTag::Binary => 2,
+            UpTag::Took => 3,
+        }
+    }
+}
 
 impl<'a> Up<'a> {
     /// Appends the message to `out`, after its length.
@@ -241,12 +398,16 @@ impl<'a> Up<'a> {
         let start = open(out);
         match self {
             Up::Text(t) => {
-                out.push(U_TEXT);
+                out.push(UpTag::Text.byte());
                 out.extend_from_slice(t.as_bytes());
             }
             Up::Binary(b) => {
-                out.push(U_BINARY);
+                out.push(UpTag::Binary.byte());
                 out.extend_from_slice(b);
+            }
+            Up::Took { version } => {
+                out.push(UpTag::Took.byte());
+                out.extend_from_slice(&version.0.to_be_bytes());
             }
         }
         close(out, start);
@@ -255,10 +416,16 @@ impl<'a> Up<'a> {
     /// Reads one message, as [`Framer::frame`] gives it (without its length).
     pub fn decode(b: &'a [u8]) -> Result<Up<'a>, Malformed> {
         let mut r = Reader(b);
-        match r.u8()? {
-            U_TEXT => text(r.rest()).map(Up::Text),
-            U_BINARY => Ok(Up::Binary(r.rest())),
-            t => Err(Malformed::Tag(t)),
+        match r.member::<UpTag>(Malformed::Tag)? {
+            UpTag::Text => text(r.rest()).map(Up::Text),
+            UpTag::Binary => Ok(Up::Binary(r.rest())),
+            UpTag::Took => {
+                let took = Up::Took {
+                    version: Version(u32::from_be_bytes(*r.chunk()?)),
+                };
+                r.end()?;
+                Ok(took)
+            }
         }
     }
 }
@@ -274,6 +441,8 @@ pub enum Malformed {
     Tag(u8),
     /// No track has this byte.
     Track(u8),
+    /// A video header's flags with a bit no reader knows.
+    Flags(u8),
     /// Text that is not UTF-8.
     Utf8,
     /// A framed length over [`MAX_MESSAGE`].
@@ -287,6 +456,7 @@ impl std::fmt::Display for Malformed {
             Malformed::Trailing => write!(f, "bytes follow the message"),
             Malformed::Tag(t) => write!(f, "no message has tag {t}"),
             Malformed::Track(t) => write!(f, "no track has byte {t}"),
+            Malformed::Flags(b) => write!(f, "a video header with flags {b:#04x}"),
             Malformed::Utf8 => write!(f, "text that is not UTF-8"),
             Malformed::Long(n) => write!(f, "a message of {n} bytes, over the longest"),
         }
@@ -365,17 +535,18 @@ impl Framer {
 struct Reader<'a>(&'a [u8]);
 
 impl<'a> Reader<'a> {
-    fn bytes(&mut self, n: usize) -> Result<&'a [u8], Malformed> {
-        if self.0.len() < n {
-            return Err(Malformed::Truncated);
-        }
-        let (b, rest) = self.0.split_at(n);
+    /// The next `N` bytes.
+    fn chunk<const N: usize>(&mut self) -> Result<&'a [u8; N], Malformed> {
+        let (chunk, rest) = self.0.split_first_chunk().ok_or(Malformed::Truncated)?;
         self.0 = rest;
-        Ok(b)
+        Ok(chunk)
     }
 
-    fn u8(&mut self) -> Result<u8, Malformed> {
-        Ok(self.bytes(1)?[0])
+    /// The next byte, as the member of the vocabulary `B` it is: a byte that is no
+    /// member's is the error `wrong` makes of it.
+    fn member<B: Byte>(&mut self, wrong: fn(u8) -> Malformed) -> Result<B, Malformed> {
+        let [byte] = *self.chunk()?;
+        B::of(byte).ok_or(wrong(byte))
     }
 
     fn rest(&mut self) -> &'a [u8] {
@@ -385,7 +556,7 @@ impl<'a> Reader<'a> {
     fn end(&self) -> Result<(), Malformed> {
         match self.0 {
             [] => Ok(()),
-            _ => Err(Malformed::Trailing),
+            [_, ..] => Err(Malformed::Trailing),
         }
     }
 }
@@ -401,10 +572,7 @@ mod tests {
 
     /// A valid frame, its bytes without its length.
     fn frame(rng: &mut Xorshift) -> Vec<u8> {
-        let track = match rng.below(2) {
-            0 => Track::Audio,
-            _ => Track::Video,
-        };
+        let track = Track::ALL[rng.below(2) as usize];
         let n = rng.below(3000) as usize;
         let data = bytes(rng, n);
         let mut out = Vec::new();
@@ -415,27 +583,31 @@ mod tests {
     fn down(rng: &mut Xorshift) -> Vec<u8> {
         let mut out = Vec::new();
         let text: String = (0..rng.below(50))
-            .map(|_| char::from_u32(rng.range(32, 0x2FFF) as u32).unwrap_or('x'))
+            .map(|_| char::from_u32(rng.range(32, 0x2FFF) as u32).expect("no surrogate so low"))
             .collect();
         let bin = {
             let n = rng.below(100) as usize;
             bytes(rng, n)
         };
         let cap = Capability(bytes(rng, CAPABILITY).try_into().unwrap());
-        match rng.below(4) {
-            0 => Down::Capability(cap.lend()).encode(&mut out),
-            1 => Down::Attached.encode(&mut out),
-            2 => Down::Text(&text).encode(&mut out),
-            _ => Down::Binary(&bin).encode(&mut out),
+        match DownTag::ALL[rng.below(4) as usize] {
+            DownTag::Capability => Down::Capability(cap.lend()).encode(&mut out),
+            DownTag::Attached => Down::Attached.encode(&mut out),
+            DownTag::Text => Down::Text(&text).encode(&mut out),
+            DownTag::Binary => Down::Binary(&bin).encode(&mut out),
         }
         out[PREFIX..].to_vec()
     }
 
     fn up(rng: &mut Xorshift) -> Vec<u8> {
         let mut out = Vec::new();
-        match rng.below(2) {
-            0 => Up::Text("k,65,1").encode(&mut out),
-            _ => Up::Binary(&{
+        match UpTag::ALL[rng.below(3) as usize] {
+            UpTag::Text => Up::Text("k,65,1").encode(&mut out),
+            UpTag::Took => Up::Took {
+                version: Version(rng.next() as u32),
+            }
+            .encode(&mut out),
+            UpTag::Binary => Up::Binary(&{
                 let n = rng.below(100) as usize;
                 bytes(rng, n)
             })
@@ -444,18 +616,48 @@ mod tests {
         out[PREFIX..].to_vec()
     }
 
-    /// Each kind's decoder re-encoded: `None` if it refuses the bytes, else the bytes its
-    /// decoding encodes to.
-    fn again(kind: usize, b: &[u8]) -> Option<Vec<u8>> {
+    /// A valid message of the relay's whose fields fix its length.
+    fn took(rng: &mut Xorshift) -> Vec<u8> {
+        loop {
+            let u = up(rng);
+            if u[0] == UpTag::Took.byte() {
+                break u;
+            }
+        }
+    }
+
+    /// The kinds of message this module reads.
+    #[derive(Clone, Copy, Debug)]
+    enum Kind {
+        Frame,
+        Down,
+        Up,
+    }
+
+    const KINDS: [Kind; 3] = [Kind::Frame, Kind::Down, Kind::Up];
+
+    /// A valid message of `kind`.
+    fn valid(kind: Kind, rng: &mut Xorshift) -> Vec<u8> {
+        match kind {
+            Kind::Frame => frame(rng),
+            Kind::Down => down(rng),
+            Kind::Up => up(rng),
+        }
+    }
+
+    /// A kind's decoder re-encoded: why it refuses the bytes, or the bytes its decoding
+    /// encodes to.
+    fn again(kind: Kind, b: &[u8]) -> Result<Vec<u8>, Malformed> {
         let mut out = Vec::new();
         match kind {
-            0 => Frame::decode(b)
-                .ok()
-                .map(|f| Frame::encode(f.track, f.bytes, &mut out)),
-            1 => Down::decode(b).ok().map(|d| d.encode(&mut out)),
-            _ => Up::decode(b).ok().map(|u| u.encode(&mut out)),
-        }?;
-        Some(out[PREFIX..].to_vec())
+            Kind::Frame => {
+                let f = Frame::decode(b)?;
+                Frame::encode(f.track, f.bytes, &mut out)
+            }
+            Kind::Down => Down::decode(b)?.encode(&mut out),
+            Kind::Up => Up::decode(b)?.encode(&mut out),
+        };
+        Ok(out[PREFIX..].to_vec())
     }
 
     /// Every message of every kind decodes to what encodes it again, byte for byte; and
@@ -465,61 +667,59 @@ mod tests {
     #[test]
     fn every_input_is_a_message_or_a_typed_error() {
         let mut rng = Xorshift::new(0x082E_FA98_EC4E_6C89);
-        let makers: [fn(&mut Xorshift) -> Vec<u8>; 3] = [frame, down, up];
         for _ in 0..20_000 {
-            let kind = rng.below(3) as usize;
-            let valid = makers[kind](&mut rng);
-            assert_eq!(
-                again(kind, &valid).as_deref(),
-                Some(&valid[..]),
-                "kind {kind}"
-            );
+            let kind = KINDS[rng.below(3) as usize];
+            let valid = valid(kind, &mut rng);
+            assert_eq!(again(kind, &valid), Ok(valid.clone()), "{kind:?}");
+            // One time in four, random bytes; else the valid message.
             let mut b = match rng.below(4) {
                 0 => {
                     let n = rng.below(1500) as usize;
                     bytes(&mut rng, n)
                 }
-                _ => valid.clone(),
+                1.. => valid,
             };
-            match rng.below(4) {
-                0 if !b.is_empty() => {
-                    let i = rng.below(b.len() as u64) as usize;
-                    b[i] ^= 1 << rng.below(8);
-                }
-                1 => b.truncate(rng.below(b.len() as u64 + 1) as usize),
-                2 => b.extend({
+            // A bit flipped, the end cut, bytes added, or the first byte another.
+            match (rng.below(4), b.len() as u64) {
+                (0 | 3.., 0) => {}
+                (0, len @ 1..) => b[rng.below(len) as usize] ^= 1 << rng.below(8),
+                (1, len) => b.truncate(rng.below(len + 1) as usize),
+                (2, _) => b.extend({
                     let n = rng.range(1, 9) as usize;
                     bytes(&mut rng, n)
                 }),
-                _ => {
-                    if !b.is_empty() {
-                        b[0] = rng.below(8) as u8;
-                    }
-                }
+                (3.., 1..) => b[0] = rng.below(8) as u8,
             }
-            for k in 0..3 {
-                if let Some(out) = again(k, &b) {
-                    assert_eq!(out, b, "kind {k} decoded bytes it does not encode to");
+            for kind in KINDS {
+                if let Ok(out) = again(kind, &b) {
+                    assert_eq!(out, b, "{kind:?} decoded bytes it does not encode to");
                 }
             }
         }
     }
 
     /// Every strict prefix of a message whose fields fix its length (the daemon's capability
-    /// and attached) is refused. (A frame's and a text's length is the stream's framing's,
-    /// not their own fields'.)
+    /// and attached, the relay's took) is refused. (A frame's and a text's length is the
+    /// stream's framing's, not their own fields'.)
     #[test]
     fn every_cut_message_is_refused() {
         let mut rng = Xorshift::new(0x4528_21E6_38D0_1377);
         for _ in 0..2000 {
             let valid = loop {
                 let d = down(&mut rng);
-                if !matches!(d[0], D_TEXT | D_BINARY) {
+                if [DownTag::Capability, DownTag::Attached]
+                    .map(DownTag::byte)
+                    .contains(&d[0])
+                {
                     break d;
                 }
             };
             for cut in 0..valid.len() {
-                assert!(again(1, &valid[..cut]).is_none(), "cut at {cut}");
+                assert!(again(Kind::Down, &valid[..cut]).is_err(), "cut at {cut}");
+            }
+            let valid = took(&mut rng);
+            for cut in 0..valid.len() {
+                assert!(again(Kind::Up, &valid[..cut]).is_err(), "took cut at {cut}");
             }
         }
     }
@@ -531,9 +731,9 @@ mod tests {
         let mut rng = Xorshift::new(0xBE54_66CF_34E9_0C6C);
         for case in 0..300 {
             let messages: Vec<Vec<u8>> = (0..rng.range(1, 20))
-                .map(|_| match case % 2 {
-                    0 => up(&mut rng),
-                    _ => frame(&mut rng),
+                .map(|_| match case % 2 == 0 {
+                    true => up(&mut rng),
+                    false => frame(&mut rng),
                 })
                 .collect();
             let mut stream = Vec::new();
@@ -568,6 +768,147 @@ mod tests {
             serde_json::from_str(include_str!("../web/src/wire.json")).unwrap();
         assert_eq!(wire["bin"]["video"], u64::from(Track::Video.byte()));
         assert_eq!(wire["bin"]["audio"], u64::from(Track::Audio.byte()));
+    }
+
+    /// The relay's took reads back as the version it was written from, over generated
+    /// versions.
+    #[test]
+    fn a_took_reads_back_as_its_version() {
+        let mut rng = Xorshift::new(0x2FFD_72DB_D01A_DFB7);
+        for _ in 0..20_000 {
+            let version = Version(rng.next() as u32);
+            let mut out = Vec::new();
+            Up::Took { version }.encode(&mut out);
+            assert_eq!(Up::decode(&out[PREFIX..]), Ok(Up::Took { version }));
+        }
+    }
+
+    /// A number of any size: a random one, shifted right by a random amount.
+    fn any(rng: &mut Xorshift) -> u64 {
+        let shift = rng.next() % 64;
+        rng.next() >> shift
+    }
+
+    fn random_header(rng: &mut Xorshift) -> Header {
+        Header {
+            coding: Coding::ALL[rng.below(2) as usize],
+            version: Version(any(rng) as u32),
+            pipe: Pipe(any(rng) as u32),
+        }
+    }
+
+    #[test]
+    fn a_header_reads_back_as_it_was_written() {
+        let mut rng = Xorshift::new(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..100_000 {
+            let header = random_header(&mut rng);
+            let picture: Vec<u8> = (0..1 + rng.next() % 64).map(|_| rng.next() as u8).collect();
+            let message = [&header.bytes()[..], &picture].concat();
+            assert_eq!(Header::read(&message), Ok(Video::Picture(header, &picture)));
+        }
+    }
+
+    #[test]
+    fn a_header_alone_is_empty_and_less_is_cut_short() {
+        let mut rng = Xorshift::new(0x2545_f491_4f6c_dd1d);
+        for _ in 0..100_000 {
+            let header = random_header(&mut rng);
+            let bytes = header.bytes();
+            assert_eq!(Header::read(&bytes), Ok(Video::Empty(header)));
+            let cut = (rng.next() % Header::LEN as u64) as usize;
+            assert_eq!(Header::read(&bytes[..cut]), Err(Malformed::Truncated));
+        }
+    }
+
+    /// A header is read exactly when its flags set no bit but the keyframe's, and then its
+    /// coding is that bit's: over every value of the flags byte, on generated headers, as
+    /// web/src/video-header.test.ts holds the page's reader to.
+    #[test]
+    fn a_header_with_a_flag_no_reader_knows_is_refused() {
+        let mut rng = Xorshift::new(0xa458_fea3_f493_3d7e);
+        for flags in 0..=u8::MAX {
+            let mut bytes = random_header(&mut rng).bytes().to_vec();
+            bytes[0] = flags;
+            bytes.extend((0..rng.below(5)).map(|_| rng.next() as u8));
+            match (flags, Header::read(&bytes)) {
+                (0, Ok(Video::Picture(h, _) | Video::Empty(h))) => {
+                    assert_eq!(h.coding, Coding::Delta)
+                }
+                (1, Ok(Video::Picture(h, _) | Video::Empty(h))) => {
+                    assert_eq!(h.coding, Coding::Key)
+                }
+                (2.., Err(e)) => assert_eq!(e, Malformed::Flags(flags)),
+                (0 | 1, read @ Err(_)) | (2.., read @ Ok(_)) => {
+                    panic!("flags {flags}: {read:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_pipe_is_whole_tenths_of_a_millisecond() {
+        use std::time::Duration;
+        let mut rng = Xorshift::new(0x6a09_e667_f3bc_c908);
+        let tenth = Duration::from_micros(100);
+        for _ in 0..100_000 {
+            let d = Duration::from_nanos(any(&mut rng));
+            let Pipe(p) = Pipe::of(d);
+            // As many whole tenths as fit, or as many as a header holds.
+            assert!(tenth * p <= d, "{d:?} as {p}");
+            if p < u32::MAX {
+                assert!(d < tenth * (p + 1), "{d:?} as {p}");
+            }
+        }
+    }
+
+    /// One case of web/src/video-header.json.
+    #[derive(serde::Deserialize)]
+    struct Case {
+        header: String,
+        picture: String,
+        coding: Coding,
+        version: u32,
+        pipe: u32,
+    }
+
+    fn hex(s: &str) -> Vec<u8> {
+        let digits: String = s.split_whitespace().collect();
+        (0..digits.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&digits[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// The page messages web/src/protocol.ts checks its reader against carry what the
+    /// daemon writes and reads: each is the frame's track byte (the page's type byte), then
+    /// the header; and the frame as the lane carries it is that page message as it is.
+    #[test]
+    fn the_header_is_what_the_fixture_says() {
+        let cases: Vec<Case> =
+            serde_json::from_str(include_str!("../web/src/video-header.json")).unwrap();
+        assert!(cases.len() >= 4);
+        for c in cases {
+            let header = Header {
+                coding: c.coding,
+                version: Version(c.version),
+                pipe: Pipe(c.pipe),
+            };
+            let page = hex(&c.header);
+            assert_eq!(page[0], Track::Video.byte(), "{}", c.header);
+            let bytes = &page[1..];
+            assert_eq!(header.bytes().to_vec(), bytes, "{}", c.header);
+            let picture = hex(&c.picture);
+            let message = [bytes, &picture].concat();
+            assert_eq!(
+                Header::read(&message),
+                Ok(Video::Picture(header, &picture)),
+                "{}",
+                c.header
+            );
+            let mut framed = Vec::new();
+            Frame::encode(Track::Video, &message, &mut framed);
+            assert_eq!(framed[PREFIX..], [&page[..], &picture].concat());
+        }
     }
 
     /// Two capabilities match exactly when their bytes are equal, wherever they differ.

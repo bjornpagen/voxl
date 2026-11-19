@@ -2,9 +2,11 @@
 // keycodes, so the browser's layout decides what each key types.
 import { Bin, cmd } from '../protocol';
 import type { App } from './app';
-import { charKeysym, Keys, type KeyEvent } from '../keys';
+import { charKeysym, codePoints, Keys, type KeyEvent } from '../keys';
 import type { Clipboard } from './clipboard';
 
+/** A newline's code point. */
+const NEWLINE = 0x0a;
 const XK_BACKSPACE = 0xff08,
 	XK_RETURN = 0xff0d,
 	XK_DELETE = 0xffff;
@@ -13,7 +15,9 @@ async function toPng(file: File): Promise<ArrayBuffer> {
 	if (file.type === 'image/png') return file.arrayBuffer();
 	const bmp = await createImageBitmap(file);
 	const c = new OffscreenCanvas(bmp.width, bmp.height);
-	c.getContext('2d')!.drawImage(bmp, 0, 0);
+	const context = c.getContext('2d');
+	if (context === null) throw new Error('voxl: a canvas without a 2D context');
+	context.drawImage(bmp, 0, 0);
 	return (await c.convertToBlob({ type: 'image/png' })).arrayBuffer();
 }
 
@@ -78,8 +82,9 @@ export function setupKeyboard(
 
 	kbd.addEventListener('paste', (e) => {
 		e.preventDefault();
-		// A paste event always carries its clipboard.
-		const dt = e.clipboardData!;
+		const dt = e.clipboardData;
+		// A paste that carries no clipboard pastes nothing: the shortcut goes as it is.
+		if (dt === null) return flushPaste();
 		const text = dt.getData('text/plain');
 		if (text) {
 			clipboard.noteLocal(text);
@@ -87,13 +92,13 @@ export function setupKeyboard(
 			flushPaste();
 			return;
 		}
-		const file = [...dt.items]
-			.find((i) => i.kind === 'file' && i.type.startsWith('image/'))
-			?.getAsFile();
-		if (!file) {
-			flushPaste();
-			return;
-		}
+		const image = [...dt.items].find(
+			(i) => i.kind === 'file' && i.type.startsWith('image/')
+		);
+		// No image either, or one the browser gives no file for: nothing to paste.
+		if (image === undefined) return flushPaste();
+		const file = image.getAsFile();
+		if (file === null) return flushPaste();
 		// The paste shortcut waits for the image to reach the remote clipboard.
 		toPng(file)
 			.then((png) => app.sendBin(Bin.clipImageUp, new Uint8Array(png)))
@@ -104,25 +109,32 @@ export function setupKeyboard(
 	// Text that arrives without usable keydowns (IME, dead-key composition, mobile
 	// keyboards, insertText) is typed as individual keysyms.
 	function typeText(text: string) {
-		for (const ch of text)
-			keys.tap(ch === '\n' ? XK_RETURN : charKeysym(ch.codePointAt(0)!));
+		for (const cp of codePoints(text))
+			keys.tap(cp === NEWLINE ? XK_RETURN : charKeysym(cp));
 	}
 	kbd.addEventListener('compositionend', (e) => {
 		if (e.data) typeText(e.data);
 		kbd.value = '';
 	});
+	// On-screen keyboards often deliver text and edits only as input events: what each
+	// kind of edit the page acts on types. An edit of any other kind types nothing.
+	// What an edit carries is its text, or none (the DOM's null) for one that is no text.
+	const edits = new Map<string, (data: string | null) => void>([
+		[
+			'insertText',
+			(data) => {
+				if (data !== null) typeText(data);
+			},
+		],
+		['deleteContentBackward', () => keys.tap(XK_BACKSPACE)],
+		['deleteContentForward', () => keys.tap(XK_DELETE)],
+		['insertLineBreak', () => keys.tap(XK_RETURN)],
+		['insertParagraph', () => keys.tap(XK_RETURN)],
+	]);
 	kbd.addEventListener('input', (e) => {
-		const ie = e as InputEvent;
-		if (ie.isComposing) return;
-		// On-screen keyboards often deliver text and edits only as input events.
-		if (ie.inputType === 'insertText' && ie.data) typeText(ie.data);
-		else if (ie.inputType === 'deleteContentBackward') keys.tap(XK_BACKSPACE);
-		else if (ie.inputType === 'deleteContentForward') keys.tap(XK_DELETE);
-		else if (
-			ie.inputType === 'insertLineBreak' ||
-			ie.inputType === 'insertParagraph'
-		)
-			keys.tap(XK_RETURN);
+		if (!(e instanceof InputEvent) || e.isComposing) return;
+		const edit = edits.get(e.inputType);
+		if (edit !== undefined) edit(e.data);
 		kbd.value = '';
 	});
 	window.addEventListener('blur', releaseAll);

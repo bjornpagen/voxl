@@ -1,40 +1,34 @@
-// Owns the WebSocket to the relay, decodes VP9 with WebCodecs and hands each update to the
-// page the moment it is decoded, which presents it through <video>. A session that ends stays
-// ended until the page asks for another: nothing reconnects by itself.
+// The worker: the socket to the relay, the VP9 decoder and the Opus decoder, off the page's
+// thread. What it decides is in two records: its session with the relay (session.ts), which
+// says when a frame was taken, and the screen (frames.ts), which holds one update at a time.
+// Here they are joined to the browser: a WebSocket, WebCodecs, the page and the counters.
 import { Frames } from './frames';
-import {
-	Bin,
-	cmd,
-	DESKTOP_AUDIO,
-	frameMicros,
-	parseVideoHeader,
-	VIDEO_HEADER_BYTES,
-} from './protocol';
-import { Count } from './stats';
-import type { FromWorker, PcmChunk, ServerMessage, ToWorker } from './protocol';
+import { DESKTOP_AUDIO, frameMicros, VIDEO_HEADER_BYTES } from './protocol';
+import { Session, type Told } from './session';
+import { Count, holds } from './stats';
+import type { FromWorker, PcmChunk, ToWorker } from './protocol';
 
 declare const self: DedicatedWorkerGlobalScope;
 
 type Init = Extract<ToWorker, { t: 'init' }>;
 
-/** The session: none yet (or the last one closed), or a socket to the relay. */
-type Session = { s: 'none' } | { s: 'live'; ws: WebSocket; ending: Ending };
+/** Where the desktop's sound goes: the player's port, the decoder (made at the first
+ * packet, and again after one fails), and the next packet's timestamp, in µs. */
+interface Player {
+	readonly port: MessagePort;
+	decoder: { s: 'none' } | { s: 'made'; dec: AudioDecoder };
+	at: number;
+}
 
-/** Why a live session will end: the relay's own words, once it said them before closing
- * the socket; until then the socket's closing is its own cause. */
-type Ending = { s: 'unsaid' } | { s: 'said'; why: string };
-
-/** Desktop audio: not asked for yet, or played through `port`, with a decoder made at the
- * first packet and again after one fails. */
-type Audio =
-	| { s: 'off' }
-	| { s: 'on'; port: MessagePort; decoder: AudioDecoder | 'none' };
-
-const post = (m: FromWorker, transfer: Transferable[] = []) =>
+const post = (m: FromWorker, transfer: Transferable[]) =>
 	self.postMessage(m, transfer);
 
-/** The decoder's timestamp of an update's picture: when the update arrived, in µs. */
+/** A time in ms as a decoder's timestamp and the counters keep it: in µs. */
 const micros = (ms: number) => Math.round(ms * 1000);
+
+/** Now, in ms on the clock the worker and the page share: each thread's `performance`
+ * counts from its own origin, and the origin itself is on one clock for both. */
+const now = () => performance.timeOrigin + performance.now();
 
 /** The first message is `init`; everything else is answered by what it starts. */
 self.addEventListener('message', function first(e: MessageEvent<ToWorker>) {
@@ -44,120 +38,136 @@ self.addEventListener('message', function first(e: MessageEvent<ToWorker>) {
 	start(e.data);
 });
 
+/** What goes to the page with a message, handed over and not copied: an image's buffer. */
+function handed(m: Told): Transferable[] {
+	switch (m.t) {
+		case 'cursor':
+		case 'clipImage':
+			return [m.buf];
+		case 'status':
+		case 'log':
+		case 'hello':
+		case 'clip':
+		case 'mic':
+			return [];
+	}
+}
+
+/** A decoder for `player`, whose PCM goes to the player's port. One that fails is closed,
+ * and the next packet makes another. */
+function audioDecoder(player: Player): AudioDecoder {
+	const dec = new AudioDecoder({
+		output: (ad) => {
+			const n = ad.numberOfFrames;
+			const chunk: PcmChunk = {
+				l: new Float32Array(n),
+				r: new Float32Array(n),
+			};
+			ad.copyTo(chunk.l, { planeIndex: 0, format: 'f32-planar' });
+			if (ad.numberOfChannels > 1)
+				ad.copyTo(chunk.r, { planeIndex: 1, format: 'f32-planar' });
+			else chunk.r.set(chunk.l);
+			ad.close();
+			player.port.postMessage(chunk, [chunk.l.buffer, chunk.r.buffer]);
+		},
+		error: (e) => {
+			if (player.decoder.s === 'made' && player.decoder.dec === dec)
+				player.decoder = { s: 'none' };
+			post({ t: 'log', s: `audio: ${e.message}` }, []);
+		},
+	});
+	dec.configure({
+		codec: 'opus',
+		sampleRate: DESKTOP_AUDIO.sampleRate,
+		numberOfChannels: DESKTOP_AUDIO.channels,
+	});
+	return dec;
+}
+
 function start(init: Init) {
-	let session: Session = { s: 'none' };
-	let audio: Audio = { s: 'off' };
-	let audioTs = 0;
-	let wantVideo = true;
 	const counts = init.counts;
-	/** What the decoder decodes, as the page was last told. */
-	let told: string | null = null;
-	/** After the record is told something: the page's codec follows it. */
-	function recorded() {
-		if (frames.codec !== told) {
-			told = frames.codec;
-			post({ t: 'codec', codec: told });
-		}
-	}
 
-	/** A message to the relay, if a session is open; with none, there is no one to tell. */
-	function send(d: string | ArrayBuffer) {
-		if (session.s === 'live' && session.ws.readyState === WebSocket.OPEN)
-			session.ws.send(d);
-	}
+	const session = new Session<WebSocket, Player>({
+		dial() {
+			const ws = new WebSocket(init.url);
+			ws.binaryType = 'arraybuffer';
+			ws.addEventListener('open', () => session.opened());
+			ws.addEventListener('close', () => session.closed());
+			ws.addEventListener('message', (e: MessageEvent<string | ArrayBuffer>) =>
+				session.message(now(), e.data)
+			);
+			return ws;
+		},
+		send: (ws, d) => ws.send(d),
+		hangUp: (ws) => ws.close(),
+		tell: (m) => post(m, handed(m)),
+		hello: (codec) => frames.hello(codec),
+		update(at, header, picture) {
+			Atomics.add(counts, Count.Bytes, VIDEO_HEADER_BYTES + picture.length);
+			Atomics.add(counts, Count.Updates, 1);
+			Atomics.add(counts, Count.PipeTenths, header.pipe);
+			frames.part(at, header, picture);
+		},
+		screenClosed: () => frames.closed(),
+		sound(player, packet) {
+			const dec =
+				player.decoder.s === 'made' ? player.decoder.dec : audioDecoder(player);
+			player.decoder = { s: 'made', dec };
+			player.at += frameMicros(
+				DESKTOP_AUDIO.frameSamples,
+				DESKTOP_AUDIO.sampleRate
+			);
+			dec.decode(
+				new EncodedAudioChunk({
+					type: 'key',
+					timestamp: player.at,
+					data: packet,
+				})
+			);
+		},
+	});
 
-	/** Ends the live session for `why`, as if the relay had said it. */
-	function end(why: string) {
-		if (session.s !== 'live') return;
-		session.ending = { s: 'said', why };
-		session.ws.close();
-	}
-
-	function connect() {
-		if (session.s === 'live') return;
-		const ws = new WebSocket(init.url);
-		const live: Session = { s: 'live', ws, ending: { s: 'unsaid' } };
-		session = live;
-		ws.binaryType = 'arraybuffer';
-		ws.addEventListener('open', () => {
-			post({ t: 'status', s: 'open' });
-			send(cmd.video(wantVideo));
-			send(cmd.audio(audio.s === 'on'));
-		});
-		ws.addEventListener('close', () => {
-			const why =
-				live.ending.s === 'said'
-					? live.ending.why
-					: 'the connection to the relay closed';
-			session = { s: 'none' };
-			post({ t: 'status', s: 'closed', why });
-			frames.closed();
-			recorded();
-		});
-		ws.addEventListener('message', (e: MessageEvent<string | ArrayBuffer>) => {
-			if (typeof e.data === 'string') return onText(e.data);
-			const b = new Uint8Array(e.data);
-			switch (b[0]) {
-				case Bin.video:
-					return onVideo(b);
-				case Bin.audio:
-					return onAudio(b);
-				case Bin.cursor:
-					return post({ t: 'cursor', buf: e.data }, [e.data]);
-				case Bin.clipImage:
-					return post({ t: 'clipImage', buf: e.data }, [e.data]);
-				default:
-					return end(`the relay sent a message of type ${b[0]}`);
-			}
-		});
-	}
-
-	/** Session `begun`'s codec is checked: one this browser cannot decode ends it. */
-	function checkCodec(codec: string, begun: number) {
-		void (async () => {
-			let r: VideoDecoderSupport;
-			try {
-				r = await VideoDecoder.isConfigSupported({
-					codec,
-					optimizeForLatency: true,
-				});
-			} catch (e) {
-				return end(`the codec ${codec} could not be checked: ${e}`);
-			}
-			if (!r.supported) frames.unsupported(begun);
-		})();
-	}
-
-	function onText(s: string) {
-		let m: ServerMessage;
-		try {
-			m = JSON.parse(s);
-		} catch {
-			return end('the relay sent text that is not JSON');
-		}
-		if (m.t === 'close') return end(m.why);
-		if (m.t === 'hello') {
-			const codec = m.codec;
-			const begun = frames.hello(codec);
-			recorded();
-			// Checked once, at the session's hello: a codec this browser cannot decode ends it.
-			if (begun !== null) checkCodec(codec, begun);
-		}
-		post(m);
-	}
-
-	// The screen arrives as one VP9 stream; each update is shown as it is decoded.
+	// The screen arrives as one VP9 stream; each update's picture goes to the page as it is
+	// decoded.
 	const frames = new Frames<VideoDecoder, VideoFrame, Uint8Array>({
+		// Asked once, at the session's hello: a codec this browser cannot decode ends it.
+		check(begun) {
+			const { codec } = begun;
+			void (async () => {
+				let r: VideoDecoderSupport;
+				try {
+					r = await VideoDecoder.isConfigSupported({
+						codec,
+						optimizeForLatency: true,
+					});
+				} catch (e) {
+					return session.screenEnded(
+						`the codec ${codec} could not be checked: ${e}`
+					);
+				}
+				if (!r.supported) frames.unsupported(begun);
+			})();
+		},
+		decodes: (codec) => post({ t: 'decodes', codec }, []),
+		decodesNothing: () => post({ t: 'decodesNothing' }, []),
+		// The page takes an update when its picture comes out, so it relies on the decoder
+		// putting out one picture for each update, before any further input (frames.ts).
+		// The daemon's part holds: each update is one shown frame, with nothing reordered.
+		// The decoder's is asked for (`optimizeForLatency`) but is not WebCodecs' promise:
+		// the option is a "hint that the selected decoder SHOULD be configured to minimize
+		// the number of EncodedVideoChunks that have to be decoded before a VideoFrame is
+		// output", and "the underlying codec implementation MAY emit new outputs only when
+		// new inputs are provided" (W3C WebCodecs, VideoDecoderConfig and "Internal Pending
+		// Output"). Measured on 2026-11-19 in Chrome 157 on an M2 Max, configured as here:
+		// 60 of 60 pictures out before the next input, none held, for hardware VP9 and for
+		// software AV1 (Chromium's dav1d wrapper sets max_frame_delay 1 in low-delay mode).
+		// A decoder that kept a picture in would leave the session waiting, and
+		// `voxlStats.decoder` would read decoding since that update's arrival: flush() is no
+		// way out, since it makes the next update have to be a keyframe.
 		open(codec) {
 			const dec = new VideoDecoder({
-				output: (frame) => {
-					frames.output(dec, frame);
-					recorded();
-				},
-				error: (e) => {
-					frames.error(dec, e.name, e.message);
-					recorded();
-				},
+				output: (frame) => frames.output(dec, frame),
+				error: (e) => frames.error(dec, e.name, e.message),
 			});
 			dec.configure({
 				codec,
@@ -166,115 +176,53 @@ function start(init: Init) {
 			});
 			return dec;
 		},
-		decode(dec, key, at, data) {
+		// The picture's timestamp is when its update arrived: `present` reads it there.
+		// How an update is coded is WebCodecs' word for it too.
+		decode(dec, coding, at, data) {
 			dec.decode(
 				new EncodedVideoChunk({
-					type: key ? 'key' : 'delta',
+					type: coding,
 					timestamp: micros(at),
 					data,
 				})
 			);
 		},
-		close(dec) {
-			dec.close();
-		},
-		end(why) {
-			post({ t: 'log', s: `video: ${why}` });
-			end(`the screen cannot be shown: ${why}`);
-		},
-		letGo(frame) {
-			frame.close();
-		},
-		show(frame) {
+		decoder: (state) => holds(counts, state),
+		close: (dec) => dec.close(),
+		end: (why) => session.screenEnded(why),
+		letGo: (frame) => frame.close(),
+		present(frame) {
 			Atomics.add(counts, Count.Frames, 1);
-			Atomics.add(
-				counts,
-				Count.DecodeUs,
-				micros(performance.now()) - frame.timestamp
-			);
+			Atomics.add(counts, Count.DecodeUs, micros(now()) - frame.timestamp);
 			post({ t: 'frame', frame }, [frame]);
+			session.decoded();
 		},
 	});
 
-	function onVideo(b: Uint8Array) {
-		const read = parseVideoHeader(b);
-		if (!read.ok)
-			return end(`the relay sent a video header with flags ${read.flags}`);
-		const h = read.header;
-		Atomics.add(counts, Count.Bytes, b.length);
-		Atomics.add(counts, Count.Updates, 1);
-		Atomics.add(counts, Count.PipeTenths, h.pipe);
-		frames.part(performance.now(), h, b.subarray(VIDEO_HEADER_BYTES));
-		recorded();
-	}
-
-	function onAudio(b: Uint8Array) {
-		if (audio.s !== 'on') return;
-		const on = audio;
-		if (on.decoder === 'none') {
-			const port = on.port;
-			const decoder = new AudioDecoder({
-				output: (ad) => {
-					const n = ad.numberOfFrames;
-					const chunk: PcmChunk = {
-						l: new Float32Array(n),
-						r: new Float32Array(n),
-					};
-					ad.copyTo(chunk.l, { planeIndex: 0, format: 'f32-planar' });
-					if (ad.numberOfChannels > 1)
-						ad.copyTo(chunk.r, { planeIndex: 1, format: 'f32-planar' });
-					else chunk.r.set(chunk.l);
-					ad.close();
-					port.postMessage(chunk, [chunk.l.buffer, chunk.r.buffer]);
-				},
-				// A decoder that failed is closed; the next packet makes another.
-				error: (e) => {
-					if (on.decoder === decoder) on.decoder = 'none';
-					post({ t: 'log', s: `audio: ${e.message}` });
-				},
-			});
-			decoder.configure({
-				codec: 'opus',
-				sampleRate: DESKTOP_AUDIO.sampleRate,
-				numberOfChannels: DESKTOP_AUDIO.channels,
-			});
-			on.decoder = decoder;
-		}
-		audioTs += frameMicros(
-			DESKTOP_AUDIO.frameSamples,
-			DESKTOP_AUDIO.sampleRate
-		);
-		on.decoder.decode(
-			new EncodedAudioChunk({
-				type: 'key',
-				timestamp: audioTs,
-				data: b.subarray(1),
-			})
-		);
-	}
-
-	self.addEventListener('message', (e: MessageEvent<ToWorker>) => {
-		const m = e.data;
+	/** Acts on a message of the page's. What it returns says only that the kind of message
+	 * has its case: one without a case does not compile. */
+	function heard(m: ToWorker): 'heard' {
 		switch (m.t) {
 			case 'init':
 				throw new Error('voxl worker: a second init');
 			case 'connect':
-				return connect();
+				session.connect();
+				return 'heard';
 			case 'send':
 			case 'sendBin':
-				return send(m.d);
+				session.say(m.d);
+				return 'heard';
 			case 'video':
-				if (wantVideo !== m.on) {
-					wantVideo = m.on;
-					send(cmd.video(m.on));
-				}
-				return;
+				session.video(m.on);
+				return 'heard';
 			case 'audioPort':
-				audio = { s: 'on', port: m.port, decoder: 'none' };
-				send(cmd.audio(true));
-				return;
+				session.sound({ port: m.port, decoder: { s: 'none' }, at: 0 });
+				return 'heard';
 		}
-	});
+	}
+	self.addEventListener('message', (e: MessageEvent<ToWorker>) =>
+		heard(e.data)
+	);
 
-	connect();
+	session.connect();
 }

@@ -10,5 +10,15 @@
 		"browser": true,
 		"es2022": true
 	},
-	"ignorePatterns": ["target/**", "node_modules/**", "bench/**"]
+	"ignorePatterns": ["target/**", "node_modules/**", "bench/**"],
+	"rules": {
+		"typescript/no-non-null-assertion": "error",
+		"typescript/no-explicit-any": "error",
+		"typescript/consistent-type-assertions": [
+			"error",
+			{
+				"assertionStyle": "never"
+			}
+		]
+	}
 }

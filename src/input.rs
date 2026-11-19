@@ -9,7 +9,6 @@
 
 use crate::event::{InputEvent, KeyAct, Press};
 use std::collections::HashMap;
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use x11rb::connection::{Connection, RequestConnection as _};
 use x11rb::protocol::xkb::{self, ConnectionExt as _};
@@ -88,7 +87,7 @@ fn key_event(
         },
         // Down already: a second viewer holding the same key, or a page that sends its
         // repeats as downs. X itself drops a second press of a key that is down.
-        (KeyAct::Down, Some(_)) => nothing(held),
+        (KeyAct::Down, Some(Held::Modifier(_) | Held::Key { .. })) => nothing(held),
         // Its down named a symbol X cannot type, or it was let go (ReleaseAll).
         (KeyAct::Repeat, None) => nothing(None),
         // X never repeats a modifier; a repeat would be a release and a press of it.
@@ -118,7 +117,7 @@ fn press(key: Held, shift: u8, shifts: &[u8]) -> Vec<Stroke> {
         Held::Key { keycode, level } => (keycode, level),
     };
     match (level, shifts.is_empty()) {
-        (Level::Either, _) | (Level::Plain, true) | (Level::Shifted, false) => {
+        (Level::Either, true | false) | (Level::Plain, true) | (Level::Shifted, false) => {
             vec![Stroke::Press(keycode)]
         }
         (Level::Shifted, true) => vec![
@@ -261,11 +260,13 @@ impl SmoothScroll {
             }
             let (mut v, mut h) = (None, None);
             for class in &dev.classes {
+                // X's scroll types are numbers (`ScrollType` is no enum): these two are the
+                // axes it has.
                 if let DeviceClassData::Scroll(sc) = &class.data {
-                    match sc.scroll_type {
-                        ScrollType::VERTICAL => v = Some(sc.number as u8),
-                        ScrollType::HORIZONTAL => h = Some(sc.number as u8),
-                        _ => {}
+                    if sc.scroll_type == ScrollType::VERTICAL {
+                        v = Some(sc.number as u8);
+                    } else if sc.scroll_type == ScrollType::HORIZONTAL {
+                        h = Some(sc.number as u8);
                     }
                 }
             }
@@ -290,10 +291,10 @@ impl SmoothScroll {
         // Always start at axis 0: XTest stores valuators at absolute indices but
         // builds the event mask relative to the first one, so a non-zero first
         // valuator loses the values. x/y get relative 0 (no pointer motion).
-        let n = self.vaxis.max(self.haxis) as usize + 1;
+        let n = usize::from(self.vaxis.max(self.haxis)) + 1;
         let mut vals = [0i32; 6];
-        vals[self.vaxis as usize] = vertical;
-        vals[self.haxis as usize] = horizontal;
+        vals[usize::from(self.vaxis)] = vertical;
+        vals[usize::from(self.haxis)] = horizontal;
         let mut req = Vec::with_capacity(4 + 64);
         req.extend_from_slice(&[self.xtest_opcode, 2, 17, 0]); // FakeInput, 68 bytes = 17 words
         let mut ev = [0u8; 32];
@@ -373,18 +374,27 @@ impl Injector {
         };
         // Undo remaps left behind by a previous run that didn't exit cleanly.
         // A missing file is a clean exit before: nothing to undo. Keycodes in it are the
-        // ones a voxl wrote; one that is not a keycode of this server is passed over.
+        // ones a voxl wrote; a word that is not a keycode of this server is passed over,
+        // and said.
         match std::fs::read_to_string(&me.scratch_path) {
             Ok(old) => {
                 me.load_keymap(max_kc)?;
-                for kc in old.split_whitespace().filter_map(|k| k.parse::<u8>().ok()) {
-                    if kc >= min_kc && kc <= max_kc {
-                        sent(me.conn.change_keyboard_mapping(
-                            1,
-                            kc,
-                            me.per as u8,
-                            &vec![0; me.per],
-                        ));
+                for word in old.split_whitespace() {
+                    match word.parse::<u8>() {
+                        Ok(kc) if (min_kc..=max_kc).contains(&kc) => {
+                            sent(me.conn.change_keyboard_mapping(
+                                1,
+                                kc,
+                                me.per as u8,
+                                &vec![0; me.per],
+                            ));
+                        }
+                        Ok(kc) => log::warn!(
+                            "the keymap left behind names keycode {kc}, not this server's"
+                        ),
+                        Err(e) => {
+                            log::warn!("the keymap left behind holds {word:?}, no keycode: {e}")
+                        }
                     }
                 }
                 me.conn
@@ -422,7 +432,7 @@ impl Injector {
             .map_err(|e| e.to_string())?
             .reply()
             .map_err(|e| e.to_string())?;
-        self.per = r.keysyms_per_keycode as usize;
+        self.per = usize::from(r.keysyms_per_keycode);
         self.syms = r.keysyms;
         // Eight modifiers' keycodes, 0 where a modifier has fewer than the most.
         self.modifiers = self
@@ -437,7 +447,7 @@ impl Injector {
             .collect();
         self.lookup.clear();
         self.scratch.clear();
-        for i in 0..count as usize {
+        for i in 0..usize::from(count) {
             let kc = self.min_kc + i as u8;
             let row = &self.syms[i * self.per..(i + 1) * self.per];
             if row.iter().all(|&s| s == 0) {
@@ -465,7 +475,7 @@ impl Injector {
     }
 
     fn row(&self, kc: u8) -> &[u32] {
-        let i = (kc - self.min_kc) as usize;
+        let i = usize::from(kc - self.min_kc);
         &self.syms[i * self.per..(i + 1) * self.per]
     }
 
@@ -487,7 +497,7 @@ impl Injector {
             let level = match (shift_neutral, lvl) {
                 (true, _) => Level::Either,
                 (false, 0) => Level::Plain,
-                (false, _) => Level::Shifted,
+                (false, 1..) => Level::Shifted,
             };
             return Some((kc, level));
         }
@@ -521,7 +531,7 @@ impl Injector {
         }
         // Clients must process MappingNotify before they see the key.
         std::thread::sleep(MAPPING_SETTLE);
-        let i = (kc - self.min_kc) as usize;
+        let i = usize::from(kc - self.min_kc);
         let per = self.per;
         self.syms[i * per..(i + 1) * per].copy_from_slice(&row);
         self.scratch_map.insert(keysym, (kc, Instant::now()));
@@ -654,20 +664,6 @@ impl Injector {
             InputEvent::Clipboard(text) => {
                 self.clipboard.set_blocking(text);
             }
-            InputEvent::Shutdown(done) => {
-                self.handle(InputEvent::ReleaseAll);
-                self.restore_keymap();
-                if let Err(e) = set_repeat(&self.conn, &self.repeat) {
-                    log::error!("key repeat not put back: {e}");
-                }
-                if let Err(e) = self.conn.sync() {
-                    log::error!("the X server took no last input: {e}");
-                }
-                // The daemon's stop waits on this; gone, it waits for nothing.
-                if done.send(()).is_err() {
-                    log::info!("the daemon stopped before the input was let go");
-                }
-            }
             InputEvent::ReleaseAll => {
                 for (_, held) in std::mem::take(&mut self.pressed) {
                     self.stroke(Stroke::Release(held.keycode()));
@@ -692,6 +688,19 @@ impl crate::event::Inject for Injector {
     fn flush(&mut self) {
         sent(self.conn.flush());
     }
+
+    /// Lets go of every key and button, and puts back the keymap and key repeat voxl
+    /// changed; the X server has taken it all when this returns.
+    fn finish(&mut self) {
+        self.handle(InputEvent::ReleaseAll);
+        self.restore_keymap();
+        if let Err(e) = set_repeat(&self.conn, &self.repeat) {
+            log::error!("key repeat not put back: {e}");
+        }
+        if let Err(e) = self.conn.sync() {
+            log::error!("the X server took no last input: {e}");
+        }
+    }
 }
 
 /// A request handed to the X server: a connection that fails is the X server gone, and
@@ -712,7 +721,7 @@ pub fn spawn(
     display: &str,
     clipboard: crate::desktop::ClipboardHandle,
     keymap: std::path::PathBuf,
-) -> Result<mpsc::Sender<InputEvent>, String> {
+) -> Result<crate::event::Input, String> {
     let inj = Injector::new(display, keymap, clipboard)?;
     crate::event::spawn(move || inj)
 }
@@ -873,7 +882,7 @@ mod tests {
                     match act {
                         KeyAct::Down if !was_held => st.viewer.push(keysym),
                         KeyAct::Up => st.viewer.retain(|&k| k != keysym),
-                        _ => {}
+                        KeyAct::Down | KeyAct::Repeat => {}
                     }
                     let mut want: Vec<u8> = st
                         .viewer

@@ -148,6 +148,53 @@ pub fn spawn(display: String, hub: Arc<Hub>) -> Result<ClipboardHandle, String> 
     })
 }
 
+/// An X event this thread acts on. The X server has many more, and x11rb's `Event` grows
+/// with it: what one of them is to this thread is read once (`Ours::of`), and none of the
+/// rest gets past it.
+enum Ours {
+    /// The cursor changed.
+    Cursor,
+    /// Another client owns the clipboard now.
+    Owned,
+    /// What this thread asked the clipboard's owner for is on its property, converted to
+    /// `target`.
+    Converted { target: u32 },
+    /// More of an incremental transfer is on this thread's property.
+    Chunk,
+    /// A client asks for the clipboard this thread owns.
+    Asked(xproto::SelectionRequestEvent),
+    /// The clipboard this thread owned is another client's.
+    Cleared,
+}
+
+impl Ours {
+    /// What `ev` is to the thread whose window is `win`, if it is one of the events it
+    /// acts on.
+    fn of(ev: &Event, atoms: &Atoms, win: u32) -> Option<Ours> {
+        if let Event::XfixesCursorNotify(_) = ev {
+            return Some(Ours::Cursor);
+        }
+        if let Event::XfixesSelectionNotify(e) = ev {
+            return (e.owner != win && e.owner != x11rb::NONE).then_some(Ours::Owned);
+        }
+        if let Event::SelectionNotify(e) = ev {
+            let converted = Ours::Converted { target: e.target };
+            return (e.property != x11rb::NONE).then_some(converted);
+        }
+        if let Event::PropertyNotify(e) = ev {
+            let new = e.atom == atoms.prop && e.state == xproto::Property::NEW_VALUE;
+            return new.then_some(Ours::Chunk);
+        }
+        if let Event::SelectionRequest(e) = ev {
+            return Some(Ours::Asked(*e));
+        }
+        if let Event::SelectionClear(_) = ev {
+            return Some(Ours::Cleared);
+        }
+        None
+    }
+}
+
 /// The desktop thread's state: its X connection and window, and the clipboard as it holds
 /// it.
 struct Desktop {
@@ -213,11 +260,15 @@ impl Desktop {
 
     fn event(&mut self, ev: Event) -> Result<(), ConnectionError> {
         let (conn, atoms, win) = (&self.conn, &self.atoms, self.win);
-        match ev {
-            Event::XfixesCursorNotify(_) => send_cursor(conn, &self.hub)?,
+        // The X server's other events are not this thread's.
+        let Some(ours) = Ours::of(&ev, atoms, win) else {
+            return Ok(());
+        };
+        match ours {
+            Ours::Cursor => send_cursor(conn, &self.hub)?,
             // Another client owns the clipboard: ask what it offers, then fetch text or
             // an image.
-            Event::XfixesSelectionNotify(e) if e.owner != win && e.owner != x11rb::NONE => {
+            Ours::Owned => {
                 conn.convert_selection(
                     win,
                     atoms.clipboard,
@@ -227,14 +278,14 @@ impl Desktop {
                 )?;
                 conn.flush()?;
             }
-            Event::SelectionNotify(e) if e.property != x11rb::NONE => {
+            Ours::Converted { target } => {
                 let reply = conn
                     .get_property(true, win, atoms.prop, AtomEnum::ANY, 0, u32::MAX / 4)?
                     .reply();
                 let Some(r) = said(reply) else {
                     return Ok(());
                 };
-                if e.target == atoms.targets {
+                if target == atoms.targets {
                     let offered: Vec<u32> = match r.value32() {
                         Some(v) => v.collect(),
                         None => return Ok(()),
@@ -253,15 +304,13 @@ impl Desktop {
                         )?;
                     }
                 } else if r.type_ == atoms.incr {
-                    self.incr = Some((e.target, Vec::new()));
+                    self.incr = Some((target, Vec::new()));
                 } else {
-                    publish(&self.hub, atoms, e.target, r.value, &mut self.last_image);
+                    publish(&self.hub, atoms, target, r.value, &mut self.last_image);
                 }
                 conn.flush()?;
             }
-            Event::PropertyNotify(e)
-                if e.atom == atoms.prop && e.state == xproto::Property::NEW_VALUE =>
-            {
+            Ours::Chunk => {
                 let Some((target, data)) = self.incr.as_mut() else {
                     return Ok(());
                 };
@@ -281,7 +330,7 @@ impl Desktop {
                 }
                 conn.flush()?;
             }
-            Event::SelectionRequest(e) => {
+            Ours::Asked(e) => {
                 let prop = match e.property {
                     x11rb::NONE => e.target,
                     p => p,
@@ -302,8 +351,7 @@ impl Desktop {
                 conn.send_event(false, e.requestor, EventMask::NO_EVENT, notify)?;
                 conn.flush()?;
             }
-            Event::SelectionClear(_) => self.owned = None,
-            _ => {}
+            Ours::Cleared => self.owned = None,
         }
         Ok(())
     }

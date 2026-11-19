@@ -1,42 +1,50 @@
-// PCM player. Receives planar Float32 [L, R] chunks on a MessagePort, as the lane delivers
-// their packets, and plays them through a ring of a packet or two.
-import type { PcmChunk } from '../protocol';
+// The desktop audio's player. Receives planar Float32 [L, R] chunks on a MessagePort, one
+// an Opus packet, as the stream delivers them, and plays them from a ring (ring.ts).
+import type { PcmChunk, PlayerOptions } from '../protocol';
+import { Ring } from '../ring';
 import wire from '../wire.json' with { type: 'json' };
 
 /** One Opus packet's samples (wire.json). */
 const FRAME = wire.desktopAudio.frameSamples;
 
-/** The samples the player renders at a time: Web Audio's render quantum (Web Audio API,
- * "render quantum size", 128). Published. */
-const QUANTUM = 128;
+/**
+ * The packets the ring holds, beside what the device takes at a time.
+ *
+ * @limitKind derived, and measured against the player before it
+ * @owner the page's desktop audio player
+ * @unit Opus packets, each `FRAME` samples (10 ms)
+ * @scope the most the ring holds: this many packets and the device's frames
+ * @derivation a stream brings a packet late and the next one with it, so two together is
+ * the least burst a stream makes, and a ring of one packet drops sound at every hiccup.
+ * Each packet more is a packet's time more of lag for a gap saved, and dropping beats lag.
+ * @evidence headless Chrome 157 on an M2 Max, whose device takes 256 frames at a time; a
+ * tone in 10 ms packets from a fake relay, 9 s a run, 2026-11-18. Packets in pairs every
+ * 20 ms, three runs: silent 0.03 to 0.06 % of the time, 3 to 5 ms dropped; the player
+ * before (it filled to one packet, and past two packets and a render quantum dropped back
+ * to one) was silent 19.4 % and dropped 1757 ms. Packets evenly: no silence and no drop, 18.9 ms held on average,
+ * 25.3 ms at most. A 200 ms stall every 2 s: silent 8.8 % (the stalls), 746 ms dropped
+ * (the sound that came stale), never more than 25.3 ms held.
+ * @revalidate a change of the packet's length; a device that takes more than two packets
+ * at a time; the sound on a real link, which this run did not have
+ */
+const PACKETS = 2;
 
-/** What the buffer plays from once it primes: one packet. Chosen when the relay gave packets
- * at deadlines that took the path's jitter out; it no longer does, and packets come as the
- * stream delivers them, behind the video frames before them, with the path's jitter. To be
- * measured again: what the player underruns at, on the live link. */
-const TARGET = FRAME;
-/** The most the buffer holds before it drops the oldest: the packet playing, the next one
- * decoded, and a render quantum the player has not yet taken. Derived. */
-const MOST = TARGET + FRAME + QUANTUM;
-/** The ring's room: the most it holds and one more packet. Derived. */
-const ROOM = MOST + FRAME;
+class PcmPlayer extends AudioWorkletProcessor<PlayerOptions> {
+	/** The most waits: the packets, and what the device takes at a time (it renders that
+	 * many frames back to back, so less beside the packets would leave each take short). */
+	private readonly ring: Ring;
 
-class PcmPlayer extends AudioWorkletProcessor {
-	private l = new Float32Array(ROOM);
-	private r = new Float32Array(ROOM);
-	private rd = 0;
-	private wr = 0;
-	private fill = 0;
-	private priming = true;
-
-	constructor() {
-		super();
+	constructor(options: { readonly processorOptions: PlayerOptions }) {
+		super(options);
+		this.ring = new Ring(
+			PACKETS * FRAME + options.processorOptions.deviceFrames
+		);
 		this.port.addEventListener(
 			'message',
 			(e: MessageEvent<{ port: MessagePort }>) => {
 				const port = e.data.port;
 				port.addEventListener('message', (m: MessageEvent<PcmChunk>) =>
-					this.push(m.data)
+					this.ring.push(m.data.l, m.data.r)
 				);
 				// Unlike assigning onmessage, addEventListener doesn't start a port.
 				port.start();
@@ -45,38 +53,10 @@ class PcmPlayer extends AudioWorkletProcessor {
 		this.port.start();
 	}
 
-	private push({ l, r }: PcmChunk) {
-		for (let i = 0; i < l.length; i++) {
-			this.l[this.wr] = l[i];
-			this.r[this.wr] = r[i];
-			this.wr = (this.wr + 1) % ROOM;
-		}
-		this.fill += l.length;
-		// Too much queued: drop the oldest so latency stays bounded.
-		if (this.fill > MOST) {
-			const drop = this.fill - TARGET;
-			this.rd = (this.rd + drop) % ROOM;
-			this.fill -= drop;
-		}
-	}
-
+	/** Plays a render quantum, or silence (the output as it came) while less waits. */
 	process(_: Float32Array[][], outputs: Float32Array[][]) {
 		const out = outputs[0];
-		const n = out[0].length;
-		if (this.priming) {
-			if (this.fill < TARGET) return true;
-			this.priming = false;
-		}
-		if (this.fill < n) {
-			this.priming = true;
-			return true;
-		}
-		for (let i = 0; i < n; i++) {
-			out[0][i] = this.l[this.rd];
-			out[1][i] = this.r[this.rd];
-			this.rd = (this.rd + 1) % ROOM;
-		}
-		this.fill -= n;
+		this.ring.play(out[0], out[1]);
 		return true;
 	}
 }

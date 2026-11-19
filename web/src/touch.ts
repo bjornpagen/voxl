@@ -59,11 +59,43 @@ interface Stamp extends P {
 	t: number;
 }
 
+/** What two fingers that land and lift without moving do: a right click when they came on
+ * a trackpad touch (the trackpad's two-finger tap), nothing on the desktop itself. */
+type Lift = 'rightClick' | 'nothing';
+
+/** What lifting two fingers does when the second came on a first that had not moved yet,
+ * by the mode the first began in. */
+const PENDING_LIFT: Readonly<Record<Mode, Lift>> = {
+	trackpad: 'rightClick',
+	direct: 'nothing',
+};
+
+/** What a second finger landing makes of the gesture `g` it lands in: what lifting both
+ * then does. Every gesture has its answer, so a new one must give its own. */
+function liftOf(g: Gesture): Lift {
+	switch (g.k) {
+		case 'pending':
+			return PENDING_LIFT[g.mode];
+		// The trackpad pointer was sliding: a second finger still makes a tap.
+		case 'slide':
+			return 'rightClick';
+		case 'idle':
+		case 'drag':
+		case 'spent':
+		case 'two':
+		case 'scroll':
+		case 'pinch':
+			return 'nothing';
+	}
+}
+
 /** What the fingers are doing. */
 type Gesture =
 	| { k: 'idle' }
-	/** One finger down, not moved enough to be anything yet. */
-	| { k: 'pending'; mode: Mode; at: Stamp }
+	/** One finger down, not moved enough to be anything yet. In trackpad mode the pointer
+	 * was put down as the finger came: `from` is where. */
+	| { k: 'pending'; mode: 'direct'; at: Stamp }
+	| { k: 'pending'; mode: 'trackpad'; at: Stamp; from: P }
 	/** The left button is held and the finger moves the pointer. */
 	| { k: 'drag'; mode: Mode; last: Stamp }
 	/** Trackpad: the finger slides the pointer; `far` is the most it has moved from where
@@ -71,9 +103,9 @@ type Gesture =
 	| { k: 'slide'; at: Stamp; from: P; far: number; last: Stamp }
 	/** Nothing more comes of it: a click was made, or fingers came and went. */
 	| { k: 'spent' }
-	/** Two fingers down, not yet moved enough to tell a scroll from a pinch (or, in
-	 * trackpad mode, from a right-click tap). */
-	| { k: 'two'; rightTap: boolean; startMid: P; startSpread: number }
+	/** Two fingers down, not yet moved enough to tell a scroll from a pinch, or from a tap
+	 * that does what `onLift` says when they lift. */
+	| { k: 'two'; onLift: Lift; startMid: P; startSpread: number }
 	| { k: 'scroll'; lastMid: P }
 	| { k: 'pinch' };
 
@@ -83,6 +115,10 @@ export function createGestures(out: (o: Out) => void) {
 	let lastTap: Stamp = { x: 0, y: 0, t: -Infinity };
 	/** The trackpad pointer, in desktop pixels; none until it is first put down. */
 	let cursor: P | null = null;
+	/** The mode the next gesture starts in. */
+	let mode: Mode = 'direct';
+	/** The desktop; none while there is none to drive (no gesture starts). */
+	let env: Env | null = null;
 
 	const mid = (): P => {
 		let x = 0,
@@ -107,24 +143,47 @@ export function createGestures(out: (o: Out) => void) {
 		button(n, false);
 	};
 	const to = (p: P) => out({ k: 'to', x: p.x, y: p.y });
+	/** Two fingers lifted without moving. */
+	function lifted(lift: Lift): Lift {
+		switch (lift) {
+			case 'rightClick':
+				click(3);
+				return lift;
+			case 'nothing':
+				return lift;
+		}
+	}
 
-	/** Puts the trackpad pointer down (in the middle of the desktop at first) and says
+	/** Puts the trackpad pointer down on the desktop `e` (in its middle at first) and says
 	 * where it is: the desktop's pointer may have been moved since. */
-	function place() {
-		const e = api.env;
-		if (!e) return;
-		const c = cursor ?? { x: e.w / 2, y: e.h / 2 };
-		cursor = {
+	function put(e: Env): P {
+		const c = cursor === null ? { x: e.w / 2, y: e.h / 2 } : cursor;
+		const at = {
 			x: Math.max(0, Math.min(e.w - 1, c.x)),
 			y: Math.max(0, Math.min(e.h - 1, c.y)),
 		};
-		to(cursor);
+		cursor = at;
+		to(at);
+		return at;
+	}
+	/** Puts the trackpad pointer down, if there is a desktop to put it on. */
+	function place() {
+		if (env !== null) put(env);
+	}
+	/** What a first finger at `at` begins, on the desktop `e`. */
+	function begun(at: Stamp, e: Env): Gesture {
+		switch (mode) {
+			case 'direct':
+				return { k: 'pending', mode, at };
+			case 'trackpad':
+				return { k: 'pending', mode, at, from: put(e) };
+		}
 	}
 	/** Moves the trackpad pointer by a finger movement (CSS px) made over `dt` ms: slow
 	 * slides move it less than the finger, for precision; fast ones more. */
 	function nudge(dx: number, dy: number, dt: number) {
-		const e = api.env;
-		if (!e || !cursor) return;
+		const e = env;
+		if (e === null || cursor === null) return;
 		const speed = Math.hypot(dx, dy) / Math.max(dt, 1);
 		const gain = Math.min(3, Math.max(0.6, speed * 1.5)) * e.perPx;
 		cursor = {
@@ -165,18 +224,21 @@ export function createGestures(out: (o: Out) => void) {
 	}
 
 	function down(id: number, x: number, y: number, t: number) {
-		if (fingers.has(id) || (fingers.size === 0 && !api.env)) return;
+		if (fingers.has(id)) return;
+		if (fingers.size === 0) {
+			// No gesture starts with no desktop to drive.
+			if (env === null) return;
+			tick(t);
+			fingers.set(id, { x, y });
+			g = begun({ x, y, t }, env);
+			return;
+		}
 		tick(t);
 		fingers.set(id, { x, y });
-		if (fingers.size === 1) {
-			const mode = api.mode;
-			if (mode === 'trackpad') place();
-			g = { k: 'pending', mode, at: { x, y, t } };
-		} else if (fingers.size === 2) {
-			const rightTap =
-				(g.k === 'pending' && g.mode === 'trackpad') || g.k === 'slide';
+		if (fingers.size === 2) {
+			const onLift = liftOf(g);
 			if (g.k === 'drag') button(1, false);
-			g = { k: 'two', rightTap, startMid: mid(), startSpread: spread() };
+			g = { k: 'two', onLift, startMid: mid(), startSpread: spread() };
 		} else rebase();
 	}
 
@@ -195,14 +257,8 @@ export function createGestures(out: (o: Out) => void) {
 					out({ k: 'at', x, y });
 					g = { k: 'drag', mode: 'direct', last: { x, y, t } };
 				} else if (g.mode === 'trackpad' && far > STILL) {
-					const { at } = g;
-					g = {
-						k: 'slide',
-						at,
-						from: { ...(cursor as P) },
-						far,
-						last: { x, y, t },
-					};
+					const { at, from } = g;
+					g = { k: 'slide', at, from: { ...from }, far, last: { x, y, t } };
 					nudge(x - at.x, y - at.y, t - at.t);
 				}
 			} else if (g.k === 'slide') {
@@ -211,9 +267,9 @@ export function createGestures(out: (o: Out) => void) {
 				g = { ...g, far, last: { x, y, t } };
 				nudge(x - last.x, y - last.y, t - last.t);
 			} else if (g.k === 'drag') {
-				const { mode, last } = g;
-				g = { k: 'drag', mode, last: { x, y, t } };
-				if (mode === 'direct') out({ k: 'at', x, y });
+				const { mode: dragging, last } = g;
+				g = { k: 'drag', mode: dragging, last: { x, y, t } };
+				if (dragging === 'direct') out({ k: 'at', x, y });
 				else nudge(x - last.x, y - last.y, t - last.t);
 			}
 			return;
@@ -269,7 +325,7 @@ export function createGestures(out: (o: Out) => void) {
 		} else if (g.k === 'two' || g.k === 'scroll' || g.k === 'pinch') {
 			if (fingers.size >= 2) rebase();
 			else {
-				if (g.k === 'two' && g.rightTap) click(3);
+				if (g.k === 'two') lifted(g.onLift);
 				g = { k: 'spent' };
 			}
 		}
@@ -285,10 +341,18 @@ export function createGestures(out: (o: Out) => void) {
 	}
 
 	const api = {
-		/** The mode the next gesture starts in. */
-		mode: 'direct' as Mode,
-		/** The desktop; none while there is none to drive (no gesture starts). */
-		env: null as Env | null,
+		get mode(): Mode {
+			return mode;
+		},
+		set mode(next: Mode) {
+			mode = next;
+		},
+		get env(): Env | null {
+			return env;
+		},
+		set env(next: Env | null) {
+			env = next;
+		},
 		down,
 		move,
 		up,

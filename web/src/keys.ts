@@ -28,31 +28,46 @@ export interface KeyEvent {
 	altGraph: boolean;
 }
 
-const NAMED: Record<string, number> = {
-	Backspace: 0xff08,
-	Tab: 0xff09,
-	Enter: 0xff0d,
-	Escape: 0xff1b,
-	Delete: 0xffff,
-	Home: 0xff50,
-	ArrowLeft: 0xff51,
-	ArrowUp: 0xff52,
-	ArrowRight: 0xff53,
-	ArrowDown: 0xff54,
-	PageUp: 0xff55,
-	PageDown: 0xff56,
-	End: 0xff57,
-	Insert: 0xff63,
-	CapsLock: 0xffe5,
-	NumLock: 0xff7f,
-	ScrollLock: 0xff14,
-	Pause: 0xff13,
-	PrintScreen: 0xff61,
-	ContextMenu: 0xff67,
-	AltGraph: 0xfe03,
-	' ': 0x20,
-};
-for (let i = 1; i <= 24; i++) NAMED['F' + i] = 0xffbd + i;
+const NAMED = new Map<string, number>(
+	Object.entries({
+		Backspace: 0xff08,
+		Tab: 0xff09,
+		Enter: 0xff0d,
+		Escape: 0xff1b,
+		Delete: 0xffff,
+		Home: 0xff50,
+		ArrowLeft: 0xff51,
+		ArrowUp: 0xff52,
+		ArrowRight: 0xff53,
+		ArrowDown: 0xff54,
+		PageUp: 0xff55,
+		PageDown: 0xff56,
+		End: 0xff57,
+		Insert: 0xff63,
+		CapsLock: 0xffe5,
+		NumLock: 0xff7f,
+		ScrollLock: 0xff14,
+		Pause: 0xff13,
+		PrintScreen: 0xff61,
+		ContextMenu: 0xff67,
+		AltGraph: 0xfe03,
+		' ': 0x20,
+	})
+);
+for (let i = 1; i <= 24; i++) NAMED.set('F' + i, 0xffbd + i);
+
+/** The code points of a text, in order. */
+export function codePoints(text: string): number[] {
+	const points: number[] = [];
+	for (let i = 0; i < text.length;) {
+		const point = text.codePointAt(i);
+		// Within the text's length there is always one.
+		if (point === undefined) return points;
+		points.push(point);
+		i += point > 0xffff ? 2 : 1;
+	}
+	return points;
+}
 
 /** Keysym of a printable character (Latin-1 directly, Unicode via 0x01000000 + code point). */
 export const charKeysym = (cp: number) =>
@@ -63,23 +78,19 @@ export const charKeysym = (cp: number) =>
 const XK_CONTROL_L = 0xffe3,
 	XK_CONTROL_R = 0xffe4,
 	XK_SUPER_L = 0xffeb,
-	XK_SUPER_R = 0xffec;
-const BY_CODE: Record<string, number> = {
-	ShiftLeft: 0xffe1,
-	ShiftRight: 0xffe2,
-	AltLeft: 0xffe9,
-	AltRight: 0xffea,
-	NumpadEnter: 0xff0d,
-};
+	XK_SUPER_R = 0xffec,
+	XK_SHIFT_L = 0xffe1,
+	XK_ALT_L = 0xffe9;
+const BY_CODE = new Map<string, number>([
+	['ShiftLeft', XK_SHIFT_L],
+	['ShiftRight', 0xffe2],
+	['AltLeft', XK_ALT_L],
+	['AltRight', 0xffea],
+	['NumpadEnter', 0xff0d],
+]);
 
 export type Mod = 'ctrl' | 'meta' | 'shift' | 'alt';
 const MODS: readonly Mod[] = ['ctrl', 'meta', 'shift', 'alt'];
-const LEFT: Record<Mod, string> = {
-	ctrl: 'ControlLeft',
-	meta: 'MetaLeft',
-	shift: 'ShiftLeft',
-	alt: 'AltLeft',
-};
 
 /** The modifier a key is, if it is one. AltGraph is a key of its own, not Alt. */
 function modOf(code: string, key: string): Mod | null {
@@ -95,15 +106,18 @@ function modOf(code: string, key: string): Mod | null {
  * (left or right, kept as it is); or because an event's flags said so, with no such key. */
 export type Held = 'up' | 'explicit' | 'inferred';
 
-/** What reconciling a key event's flags does to each modifier: it is let go (`up`) or
- * pressed as inferred. A modifier not listed stays as it is; one pressed by a key stays
- * while its flag is set. The event's own modifier,
- * if it is one, is left to its own press, except an inferred one it replaces. */
+/** What reconciling a key event's flags does to a modifier: it stays as it is, is let go
+ * (`up`), or is pressed as inferred. */
+export type Move = 'stay' | 'up' | 'inferred';
+
+/** What reconciling a key event's flags does to each modifier. One pressed by a key stays
+ * while its flag is set. The event's own modifier, if it is one, is left to its own press,
+ * except an inferred one it replaces. */
 export function reconcile(
 	e: KeyEvent,
 	held: Record<Mod, Held>,
 	infer: boolean
-): Partial<Record<Mod, 'up' | 'inferred'>> {
+): Record<Mod, Move> {
 	const flags: Record<Mod, boolean> = {
 		ctrl: e.ctrlKey,
 		meta: e.metaKey,
@@ -112,9 +126,14 @@ export function reconcile(
 	};
 	// AltGraph often reports Ctrl+Alt, but those flags are not a shortcut.
 	const shortcut = (e.ctrlKey || e.metaKey) && !e.altGraph;
-	const named = NAMED[e.key] !== undefined;
+	const named = NAMED.has(e.key);
 	const own = modOf(e.code, e.key);
-	const moves: Partial<Record<Mod, 'up' | 'inferred'>> = {};
+	const moves: Record<Mod, Move> = {
+		ctrl: 'stay',
+		meta: 'stay',
+		shift: 'stay',
+		alt: 'stay',
+	};
 	for (const m of MODS) {
 		const active = flags[m] && !(e.altGraph && (m === 'ctrl' || m === 'alt'));
 		if (!active) {
@@ -158,39 +177,52 @@ export class Keys {
 		return isCtrl ? ctrl : sup;
 	}
 
-	keysym(e: KeyEvent): number {
+	/** The keysym a key event presses; null for an event that presses none (a dead key, a
+	 * key with no keysym). */
+	keysym(e: KeyEvent): number | null {
 		const mod = this.modifierKeysym(e.code);
 		if (mod !== undefined) return mod;
-		if (BY_CODE[e.code] !== undefined) {
-			if (e.code === 'AltRight' && e.key === 'AltGraph') return 0xfe03;
-			return BY_CODE[e.code];
-		}
-		const k = e.key;
-		if (NAMED[k] !== undefined) return NAMED[k];
-		if (!k || k === 'Dead' || k === 'Unidentified' || k === 'Process') return 0;
-		if ([...k].length !== 1) return 0;
-		return charKeysym(k.codePointAt(0)!);
+		const coded = BY_CODE.get(e.code);
+		if (coded !== undefined)
+			return e.code === 'AltRight' && e.key === 'AltGraph' ? 0xfe03 : coded;
+		const named = NAMED.get(e.key);
+		if (named !== undefined) return named;
+		const points = codePoints(e.key);
+		return points.length === 1 ? charKeysym(points[0]) : null;
 	}
 
-	/** The keysym of a modifier an event's flags press: its left key. */
+	/** The keysym of a modifier an event's flags press: its left key, which for the
+	 * shortcut key is Control on a Mac (see `modifierKeysym`). */
 	private modKeysym(m: Mod): number {
-		return this.modifierKeysym(LEFT[m]) ?? BY_CODE[LEFT[m]];
+		switch (m) {
+			case 'ctrl':
+				return XK_CONTROL_L;
+			case 'meta':
+				return this.isMac ? XK_CONTROL_L : XK_SUPER_L;
+			case 'shift':
+				return XK_SHIFT_L;
+			case 'alt':
+				return XK_ALT_L;
+		}
 	}
 
 	private heldOf(): Record<Mod, Held> {
-		const held = { ctrl: 'up', meta: 'up', shift: 'up', alt: 'up' } as Record<
-			Mod,
-			Held
-		>;
+		const held: Record<Mod, Held> = {
+			ctrl: 'up',
+			meta: 'up',
+			shift: 'up',
+			alt: 'up',
+		};
 		for (const m of this.inferred.keys()) held[m] = 'inferred';
 		for (const { mod } of this.down.values()) if (mod) held[mod] = 'explicit';
 		return held;
 	}
 
 	private apply(e: KeyEvent, infer: boolean) {
-		for (const [m, to] of Object.entries(
-			reconcile(e, this.heldOf(), infer)
-		) as [Mod, 'up' | 'inferred'][]) {
+		const moves = reconcile(e, this.heldOf(), infer);
+		for (const m of MODS) {
+			const to = moves[m];
+			if (to === 'stay') continue;
 			for (const [code, k] of this.down)
 				if (to === 'up' && k.mod === m) this.release(code);
 			const ks = this.inferred.get(m);
@@ -232,8 +264,9 @@ export class Keys {
 	/** A keydown. `defer` may take over pressing the key (it will call `hold`) once its
 	 * modifiers are in place. Returns whether the page consumed the event. */
 	keyDown(e: KeyEvent, defer: (e: KeyEvent, ks: number) => boolean): boolean {
-		const ks = e.isComposing ? 0 : this.keysym(e);
-		if (!ks) {
+		// A composing event presses no key.
+		const ks = e.isComposing ? null : this.keysym(e);
+		if (ks === null) {
 			this.apply(e, false); // the flags still say which modifiers are up
 			return false;
 		}

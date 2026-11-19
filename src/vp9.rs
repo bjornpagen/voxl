@@ -4,6 +4,27 @@
 //! order, so a viewer has every picture a frame refers to. The rate follows the capture gate:
 //! the frame rate falls when the link does, never the quality.
 //!
+//! Why no rate control, and no frame held to a budget of bytes: it was built and measured
+//! (libvpx 1.15.0, speed 9, generated pages of text, 2026-11-18; the trial's code was not
+//! kept).
+//! - A frame held coarse and then refined is not the frame coded once. Refined down to the
+//!   target quantiser, the picture ended 4.4 to 6.4 dB of luma PSNR under the same screen
+//!   coded at the target at once (38.7 dB against 45.1 at worst, on 640x384). It reached the
+//!   direct picture only when refined at speed 5 down to quantiser 10, for twice the direct
+//!   frame's bytes over 30 to 68 frames (1280x800: 327 to 332 KB against 164 KB): readable
+//!   text came later than one sharp frame brings it.
+//! - A budget cannot be kept under the coarsest picture libvpx codes: a whole-screen frame
+//!   at quantiser 63 was 21 to 29 KB and a keyframe 39 KB on 1280x800 (by their pixels, 100
+//!   to 190 KB at 2912x1736), and a keyframe left to libvpx's rate control came out at up to
+//!   5.9 times its target.
+//! - libvpx's rate control alone does not hold a frame to its target: a whole-screen change
+//!   came out 3.7 to 11 times over, and its guard against that codes every change of scene
+//!   at the coarsest quantiser whatever the room (scrolled text at quantiser 42 on average
+//!   in a tenth of its budget).
+//!
+//! So what is in flight is bounded where it can be, at the capture gate (`session::link`),
+//! and every frame that goes is whole and sharp.
+//!
 //! The stream's shape fixes the rest: its VP9 level (the published table), and from the
 //! level and the width the tile columns and the threads.
 
@@ -19,6 +40,7 @@ mod ffi {
     include!(concat!(env!("OUT_DIR"), "/vpx.rs"));
 }
 
+use crate::wire::Coding;
 use std::ffi::c_int;
 
 /// One row of the VP9 level table, the columns a stream's shape and rate decide.
@@ -140,22 +162,12 @@ impl Stream {
     ///   it has rows; the threads are what all tiles code at once, at most the cores and
     ///   `MAX_THREADS`.
     pub fn new(shape: Shape, cores: std::num::NonZeroUsize) -> Result<Stream, Unleveled> {
-        let breadth = shape.width.max(shape.height);
-        let picture = u64::from(shape.width) * u64::from(shape.height);
-        let level = *LEVELS
-            .iter()
-            .find(|r| {
-                picture * u64::from(shape.fps) <= r.sample_rate
-                    && picture <= r.picture
-                    && breadth <= r.breadth
-            })
-            .ok_or(Unleveled(shape))?;
+        let level = Row::of(shape)?;
         let sb_cols = shape.width.div_ceil(64);
         let sb_rows = shape.height.div_ceil(64);
-        let by_width = (0..)
-            .take_while(|&k| k == 0 || sb_cols >> k >= MIN_TILE_WIDTH_B64)
-            .last()
-            .unwrap_or(0);
+        // The most halvings that leave a tile its least width: a picture narrower than that
+        // is one tile.
+        let by_width = (sb_cols / MIN_TILE_WIDTH_B64).max(1).ilog2();
         let log2_tiles = by_width.min(level.tiles.ilog2());
         // A tile's superblock columns, as VP9 splits them (§6.4.3 `get_tile_offset`).
         let at = |i: u32| (i * sb_cols) >> log2_tiles;
@@ -185,11 +197,30 @@ impl Stream {
     pub fn codec(&self) -> String {
         format!("vp09.00.{:02}.08", self.level.level)
     }
+}
 
-    /// The level, times ten, as `vpcC` and the codec string carry it.
-    pub fn level(&self) -> u8 {
-        self.level.level
+impl Row {
+    /// The least level that holds a stream of `shape`: the table's first row whose sample
+    /// rate, picture size and breadth it is within.
+    fn of(shape: Shape) -> Result<Row, Unleveled> {
+        let breadth = shape.width.max(shape.height);
+        let picture = u64::from(shape.width) * u64::from(shape.height);
+        LEVELS
+            .iter()
+            .find(|r| {
+                picture * u64::from(shape.fps) <= r.sample_rate
+                    && picture <= r.picture
+                    && breadth <= r.breadth
+            })
+            .copied()
+            .ok_or(Unleveled(shape))
     }
+}
+
+/// The level, times ten, of a stream of `shape`, as `vpcC` and the codec string carry it:
+/// the level `Stream::new` codes a stream of that shape at.
+pub fn level(shape: Shape) -> Result<u8, Unleveled> {
+    Row::of(shape).map(|row| row.level)
 }
 
 /// A keyframe's picture size, as its uncompressed header says it (the VP9 bitstream
@@ -238,15 +269,6 @@ pub fn keyframe_size(frame: &[u8]) -> Option<(u32, u32)> {
     Some((bits(16)? + 1, bits(16)? + 1))
 }
 
-/// What a frame is coded as.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Coding {
-    /// From nothing: a viewer starts on it.
-    Key,
-    /// From the frames before it, as libvpx predicts.
-    Delta,
-}
-
 /// A libvpx VP9 encoder.
 pub struct Encoder {
     ctx: ffi::vpx_codec_ctx_t,
@@ -276,21 +298,18 @@ pub struct Planes<'a> {
 /// @evidence scratchpad run output vp9h/examples/sharp.rs (uncommitted), page1280.y: voxl's
 /// own source rendered by ffmpeg drawtext in Menlo at 26 px on 1280x5760
 /// @observed 2026-11-18, the measuring machine's local day
-/// @environment libvpx 1.15.0 (MacPorts), speed 9, screen tune, CBR, error resilient, SVC
-/// bypass as `Encoder::new` then configured it (before the plain encoder); an M2 Max laptop
-/// @workload 1280x800 of text scrolled 8 px a frame for 30 frames at 2 and 8 Mbit/s (2 is the
-/// live link's data share, 257 KB/s), then the still picture coded again; references the
-/// previous frame (a stream lane) and 22 frames old (a datagram lane's report round trip,
-/// 370 ms at 60 a second); one run per floor of 12, 20, 28
-/// @result references the previous frame: the last scroll frame 50.9, 47.0, 43.4 dB luma PSNR
-/// at floors 12, 20, 28, at 1.9 KB a frame; a pass adds nothing. References 22 frames old:
-/// the last scroll frame 30.3 dB (2 Mbit/s) and 37.8 dB (8 Mbit/s); frames at the rate after
-/// it stay there or fall (28.0 dB after four); one pass held to 12, 20, 28: 50.4, 46.4,
-/// 42.7 dB at 79, 67, 57 KB. No viewer judgement recorded
+/// @environment libvpx 1.15.0 (MacPorts), speed 9, screen tune, on an M2 Max laptop; the
+/// encoder of that day, which held a bit rate (CBR) with this quantiser as its floor, was
+/// error resilient and ran libvpx's SVC in bypass: not the plain encoder `Encoder::new`
+/// configures now, which codes every frame at this quantiser
+/// @workload 1280x800 of text scrolled 8 px a frame for 30 frames at 2 and 8 Mbit/s, each
+/// frame predicted from the one before it; one run per floor of 12, 20, 28
+/// @result the last scroll frame 50.9, 47.0, 43.4 dB luma PSNR at floors 12, 20, 28, at
+/// 1.9 KB a frame. No viewer judgement recorded
 /// @decision 20, the coarsest of the three that brings the page past 45 dB, taken
 /// provisionally as the line of legible text
 /// @revalidate a viewer's judgement of text at 12, 20 and 28; a libvpx or speed change; the
-/// move to the plain encoder (no SVC, no error resilience), which this was not measured on
+/// same scroll on the plain encoder at a fixed quantiser, which this was not measured on
 const TARGET_Q: u32 = 20;
 
 /// libvpx's realtime speed, 0 to 9 (vp8cx.h `VP8E_SET_CPUUSED`): 9, the fastest, for the
@@ -333,7 +352,15 @@ impl Encoder {
             cfg.g_h = shape.height;
             cfg.g_timebase = ffi::vpx_rational { num: 1, den: 1000 };
             cfg.g_threads = stream.threads;
+            // Every picture given comes out as one frame that shows one picture, at once:
+            // a viewer's page holds one update at a time and says it took it when its
+            // decoder puts out that update's picture, so an update that showed none would
+            // stall its session for good. With no lag libvpx has no later picture to code an
+            // alternate reference from, the only frame it hides; and it drops no frame (its
+            // dropper is for a rate target, and off). `encode` holds it to this: a picture
+            // that made no frame is its error.
             cfg.g_lag_in_frames = 0;
+            cfg.rc_dropframe_thresh = 0;
             cfg.rc_min_quantizer = TARGET_Q;
             cfg.rc_max_quantizer = TARGET_Q;
             // A keyframe only when a viewer starts (`Coding::Key`).
@@ -385,20 +412,24 @@ impl Encoder {
         })
     }
 
-    /// Codes `p` at `ms` as `coding`, appending the frame to `out`. A picture libvpx put out
-    /// nothing for is the error.
+    /// Codes `p` at `ms`, appending the frame to `out`: a keyframe if `coding` asks for one,
+    /// else as libvpx chooses. What libvpx coded it as, by the frame's own flags: it makes
+    /// keyframes nobody asked for (seen on a scrolled page, `kf_mode` disabled as it is),
+    /// and a frame's header says what the frame is, not what was asked. A picture libvpx
+    /// put out nothing for, and a keyframe asked for that it did not make, are errors.
     pub fn encode(
         &mut self,
         p: &Planes,
         ms: i64,
         coding: Coding,
         out: &mut Vec<u8>,
-    ) -> Result<(), Failed> {
+    ) -> Result<Coding, Failed> {
         let flags = match coding {
             Coding::Key => ffi::VPX_EFLAG_FORCE_KF as i64,
             Coding::Delta => 0,
         };
-        let before = out.len();
+        // What libvpx says the first frame it put out is: the one a decoder starts on.
+        let mut coded = None;
         // SAFETY: the image points at `p`'s planes, read during the call; each packet is
         // copied before the next call.
         unsafe {
@@ -439,16 +470,24 @@ impl Encoder {
                 if (*pkt).kind == ffi::vpx_codec_cx_pkt_kind_VPX_CODEC_CX_FRAME_PKT {
                     let f = (*pkt).data.frame;
                     out.extend_from_slice(std::slice::from_raw_parts(f.buf as *const u8, f.sz));
+                    let is = match f.flags & ffi::VPX_FRAME_IS_KEY == ffi::VPX_FRAME_IS_KEY {
+                        true => Coding::Key,
+                        false => Coding::Delta,
+                    };
+                    coded = coded.or(Some(is));
                 }
             }
         }
-        if out.len() == before {
-            return Err(Failed {
-                what: "a frame for the picture",
-                error: ffi::vpx_codec_err_t_VPX_CODEC_ERROR,
-            });
+        let failed = |what| Failed {
+            what,
+            error: ffi::vpx_codec_err_t_VPX_CODEC_ERROR,
+        };
+        match (coding, coded) {
+            (Coding::Key | Coding::Delta, None) => Err(failed("a frame for the picture")),
+            (Coding::Key, Some(Coding::Delta)) => Err(failed("the keyframe asked for")),
+            (Coding::Key, Some(Coding::Key)) => Ok(Coding::Key),
+            (Coding::Delta, Some(coded @ (Coding::Key | Coding::Delta))) => Ok(coded),
         }
-        Ok(())
     }
 
     /// The quantiser the last frame was coded at (`VP8E_GET_LAST_QUANTIZER_64`).
@@ -560,7 +599,7 @@ pub(crate) mod tests {
                         screen.copy_from_slice(&text[top * w..(top + h) * w]);
                     }
                     // Typing: a mark changes.
-                    _ => {
+                    1.. => {
                         let at = rng.below((w * h) as u64) as usize;
                         screen[at] = screen[at].wrapping_add(128);
                     }
@@ -578,7 +617,7 @@ pub(crate) mod tests {
         f: u64,
         coding: Coding,
         out: &mut Vec<u8>,
-    ) {
+    ) -> Coding {
         let (u, v) = (vec![128u8; w * h / 4], vec![128u8; w * h / 4]);
         let p = Planes {
             y,
@@ -588,12 +627,14 @@ pub(crate) mod tests {
             stride_uv: w / 2,
         };
         let ms = (f * 1000 / u64::from(enc.shape.fps)) as i64;
-        enc.encode(&p, ms, coding, out).unwrap();
+        // libvpx makes a keyframe exactly when one is asked for.
+        let coded = enc.encode(&p, ms, coding, out).unwrap();
         assert_eq!(
             enc.last_quantiser().unwrap(),
             TARGET_Q,
             "a frame off the quantiser"
         );
+        coded
     }
 
     /// The codec gate. A viewer decodes the stream from the keyframe it starts on: over
@@ -616,7 +657,7 @@ pub(crate) mod tests {
         };
         let stream = Stream::new(shape, std::num::NonZeroUsize::MIN.saturating_add(1)).unwrap();
         let frame = w * h * 3 / 2;
-        let mut later_keys = 0;
+        let (mut later_keys, mut unasked) = (0, 0);
         for case in 0..6 {
             let mut enc = Encoder::new(&stream).unwrap();
             let mut frames: Vec<(bool, Vec<u8>)> = Vec::new();
@@ -628,7 +669,8 @@ pub(crate) mod tests {
                     false => Coding::Delta,
                 };
                 let mut out = Vec::new();
-                code(&mut enc, (w, h), y, f as u64, coding, &mut out);
+                let coded = code(&mut enc, (w, h), y, f as u64, coding, &mut out);
+                unasked += usize::from((coding, coded) == (Coding::Delta, Coding::Key));
                 frames.push((key, out));
             }
             let decode_from = |from: usize| {
@@ -651,7 +693,82 @@ pub(crate) mod tests {
             }
         }
         std::fs::remove_dir_all(&dir).unwrap();
+        println!(
+            "{unasked} keyframes libvpx made unasked, of {} frames",
+            6 * 120
+        );
         assert!(later_keys > 5, "{later_keys} keyframes after the first");
+    }
+
+    /// What a frame's first bits say of how it is shown (the VP9 bitstream specification
+    /// §6.2, `uncompressed_header`): whether it is a frame of its own that shows its
+    /// picture. A frame that shows an existing one instead, or is coded hidden, shows none
+    /// of its own; a superframe (§B.1: its last byte is a marker, `0b110` in its top bits)
+    /// packs a hidden frame with a shown one.
+    fn shows_its_picture(frame: &[u8]) -> bool {
+        let bit = |i: usize| frame[i / 8] >> (7 - i % 8) & 1;
+        // frame_marker (2 bits), the profile's low and high bits, then, in profile 0:
+        // show_existing_frame, frame_type, show_frame.
+        let (marker, profile) = (bit(0) << 1 | bit(1), bit(2) | bit(3) << 1);
+        let (show_existing, show) = (bit(4), bit(6));
+        let superframe = frame.last().is_some_and(|last| last & 0xe0 == 0xc0);
+        marker == 2 && profile == 0 && show_existing == 0 && show == 1 && !superframe
+    }
+
+    /// Every update is one picture. Over generated runs of typing and scrolling, with
+    /// keyframes forced now and then, every frame the encoder puts out for a picture is one
+    /// VP9 frame that shows its own picture (by its header: not hidden, not a superframe,
+    /// not a repeat of another), and ffmpeg, every error fatal, decodes each run to exactly
+    /// as many pictures as it had updates, keyframes included, and each run up to any
+    /// update to exactly that many. An encoder that held frames back, hid one or dropped
+    /// one fails this: a viewer's page takes one update at a time and waits for its
+    /// picture.
+    #[test]
+    fn every_update_is_one_picture() {
+        let (w, h) = (320usize, 192usize);
+        let dir = std::env::temp_dir().join(format!("voxl-vp9-picture-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut rng = Xorshift::new(0x9216_d5d9_8979_fb1b);
+        let shape = Shape {
+            width: w as u32,
+            height: h as u32,
+            fps: 60,
+        };
+        let stream = Stream::new(shape, std::num::NonZeroUsize::MIN.saturating_add(1)).unwrap();
+        let picture = w * h * 3 / 2;
+        let mut keys = 0;
+        for case in 0..8 {
+            let mut enc = Encoder::new(&stream).unwrap();
+            let mut ivf = ivf_header(w, h);
+            let n = rng.range(20, 90) as usize;
+            // Runs up to these updates are decoded too: a few, anywhere.
+            let cuts: Vec<usize> = (0..3).map(|_| rng.range(1, n as u64) as usize).collect();
+            for (f, y) in screens(w, h, n, &mut rng).iter().enumerate() {
+                let key = f == 0 || rng.below(15) == 0;
+                keys += usize::from(key);
+                let coding = match key {
+                    true => Coding::Key,
+                    false => Coding::Delta,
+                };
+                let mut out = Vec::new();
+                code(&mut enc, (w, h), y, f as u64, coding, &mut out);
+                assert!(shows_its_picture(&out), "case {case}, update {f}");
+                assert_eq!(
+                    keyframe_size(&out).is_some(),
+                    key,
+                    "case {case}, update {f}"
+                );
+                ivf_frame(&mut ivf, f as u64, &out);
+                if cuts.contains(&(f + 1)) || f + 1 == n {
+                    let file = dir.join(format!("run{case}-{f}.ivf"));
+                    std::fs::write(&file, &ivf).unwrap();
+                    let pictures = decode(&file).unwrap_or_else(|e| panic!("case {case}: {e}"));
+                    assert_eq!(pictures.len(), (f + 1) * picture, "case {case}, to {f}");
+                }
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(keys > 20, "{keys} keyframes");
     }
 
     /// Every keyframe says its size, and no other frame says one: over generated shapes,
@@ -719,13 +836,14 @@ pub(crate) mod tests {
             for f in 0..24u64 {
                 let coding = match f {
                     0 => Coding::Key,
-                    _ => Coding::Delta,
+                    1.. => Coding::Delta,
                 };
                 code(&mut enc, (w, h), &y, f, coding, &mut Vec::new());
             }
             let measured = enc.measured_level().unwrap();
-            assert_eq!(measured, c_int::from(stream.level()), "{shape:?}");
-            levels.insert(stream.level());
+            let level = level(shape).unwrap();
+            assert_eq!(measured, c_int::from(level), "{shape:?}");
+            levels.insert(level);
         }
         assert!(levels.len() >= 4, "levels reached: {levels:?}");
     }

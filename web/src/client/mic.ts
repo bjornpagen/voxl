@@ -1,7 +1,7 @@
 // Microphone: capture -> Opus (WebCodecs) -> server, which feeds the VM's microphone.
 import { Bin, cmd, frameMicros, MICROPHONE } from '../protocol';
 import type { App } from './app';
-import { el } from './app';
+import { button } from './app';
 
 const RATE = MICROPHONE.sampleRate;
 /** A chunk's length, as the capture worklet cuts them: one of the daemon's frames. */
@@ -10,13 +10,13 @@ const CHUNK_MICROS = frameMicros(MICROPHONE.frameSamples, RATE);
 /** The microphone's Opus: one channel at the daemon's rate, in its frames, tuned for
  * speech, at 32 kbit/s: inside the 28-40 kbit/s RFC 7587 §3.1.1 recommends for fullband
  * speech. Published. */
-const OPUS = {
+const OPUS: AudioEncoderConfig = {
 	codec: 'opus',
 	sampleRate: RATE,
 	numberOfChannels: 1,
 	bitrate: 32_000,
 	opus: { frameDuration: CHUNK_MICROS, application: 'voip' },
-} as AudioEncoderConfig;
+};
 
 /** The microphone: off, or captured from `stream` through `ctx`. */
 type Mic =
@@ -24,7 +24,7 @@ type Mic =
 	| { s: 'on'; stream: MediaStream; ctx: AudioContext; enc: AudioEncoder };
 
 export function createMic(app: App) {
-	const btn = el<HTMLButtonElement>('mic-btn');
+	const btn = button('mic-btn');
 	let mic: Mic = { s: 'off' };
 	let ts = 0;
 

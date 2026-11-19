@@ -4,7 +4,6 @@
 //! starts the one input thread here, which injects these); the microphone's messages; and
 //! the type bytes of the binary messages between the page and the daemon.
 
-#[cfg(target_os = "linux")]
 use std::sync::mpsc;
 
 /// A clipboard's contents, as a viewer and the desktop exchange them.
@@ -14,37 +13,75 @@ pub enum ClipContent {
     Image(Vec<u8>),
 }
 
-/// The first byte of a binary message between the page and the daemon: what it is.
-/// `bin` in web/src/wire.json, the page's copy, which a test checks against these.
+/// The first byte of a binary message the daemon sends the page: what it is. `bin` in
+/// web/src/wire.json, the page's copy, which a test checks against these.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(u8)]
 pub enum Bin {
-    /// Down: the cursor's image.
+    /// The cursor's image.
     Cursor = 0x03,
-    /// Down: the desktop's clipboard image (PNG).
+    /// The desktop's clipboard image (PNG).
     ClipImage = 0x04,
-    /// Up: a clipboard image pasted on the page (PNG).
-    ClipImageUp = 0x11,
-    /// Up: a microphone Opus packet.
-    MicOpus = 0x12,
 }
 
-impl Bin {
-    /// The kind a page's binary message is, by its first byte, if it is one the page sends.
-    pub fn up(tag: u8) -> Option<Bin> {
-        [Bin::ClipImageUp, Bin::MicOpus]
-            .into_iter()
-            .find(|b| *b as u8 == tag)
+/// The first byte of a binary message the page sends the daemon: what it is, read by
+/// looking it up (`wire::Byte`). `bin` in web/src/wire.json, as for [`Bin`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BinUp {
+    /// A clipboard image pasted on the page (PNG).
+    ClipImage,
+    /// A microphone Opus packet.
+    MicOpus,
+}
+
+impl crate::wire::Byte for BinUp {
+    const ALL: &'static [BinUp] = &[BinUp::ClipImage, BinUp::MicOpus];
+
+    fn byte(self) -> u8 {
+        match self {
+            BinUp::ClipImage => 0x11,
+            BinUp::MicOpus => 0x12,
+        }
     }
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // read by the Linux-only threads
 /// What the microphone's thread is sent: a session takes the microphone, sends it audio,
 /// and lets it go.
 pub enum MicMsg {
     Start(u64),
     Opus(u64, bytes::Bytes),
     Stop(u64),
+}
+
+/// A closed vocabulary of a command's field: its members, and the word a command says each
+/// by. A field is read by looking it up here, so a word that is no member's is no field.
+pub(crate) trait Word: Copy + 'static {
+    const ALL: &'static [Self];
+
+    fn word(self) -> &'static str;
+
+    /// The member `field` says, if it says one.
+    fn of(field: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|w| w.word() == field)
+    }
+}
+
+/// On or off, as a command says it: `1` or `0`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Switch {
+    On,
+    Off,
+}
+
+impl Word for Switch {
+    const ALL: &'static [Switch] = &[Switch::On, Switch::Off];
+
+    fn word(self) -> &'static str {
+        match self {
+            Switch::On => "1",
+            Switch::Off => "0",
+        }
+    }
 }
 
 /// A button the viewer's pointer has, which a command names by X's number for it.
@@ -79,8 +116,8 @@ impl Button {
         }
     }
 
-    pub(crate) fn parse(field: &str) -> Option<Button> {
-        let number: u8 = field.trim().parse().ok()?;
+    /// The button X numbers `number`, if the pointer has it.
+    pub(crate) fn numbered(number: u8) -> Option<Button> {
         Button::ALL.into_iter().find(|b| b.number() == number)
     }
 }
@@ -93,13 +130,14 @@ pub enum Press {
     Up,
 }
 
-impl Press {
-    /// From a command's field: `1` down, `0` up.
-    pub(crate) fn parse(field: &str) -> Option<Press> {
-        match field {
-            "1" => Some(Press::Down),
-            "0" => Some(Press::Up),
-            _ => None,
+/// As a command's field says it: `1` down, `0` up.
+impl Word for Press {
+    const ALL: &'static [Press] = &[Press::Down, Press::Up];
+
+    fn word(self) -> &'static str {
+        match self {
+            Press::Down => "1",
+            Press::Up => "0",
         }
     }
 }
@@ -131,8 +169,8 @@ pub(crate) const MAX_SCROLL_PX: f64 = 1_048_576.0;
 pub struct Pixels(f64);
 
 impl Pixels {
-    pub(crate) fn parse(field: &str) -> Option<Pixels> {
-        let px: f64 = field.trim().parse().ok()?;
+    /// `px` pixels, if that is finite and within the bound.
+    pub(crate) fn of(px: f64) -> Option<Pixels> {
         (px.abs() <= MAX_SCROLL_PX).then_some(Pixels(px))
     }
 
@@ -150,7 +188,19 @@ pub enum KeyAct {
     Up,
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // read by the Linux-only threads
+/// As a command's field says it: `1` down, `2` repeat, `0` up.
+impl Word for KeyAct {
+    const ALL: &'static [KeyAct] = &[KeyAct::Down, KeyAct::Repeat, KeyAct::Up];
+
+    fn word(self) -> &'static str {
+        match self {
+            KeyAct::Down => "1",
+            KeyAct::Repeat => "2",
+            KeyAct::Up => "0",
+        }
+    }
+}
+
 pub enum InputEvent {
     /// A desktop pixel, in X's own 16-bit coordinates; macOS's CGFloat holds
     /// every one.
@@ -174,38 +224,49 @@ pub enum InputEvent {
     /// Remote clipboard update, ordered with the key events around it.
     Clipboard(ClipContent),
     ReleaseAll,
-    /// Release everything before exit, and put back the keymap and key repeat voxl
-    /// changed; then say so on the channel, which the daemon's stop waits on.
-    Shutdown(tokio::sync::oneshot::Sender<()>),
 }
 
-#[cfg(target_os = "linux")]
 /// A platform's injector, as the input thread drives it.
 pub trait Inject {
     /// Puts one event on the desktop.
     fn inject(&mut self, ev: InputEvent);
     /// Ends a batch: everything injected since the last one reaches the desktop.
     fn flush(&mut self);
+    /// The input has ended: let go of everything held down, and put back what voxl
+    /// changed on the desktop.
+    fn finish(&mut self);
 }
 
-/// Starts the input thread and returns its sender. `start` runs first on that thread and
-/// makes the injector; the thread then injects every event it is sent until every
-/// sender is gone. A thread that cannot be started is the error.
-#[cfg(target_os = "linux")]
-pub fn spawn<I: Inject>(
-    start: impl FnOnce() -> I + Send + 'static,
-) -> Result<mpsc::Sender<InputEvent>, String> {
-    let (tx, rx) = mpsc::channel::<InputEvent>();
+/// The input thread, as the daemon holds it: the one sender of its events, and the word
+/// that it has finished. Dropping the sender ends the input; the thread then finishes
+/// (`Inject::finish`) and says so.
+pub struct Input {
+    pub events: mpsc::Sender<InputEvent>,
+    pub finished: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// Starts the input thread. `start` runs first on that thread and makes the injector; the
+/// thread then injects every event it is sent until every sender is gone, and finishes. A
+/// thread that cannot be started is the error.
+pub fn spawn<I: Inject>(start: impl FnOnce() -> I + Send + 'static) -> Result<Input, String> {
+    let (events, rx) = mpsc::channel::<InputEvent>();
+    let (done, finished) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
         .name("input".into())
-        .spawn(move || run(&rx, &mut start()))
+        .spawn(move || {
+            run(&rx, &mut start());
+            // The daemon's stop waits on this; gone, it waits for nothing.
+            if done.send(()).is_err() {
+                log::info!("the daemon stopped before the input was let go");
+            }
+        })
         .map_err(|e| format!("no input thread: {e}"))?;
-    Ok(tx)
+    Ok(Input { events, finished })
 }
 
 /// The input thread, a batch at a time. A batch begins with the next event to arrive and
-/// takes every one waiting behind it, until none is; then it is flushed.
-#[cfg(target_os = "linux")]
+/// takes every one waiting behind it, until none is; then it is flushed. Once every sender
+/// is gone, the injector finishes.
 fn run(rx: &mpsc::Receiver<InputEvent>, inj: &mut impl Inject) {
     while let Ok(first) = rx.recv() {
         for ev in coalesce(std::iter::once(first).chain(rx.try_iter())) {
@@ -213,6 +274,7 @@ fn run(rx: &mpsc::Receiver<InputEvent>, inj: &mut impl Inject) {
         }
         inj.flush();
     }
+    inj.finish();
 }
 
 /// `events` without each move that another move follows at once: the pointer goes where
@@ -229,8 +291,7 @@ fn coalesce(events: impl Iterator<Item = InputEvent>) -> impl Iterator<Item = In
             | InputEvent::ScrollPx { .. }
             | InputEvent::Key { .. }
             | InputEvent::Clipboard(_)
-            | InputEvent::ReleaseAll
-            | InputEvent::Shutdown(_) => return Some(ev),
+            | InputEvent::ReleaseAll => return Some(ev),
         }
     })
 }
@@ -244,20 +305,19 @@ mod tests {
     /// server.rs's parser).
     fn event(r: u64) -> InputEvent {
         let (x, y) = ((r >> 8) as i16, (r >> 24) as i16);
-        match r % 12 {
+        match r % 11 {
             0..=5 => InputEvent::Move { x, y },
             6 => InputEvent::Button {
                 button: Button::ALL[(r >> 40) as usize % Button::ALL.len()],
-                press: [Press::Up, Press::Down][(r >> 50) as usize % 2],
+                press: Press::ALL[(r >> 50) as usize % 2],
             },
             7 => InputEvent::Key {
                 keysym: (r >> 32) as u32 % 0x10000,
-                act: [KeyAct::Down, KeyAct::Repeat, KeyAct::Up][(r >> 48) as usize % 3],
+                act: KeyAct::ALL[(r >> 48) as usize % 3],
             },
             8 => InputEvent::Clipboard(ClipContent::Text(format!("{x}"))),
             9 => InputEvent::Clipboard(ClipContent::Image(vec![y as u8])),
-            10 => InputEvent::ReleaseAll,
-            _ => InputEvent::Shutdown(tokio::sync::oneshot::channel().0),
+            10.. => InputEvent::ReleaseAll,
         }
     }
 
@@ -273,7 +333,6 @@ mod tests {
                 format!("image {png:?}")
             }
             InputEvent::ReleaseAll => "release all".into(),
-            InputEvent::Shutdown(_) => "shutdown".into(),
         }
     }
 
@@ -308,22 +367,91 @@ mod tests {
         assert!(dropped >= 5_000, "{dropped} moves replaced");
     }
 
-    /// The type bytes are the page's: `bin` in web/src/wire.json names each the same.
+    /// What an injector was given, in order, as a test reads it.
+    struct Recorder(std::sync::Arc<parking_lot::Mutex<Vec<String>>>);
+
+    impl Inject for Recorder {
+        fn inject(&mut self, ev: InputEvent) {
+            self.0.lock().push(said(&ev));
+        }
+        fn flush(&mut self) {
+            self.0.lock().push("flush".into());
+        }
+        fn finish(&mut self) {
+            self.0.lock().push("finish".into());
+        }
+    }
+
+    /// The input thread injects what it is sent and finishes once its sender is gone, and
+    /// says so then. Over 300 generated streams of up to 60 events, sent from another thread
+    /// in bursts, and then the sender dropped: once the thread says it finished, the injector
+    /// was given every event but a move, in the order sent; the last move sent, if any; a
+    /// flush after the last event; and then `finish`, once, last.
+    #[test]
+    fn the_input_finishes_once_its_sender_is_gone() {
+        let mut rng = crate::xorshift::Xorshift::new(0x428a_2f98_d728_ae22);
+        for _ in 0..300 {
+            let given = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let recorder = Recorder(given.clone());
+            let Input { events, finished } = spawn(move || recorder).expect("a thread");
+            let rs: Vec<u64> = (0..rng.below(60)).map(|_| rng.next()).collect();
+            let sent: Vec<String> = rs.iter().map(|&r| said(&event(r))).collect();
+            for (i, &r) in rs.iter().enumerate() {
+                events.send(event(r)).expect("the thread runs");
+                if i % 7 == 0 {
+                    std::thread::yield_now();
+                }
+            }
+            drop(events);
+            finished
+                .blocking_recv()
+                .expect("the thread says it finished");
+            let given = given.lock().clone();
+            let is_move = |s: &String| s.starts_with("move");
+            let injected: Vec<&String> = given.iter().filter(|s| *s != "flush").collect();
+            let (last, before) = injected.split_last().expect("it finished");
+            assert_eq!(*last, "finish");
+            let others = |l: &[&String]| -> Vec<String> {
+                l.iter()
+                    .filter(|s| !is_move(s))
+                    .map(|s| s.to_string())
+                    .collect()
+            };
+            let sent_others: Vec<String> = sent.iter().filter(|s| !is_move(s)).cloned().collect();
+            assert_eq!(others(before), sent_others);
+            assert!(before.iter().all(|s| sent.contains(s)), "{given:?}");
+            assert_eq!(
+                before.iter().rev().find(|s| is_move(s)).map(|s| s.as_str()),
+                sent.iter().rev().find(|s| is_move(s)).map(String::as_str),
+                "{given:?}"
+            );
+            let flushed = given.len() < 2 || given[given.len() - 2] == "flush";
+            assert!(sent.is_empty() || flushed, "{given:?}");
+            assert_eq!(given.iter().filter(|s| *s == "finish").count(), 1);
+        }
+    }
+
+    /// The type bytes are the page's: `bin` in web/src/wire.json names each the same; and
+    /// a byte reads as a kind the page sends exactly when it is one's.
     #[test]
     fn the_type_bytes_are_the_pages() {
+        use crate::wire::Byte;
         let wire: serde_json::Value =
             serde_json::from_str(include_str!("../web/src/wire.json")).unwrap();
-        for (name, bin) in [
-            ("cursor", Bin::Cursor),
-            ("clipImage", Bin::ClipImage),
-            ("clipImageUp", Bin::ClipImageUp),
-            ("micOpus", Bin::MicOpus),
-        ] {
+        for (name, bin) in [("cursor", Bin::Cursor), ("clipImage", Bin::ClipImage)] {
             assert_eq!(wire["bin"][name], bin as u8, "{name}");
         }
+        for (name, bin) in [
+            ("clipImageUp", BinUp::ClipImage),
+            ("micOpus", BinUp::MicOpus),
+        ] {
+            assert_eq!(wire["bin"][name], bin.byte(), "{name}");
+        }
         for tag in 0..=u8::MAX {
-            let up = [Bin::ClipImageUp, Bin::MicOpus].map(|b| b as u8);
-            assert_eq!(Bin::up(tag).is_some(), up.contains(&tag), "{tag}");
+            let read = BinUp::of(tag);
+            let theirs = ["clipImageUp", "micOpus"].map(|name| wire["bin"][name] == tag);
+            assert_eq!(read.is_some(), theirs.contains(&true), "{tag}");
+            assert_eq!(read.map(BinUp::byte), read.map(|_| tag), "{tag}");
         }
     }
 }

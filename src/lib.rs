@@ -156,8 +156,8 @@ fn parse_args(
 struct Flags {
     /// The runtime folder, as given: judged when the daemon starts.
     runtime: std::path::PathBuf,
-    /// Desktop pixels per CSS pixel of the viewer's window: finite, over 0.
-    resize_scale: f64,
+    /// Desktop pixels per CSS pixel of the viewer's window.
+    resize: hub::Resize,
     audio: session::control::Audio,
 }
 
@@ -174,16 +174,18 @@ impl Flags {
         };
         Ok(Flags {
             runtime: folder(value(&RUNTIME))?,
-            resize_scale: {
+            resize: {
                 let (flag, v) = value(&RESIZE_SCALE);
-                v.parse::<f64>()
-                    .ok()
-                    .filter(|s| s.is_finite() && *s > 0.0)
-                    .ok_or_else(|| FlagError::Malformed {
-                        flag,
-                        value: v.into(),
-                        takes: "a number of pixels over 0",
-                    })?
+                match v.parse::<f64>() {
+                    Ok(scale) if scale.is_finite() && scale > 0.0 => hub::Resize { scale },
+                    Ok(_) | Err(_) => {
+                        return Err(FlagError::Malformed {
+                            flag,
+                            value: v.into(),
+                            takes: "a number of pixels over 0",
+                        })
+                    }
+                }
             },
             audio: {
                 use session::control::Audio;
@@ -378,8 +380,8 @@ async fn serve(flags: Flags, runtime: session::Runtime, env: env::Desktop) {
         log::error!("the hub's waker: {e}");
         logging::exit(1)
     });
-    // The desktop follows the viewer's window where the X server can change its size;
-    // where it cannot, the desktop keeps its size, and the viewer is told so.
+    // The desktop follows the viewer's window: an X server that cannot change its size is
+    // no desktop voxl serves.
     let screen = match screen::Screen::open(&display) {
         Ok(s) => {
             log::info!("dynamic resolution on, up to {}x{}", s.max().0, s.max().1);
@@ -398,16 +400,12 @@ async fn serve(flags: Flags, runtime: session::Runtime, env: env::Desktop) {
                     logging::exit(1)
                 }
             }
-            Some(s)
+            s
         }
         Err(e) => {
-            log::warn!("dynamic resolution unavailable, the desktop keeps its size: {e}");
-            None
+            log::error!("dynamic resolution: {e}");
+            logging::exit(1)
         }
-    };
-    let resize = match screen {
-        Some(_) => session::control::Resizing::Follows,
-        None => session::control::Resizing::Fixed,
     };
     // The cores this process may run on; one if the kernel will not say.
     let cores = std::thread::available_parallelism().unwrap_or_else(|e| {
@@ -423,13 +421,16 @@ async fn serve(flags: Flags, runtime: session::Runtime, env: env::Desktop) {
         log::error!("cursor and clipboard: {e}");
         logging::exit(1)
     });
-    match input::spawn(&display, clipboard, runtime.keymap()) {
-        Ok(tx) => *hub.input.lock() = Some(tx),
+    let finished = match input::spawn(&display, clipboard, runtime.keymap()) {
+        Ok(event::Input { events, finished }) => {
+            *hub.input.lock() = Some(events);
+            finished
+        }
         Err(e) => {
             log::error!("input: {e}");
             logging::exit(1)
         }
-    }
+    };
     let audio = flags.audio;
     if audio == session::control::Audio::Sent {
         audio::spawn(hub.clone());
@@ -452,23 +453,18 @@ async fn serve(flags: Flags, runtime: session::Runtime, env: env::Desktop) {
     };
     log::info!("file transfer under {}", files.root);
     let mic = mic::spawn(hub.clone(), runtime.mic());
-    hub.settings.lock().start(
-        hub::Startup {
-            audio: audio == session::control::Audio::Sent,
-            files,
-        },
-        (resize == session::control::Resizing::Follows).then_some(hub::Resize {
-            scale: flags.resize_scale,
-        }),
-    );
+    hub.settings.lock().start(hub::Startup {
+        audio,
+        files,
+        resize: flags.resize,
+    });
     let daemon = std::sync::Arc::new(session::control::Daemon {
         hub: hub.clone(),
         audio,
         mic,
-        resize,
         max_record: MAX_RECORD,
     });
-    tokio::spawn(stop_on_signal(hub.clone()));
+    tokio::spawn(stop_on_signal(hub.clone(), finished));
     if let Err(e) = session::serve(&runtime.sockets(), daemon).await {
         log::error!("{e}");
         logging::exit(1);
@@ -476,9 +472,13 @@ async fn serve(flags: Flags, runtime: session::Runtime, env: env::Desktop) {
 }
 
 /// Ends the daemon on SIGTERM or SIGINT, once the input thread has let go of every key
-/// and button it holds down (`InputEvent::Shutdown`, answered when done).
+/// and button it holds down: its input ends with the hub's sender, and it says when it
+/// has finished.
 #[cfg(target_os = "linux")]
-async fn stop_on_signal(hub: std::sync::Arc<hub::Hub>) {
+async fn stop_on_signal(
+    hub: std::sync::Arc<hub::Hub>,
+    finished: tokio::sync::oneshot::Receiver<()>,
+) {
     use tokio::signal::unix::{signal, SignalKind};
     let (term, int) = (
         signal(SignalKind::terminate()),
@@ -493,15 +493,10 @@ async fn stop_on_signal(hub: std::sync::Arc<hub::Hub>) {
     };
     tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
     log::info!("shutting down");
-    let released = hub.input.lock().as_ref().map(|tx| {
-        let (done, released) = tokio::sync::oneshot::channel();
-        (tx.send(event::InputEvent::Shutdown(done)).is_ok()).then_some(released)
-    });
-    if let Some(Some(released)) = released {
-        // The input thread answers once every key is up; gone, it holds none.
-        if released.await.is_err() {
-            log::info!("the input thread had ended, holding no key");
-        }
+    drop(hub.input.lock().take());
+    // The input thread says so once every key is up; gone, it holds none.
+    if finished.await.is_err() {
+        log::info!("the input thread had ended, holding no key");
     }
     logging::exit(0);
 }
@@ -558,7 +553,7 @@ mod tests {
             none,
             Flags {
                 runtime: "/run/voxl".into(),
-                resize_scale: 1.5,
+                resize: hub::Resize { scale: 1.5 },
                 audio: session::control::Audio::Sent,
             }
         );
@@ -592,7 +587,7 @@ mod tests {
                     (Ok(flags), true) => {
                         let read = match f.name {
                             "runtime" => flags.runtime.to_str() == Some(&v),
-                            "resize-scale" => Some(flags.resize_scale) == v.parse().ok(),
+                            "resize-scale" => Some(flags.resize.scale) == v.parse().ok(),
                             _ => (flags.audio == session::control::Audio::Sent) == (v == "true"),
                         };
                         assert!(read, "--{}={v:?}", f.name);

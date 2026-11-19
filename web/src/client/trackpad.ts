@@ -15,31 +15,46 @@ export function createPointerView(
 	const ptr = document.createElement('div');
 	ptr.id = 'tp-pointer';
 	app.surface.appendChild(ptr);
-	// The cursor image last drawn; none until the first draw (which sets it, or the dot).
-	let shown: string | null = null;
+	/** What the pointer is drawn as: nothing yet, the dot, or the cursor's image. */
+	let drawn: { s: 'nothing' } | { s: 'dot' } | { s: 'image'; url: string } = {
+		s: 'nothing',
+	};
+	/** Draws the dot, and says where its hot spot is. A hidden remote cursor still gets one,
+	 * or the pointer would be lost. */
+	function dot() {
+		if (drawn.s !== 'dot') {
+			drawn = { s: 'dot' };
+			ptr.classList.add('dot');
+			ptr.style.backgroundImage = '';
+			ptr.style.width = '';
+			ptr.style.height = '';
+		}
+		return { hx: DOT / 2, hy: DOT / 2 };
+	}
+	/** Draws the cursor's image, and says where its hot spot is. */
+	function picture(img: CursorImage) {
+		if (drawn.s !== 'image' || drawn.url !== img.url) {
+			drawn = { s: 'image', url: img.url };
+			ptr.classList.remove('dot');
+			ptr.style.backgroundImage = `url(${img.url})`;
+			ptr.style.width = `${img.w}px`;
+			ptr.style.height = `${img.h}px`;
+		}
+		return { hx: img.hx, hy: img.hy };
+	}
 
 	return {
 		/** Draws the pointer at a desktop position (hidden if none), with a ring while the
 		 * left button is held. */
 		draw(at: { x: number; y: number } | null, grabbing: boolean) {
 			const desk = app.desk;
-			if (!at || desk.s === 'none') {
+			if (at === null || desk.s === 'none') {
 				ptr.style.display = 'none';
 				return;
 			}
 			ptr.style.display = 'block';
-			// A hidden remote cursor still gets a dot, or the pointer would be lost.
 			const img = cursor.image();
-			const url = img?.url ?? '';
-			if (url !== shown) {
-				shown = url;
-				ptr.classList.toggle('dot', !img);
-				ptr.style.backgroundImage = img ? `url(${img.url})` : '';
-				ptr.style.width = img ? `${img.w}px` : '';
-				ptr.style.height = img ? `${img.h}px` : '';
-			}
-			const hx = img ? img.hx : DOT / 2,
-				hy = img ? img.hy : DOT / 2;
+			const { hx, hy } = img === null ? dot() : picture(img);
 			ptr.style.setProperty('--hx', `${hx}px`);
 			ptr.style.setProperty('--hy', `${hy}px`);
 			// The surface is scaled by pinch zoom; keep the pointer its usual size.

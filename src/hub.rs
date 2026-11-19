@@ -1,11 +1,14 @@
 //! Shared state between media producers (video, audio, cursor, clipboard) and the
 //! sessions that watch them.
 
-use crate::session::sender::{Queue, Sender};
-use crate::wire::Capability;
+use crate::event::Switch;
+use crate::session::control::Audio;
+use crate::session::link::Gate;
+use crate::session::sender::{Sender, Writer};
+use crate::wire::{Capability, Version};
 use bytes::Bytes;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -59,15 +62,17 @@ impl ServerMessage {
                     o.text("codec", codec);
                 }
                 if let Some(s) = &h.settings.startup {
-                    o.raw("audio", &s.audio.to_string());
+                    let audio = match s.audio {
+                        Audio::Sent => "true",
+                        Audio::Off => "false",
+                    };
+                    o.raw("audio", audio);
                     let mut files = Object::empty();
                     files.text("root", &s.files.root);
                     files.text("dir", &s.files.dir);
                     o.raw("files", &files.end());
-                }
-                if let Some(r) = h.settings.resize {
                     let mut resize = Object::empty();
-                    resize.raw("scale", &float(r.scale));
+                    resize.raw("scale", &float(s.resize.scale));
                     o.raw("resize", &resize.end());
                 }
             }
@@ -153,30 +158,29 @@ pub struct Hello {
 }
 
 /// What a hello tells a viewer besides the codec: what voxl started with, which `run`
-/// says once, before it serves a viewer, and dynamic resolution's scale.
+/// says once, before it serves a viewer.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Settings {
     /// None until `run` has started all it reports: only the first pipeline's hello,
     /// which goes to nobody, is without it.
     pub startup: Option<Startup>,
-    pub resize: Option<Resize>,
 }
 
 impl Settings {
     #[cfg(target_os = "linux")]
     /// What `run` says, once it has started everything a viewer is told of.
-    pub fn start(&mut self, startup: Startup, resize: Option<Resize>) {
+    pub fn start(&mut self, startup: Startup) {
         self.startup = Some(startup);
-        self.resize = resize;
     }
 }
 
 /// What voxl started with, as a viewer needs it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Startup {
-    /// Desktop audio is sent.
-    pub audio: bool,
+    pub audio: Audio,
     pub files: FilesConfig,
+    /// Dynamic resolution, the one way a desktop is sized: its scale.
+    pub resize: Resize,
 }
 
 /// Where a viewer's files are (`FilesConfig` in web/src/protocol.ts), and what the relay
@@ -189,7 +193,8 @@ pub struct FilesConfig {
     pub dir: String,
 }
 
-/// Dynamic resolution: desktop pixels per CSS pixel of the viewer's window.
+/// Dynamic resolution: desktop pixels per CSS pixel of the viewer's window, finite and
+/// over 0 (`--resize-scale`, parsed once where the daemon's flags are).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Resize {
     pub scale: f64,
@@ -227,6 +232,9 @@ fn restarted(viewer: Viewer) -> Viewer {
 /// them is one step, and every read of them one state.
 struct Viewing {
     viewer: Viewer,
+    /// Whether it wants desktop audio: changed under the hub's `clients` too, which the
+    /// audio thread waits on.
+    audio: Switch,
     sender: Sender,
 }
 
@@ -236,16 +244,14 @@ pub struct Client {
     /// Its control stream's writer.
     control: mpsc::UnboundedSender<Out>,
     viewing: Mutex<Viewing>,
-    /// It wants desktop audio.
-    pub audio: AtomicBool,
 }
 
 /// What the capture loop sees of a watching client with a lane in one look at it: what it
-/// is to the stream, and whether its bytes wait for its lane's socket.
+/// is to the stream, and whether its link lets a capture start.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Seen {
     pub viewer: Viewer,
-    pub waits: bool,
+    pub gate: Gate,
 }
 
 /// The viewers a keyframe starts: at least one, each promised it (`Hub::promise`). A
@@ -281,18 +287,29 @@ impl Client {
         f(&mut self.viewing.lock().sender)
     }
 
-    /// What the capture loop sees of it, if it watches and has a lane to be sent frames
-    /// on: one without a lane is sent nothing and holds nobody until it has one.
+    /// What the capture loop sees of it now, if it watches and has a lane to be sent
+    /// frames on: one without a lane is sent nothing and holds nobody until it has one.
+    ///
+    /// Here and wherever its link is given a time, the clock is read under the session's
+    /// lock, which is what keeps a link's events in time order (`session::link`).
     pub fn look(&self) -> Option<Seen> {
         let v = self.viewing.lock();
-        let watches = v.viewer != Viewer::NotWatching && v.sender.attached();
-        watches.then(|| Seen {
-            viewer: v.viewer,
-            waits: v.sender.waits(),
-        })
+        let gate = v.sender.gate(Instant::now())?;
+        match v.viewer {
+            Viewer::NotWatching => None,
+            viewer @ (Viewer::Waiting | Viewer::Promised | Viewer::Started) => {
+                Some(Seen { viewer, gate })
+            }
+        }
     }
 
-    /// What `voxl stats` says of it, as one read of it sees it.
+    /// The relay said that this session's page took the update named `version`.
+    pub fn took(&self, version: Version) {
+        let mut v = self.viewing.lock();
+        v.sender.took(version, Instant::now());
+    }
+
+    /// What `voxl stats` says of it now, as one read of it sees it.
     pub fn stats(&self) -> serde_json::Value {
         let v = self.viewing.lock();
         let viewer = match v.viewer {
@@ -304,9 +321,15 @@ impl Client {
         serde_json::json!({
             "id": self.id,
             "viewer": viewer,
-            "audio": self.audio.load(Ordering::Relaxed),
-            "way": v.sender.stats(),
+            "audio": v.audio == Switch::On,
+            "way": v.sender.stats(Instant::now()),
         })
+    }
+
+    /// Whether it wants desktop audio.
+    #[cfg(target_os = "linux")]
+    fn wants_audio(&self) -> bool {
+        self.viewing.lock().audio == Switch::On
     }
 
     /// It starts watching (`v,1`): it waits for a keyframe.
@@ -328,17 +351,17 @@ impl Client {
         v.viewer = restarted(v.viewer);
     }
 
-    /// The capture loop planned a keyframe: one waiting to start, with a lane to be sent it
+    /// The capture loop planned a keyframe: one waiting to start, with a way to be sent it
     /// on, is promised it; one started takes it as any frame. Whether it was promised it.
     pub fn promise(&self) -> bool {
         let mut v = self.viewing.lock();
-        match (v.viewer, v.sender.attached()) {
+        match (v.viewer, v.sender.sends()) {
             (Viewer::Waiting, true) => {
                 v.viewer = Viewer::Promised;
                 true
             }
             (Viewer::Waiting, false)
-            | (Viewer::NotWatching | Viewer::Promised | Viewer::Started, _) => false,
+            | (Viewer::NotWatching | Viewer::Promised | Viewer::Started, true | false) => false,
         }
     }
 
@@ -351,30 +374,28 @@ impl Client {
         }
     }
 
-    /// The encode loop has an update to send at `now`: a client that has started takes it
-    /// onto its lane. Whether it took it.
-    pub fn takes(&self, bytes: &Bytes) -> bool {
+    /// The encode loop has an update named `version` to send: a client that has started
+    /// takes it onto its lane. Whether it took it.
+    pub fn takes(&self, bytes: &Bytes, version: Version) -> bool {
         let mut v = self.viewing.lock();
-        let Viewing { viewer, sender } = &mut *v;
+        let Viewing { viewer, sender, .. } = &mut *v;
         match viewer {
             Viewer::Started => {
-                sender.video(bytes);
+                sender.video(bytes, version, Instant::now());
                 true
             }
             Viewer::NotWatching | Viewer::Waiting | Viewer::Promised => false,
         }
     }
 
-    /// A lane attached with its capability, its queue `queue`, in place of any before: the
-    /// viewer starts over on a keyframe sent on it, since bytes a lane before took may never
-    /// have reached the page. Whether it was taken.
-    pub fn attach(&self, queue: Arc<Queue>) -> bool {
+    /// A lane attached with its capability, in place of any before: the viewer starts over
+    /// on a keyframe sent on it, since bytes a lane before took may never have reached the
+    /// page. The lane's writer's hold on it, if the session took it.
+    pub fn attach(&self) -> Option<Writer> {
         let mut v = self.viewing.lock();
-        let taken = v.sender.attach(queue);
-        if taken {
-            v.viewer = restarted(v.viewer);
-        }
-        taken
+        let writer = v.sender.attach()?;
+        v.viewer = restarted(v.viewer);
+        Some(writer)
     }
 }
 
@@ -465,28 +486,26 @@ pub struct Hub {
     /// thread waits on it while none wants any.
     audio_asked: parking_lot::Condvar,
     pub next_id: AtomicU64,
+    /// The frames coded since the daemon started: the next one's name.
+    versions: AtomicU32,
     /// Last cursor message, replayed to new clients.
     pub cursor: Mutex<Option<Bytes>>,
-    /// Wakes the capture thread (joins, lanes attached, lanes emptied or ended).
+    /// Wakes the capture thread (joins, lanes attached or ended, updates told taken).
     pub waker: Wake,
     pub input: Mutex<Option<std::sync::mpsc::Sender<crate::event::InputEvent>>>,
     #[cfg(target_os = "linux")]
     pub last_clipboard: Mutex<Option<String>>,
-    /// The newest ask for a desktop size (dynamic resolution), until the capture loop takes
-    /// it and gives it to the screen.
+    /// The newest ask for a desktop size, until the capture loop takes it and gives it to
+    /// the screen: none while no ask waits.
     pub resize_req: Mutex<Option<(u32, u32)>>,
-    /// Largest desktop size (Some when dynamic resolution is on).
-    pub resize_max: Mutex<Option<(u32, u32)>>,
     /// What every `hello` says besides the codec.
     pub settings: Mutex<Settings>,
-    /// How the stream is coded, once the first pipeline is built: its recordings' `vpcC`.
-    pub stream: Mutex<Option<crate::vp9::Stream>>,
     /// The codec every hello names, the same for the daemon's whole life: the level of the
-    /// largest picture the desktop can take (the most it can be resized to, or its one size),
-    /// so that a page configures its decoder once. VP9 carries no level in its bitstream, so
-    /// a decoder told the higher level decodes every smaller stream; a hello that named each
-    /// stream's own level would have to reach the page before that stream's keyframe, which
-    /// the control stream and the lane do not order.
+    /// largest picture the desktop can be resized to, so that a page configures its decoder
+    /// once. VP9 carries no level in its bitstream, so a decoder told the higher level
+    /// decodes every smaller stream; a hello that named each stream's own level would have
+    /// to reach the page before that stream's keyframe, which the control stream and the
+    /// lane do not order.
     pub codec: std::sync::OnceLock<String>,
     pub stats: Stats,
     /// Screenshots asked for (`voxl screenshot`), answered by the capture thread with the
@@ -503,15 +522,14 @@ impl Hub {
             clients: Mutex::new(Vec::new()),
             audio_asked: parking_lot::Condvar::new(),
             next_id: AtomicU64::new(1),
+            versions: AtomicU32::new(0),
             cursor: Mutex::new(None),
             waker: Wake::new()?,
             input: Mutex::new(None),
             #[cfg(target_os = "linux")]
             last_clipboard: Mutex::new(None),
             resize_req: Mutex::new(None),
-            resize_max: Mutex::new(None),
             settings: Mutex::new(Settings::default()),
-            stream: Mutex::new(None),
             codec: std::sync::OnceLock::new(),
             stats: Stats::default(),
             snapshots: Mutex::new(Vec::new()),
@@ -521,6 +539,14 @@ impl Hub {
 
     pub fn wake(&self) {
         self.waker.signal();
+    }
+
+    /// The name of the frame coded next: the capture's number, counted for the daemon, not
+    /// for a stream, so that a name is one frame's for as long as any lane may still be told
+    /// it taken (a stream rebuilt for a new size starts no count again). It wraps after 2^32
+    /// frames, 828 days of them at 60 a second.
+    pub fn next_version(&self) -> Version {
+        Version(self.versions.fetch_add(1, Ordering::Relaxed))
     }
 
     pub fn drain_wake(&self) {
@@ -534,9 +560,9 @@ impl Hub {
             control,
             viewing: Mutex::new(Viewing {
                 viewer: Viewer::NotWatching,
+                audio: Switch::Off,
                 sender,
             }),
-            audio: AtomicBool::new(false),
         });
         self.clients.lock().push(c.clone());
         c
@@ -547,7 +573,7 @@ impl Hub {
     /// desktop without audio never sends.
     pub fn add_recorder(&self, to: mpsc::UnboundedSender<Out>) -> Arc<Client> {
         let c = self.add_client(to.clone(), Sender::recording(to));
-        self.set_audio(&c, true);
+        self.set_audio(&c, Switch::On);
         c.watch();
         self.wake();
         c
@@ -559,24 +585,20 @@ impl Hub {
         self.wake();
     }
 
-    /// A lane presenting a capability, with its writer's queue: it joins the session whose
-    /// capability it is, which is told so on its control stream. Every open session's
-    /// capability is compared, each in constant time. Whether one took it.
-    pub fn attach(&self, presented: &Capability, queue: Arc<Queue>) -> bool {
+    /// A lane presenting a capability: it joins the session whose capability it is, which
+    /// is told so on its control stream. Every open session's capability is compared, each
+    /// in constant time. The session that took it and the lane's writer's hold on it, if
+    /// one did.
+    pub fn attach(&self, presented: &Capability) -> Option<(Arc<Client>, Writer)> {
         let clients = self.clients.lock().clone();
-        let whose = clients.iter().fold(None, |found, c| {
+        let whose = clients.into_iter().fold(None, |found, c| {
             let is = c.lane(|s| s.is(presented));
             found.or(is.then_some(c))
-        });
-        let Some(c) = whose else {
-            return false;
-        };
-        let taken = c.attach(queue);
-        if taken {
-            c.send(Out::Attached);
-            self.wake();
-        }
-        taken
+        })?;
+        let writer = whose.attach()?;
+        whose.send(Out::Attached);
+        self.wake();
+        Some((whose, writer))
     }
 
     /// Each watching client with a lane and what one look at it saw, into `into` in place
@@ -645,9 +667,9 @@ impl Hub {
     }
 
     /// Session `c` wants desktop audio, or no longer does.
-    pub fn set_audio(&self, c: &Client, on: bool) {
+    pub fn set_audio(&self, c: &Client, audio: Switch) {
         let _clients = self.clients.lock();
-        c.audio.store(on, Ordering::Relaxed);
+        c.viewing.lock().audio = audio;
         self.audio_asked.notify_all();
     }
 
@@ -655,14 +677,14 @@ impl Hub {
     /// Whether any session wants desktop audio.
     pub fn audio_wanted(&self) -> bool {
         let clients = self.clients.lock();
-        clients.iter().any(|c| c.audio.load(Ordering::Relaxed))
+        clients.iter().any(|c| c.wants_audio())
     }
 
     #[cfg(target_os = "linux")]
     /// Blocks until a session wants desktop audio.
     pub fn wait_for_audio(&self) {
         let mut clients = self.clients.lock();
-        while !clients.iter().any(|c| c.audio.load(Ordering::Relaxed)) {
+        while !clients.iter().any(|c| c.wants_audio()) {
             self.audio_asked.wait(&mut clients);
         }
     }
@@ -672,8 +694,10 @@ impl Hub {
     /// onto the lane of every session that wants it.
     pub fn audio(&self, packet: &[u8], silent: u32) {
         for c in self.clients.lock().iter() {
-            if c.audio.load(Ordering::Relaxed) {
-                c.lane(|s| s.audio(packet, silent));
+            let mut v = c.viewing.lock();
+            match v.audio {
+                Switch::On => v.sender.audio(packet, silent),
+                Switch::Off => {}
             }
         }
     }
@@ -689,6 +713,7 @@ impl Hub {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::sender::Way;
     use crate::wire::Capability;
 
     /// A step of the hub's, for one of two clients or for all.
@@ -814,29 +839,28 @@ mod tests {
         }
     }
 
-    /// A lane attaches to `c`: its queue.
-    fn attach(c: &Client) -> Arc<Queue> {
-        let queue = Queue::new(Arc::new(|| {}));
-        assert!(c.attach(queue.clone()));
-        queue
+    /// A lane attaches to `c`: its writer's hold on it.
+    fn attach(c: &Client) -> Writer {
+        c.attach().expect("an open session takes a lane")
     }
 
-    /// Two real clients of `hub` set to `m`, each with its lane's queue, if any.
-    fn clients(hub: &Hub, m: &Model) -> Vec<(Arc<Client>, Option<Arc<Queue>>)> {
+    /// Two real clients of `hub` set to `m`, each with the writer of the lane it was last
+    /// given, if any.
+    fn clients(hub: &Hub, m: &Model) -> Vec<(Arc<Client>, Option<Writer>)> {
         hub.clients.lock().clear();
         m.c.iter()
             .map(|&(viewer, lane)| {
                 let (tx, _rx) = mpsc::unbounded_channel();
                 let c = hub.add_client(tx, Sender::new(Capability::mint().unwrap()));
-                let queue = match lane {
+                let writer = match lane {
                     Lane::None => None,
                     Lane::Live | Lane::Lost => Some(attach(&c)),
                 };
-                if let (Lane::Lost, Some(q)) = (lane, &queue) {
-                    q.lose();
+                if let (Lane::Lost, Some(w)) = (lane, &writer) {
+                    c.lane(|s| s.lost(w));
                 }
                 c.viewing.lock().viewer = viewer;
-                (c, queue)
+                (c, writer)
             })
             .collect()
     }
@@ -853,8 +877,8 @@ mod tests {
             Step::StartOver(i) => c[i].0.start_over(),
             Step::Attach(i) => c[i].1 = Some(attach(&c[i].0)),
             Step::Lose(i) => {
-                if let Some(q) = &c[i].1 {
-                    q.lose();
+                if let Some(w) = &c[i].1 {
+                    c[i].0.lane(|s| s.lost(w));
                 }
             }
             Step::Restart => {
@@ -887,17 +911,23 @@ mod tests {
                     }
                 }
                 for (i, (c, _)) in c.iter().enumerate() {
-                    if c.takes(&Bytes::from_static(&[0; 16])) {
+                    if c.takes(&Bytes::from_static(&[0; 16]), Version(0)) {
                         sent.push(i);
                     }
                 }
             }
         }
+        // What `voxl stats` says of each lane is what the capture loop was shown of it.
         after.c = [0, 1].map(|i| {
-            let lane = match &c[i].1 {
-                None => Lane::None,
-                Some(_) if c[i].0.lane(|s| s.attached()) => Lane::Live,
-                Some(_) => Lane::Lost,
+            let way = c[i].0.lane(|s| s.stats(Instant::now()));
+            let lane = match (&c[i].1, way) {
+                (None, Way::Unattached) => Lane::None,
+                (Some(_), Way::Lane(_)) => Lane::Live,
+                (Some(_), Way::Unattached) => Lane::Lost,
+                (None, way @ Way::Lane(_))
+                | (None | Some(_), way @ (Way::Recording | Way::Closed)) => {
+                    panic!("{step:?}: a session's way is {way:?}")
+                }
             };
             (c[i].0.viewer(), lane)
         });
@@ -992,7 +1022,7 @@ mod tests {
             (0..self.below(8))
                 .map(|_| match self.below(3) {
                     0 => char::from(self.below(0x20) as u8).to_string(),
-                    _ => PIECES[self.below(PIECES.len() as u64) as usize].to_string(),
+                    1.. => PIECES[self.below(PIECES.len() as u64) as usize].to_string(),
                 })
                 .collect()
         }
@@ -1002,22 +1032,19 @@ mod tests {
         }
         fn startup(&mut self) -> Startup {
             Startup {
-                audio: self.next() & 1 == 1,
+                audio: [Audio::Sent, Audio::Off][self.below(2) as usize],
                 files: FilesConfig {
                     root: self.text(),
                     dir: self.text(),
                 },
+                resize: Resize {
+                    scale: self.float(),
+                },
             }
-        }
-        fn resize(&mut self) -> Option<Resize> {
-            (self.next() & 1 == 1).then(|| Resize {
-                scale: self.float(),
-            })
         }
         fn settings(&mut self) -> Settings {
             Settings {
                 startup: (self.next() & 1 == 1).then(|| self.startup()),
-                resize: self.resize(),
             }
         }
         fn message(&mut self) -> ServerMessage {
@@ -1027,7 +1054,7 @@ mod tests {
                     settings: self.settings(),
                 }),
                 1 => ServerMessage::Clip { d: self.text() },
-                _ => ServerMessage::Mic {
+                2.. => ServerMessage::Mic {
                     on: self.next() & 1 == 1,
                 },
             }
@@ -1063,15 +1090,14 @@ mod tests {
                         f.insert("codec".into(), codec.clone().into());
                     }
                     if let Some(s) = &h.settings.startup {
-                        f.insert("audio".into(), s.audio.into());
+                        f.insert("audio".into(), (s.audio == Audio::Sent).into());
                         let files = &s.files;
                         f.insert(
                             "files".into(),
                             serde_json::json!({ "root": files.root, "dir": files.dir }),
                         );
-                    }
-                    if let Some(r) = h.settings.resize {
-                        f.insert("resize".into(), serde_json::json!({ "scale": r.scale }));
+                        let scale = s.resize.scale;
+                        f.insert("resize".into(), serde_json::json!({ "scale": scale }));
                     }
                     ("hello", serde_json::Value::Object(f))
                 }
