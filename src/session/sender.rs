@@ -6,8 +6,8 @@
 //! Its socket takes whatever the daemon writes, far past what has arrived: the transport's
 //! window is megabytes deep. So nothing here reads the socket for what the link carries.
 //! What was delivered is told on the control stream: the lane keeps what it was sent and
-//! has not been told taken (`link::Outstanding`), and the session keeps what the tooks have
-//! shown of the path (`estimate`). From those comes the gate (`link.rs`), which every frame
+//! has not been told taken (`link::Outstanding`), and its path as its transport states it
+//! (`statement`, `link::Path`). From those comes the gate (`link.rs`), which every frame
 //! passes: a video frame goes onto the lane only if its gate was open when the frame's
 //! capture was planned, and an Opus packet only while it is open. The gate is this lane's
 //! alone: when its path slows or stalls, the frames planned meanwhile go on without it, and
@@ -25,8 +25,7 @@
 //! task (`lane.rs`) takes that lock for each write, so what it writes is its session's lane
 //! as it is at that moment, and a lane that has ended gets not one byte more.
 
-use super::estimate::Estimate;
-use super::link::{Gate, Outstanding, Stats};
+use super::link::{Gate, Outstanding, Path, Stats};
 use crate::hub::Out;
 use crate::wire::{Capability, Frame, Sequence, Track, PLAYER_PACKETS};
 use std::collections::VecDeque;
@@ -71,9 +70,6 @@ enum State {
 struct Session {
     /// What its lane attaches with.
     capability: Capability,
-    /// What its lanes' tooks have shown of the path: it outlives a lane. On the heap: it is
-    /// most of what a session holds.
-    estimate: Box<Estimate>,
     /// The name of the next frame its lanes are sent. It outlives a lane, so a took of a
     /// lane since replaced names nothing on the next.
     next: Sequence,
@@ -83,7 +79,6 @@ impl Session {
     fn new(capability: Capability) -> Session {
         Session {
             capability,
-            estimate: Box::default(),
             next: Sequence(0),
         }
     }
@@ -94,15 +89,14 @@ impl Session {
         let sequence = self.next;
         self.next = sequence.next();
         lane.push(sequence, track, bytes);
-        let len = bytes.len() as u64;
-        self.estimate.sent(&mut lane.sent, sequence, len, now);
+        lane.sent.sent(sequence, bytes.len() as u64, now);
     }
 
     /// The Opus packets `lane` holds go onto it, oldest first, each while the gate is open
     /// at `now`.
     fn flow(&mut self, lane: &mut Lane, now: Instant) {
         loop {
-            match self.estimate.gate(&lane.sent, now) {
+            match lane.gate(now) {
                 Gate::Open => {}
                 Gate::Full | Gate::Late => return,
             }
@@ -116,7 +110,7 @@ impl Session {
 }
 
 /// A session's lane: the frames waiting for its socket, the Opus packets held while the gate
-/// is not open, and what it was sent and has not been told taken. Dropped, it is the
+/// is not open, what it was sent and has not been told taken, and its path. Dropped, it is the
 /// session's lane no longer, and its writer is woken to find that out.
 struct Lane {
     writer: Writer,
@@ -130,6 +124,9 @@ struct Lane {
     /// [`PLAYER_PACKETS`], what the page's player holds, so a stall keeps no older sound.
     held: VecDeque<Vec<u8>>,
     sent: Outstanding,
+    /// The path it crosses, as its transport states it: this lane's alone, since the next
+    /// lane may cross another.
+    path: Path,
 }
 
 /// A lane's writer's hold on its lane: what wakes it, and what its session knows the lane
@@ -167,7 +164,8 @@ impl Drop for Lane {
 }
 
 impl Lane {
-    fn new(writer: Writer) -> Lane {
+    /// A lane whose path is `path` as it attaches: not stated, or not yet.
+    fn new(writer: Writer, path: Path) -> Lane {
         Lane {
             writer,
             messages: VecDeque::new(),
@@ -175,7 +173,13 @@ impl Lane {
             spare: Vec::new(),
             held: VecDeque::with_capacity(PLAYER_PACKETS),
             sent: Outstanding::default(),
+            path,
         }
+    }
+
+    /// Whether it takes a capture at `now`.
+    fn gate(&self, now: Instant) -> Gate {
+        self.sent.gate(self.path, now)
     }
 
     /// A buffer to fill: a spare one if one is left, else a new one.
@@ -269,18 +273,19 @@ impl Sender {
     /// a capture then. A recording is no link: it takes every frame at once.
     pub fn gate(&self, now: Instant) -> Option<Gate> {
         match &self.state {
-            State::Attached(s, lane) => Some(s.estimate.gate(&lane.sent, now)),
+            State::Attached(_, lane) => Some(lane.gate(now)),
             State::Recording(_) => Some(Gate::Open),
             State::Unattached(_) | State::Closed => None,
         }
     }
 
-    /// A lane attaches: it takes the place of the lane before, which is the session's no
-    /// longer, and starts with nothing on the way. Its writer's hold on it; none for a
-    /// closed session or a recording, which take no lane.
-    pub fn attach(&mut self) -> Option<Writer> {
+    /// A lane attaches, its path `path` (not stated, or not yet): it takes the place of the
+    /// lane before, which is the session's no longer, and starts with nothing on the way.
+    /// Its writer's hold on it; none for a closed session or a recording, which take no
+    /// lane.
+    pub fn attach(&mut self, path: Path) -> Option<Writer> {
         let writer = Writer(Arc::new(tokio::sync::Notify::new()));
-        let lane = Lane::new(writer.clone());
+        let lane = Lane::new(writer.clone(), path);
         // The lane before, if any, is dropped here, which wakes its writer to end.
         let (state, attached) = match std::mem::replace(&mut self.state, State::Closed) {
             State::Unattached(s) | State::Attached(s, _) => {
@@ -298,17 +303,30 @@ impl Sender {
     pub fn took(&mut self, sequence: Sequence, now: Instant) {
         match &mut self.state {
             State::Attached(s, lane) => {
-                s.estimate.took(&mut lane.sent, sequence, now);
+                lane.sent.took(sequence);
                 s.flow(lane, now);
             }
             State::Unattached(_) | State::Recording(_) | State::Closed => {}
         }
     }
 
+    /// The statement of the lane `writer` writes said at `now` that its path is `path`,
+    /// which may open the gate to the sound the lane holds. A lane that is the session's no
+    /// longer is told nothing: its statement is not the next lane's.
+    pub(crate) fn stated(&mut self, writer: &Writer, path: Path, now: Instant) {
+        match &mut self.state {
+            State::Attached(s, lane) if lane.writer.is(writer) => {
+                lane.path = path;
+                s.flow(lane, now);
+            }
+            State::Attached(_, _) | State::Unattached(_) | State::Recording(_) | State::Closed => {}
+        }
+    }
+
     /// What `voxl stats` says of it at `now`.
     pub fn stats(&self, now: Instant) -> Way {
         match &self.state {
-            State::Attached(s, lane) => Way::Lane(s.estimate.stats(&lane.sent, now)),
+            State::Attached(_, lane) => Way::Lane(lane.sent.stats(lane.path, now)),
             State::Unattached(_) => Way::Unattached,
             State::Recording(_) => Way::Recording,
             State::Closed => Way::Closed,
@@ -462,10 +480,13 @@ impl Sender {
         }
     }
 
-    /// A session's sender with a lane attached, which no writer drains: a test reads it.
+    /// A session's sender with a lane attached, its path not stated, which no writer
+    /// drains: a test reads it.
     pub fn with_lane() -> (Sender, Writer) {
         let mut s = Sender::new(Capability::mint().expect("a random source"));
-        let writer = s.attach().expect("an open session takes a lane");
+        let writer = s
+            .attach(Path::Unstated)
+            .expect("an open session takes a lane");
         (s, writer)
     }
 }
@@ -507,12 +528,35 @@ mod tests {
         Tick,
         /// A new lane takes the place of the one before.
         Replace,
+        /// The lane's statement says its path, or ends.
+        State,
+        /// The statement of a lane since replaced says a path.
+        StaleState,
+    }
+
+    /// A lane's path as it attaches: not stated, or not yet.
+    fn new_path(rng: &mut Xorshift) -> Path {
+        [Path::Unstated, Path::Unknown][rng.below(2) as usize]
+    }
+
+    /// A path a statement says: any rate from 20 KB/s to 40 MB/s and any round trip from 1
+    /// to 400 ms; or, one time in five, its end.
+    fn said(rng: &mut Xorshift) -> Path {
+        match rng.below(5) {
+            0 => Path::Unknown,
+            1.. => Path::Known(crate::session::link::Known {
+                round_trip: Duration::from_micros(rng.range(1_000, 400_000)),
+                rate: crate::session::link::BytesPerSecond(
+                    (20_000u64 << rng.below(11)) + rng.below(20_000),
+                ),
+            }),
+        }
     }
 
     /// The steps a session is drawn from, each as often as it is listed: sound comes more
     /// often than anything else, as it does (100 packets a second), and tooks less, so the
     /// gate is shut for long runs of it.
-    const STEPS: [Step; 12] = [
+    const STEPS: [Step; 15] = [
         Step::Capture,
         Step::Capture,
         Step::Packet,
@@ -525,24 +569,31 @@ mod tests {
         Step::Tick,
         Step::Tick,
         Step::Replace,
+        Step::State,
+        Step::State,
+        Step::StaleState,
     ];
 
     /// Every frame of a lane is told taken by its name, and a shut gate keeps only the newest
     /// sound. Over generated sessions of captures (each only while the gate is open, as the
     /// capture loop starts them), Opus packets, tooks of frames on the lane, tooks of frames
     /// of lanes since replaced and of names never sent, stalls, and lanes replaced; the gate
-    /// is the session's own, read as the capture loop reads it. The model keeps, apart from
+    /// is the session's own, read as the capture loop reads it, on a path its lane's
+    /// statement says and says again (and the statement of a lane since replaced says to
+    /// nobody). The model keeps, apart from
     /// the sender, the packets not yet sent (the newest of them, at most the player's) and
     /// the frames on the lane not yet named. After every step:
     /// - every frame that went onto the lane has a name no frame of the session had before;
     /// - a packet goes onto the lane only from the front of the model's held packets, in
-    ///   order, and none goes in a step that began with the gate shut, unless a took opened
-    ///   it: while the gate is shut, no sound goes and at most the player's packets wait,
+    ///   order, and none goes in a step that began with the gate shut, unless a took or a
+    ///   path stated opened it: while the gate is shut, no sound goes and at most the player's packets wait,
     ///   the newest;
     /// - with the gate open, no packet waits;
     /// - a took takes exactly the frames up to the one it names on the lane, and a took of
     ///   any other name takes nothing: what is on the way is the model's frames, video and
     ///   audio alike, byte for byte;
+    /// - the lane's path is exactly what its own statement said last, or what it attached
+    ///   with;
     /// - the gate's bound covers the sound's bytes: with the path unknown, frames on the way
     ///   (sound alone too) hold the gate, and with it known, more on the way than the window
     ///   holds it.
@@ -551,8 +602,10 @@ mod tests {
         let mut rng = Xorshift::new(0x5BE0_CD19_137E_2179);
         let (mut shut, mut dropped, mut released, mut stale) = (0, 0, 0, 0);
         let (mut sound_alone, mut over_window, mut cumulative) = (0, 0, 0);
+        let (mut stated, mut stale_stated) = (0, 0);
         for case in 0..400 {
-            let (mut s, _writer) = Sender::with_lane();
+            let (mut s, mut writer) = Sender::with_lane();
+            let (mut path, mut old) = (Path::Unstated, None);
             let mut now = Instant::now();
             let mut held: VecDeque<u32> = VecDeque::new();
             let mut on: Vec<(Sequence, Track, u64)> = Vec::new();
@@ -613,9 +666,22 @@ mod tests {
                     Step::Stall => now += Duration::from_millis(rng.range(500, 30_000)),
                     Step::Tick => now += Duration::from_millis(rng.range(1, 50)),
                     Step::Replace => {
-                        let _ = s.attach().expect("an open session takes a lane");
+                        path = new_path(&mut rng);
+                        let new = s.attach(path).expect("an open session takes a lane");
+                        old = Some(std::mem::replace(&mut writer, new));
                         gone.extend(on.drain(..).map(|(name, _, _)| name));
                         held.clear();
+                    }
+                    Step::State => {
+                        path = said(&mut rng);
+                        s.stated(&writer, path, now);
+                        stated += 1;
+                    }
+                    Step::StaleState => {
+                        if let Some(old) = &old {
+                            s.stated(old, said(&mut rng), now);
+                            stale_stated += 1;
+                        }
                     }
                 }
                 let at = format!("case {case} step {step} ({does:?})");
@@ -625,7 +691,7 @@ mod tests {
                         Track::Video => assert_eq!(does, Step::Capture, "{at}"),
                         Track::Audio => {
                             match (before, does) {
-                                (Some(Gate::Open), _) | (_, Step::Took) => {}
+                                (Some(Gate::Open), _) | (_, Step::Took | Step::State) => {}
                                 (Some(Gate::Full | Gate::Late) | None, _) => {
                                     panic!("{at}: sound went while the gate was shut")
                                 }
@@ -645,14 +711,15 @@ mod tests {
                     panic!("{at}: a session with a lane says its lane");
                 };
                 assert_eq!(stats.outstanding_frames, on.len(), "{at}");
+                assert_eq!(stats.path, path, "{at}");
                 match (stats.gate, held.len()) {
                     (Gate::Open, 0) | (Gate::Full | Gate::Late, _) => {}
                     (Gate::Open, 1..) => panic!("{at}: sound waits at an open gate"),
                 }
                 let sound_only = on.iter().all(|(_, t, _)| *t == Track::Audio);
                 match (stats.path, on.len()) {
-                    (Path::Unknown, 0) => {}
-                    (Path::Unknown, 1..) => {
+                    (Path::Unstated | Path::Unknown, 0) => {}
+                    (Path::Unstated | Path::Unknown, 1..) => {
                         assert_ne!(stats.gate, Gate::Open, "{at}: the first flight let more");
                         sound_alone += usize::from(sound_only);
                     }
@@ -672,6 +739,10 @@ mod tests {
         assert!(
             sound_alone > 1_500 && over_window > 1_200 && cumulative > 2_000,
             "{sound_alone} {over_window} {cumulative}"
+        );
+        assert!(
+            stated > 4_000 && stale_stated > 1_000,
+            "{stated} {stale_stated}"
         );
     }
 }

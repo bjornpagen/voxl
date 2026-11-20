@@ -79,6 +79,7 @@ nix = { version = "0.31", features = [
 	"signal",
 	"socket",
 	"time",
+	"uio",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

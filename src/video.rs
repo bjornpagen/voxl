@@ -1158,8 +1158,7 @@ fn marker_age(ms: u32) -> Result<i64, std::time::SystemTimeError> {
 pub(crate) mod tests {
     use super::*;
     use crate::hub::{Chain, Holds, Part, Seen, Viewer};
-    use crate::session::estimate::tests::Link;
-    use crate::session::link::tests::Simulated;
+    use crate::session::link::tests::{Link, Simulated};
     use crate::session::link::{Gate, Path};
     use crate::session::sender::Sender;
     use crate::xorshift::Xorshift;
@@ -1468,7 +1467,9 @@ pub(crate) mod tests {
                 }
                 if f == reopen || f == again {
                     lanes.push(std::mem::take(&mut now));
-                    moved.attach().expect("an open session takes a lane");
+                    moved
+                        .attach(Path::Unstated)
+                        .expect("an open session takes a lane");
                 }
                 let mut seen = Vec::new();
                 hub.look_into(&mut seen);
@@ -2465,7 +2466,7 @@ pub(crate) mod tests {
         fn fastest(&self) -> Option<Duration> {
             match self.path {
                 Path::Known(known) => Some(known.round_trip),
-                Path::Unknown => None,
+                Path::Unstated | Path::Unknown => None,
             }
         }
 
@@ -2473,7 +2474,7 @@ pub(crate) mod tests {
         fn rate(&self) -> Option<u64> {
             match self.path {
                 Path::Known(known) => Some(known.rate.0),
-                Path::Unknown => None,
+                Path::Unstated | Path::Unknown => None,
             }
         }
     }
@@ -2482,8 +2483,6 @@ pub(crate) mod tests {
     #[derive(Clone, Copy)]
     enum Change {
         RoundTrip(Duration),
-        /// Bytes a second.
-        Rate(u64),
     }
 
     /// The least and the most a simulated frame takes to code, in milliseconds: what the
@@ -2546,8 +2545,9 @@ pub(crate) mod tests {
     /// bytes the screen then codes to; a whole screen, a keyframe, codes to `whole`); the
     /// capture loop's own decision (`step`) says what to do at each look, with the gate the
     /// session's link gives; a capture is coded for a time within `CODING_MS` and sent if
-    /// its viewer is in the chain, and the path says each frame taken. The screen as it is
-    /// goes next: a change drawn while another waits replaces it, and a keyframe holds both.
+    /// its viewer is in the chain, and the path says each frame taken, and states itself as
+    /// a transport does: nothing before it has carried a frame, and from the first took its
+    /// own round trip and rate, as they then are. The screen as it is goes next: a change drawn while another waits replaces it, and a keyframe holds both.
     ///
     /// Around `step`, the session does what the capture loop and the hub do: a stream ends
     /// when its screen is resized, once its encoder has sent what it holds, and the loop
@@ -2567,7 +2567,9 @@ pub(crate) mod tests {
     ) -> Vec<Shown> {
         let interval = Duration::from_secs_f64(1.0 / f64::from(FRAMERATE));
         let min_interval = interval.mul_f64(MIN_INTERVAL_SHARE);
-        let mut link = Link::default();
+        let mut link = Link::new(Path::Unknown);
+        // The path has carried a frame: its transport has measured it, and states it.
+        let mut measured = false;
         let (mut shown, mut next) = (Vec::new(), 0u32);
         let mut coding_times = Xorshift::new(0x1b87_3593_cc9e_2d51);
         // The change waiting to be captured: when the first of it was drawn, and its bytes.
@@ -2585,7 +2587,6 @@ pub(crate) mod tests {
         while now < end {
             match change.filter(|(at, _)| *at <= now) {
                 Some((_, Change::RoundTrip(delay))) => path.delay = delay,
-                Some((_, Change::Rate(rate))) => path.rate = rate,
                 None => {}
             }
             while let Some((at, bytes)) = draws.next_if(|(at, _)| *at <= now) {
@@ -2598,7 +2599,13 @@ pub(crate) mod tests {
                     Turn::Watch => viewer = crate::hub::watching(viewer),
                 }
             }
-            path.tell(now, |sequence, at| link.took(sequence, at));
+            path.tell(now, |sequence, _| {
+                link.took(sequence);
+                measured = true;
+            });
+            if measured {
+                link.path = Path::Known(path.known());
+            }
             if let Sim::Busy(frame) = sim {
                 if frame.done <= now {
                     sim = Sim::Idle;
@@ -2708,7 +2715,7 @@ pub(crate) mod tests {
                         coding,
                         allowed: match link.stats(now).path {
                             Path::Known(known) => known.window(),
-                            Path::Unknown => 0,
+                            Path::Unstated | Path::Unknown => 0,
                         },
                         held: std::mem::take(&mut held),
                     });
@@ -2760,8 +2767,8 @@ pub(crate) mod tests {
     /// @evidence the test's own output (`--nocapture`): it prints every session's frames a
     /// second and the percentiles of its frames' time on the way
     /// @observed 2026-11-19, the measuring machine's local day
-    /// @environment the path simulated in `session::link`'s tests, on a virtual clock, as
-    /// the two paths were measured: one of 1,860 KB/s and a round trip of 236 ms that goes
+    /// @environment the path simulated in `session::link`'s tests, on a virtual clock, stating
+    /// itself from its first took, as the two paths were measured: one of 1,860 KB/s and a round trip of 236 ms that goes
     /// silent both ways for 0.43 s every 1.8 s; one of 2,400 KB/s, no silences, whose round
     /// trip steps from 106 to 243 ms halfway
     /// @workload a keyframe of 400 KB, then for 30 s: a scroll (a frame of 20 to 25 KB wanted
@@ -2769,15 +2776,16 @@ pub(crate) mod tests {
     /// screen of 400 KB every 5 s; a frame coded in 15 to 27 ms (`CODING_MS`), which alone
     /// leaves a scroll 47.6 frames a second
     /// @result frames a second, and a frame's time from its send to its took at the median,
-    /// the 90th percentile and the most. The silent path: scroll 36.70 (249, 638, 679 ms),
-    /// of the 36.2 its silences leave of 47.6; typing 8.03 (237, 604, 615 ms); with whole
-    /// screens 7.43 (237, 604, 881 ms). The other: scroll 45.57 (251, 253, 273 ms), the
-    /// same before its round trip steps as after; typing 8.03 (244, 244, 273 ms); with
-    /// whole screens 7.83 (244, 244, 410 ms)
+    /// the 90th percentile and the most. The silent path: scroll 38.43 (249, 635, 679 ms);
+    /// typing 8.03 (237, 604, 615 ms); with whole screens 8.17 (237, 605, 881 ms). The
+    /// other: scroll 45.67 (251, 253, 273 ms), the same before its round trip steps as
+    /// after; typing 8.03 (244, 244, 273 ms); with whole screens 8.20 (244, 244, 410 ms).
+    /// With the path guessed from the tooks, before the transport stated it, the same
+    /// sessions showed 36.70, 8.03, 7.43, 45.57, 8.03 and 7.83
     /// @decision each measured rate less a hundredth of a frame a second: a floor, not a
     /// goal
-    /// @revalidate a change to the link's gate or estimators, or to the capture decision
-    const SHOWN_A_SECOND: [f64; 6] = [36.69, 8.02, 7.42, 45.56, 8.02, 7.82];
+    /// @revalidate a change to the link's gate, or to the capture decision
+    const SHOWN_A_SECOND: [f64; 6] = [38.42, 8.02, 8.16, 45.66, 8.02, 8.19];
 
     /// Sessions over the two paths as they were measured, the capture loop's own decision
     /// driving them: a scroll, typing, and typing with whole-screen changes, each after a
@@ -2836,7 +2844,7 @@ pub(crate) mod tests {
                     let (lag, own) = (f.took - f.sent, path.time(f.bytes));
                     let grown = match step_to {
                         Some((_, Change::RoundTrip(to))) => to,
-                        Some((_, Change::Rate(_))) | None => Duration::ZERO,
+                        None => Duration::ZERO,
                     };
                     assert!(
                         lag <= fastest * 2 + RESPONSE + own + f.silent + grown,
@@ -2939,165 +2947,5 @@ pub(crate) mod tests {
             held > 100 && starts - held > 100,
             "{starts} keyframes, {held} of them held by the gate"
         );
-    }
-
-    /// The most round trips the link's rate took to come within a tenth of a path's that
-    /// fell to a third in the middle of a scroll, in `a_pause_a_silence_and_a_slower_path`:
-    /// what the rate's memory was measured to take, which the test holds it to.
-    ///
-    /// @limitKind measured
-    /// @owner this module's tests
-    /// @unit round trips of the path, a frame's own time on it included
-    /// @scope `a_pause_a_silence_and_a_slower_path`
-    /// @evidence the test's own output (`--nocapture`): it prints the round trips, and the
-    /// longest a frame was on the way meanwhile
-    /// @observed 2026-11-19, the measuring machine's local day
-    /// @environment the two measured paths as `sessions_over_the_measured_paths` simulates
-    /// them, on a virtual clock
-    /// @workload a keyframe of 400 KB, then a scroll (a frame of 20 to 25 KB wanted every
-    /// sixtieth of a second) for 20 s; the path's rate falls to a third 8 s in
-    /// @result 15.1 round trips on the silent path, 8.5 on the other: the ten of the rate's
-    /// memory, and the time the frames already on the way took to show the fall. Meanwhile
-    /// a frame was on the way for up to 0.96 s on the silent path (a silence of 0.43 s
-    /// among it) and 0.39 s on the other, against 0.61 s and 0.34 s for a frame the window
-    /// lets go at the path's true rate: what was sent into a window three times too wide
-    /// @decision the measured most, rounded up to the next whole round trip
-    /// @revalidate a change to the link's rate, its memory or what presses a path
-    const FOLLOWS_WITHIN_TRIPS: f64 = 16.0;
-
-    /// The fewest frames a second a scroll showed in its first round trip after a pause, in
-    /// `a_pause_a_silence_and_a_slower_path`.
-    ///
-    /// @limitKind measured
-    /// @owner this module's tests
-    /// @unit frames a second, over the scroll's first round trip
-    /// @scope `a_pause_a_silence_and_a_slower_path`
-    /// @evidence the test's own output (`--nocapture`): it prints each
-    /// @observed 2026-11-19, the measuring machine's local day
-    /// @environment the two measured paths as `sessions_over_the_measured_paths` simulates
-    /// them, on a virtual clock
-    /// @workload a keyframe of 400 KB, a scroll for 4 s, a still screen or typing for 5 s,
-    /// then the scroll again
-    /// @result the silent path: 44 after a still screen, 44 after typing; the other path:
-    /// 52 and 43; of the 47.6 a second that a frame coded in 15 to 27 ms leaves a scroll.
-    /// The rate the link held through each pause was the rate the first scroll left
-    /// (1,600 and 1,606 KB/s on the silent path, 1,467 KB/s on the other)
-    /// @decision the measured least, rounded down to a whole frame a second
-    /// @revalidate a change to the link's rate, its memory or what presses a path
-    const AFTER_A_PAUSE_A_SECOND: f64 = 42.0;
-
-    /// A pause does not forget the path, a silence is not a rate, and a path grown slower
-    /// is still followed. Over the two measured paths, the capture loop's own decision
-    /// driving each session:
-    /// - a scroll, then five seconds of a still screen or of typing (which on the silent
-    ///   path meets its silences), then a scroll again: the link's rate is never lower in
-    ///   the pause or at the second scroll's start than the first scroll left it, and the
-    ///   second scroll shows no fewer than `AFTER_A_PAUSE_A_SECOND` frames a second in its
-    ///   first round trip, of the 47.6 its coding time leaves it;
-    /// - a scroll under which the path's rate falls to a third: the link's rate is within
-    ///   a tenth of the fallen rate within `FOLLOWS_WITHIN_TRIPS` round trips, and from
-    ///   then on every frame is on the way no longer than a frame the window lets go can
-    ///   be, with the silence it met.
-    #[test]
-    fn a_pause_a_silence_and_a_slower_path() {
-        use crate::session::link::RESPONSE;
-        let start = Instant::now();
-        let secs = Duration::from_secs_f64;
-        let mut rng = Xorshift::new(0x0fc1_9dc6_8b8c_d5b5);
-        let key = (start, 400_000u64);
-        let scroll = |from: f64, to: f64, rng: &mut Xorshift| -> Vec<(Instant, u64)> {
-            let n = ((to - from) * 60.0) as u32;
-            (0..n)
-                .map(|i| {
-                    (
-                        start + secs(from + f64::from(i) / 60.0),
-                        20_000 + rng.below(5_000),
-                    )
-                })
-                .collect()
-        };
-        let silences = Some((secs(1.8), secs(0.43)));
-        for (name, rate, delay, holes) in [
-            ("the silent path", 1_860_000u64, 236, silences),
-            ("the other", 2_400_000, 106, None),
-        ] {
-            let delay = Duration::from_millis(delay);
-            let path = || {
-                let mut path = Simulated::new(rate, delay, start);
-                path.holes = holes;
-                path
-            };
-            // A round trip, a frame's own time on the path included.
-            let trip = delay + path().time(25_000);
-            let a_second = |shown: &[Shown], from: Instant| {
-                let sent = shown
-                    .iter()
-                    .filter(|f| f.sent >= from && f.sent < from + trip);
-                sent.count() as f64 / trip.as_secs_f64()
-            };
-            for pause in ["a still screen", "typing"] {
-                let (paused, again) = (start + secs(4.5), start + secs(9.5));
-                let mut draws = scroll(0.6, 4.5, &mut rng);
-                if pause == "typing" {
-                    draws.extend((1..41).map(|i| (paused + secs(f64::from(i) * 0.12), 2_000)));
-                }
-                draws.extend(scroll(9.5, 14.5, &mut rng));
-                let shown = session(&mut path(), key, &draws, None, &[], again + secs(5.0));
-                let rates = |from: Instant, to: Instant| {
-                    let sent = shown.iter().filter(move |f| f.sent >= from && f.sent < to);
-                    sent.filter_map(|f| f.rate())
-                };
-                let left = rates(start, paused)
-                    .next_back()
-                    .expect("the first scroll showed a rate");
-                let least = rates(paused, again + trip)
-                    .min()
-                    .expect("the second scroll began");
-                assert!(
-                    least >= left,
-                    "{name}, {pause}: the rate fell from {left} to {least}"
-                );
-                let first = a_second(&shown, again);
-                println!(
-                    "{name}, a scroll after 5 s of {pause}: {first:.0} frames a second in its \
-                     first round trip, the rate {left} B/s before and {least} at the least since"
-                );
-                assert!(
-                    first >= AFTER_A_PAUSE_A_SECOND,
-                    "{name}, {pause}: {first:.0} frames a second"
-                );
-            }
-            let fell = start + secs(8.0);
-            let draws = scroll(0.6, 20.0, &mut rng);
-            let (mut path, third) = (path(), rate / 3);
-            let change = Some((fell, Change::Rate(third)));
-            let shown = session(&mut path, key, &draws, change, &[], start + secs(20.0));
-            let followed = shown
-                .iter()
-                .find(|f| f.sent > fell && f.rate().is_some_and(|r| r <= third / 10 * 11))
-                .map(|f| f.sent)
-                .unwrap_or_else(|| panic!("{name}: the rate never followed the path's"));
-            let trips = (followed - fell).as_secs_f64() / trip.as_secs_f64();
-            let meanwhile = shown
-                .iter()
-                .filter(|f| f.sent > fell - trip && f.sent < followed);
-            let longest = meanwhile.map(|f| f.took - f.sent).max();
-            println!(
-                "{name}, its rate falls to a third under a scroll: followed in {trips:.1} round \
-                 trips; a frame on the way for up to {longest:?} meanwhile"
-            );
-            assert!(
-                trips <= FOLLOWS_WITHIN_TRIPS,
-                "{name}: {trips:.1} round trips"
-            );
-            for f in shown.iter().filter(|f| f.sent > followed + trip * 2) {
-                let fastest = f.fastest().expect("the path is known");
-                let (lag, own) = (f.took - f.sent, path.time(f.bytes));
-                assert!(
-                    lag <= fastest * 2 + RESPONSE + own + f.silent,
-                    "{name}: a frame {lag:?} on the way once the rate followed"
-                );
-            }
-        }
     }
 }

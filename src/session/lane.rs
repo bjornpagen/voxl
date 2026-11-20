@@ -4,12 +4,20 @@
 //! A lane's first bytes are a session's capability, and they are the only bytes the daemon
 //! ever reads from a lane. A lane that opens with a capability no open session has is closed
 //! unanswered; a lane attached is never read again.
+//!
+//! With those bytes the lane's transport hands over its statement of the path, a
+//! descriptor (`statement`): read for as long as the lane is its session's, each path it
+//! says is the lane's path from then (`link::Path`), and the capture loop is woken to look
+//! at the gate again. A lane that brings no descriptor has no statement, and its path is
+//! not stated; one that brings a descriptor that is no statement, or more than one, is
+//! closed as a lane with no capability is.
 
+use super::link::Path;
 use super::sender::{Next, Writer};
+use super::statement::{self, Handed, Said, Statement};
 use crate::hub::{Client, Hub};
 use crate::wire::{Capability, CAPABILITY};
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
 use tokio::net::unix::OwnedWriteHalf;
 #[cfg(target_os = "linux")]
 use tokio::net::UnixListener;
@@ -27,27 +35,87 @@ pub async fn lanes(listener: UnixListener, hub: Arc<Hub>) {
     }
 }
 
-/// A lane: the capability it presents, read into a buffer of that size and nothing more;
-/// then, attached, its writer. When the lane ends the capture loop is woken, to look again
-/// at who watches with a lane.
+/// A lane: the capability it presents, read into a buffer of that size and nothing more,
+/// with the statement of its path, if one was handed over with it; then, attached, its
+/// writer, and beside it the reader of its statement. When the lane ends the capture loop
+/// is woken, to look again at who watches with a lane.
 pub(super) async fn lane(stream: tokio::net::UnixStream, hub: Arc<Hub>) {
-    let (mut read, write) = stream.into_split();
     let mut first = [0u8; CAPABILITY];
-    if read.read_exact(&mut first).await.is_err() {
+    let Ok(handed) = statement::first(&stream, &mut first).await else {
         return;
-    }
+    };
     let presented = Capability::presented(&first);
     // The capability is read; the buffer that held it is zeroed.
     zero(&mut first);
-    let Some((session, writer)) = hub.attach(&presented) else {
+    let statement = match handed {
+        Handed::Nothing => None,
+        Handed::One(descriptor) => match Statement::of(descriptor) {
+            Ok(statement) => Some(statement),
+            Err(why) => {
+                log::warn!("a lane handed over a descriptor that states no path: {why}");
+                return;
+            }
+        },
+        Handed::Many => {
+            log::warn!("a lane handed over more than one descriptor: none is its statement");
+            return;
+        }
+    };
+    let path = match statement {
+        None => Path::Unstated,
+        Some(_) => Path::Unknown,
+    };
+    let Some((session, writer)) = hub.attach(&presented, path) else {
         return;
     };
+    let (read, write) = stream.into_split();
     drop(read);
     // The hub is not held for as long as the lane lasts: a lane may outlast it.
     let hub = Arc::downgrade(&hub);
-    write_lane(&session, &writer, &write).await;
+    let stated = async {
+        if let Some(statement) = statement {
+            follow(&statement, &session, &writer, &hub).await;
+        }
+        // The statement said its last, or there is none: the lane goes on as it is.
+        std::future::pending::<()>().await
+    };
+    tokio::select! {
+        () = write_lane(&session, &writer, &write) => {}
+        () = stated => {}
+    }
     if let Some(hub) = hub.upgrade() {
         hub.wake();
+    }
+}
+
+/// Reads `statement`, the statement of the lane `writer` writes for `session`, to its end:
+/// each path it says is the lane's from then, and at its end nothing is known of the path
+/// any more. Each wakes the capture loop, which waits on a gate with no time: a path that
+/// widens the window opens it.
+async fn follow(
+    statement: &Statement,
+    session: &Client,
+    writer: &Writer,
+    hub: &std::sync::Weak<Hub>,
+) {
+    loop {
+        let (path, ended) = match statement.next().await {
+            Said::Path(known) => (Path::Known(known), false),
+            Said::End(end) => {
+                log::info!(
+                    "session {}: its lane's path is stated no longer: {end}",
+                    session.id
+                );
+                (Path::Unknown, true)
+            }
+        };
+        session.stated(writer, path);
+        if let Some(hub) = hub.upgrade() {
+            hub.wake();
+        }
+        if ended {
+            return;
+        }
     }
 }
 

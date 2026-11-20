@@ -9,6 +9,8 @@ use super::control::{connection, Daemon};
 use super::query::Opening;
 use crate::event::{BinUp, MicMsg};
 use crate::hub::Hub;
+use crate::session::link::Path;
+use crate::session::sender::Way;
 use crate::wire::Byte;
 use crate::wire::{Capability, Down, Frame, Framer, Sequence, Track, Up};
 use std::sync::Arc;
@@ -139,6 +141,237 @@ async fn open_lane(hub: &Arc<Hub>, bytes: &[u8]) -> UnixStream {
     tokio::spawn(super::lane::lane(ours, hub.clone()));
     relay.write_all(bytes).await.unwrap();
     relay
+}
+
+/// Writes `bytes` on `lane` as one message that hands over `descriptors`, as a proxy hands
+/// a statement over with a stream's first bytes.
+fn hand(lane: &UnixStream, bytes: &[u8], descriptors: &[std::os::fd::RawFd]) {
+    use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
+    use std::os::fd::AsRawFd;
+    let rights = [ControlMessage::ScmRights(descriptors)];
+    let with: &[ControlMessage] = match descriptors {
+        [] => &[],
+        [_, ..] => &rights,
+    };
+    let iov = [std::io::IoSlice::new(bytes)];
+    let sent = sendmsg::<()>(lane.as_raw_fd(), &iov, with, MsgFlags::empty(), None).unwrap();
+    assert_eq!(sent, bytes.len());
+}
+
+/// The path of `client`'s lane, as `voxl stats` says it.
+fn path_of(client: &crate::hub::Client) -> Path {
+    match client.lane(|s| s.stats(Instant::now())) {
+        Way::Lane(stats) => stats.path,
+        way @ (Way::Unattached | Way::Recording | Way::Closed) => panic!("no lane: {way:?}"),
+    }
+}
+
+/// A lane takes its statement or nothing. Over generated lanes, each presenting its
+/// session's capability in one to three writes, any of which hands descriptors over:
+/// - one that hands none over attaches, and its path is not stated;
+/// - one that hands over a descriptor that is no `SOCK_SEQPACKET` socket (a pipe's writing
+///   end, a datagram socket), or more than one descriptor, in one write or across them, is
+///   closed unanswered, as a lane with no capability is, and the session's lane before it
+///   stays; and the daemon keeps no copy of what was handed over: once the test has let go
+///   of its own, each pipe reads its end of file.
+#[tokio::test]
+async fn a_lane_takes_its_statement_or_nothing() {
+    use std::os::fd::AsRawFd;
+    let mut rng = crate::xorshift::Xorshift::new(0x1f83_d9ab_5be0_cd19);
+    let hub = Hub::new(crate::hub::tests::hello()).unwrap();
+    let d = daemon(&hub);
+    let mut relay = Relay::open(&d).await;
+    let (c, _) = relay.greeted().await;
+    let client = hub.clients.lock()[0].clone();
+    let (mut bare, mut refused) = (0, 0);
+    for run in 0..200 {
+        let capability = attach(&c);
+        // Where the capability's writes are cut, and which of them hands over how many.
+        let cuts = [rng.range(1, 32) as usize, rng.range(1, 32) as usize];
+        let (a, b) = (cuts[0].min(cuts[1]), cuts[0].max(cuts[1]));
+        let writes = [&capability[..a], &capability[a..b], &capability[b..]];
+        let mut with = [0usize; 3];
+        for _ in 0..[0, 1, 2, 3][rng.below(4) as usize] {
+            with[rng.below(3) as usize] += 1;
+        }
+        // The middle write may be empty (the cuts met): it is not sent, and hands nothing.
+        if a == b {
+            with[1] = 0;
+        }
+        let handed: usize = with.iter().sum();
+        let datagram = rng.below(2) == 0;
+        let (lane_end, ours) = UnixStream::pair().unwrap();
+        tokio::spawn(super::lane::lane(ours, hub.clone()));
+        let mut pipes = Vec::new();
+        for (bytes, n) in writes.into_iter().zip(with) {
+            let mut descriptors = Vec::new();
+            for _ in 0..n {
+                let (r, w) = nix::unistd::pipe().unwrap();
+                descriptors.push(w);
+                pipes.push(r);
+            }
+            let raw: Vec<_> = match (datagram, n) {
+                // One descriptor alone may be a socket that keeps no record whole.
+                (true, 1) if handed == 1 => {
+                    let (s, _other) = std::os::unix::net::UnixDatagram::pair().unwrap();
+                    descriptors.push(s.into());
+                    vec![descriptors[1].as_raw_fd()]
+                }
+                _ => descriptors.iter().map(|d| d.as_raw_fd()).collect(),
+            };
+            if !bytes.is_empty() {
+                hand(&lane_end, bytes, &raw);
+            }
+            // The test's own copies are let go here: the daemon's are the only ones.
+        }
+        let mut lane_end = lane_end;
+        match handed {
+            0 => {
+                assert_eq!(relay.next().await.0, Said::Attached, "run {run}");
+                assert_eq!(path_of(&client), Path::Unstated, "run {run}");
+                bare += 1;
+            }
+            1.. => {
+                assert!(
+                    to_the_end(&mut lane_end).await.is_empty(),
+                    "run {run}: a refused lane was answered"
+                );
+                assert!(
+                    relay.silent().await,
+                    "run {run}: a refused lane was confirmed"
+                );
+                for pipe in &pipes {
+                    nix::fcntl::fcntl(
+                        pipe,
+                        nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+                    )
+                    .unwrap();
+                    let mut byte = [0u8; 1];
+                    assert_eq!(
+                        nix::unistd::read(pipe, &mut byte),
+                        Ok(0),
+                        "run {run}: a copy kept"
+                    );
+                }
+                refused += 1;
+            }
+        }
+    }
+    assert!(bare > 20 && refused > 100, "{bare} {refused}");
+}
+
+/// A statement's two ends: a `SOCK_SEQPACKET` pair, as the proxy makes one.
+#[cfg(target_os = "linux")]
+fn statement() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+    use nix::sys::socket::{socketpair, AddressFamily, SockFlag, SockType};
+    socketpair(
+        AddressFamily::Unix,
+        SockType::SeqPacket,
+        None,
+        SockFlag::empty(),
+    )
+    .unwrap()
+}
+
+/// A lane's path is what its statement says, and nothing once it ends. Through the real
+/// lane socket's reader and a real `SOCK_SEQPACKET` pair, over generated lanes: the
+/// reading end is handed over with the first of the capability's bytes, cut at a generated
+/// place, and the test keeps no copy. The lane attaches with nothing known of its path;
+/// each record written (generated round trips and rates, written as the proxy writes them)
+/// is then the lane's path, and wakes the capture loop, which waits on the gate with no
+/// time; the statement's end (its writing end closed, a message of another length, a
+/// record with a zero field) leaves nothing known, wakes the loop, and the lane still
+/// carries its frames. And a lane that hands over two such reading ends is refused.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_lanes_path_is_what_its_statement_says() {
+    use crate::session::link::{BytesPerSecond, Known};
+    use std::os::fd::AsRawFd;
+    let mut rng = crate::xorshift::Xorshift::new(0x428a_2f98_d728_ae22);
+    let hub = Hub::new(crate::hub::tests::hello()).unwrap();
+    let d = daemon(&hub);
+    let mut relay = Relay::open(&d).await;
+    let (c, _) = relay.greeted().await;
+    let client = hub.clients.lock()[0].clone();
+    let until = |want: Path| {
+        let client = client.clone();
+        async move {
+            while path_of(&client) != want {
+                tokio::task::yield_now().await;
+            }
+        }
+    };
+    // Two statements are none: a lane that hands over two reading ends is closed unanswered.
+    let (one, _a) = statement();
+    let (other, _b) = statement();
+    let (mut two, ours) = UnixStream::pair().unwrap();
+    tokio::spawn(super::lane::lane(ours, hub.clone()));
+    hand(&two, &attach(&c), &[one.as_raw_fd(), other.as_raw_fd()]);
+    assert!(to_the_end(&mut two).await.is_empty());
+    assert!(
+        relay.silent().await,
+        "a lane with two statements was confirmed"
+    );
+    let (mut said, mut ends) = (0, [0; 3]);
+    for run in 0..60 {
+        let (reading, writing) = statement();
+        let capability = attach(&c);
+        let cut = rng.range(1, 33) as usize;
+        let (mut lane, ours) = UnixStream::pair().unwrap();
+        tokio::spawn(super::lane::lane(ours, hub.clone()));
+        hand(&lane, &capability[..cut], &[reading.as_raw_fd()]);
+        drop(reading);
+        lane.write_all(&capability[cut..]).await.unwrap();
+        assert_eq!(relay.next().await.0, Said::Attached, "run {run}");
+        assert_eq!(path_of(&client), Path::Unknown, "run {run}");
+        let record = |least: u64, rate: u64| [least.to_be_bytes(), rate.to_be_bytes()].concat();
+        let write = |message: &[u8]| {
+            let sent = nix::sys::socket::send(
+                writing.as_raw_fd(),
+                message,
+                nix::sys::socket::MsgFlags::empty(),
+            );
+            assert_eq!(sent, Ok(message.len()));
+        };
+        for _ in 0..rng.below(6) {
+            let (least, rate) = (rng.range(1, 1 << 40), rng.range(1, 1 << 40));
+            settle().await;
+            hub.drain_wake();
+            write(&record(least, rate));
+            until(Path::Known(Known {
+                round_trip: Duration::from_nanos(least),
+                rate: BytesPerSecond(rate),
+            }))
+            .await;
+            assert!(woken(&hub), "run {run}: a path stated woke nothing");
+            said += 1;
+        }
+        settle().await;
+        hub.drain_wake();
+        let how = rng.below(3) as usize;
+        match how {
+            0 => drop(writing),
+            1 => {
+                let len = [1, 8, 15, 17, 24][rng.below(5) as usize];
+                write(&vec![7u8; len]);
+            }
+            2.. => {
+                let zero = [(0, 5), (5, 0), (0, 0)][rng.below(3) as usize];
+                write(&record(zero.0, zero.1));
+            }
+        }
+        // Nothing may have been known before the end either: the wake is what tells it.
+        while !woken(&hub) {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(path_of(&client), Path::Unknown, "run {run}");
+        ends[how] += 1;
+        let frame = bytes::Bytes::from(vec![run as u8; 2_000]);
+        client.lane(|s| s.video(&frame, Instant::now()));
+        let (_, track, bytes) = next_frame(&mut lane, &mut Framer::new()).await;
+        assert_eq!((track, &bytes[..]), (Track::Video, &frame[..]), "run {run}");
+    }
+    assert!(said > 60 && ends.iter().all(|n| *n > 5), "{said} {ends:?}");
 }
 
 /// The next frame a lane carries, read with `framer`: its name, its track and its bytes.
@@ -704,7 +937,6 @@ async fn carried(lane: &mut UnixStream, framer: &mut Framer) -> Vec<(Sequence, T
 /// lane's frames not yet named, as many and of as many bytes.
 #[tokio::test]
 async fn a_took_counts_for_the_lane_it_was_sent_on() {
-    use crate::session::sender::Way;
     let mut rng = crate::xorshift::Xorshift::new(0x7137_449f_23ef_65cd);
     let (mut stale, mut counted, mut sound) = (0, 0, 0);
     for _ in 0..40 {

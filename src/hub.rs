@@ -4,7 +4,7 @@
 use crate::event::Switch;
 use crate::histogram::Histogram;
 use crate::session::control::Audio;
-use crate::session::link::Gate;
+use crate::session::link::{Gate, Path};
 use crate::session::sender::{Sender, Writer};
 use crate::wire::{Capability, Sequence, Version};
 use bytes::Bytes;
@@ -456,6 +456,12 @@ impl Client {
         v.sender.took(sequence, Instant::now());
     }
 
+    /// The statement of the lane `writer` writes said its path is `path`.
+    pub fn stated(&self, writer: &Writer, path: Path) {
+        let mut v = self.viewing.lock();
+        v.sender.stated(writer, path, Instant::now());
+    }
+
     /// What `voxl stats` says of it now, as one read of it sees it.
     pub fn stats(&self) -> serde_json::Value {
         let v = self.viewing.lock();
@@ -553,12 +559,13 @@ impl Client {
         }
     }
 
-    /// A lane attached with its capability, in place of any before: the viewer starts over
-    /// on a keyframe sent on it, since bytes a lane before took may never have reached the
-    /// page. The lane's writer's hold on it, if the session took it.
-    pub fn attach(&self) -> Option<Writer> {
+    /// A lane attached with its capability, in place of any before, its path `path` (not
+    /// stated, or not yet): the viewer starts over on a keyframe sent on it, since bytes a
+    /// lane before took may never have reached the page. The lane's writer's hold on it, if
+    /// the session took it.
+    pub fn attach(&self, path: Path) -> Option<Writer> {
         let mut v = self.viewing.lock();
-        let writer = v.sender.attach()?;
+        let writer = v.sender.attach(path)?;
         v.viewer = restarted(v.viewer);
         Some(writer)
     }
@@ -773,15 +780,15 @@ impl Hub {
 
     /// A lane presenting a capability: it joins the session whose capability it is, which
     /// is told so on its control stream. Every open session's capability is compared, each
-    /// in constant time. The session that took it and the lane's writer's hold on it, if
-    /// one did.
-    pub fn attach(&self, presented: &Capability) -> Option<(Arc<Client>, Writer)> {
+    /// in constant time. The lane's path is `path` as it attaches. The session that took it
+    /// and the lane's writer's hold on it, if one did.
+    pub fn attach(&self, presented: &Capability, path: Path) -> Option<(Arc<Client>, Writer)> {
         let clients = self.clients.lock().clone();
         let whose = clients.into_iter().fold(None, |found, c| {
             let is = c.lane(|s| s.is(presented));
             found.or(is.then_some(c))
         })?;
-        let writer = whose.attach()?;
+        let writer = whose.attach(path)?;
         whose.send(Out::Attached);
         self.wake();
         Some((whose, writer))
@@ -1134,7 +1141,8 @@ pub(crate) mod tests {
 
     /// A lane attaches to `c`: its writer's hold on it.
     fn attach(c: &Client) -> Writer {
-        c.attach().expect("an open session takes a lane")
+        c.attach(Path::Unstated)
+            .expect("an open session takes a lane")
     }
 
     /// A real client of `hub` as `seat` says: a page with the writer of the lane it was last
