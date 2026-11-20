@@ -3,8 +3,7 @@
 ## Reporting a vulnerability
 
 Report vulnerabilities privately on GitHub: open the repository's **Security** tab and
-choose **Report a vulnerability**
-([direct link](https://github.com/tembo/voxl/security/advisories/new)). Please don't
+choose **Report a vulnerability**. Please don't
 open a public issue. Say which version (`voxl --version`) and platform you found it on,
 and how to reproduce it. We'll confirm we got it and keep you posted while we fix it.
 

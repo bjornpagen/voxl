@@ -40,7 +40,7 @@ browser page --WebSocket, 127.0.0.1--> voxl relay (the viewer's machine)
 - **The control stream** is `ssh <host> voxl attach`: whatever ssh's own configuration
   makes of the host (its keys, its master connection) is the door. It carries everything
   but the picture and the sound: the hello, input, clipboard, cursor images, the
-  microphone, and the relay's word of each update the page took. `voxl attach` only joins
+  microphone, and the relay's word of each frame the page took. `voxl attach` only joins
   ssh's stdio to the daemon's control socket, which takes connections from the daemon's
   own user and no one else.
 - **The lane** is one HTTP CONNECT stream through the proxy, whose server end reaches the
@@ -56,22 +56,25 @@ browser page --WebSocket, 127.0.0.1--> voxl relay (the viewer's machine)
   the audio decoder. So the page holds at
   most one undecoded update, and nothing queues in the browser, whose socket would
   otherwise hold about a megabyte where no one sees it. The relay tells the daemon each
-  update the page took, on the control stream, and that is all the daemon knows of
-  delivery: its socket accepts far more than has arrived. A screen is sent to a viewer only
+  frame the page took, update or Opus packet, on the control stream, and that is all the
+  daemon knows of delivery: its socket accepts far more than has arrived. A screen is
+  sent to a viewer only
   while what was sent it and not yet taken is within what its path carries in its round
   trip and the response time (a tenth of a second), and no frame is late: none sent has
   gone untaken longer than twice the round trip, plus the response time, plus its own
-  bytes' time at the path's rate. Until the transport states the path, its round trip and
-  rate are estimated from the page's tooks, and before the first took any frame not yet
-  taken holds the next. A screen is captured while any viewer's link lets one go. A slow
+  bytes' time at the path's rate. The path is what the transport states: the tunnel server
+  hands the lane's socket, with its first bytes, a statement of its connection's least
+  round trip and delivery rate, and voxl estimates nothing. Until the first record comes,
+  or on a lane whose transport states nothing, a frame not yet taken holds the next. A screen is captured while any viewer's link lets one go. A slow
   link or a slow page lowers its own viewer's frame rate, and the newest screen goes next;
   it holds no other viewer, nor a recording, back: frames go on without it, and it starts
   again on a keyframe once its link lets one go. Every frame is coded whole, at one
   quality.
 - **The stream.** A viewer starts on a keyframe, and every frame after it refers to the
   frames before it, which the lane carried in order. Keyframes are sent only when a viewer
-  starts, which a lane that reopens, a viewer that frames went on without, or a resize
-  also is. The desktop's size is the keyframe's: the page lays itself out from the
+  starts, which a viewer that frames went on without, or a resize, also is. A lane that
+  reopens says which frame its page last took, and goes on with a delta when that is
+  still the newest. The desktop's size is the keyframe's: the page lays itself out from the
   pictures it decodes.
 
 ## Benchmarks
@@ -135,8 +138,9 @@ frame being decoded. voxl's column is its best run of each test. To reproduce, s
 - **Links:** a bottleneck with a deep queue: a TCP proxy for the WebSocket servers, and
   `tc netem` for Neko's WebRTC media and Sunshine's video (UDP). None of them drop
   packets, where UDP with error correction would have the edge.
-- These runs predate the lane through a proxy: voxl's video then crossed one WebSocket, as the other
-  WebSocket servers' did.
+- These runs predate the lane through a proxy and the AV1 encoder: voxl's video then
+  crossed one WebSocket, as the other WebSocket servers' did, coded by the encoder voxl
+  had before. They have not been run again.
 
 ## Usage
 
@@ -147,9 +151,6 @@ Build (needs Rust, pkg-config, clang, libaom, libyuv, libopus, libpulse and esbu
 nix-shell
 cargo build --release
 ```
-
-On Linux, `--no-default-features` leaves out PulseAudio, and with it desktop audio: a
-voxl that can be linked statically (musl) and runs without PulseAudio's libraries.
 
 Or install it from this repository with the same libraries on your system (the crate is
 `voxl-server`, the binary is `voxl`; crates.io's `voxl-server` is the original, not this fork):
@@ -218,8 +219,8 @@ and get through.
 
 A session's WebSocket, its ssh and its lane start together and end together; the page
 shows why a session ended, and clicking it starts a new one. Nothing reconnects by
-itself, but a lane the transport closes is opened again, and its viewer starts over on a
-keyframe.
+itself, but a lane the transport closes is opened again, and its viewer goes on from the
+frame its page holds: a keyframe only if frames went on without it.
 
 ### `voxl attach` and `voxl files`
 
@@ -297,13 +298,13 @@ click.
 **Wayland?** Not yet; on Linux voxl streams X11 displays, Xvfb included. The virtual
 desktops voxl is built for run on Xvfb (E2B's and Daytona's do too), and X11 lets voxl
 capture them without a permission prompt, with damage events that keep a still screen at
-no CPU. Wayland support is being worked on.
+no CPU.
 
 **Does it use the GPU?** Not to encode: voxl encodes AV1 on the CPU with libaom, in its
 realtime mode with the tools made for screens (palette coding), at one quantiser. The
 browser decodes it in hardware where the machine has an AV1 decoder (Apple M3 and later)
 and in software elsewhere, about a core while the whole screen moves. (The CPU table above
-was measured with the H.264 encoder voxl used before.)
+predates the AV1 encoder.)
 
 **What's the license?** voxl's code is MIT. It links libaom, libyuv and Opus, each under a
 BSD license.
