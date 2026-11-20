@@ -1,5 +1,5 @@
 {
-	// The page (main thread). Type-check all three (no npm needed):
+	// The page (main thread). Type-check all three (no packages needed):
 	//   tsc -p web && tsc -p web/tsconfig.worker.json && tsc -p web/tsconfig.worklet.json
 	"extends": "./tsconfig.base.json",
 	"compilerOptions": { "lib": ["ES2022", "DOM", "DOM.Iterable"] },
