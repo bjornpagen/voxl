@@ -269,8 +269,9 @@ export function readRelay(data: string | ArrayBuffer): FromRelay {
 /** Worker -> page. Relay messages other than close are forwarded as is; the session's
  * end is the status `closed`, with its cause. */
 export type FromWorker =
-	/** A decoded update, handed to the page to present. */
-	| { t: 'frame'; frame: VideoFrame }
+	/** The desktop's size, the size of the pictures decoded, when it changes: the pictures
+	 * themselves the worker writes to the track (track.ts). */
+	| { t: 'size'; w: number; h: number }
 	/** The decoder now decodes this codec. */
 	| { t: 'decodes'; codec: string }
 	/** The decoder decodes nothing any more. */
@@ -284,8 +285,14 @@ export type FromWorker =
 
 /** Page -> worker. */
 export type ToWorker =
-	/** `counts` is the page's meter's (stats.ts), which the worker adds to. */
-	| { t: 'init'; url: string; counts: Uint32Array }
+	/** `counts` is the page's meter's (stats.ts), which the worker adds to; `track` is the
+	 * page's video track's writable stream, handed over: the worker writes it. */
+	| {
+			t: 'init';
+			url: string;
+			counts: Uint32Array;
+			track: WritableStream<VideoFrame>;
+	  }
 	/** Open a new session after the last one ended (the viewer asked). */
 	| { t: 'connect' }
 	| { t: 'send'; d: string }

@@ -6,7 +6,7 @@
 /** The counters, by their index in the shared array: each a running total, wrapping at
  * 2^32. */
 export const Count = {
-	/** Updates decoded: their pictures out of the decoder and handed to the page. */
+	/** Updates decoded: their pictures out of the decoder and handed to the track. */
 	Frames: 0,
 	/** Bytes of updates arrived. */
 	Bytes: 1,

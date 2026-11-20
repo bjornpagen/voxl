@@ -19,7 +19,7 @@ import { createZoom } from './zoom';
 
 /** What the page cannot run without, each by the name the refusal gives it. WebCodecs and
  * a secure context (the relay's 127.0.0.1 is one) for the stream; MediaStreamTrackGenerator
- * to present it; ClipboardItem for clipboard images; Keyboard Lock for the desktop's
+ * to present it (its stream is handed to the worker, which writes it); ClipboardItem for clipboard images; Keyboard Lock for the desktop's
  * shortcuts in fullscreen; cross-origin isolation (which the relay's headers give) for the
  * counters the worker shares with the page. */
 const REQUIRED: [string, () => boolean][] = [
@@ -96,7 +96,10 @@ function main() {
 	const resize = createResize(app);
 
 	const meter = new Meter(performance.now());
-	post({ t: 'init', url: wsUrl.href, counts: meter.counts }, []);
+	post(
+		{ t: 'init', url: wsUrl.href, counts: meter.counts, track: video.track },
+		[video.track]
+	);
 	/** What the decoder decodes, as the worker last said. */
 	let decodes: { s: 'nothing' } | { s: 'codec'; codec: string } = {
 		s: 'nothing',
@@ -156,17 +159,13 @@ function main() {
 	 * message has its case: one without a case does not compile. */
 	function heard(m: FromWorker): 'heard' {
 		switch (m.t) {
-			case 'frame': {
-				// The desktop is the size of the pictures it sends: a keyframe of another size
-				// (a resize) lays the page out again.
-				const { displayWidth: w, displayHeight: h } = m.frame;
-				if (app.desk.s === 'none' || app.desk.w !== w || app.desk.h !== h) {
-					app.desk = { s: 'shown', w, h };
-					video.layout();
-				}
-				video.present(m.frame);
+			// The desktop is the size of the pictures it sends: a keyframe of another size
+			// (a resize) lays the page out again. The pictures go to the track from the
+			// worker, and never come here.
+			case 'size':
+				app.desk = { s: 'shown', w: m.w, h: m.h };
+				video.layout();
 				return 'heard';
-			}
 			case 'hello':
 				files.setup(m.files);
 				mic.setup();

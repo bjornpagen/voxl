@@ -1,11 +1,13 @@
 // The worker: the socket to the relay, the AV1 decoder and the Opus decoder, off the page's
 // thread. What it decides is in two records: its session with the relay (session.ts), which
-// says when a frame was taken, and the screen (frames.ts), which holds one update at a time.
-// Here they are joined to the browser: a WebSocket, WebCodecs, the page and the counters.
+// says when a frame was taken, the screen (frames.ts), which holds one update at a time, and
+// the presenter (track.ts), which writes each picture to the page's video track. Here they
+// are joined to the browser: a WebSocket, WebCodecs, the track, the page and the counters.
 import { Frames } from './frames';
 import { DESKTOP_AUDIO, frameMicros, VIDEO_HEADER_BYTES } from './protocol';
 import { Session, type Told } from './session';
 import { Count, holds, Timed, took } from './stats';
+import { Track } from './track';
 import type { FromWorker, PcmChunk, ToWorker } from './protocol';
 
 declare const self: DedicatedWorkerGlobalScope;
@@ -87,6 +89,22 @@ function audioDecoder(player: Player): AudioDecoder {
 function start(init: Init) {
 	const counts = init.counts;
 
+	// The page's video track, written here: a write that fails is said, and ends as any.
+	const writer = init.track.getWriter();
+	const track = new Track<VideoFrame>({
+		write(frame) {
+			writer.write(frame).then(
+				() => track.written(),
+				(e: unknown) => {
+					post({ t: 'log', s: `video track: ${e}` }, []);
+					track.written();
+				}
+			);
+		},
+		letGo: (frame) => frame.close(),
+		size: (w, h) => post({ t: 'size', w, h }, []),
+	});
+
 	const session = new Session<WebSocket, Player>({
 		dial() {
 			const ws = new WebSocket(init.url);
@@ -107,7 +125,10 @@ function start(init: Init) {
 			took(counts, Timed.Pipe, header.pipe);
 			frames.part(at, header, picture);
 		},
-		screenClosed: () => frames.closed(),
+		screenClosed() {
+			frames.closed();
+			track.closed();
+		},
 		sound(player, packet) {
 			const dec =
 				player.decoder.s === 'made' ? player.decoder.dec : audioDecoder(player);
@@ -126,7 +147,7 @@ function start(init: Init) {
 		},
 	});
 
-	// The screen arrives as one AV1 stream; each update's picture goes to the page as it is
+	// The screen arrives as one AV1 stream; each update's picture goes to the track as it is
 	// decoded.
 	const frames = new Frames<VideoDecoder, VideoFrame, Uint8Array>({
 		// Asked once, at the session's hello: a codec this browser cannot decode ends it.
@@ -193,7 +214,7 @@ function start(init: Init) {
 		present(frame) {
 			Atomics.add(counts, Count.Frames, 1);
 			took(counts, Timed.Decode, micros(now()) - frame.timestamp);
-			post({ t: 'frame', frame }, [frame]);
+			track.present(frame, frame.displayWidth, frame.displayHeight);
 			session.decoded();
 		},
 	});

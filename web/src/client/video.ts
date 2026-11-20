@@ -2,56 +2,11 @@
 import type { App } from './app';
 
 /**
- * Decoded frames go to a <video> through MediaStreamTrackGenerator: the compositor scans
- * YUV out directly. At most one write is in flight; a newer frame replaces one waiting
- * behind it.
+ * Decoded frames go to a <video> through a MediaStreamTrackGenerator: the compositor scans
+ * YUV out directly. The page makes the track and its element; the track's writable stream
+ * is handed to the worker (`track`, in `init`), which writes each picture as it is decoded
+ * (track.ts), so no picture crosses this thread.
  */
-interface Track {
-	writer: WritableStreamDefaultWriter<VideoFrame>;
-	queue: Queue;
-}
-
-/** What waits behind the write in flight: no write in flight, a write with nothing behind
- * it, or a frame. */
-type Queue =
-	| { s: 'idle' }
-	| { s: 'writing' }
-	| { s: 'next'; frame: VideoFrame };
-
-function write(t: Track, frame: VideoFrame) {
-	t.queue = queued(t, frame);
-}
-
-/** The queue once `frame` has come. */
-function queued(t: Track, frame: VideoFrame): Queue {
-	switch (t.queue.s) {
-		case 'next':
-			t.queue.frame.close();
-			return { s: 'next', frame };
-		case 'writing':
-			return { s: 'next', frame };
-		case 'idle':
-			t.writer
-				.write(frame)
-				.catch((e: unknown) => console.warn('[voxl] video track:', e))
-				// What it returns says only that every state of the queue has its case.
-				.finally((): 'done' => {
-					const q = t.queue;
-					t.queue = { s: 'idle' };
-					switch (q.s) {
-						case 'next':
-							write(t, q.frame);
-							return 'done';
-						// Nothing came behind it.
-						case 'idle':
-						case 'writing':
-							return 'done';
-					}
-				});
-			return { s: 'writing' };
-	}
-}
-
 export function createVideo(app: App, onLayout: () => void) {
 	const gen = new MediaStreamTrackGenerator({ kind: 'video' });
 	const video = document.createElement('video');
@@ -63,15 +18,6 @@ export function createVideo(app: App, onLayout: () => void) {
 	video.srcObject = new MediaStream([gen]);
 	app.surface.appendChild(video);
 	video.play().catch((e: unknown) => console.warn('[voxl] video:', e));
-	const track: Track = {
-		writer: gen.writable.getWriter(),
-		queue: { s: 'idle' },
-	};
-
-	function present(frame: VideoFrame) {
-		write(track, frame);
-	}
-
 	function layout() {
 		const desk = app.desk;
 		if (desk.s === 'none') return;
@@ -86,5 +32,5 @@ export function createVideo(app: App, onLayout: () => void) {
 		onLayout();
 	}
 
-	return { present, layout };
+	return { track: gen.writable, layout };
 }

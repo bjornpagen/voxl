@@ -7,7 +7,7 @@
 		"fmt:check": "oxfmt --check .",
 		"lint": "oxlint",
 		"typecheck": "tsc -p web && tsc -p web/tsconfig.worker.json && tsc -p web/tsconfig.worklet.json",
-		"test": "node web/src/video-header.test.ts && node web/src/protocol.test.ts && node web/src/session.test.ts && node web/src/frames.test.ts && node web/src/stats.test.ts && node web/src/ring.test.ts && node web/src/keyboard.test.ts && node web/src/touch.test.ts",
+		"test": "node web/src/video-header.test.ts && node web/src/protocol.test.ts && node web/src/session.test.ts && node web/src/frames.test.ts && node web/src/stats.test.ts && node web/src/track.test.ts && node web/src/ring.test.ts && node web/src/keyboard.test.ts && node web/src/touch.test.ts",
 		"check": "pnpm fmt:check && pnpm lint && pnpm typecheck && pnpm test"
 	},
 	"devDependencies": {

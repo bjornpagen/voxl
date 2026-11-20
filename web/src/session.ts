@@ -33,7 +33,7 @@ import type {
 /** What the record tells the page: everything the worker does but the screen's own. */
 export type Told = Exclude<
 	FromWorker,
-	{ t: 'frame' } | { t: 'decodes' } | { t: 'decodesNothing' }
+	{ t: 'size' } | { t: 'decodes' } | { t: 'decodesNothing' }
 >;
 
 /** What the record does. `S` is a socket to the relay, and `A` where the desktop's sound

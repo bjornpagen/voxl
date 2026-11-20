@@ -11,8 +11,8 @@
 // first, and what waits in the page is lag the daemon cannot see. The relay gives one update
 // at a time, and the next only once the page says it took the one before (`took`, said by
 // session.ts). Took means exactly this: the page is done with that update, which is decoded
-// and its picture handed to the track (`World.present`, which the worker posts to the
-// page's thread, whose presenter writes it to the video track). It does not mean the picture
+// and its picture handed to the track (`World.present`, which the worker's presenter writes
+// to the page's video track, track.ts). It does not mean the picture
 // was seen: the presenter keeps the newest picture it was handed, and one still waiting
 // behind a write is replaced. So an update is never behind another in the worker, its time
 // from arrival to handed over is its own decode, and one that arrives while another is
