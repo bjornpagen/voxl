@@ -460,11 +460,20 @@ async fn next_frame(lane: &mut UnixStream, framer: &mut Framer) -> (Sequence, Tr
     }
 }
 
-/// Reads a lane until it ends: what it carried.
+/// Reads a lane until it ends: what it carried. A lane has ended when a read of it brings
+/// nothing or fails, which is the relay's own rule (`relay::session::Open::read`: either is
+/// the lane's end, for a cause it only says). The daemon reads a lane's first bytes and
+/// nothing after them, so a lane it closes with more sent than it read ends, on Linux, with
+/// a reset after whatever it carried, and with an end of file elsewhere: one end, either way.
 async fn to_the_end(lane: &mut UnixStream) -> Vec<u8> {
     let mut all = Vec::new();
-    lane.read_to_end(&mut all).await.unwrap();
-    all
+    let mut buf = [0u8; 8192];
+    loop {
+        match lane.read(&mut buf).await {
+            Ok(0) | Err(_) => return all,
+            Ok(n) => all.extend_from_slice(&buf[..n]),
+        }
+    }
 }
 
 /// Ten minutes of a still desktop, on tokio's paused clock, send nothing after the hello:
