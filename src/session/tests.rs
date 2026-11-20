@@ -12,7 +12,7 @@ use crate::hub::Hub;
 use crate::session::link::Path;
 use crate::session::sender::Way;
 use crate::wire::Byte;
-use crate::wire::{Capability, Down, Frame, Framer, Sequence, Track, Up};
+use crate::wire::{Capability, Down, Frame, Framer, Holds, Sequence, Track, Up};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -130,9 +130,16 @@ async fn settle() {
     }
 }
 
-/// A lane's first bytes: the capability it presents.
-fn attach(c: &Capability) -> [u8; crate::wire::CAPABILITY] {
-    *c.bytes()
+/// A lane's first bytes: the capability it presents, and that its page holds nothing.
+fn attach(c: &Capability) -> Vec<u8> {
+    attach_holding(c, Holds::Nothing)
+}
+
+/// A lane's first bytes: the capability it presents, and what its page holds.
+fn attach_holding(c: &Capability, holds: Holds) -> Vec<u8> {
+    let mut first = c.bytes().to_vec();
+    holds.encode(&mut first);
+    first
 }
 
 /// A lane opened to `hub` with `bytes` first: the relay's end.
@@ -258,6 +265,71 @@ async fn a_lane_takes_its_statement_or_nothing() {
         }
     }
     assert!(bare > 20 && refused > 100, "{bare} {refused}");
+}
+
+/// A lane says what its page holds, and its viewer holds exactly that. Through the real
+/// lane socket, over generated lanes of one session that watches or does not (`v,1`,
+/// `v,0`), each saying after its capability that its page holds nothing or the stream
+/// through a generated frame: the lane attaches, and the viewer is watching or not, as it
+/// was, holding what the lane said, whatever it held or was before. A lane whose byte after
+/// the capability is no tag of what a page holds, with or without bytes after it, is closed
+/// unanswered, and the viewer is as it was.
+#[tokio::test]
+async fn a_lane_says_what_its_page_holds() {
+    use crate::hub::Viewer;
+    let mut rng = crate::xorshift::Xorshift::new(0xbb67_ae85_84ca_a73b);
+    let hub = Hub::new(crate::hub::tests::hello()).unwrap();
+    let d = daemon(&hub);
+    let mut relay = Relay::open(&d).await;
+    let (c, _) = relay.greeted().await;
+    let client = hub.clients.lock()[0].clone();
+    let (mut through, mut nothing, mut refused, mut watched) = (0, 0, 0, 0);
+    for run in 0..300 {
+        let watches = rng.below(2) == 0;
+        relay
+            .say(Up::Text(["v,0", "v,1"][usize::from(watches)]))
+            .await;
+        let is_set = |v: Viewer| matches!(v, Viewer::NotWatching(_)) != watches;
+        while !is_set(client.viewer()) {
+            tokio::task::yield_now().await;
+        }
+        let before = client.viewer();
+        if rng.below(5) == 0 {
+            let mut first = c.bytes().to_vec();
+            first.push(rng.range(2, 256) as u8);
+            first.extend((0..rng.below(6)).map(|_| rng.next() as u8));
+            let mut lane = open_lane(&hub, &first).await;
+            drop(lane.shutdown().await);
+            assert!(to_the_end(&mut lane).await.is_empty(), "run {run}");
+            assert!(
+                relay.silent().await,
+                "run {run}: a refused lane was confirmed"
+            );
+            assert_eq!(client.viewer(), before, "run {run}");
+            refused += 1;
+            continue;
+        }
+        let holds = match rng.below(3) {
+            0 => Holds::Nothing,
+            1.. => Holds::Through(crate::wire::Version(rng.next() as u32)),
+        };
+        let _lane = open_lane(&hub, &attach_holding(&c, holds)).await;
+        assert_eq!(relay.next().await.0, Said::Attached, "run {run}");
+        let want = match watches {
+            true => Viewer::Watching(holds),
+            false => Viewer::NotWatching(holds),
+        };
+        assert_eq!(client.viewer(), want, "run {run}");
+        match holds {
+            Holds::Nothing => nothing += 1,
+            Holds::Through(_) => through += 1,
+        }
+        watched += usize::from(watches);
+    }
+    assert!(
+        through > 100 && nothing > 40 && refused > 30 && watched > 60,
+        "{through} {nothing} {refused} {watched}"
+    );
 }
 
 /// A statement's two ends: a `SOCK_SEQPACKET` pair, as the proxy makes one.

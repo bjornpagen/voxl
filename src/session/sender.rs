@@ -17,9 +17,10 @@
 //! dropped by the page on arrival, behind it on the lane. Dropping beats lag, at the source.
 //!
 //! A session has a lane or it has none: a lane whose socket breaks is the session's lane
-//! no longer, and what it held goes with it. The next lane the relay attaches starts its
-//! viewer over on a keyframe (`hub::Client::attach`), since bytes the broken socket
-//! accepted may never have reached the relay.
+//! no longer, and what it held goes with it. The next lane the relay attaches says what
+//! the page decoded (`wire::Holds`), since bytes the broken socket accepted may never have
+//! reached the relay: its viewer goes on from that if it is the stream's newest frame, and
+//! starts over on a keyframe if not (`hub::Client::attach`).
 //!
 //! Everything here is synchronous, under the session's lock in the hub: the lane's writer
 //! task (`lane.rs`) takes that lock for each write, so what it writes is its session's lane

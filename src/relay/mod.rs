@@ -8,9 +8,11 @@
 //! session begins: the transport delivers every byte, in order, and the relay gives
 //! the page each frame as it is, one at a time, reading the next only once the page has said
 //! it took the one before; each update the page took it tells the daemon on the control
-//! stream. A lane that ends after the daemon confirmed it (`Down::Attached`) opens again, and
-//! the daemon starts its viewer over on a keyframe; one that ends before is the daemon or the
-//! transport refusing it, and ends the session.
+//! stream. A lane that ends after the daemon confirmed it (`Down::Attached`) opens again,
+//! saying the last update the page took (`wire::Holds`): the daemon goes on from it with
+//! the next frame if it is still the stream's newest, and starts its viewer over on a
+//! keyframe if not; one that ends before is the daemon or the transport refusing it, and
+//! ends the session.
 
 mod access;
 mod files;

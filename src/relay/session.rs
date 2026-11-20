@@ -33,7 +33,7 @@
 
 use super::proxy::{self, ProxyError};
 use super::{files, ssh};
-use crate::wire::{self, Capability, Down, Frame, Framer, Header, Sequence, Track, Up};
+use crate::wire::{self, Capability, Down, Frame, Framer, Header, Holds, Sequence, Track, Up};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::Response;
@@ -340,13 +340,18 @@ struct Connected<S> {
 }
 
 impl<S: AsyncWrite + Unpin> Connected<S> {
-    /// Attaches the lane to the session: its capability is the lane's first bytes, and the
-    /// only ones the relay ever sends on it.
-    async fn attach(mut self, key: &Capability) -> Result<Open<S>, End> {
-        self.stream
-            .write_all(key.bytes())
-            .await
-            .map_err(|e| End::Proxy(ProxyError::Io(e)))?;
+    /// Attaches the lane to the session: its capability and what the page holds of the
+    /// stream are the lane's first bytes, and the only ones the relay ever sends on it.
+    async fn attach(mut self, key: &Capability, holds: Holds) -> Result<Open<S>, End> {
+        let mut said = Vec::new();
+        holds.encode(&mut said);
+        // The capability goes from where it lies: it is copied into no buffer.
+        for bytes in [&key.bytes()[..], &said] {
+            self.stream
+                .write_all(bytes)
+                .await
+                .map_err(|e| End::Proxy(ProxyError::Io(e)))?;
+        }
         Ok(Open {
             stream: self.stream,
             framer: self.framer,
@@ -357,8 +362,9 @@ impl<S: AsyncWrite + Unpin> Connected<S> {
 }
 
 /// Whether the daemon has confirmed an open lane (`Down::Attached`). One that ends attached
-/// was closed by its transport, and is opened again: the daemon starts its viewer over on a
-/// keyframe. One that ends unconfirmed is the daemon or the transport refusing it, and
+/// was closed by its transport, and is opened again, saying what the page holds: the daemon
+/// goes on from that if it is the stream's newest frame, and starts its viewer over on a
+/// keyframe if not. One that ends unconfirmed is the daemon or the transport refusing it, and
 /// opening it again would loop.
 ///
 /// It is the lane's stream's own, and an axis of the session of its own: the confirmation
@@ -393,21 +399,24 @@ impl<S: AsyncRead + Unpin> Open<S> {
         }
     }
 
-    /// The next whole frame, if one is in: its name, and the page's message, which is the
-    /// frame as it is without its name. An update is its header and a picture: one cut short
-    /// of either, or with flags no reader knows, is no frame.
-    fn frame(&mut self) -> Result<Option<(Sequence, Bytes)>, End> {
+    /// The next whole frame, if one is in: its name, the page's message, which is the frame
+    /// as it is without its name, and what the page holds of the stream once it took it, if
+    /// the frame is an update. An update is its header and a picture: one cut short of
+    /// either, or with flags no reader knows, is no frame.
+    fn frame(&mut self) -> Result<Option<(Sequence, Bytes, Option<Holds>)>, End> {
         let Some(m) = self.framer.frame().map_err(End::Lane)? else {
             return Ok(None);
         };
         let frame = Frame::decode(m).map_err(End::Lane)?;
-        match frame.track {
+        let holds = match frame.track {
             Track::Video => {
-                Header::read(frame.bytes).map_err(End::Lane)?;
+                let update = Header::read(frame.bytes).map_err(End::Lane)?;
+                Some(Holds::Through(update.header.version))
             }
-            Track::Audio => {}
-        }
-        Ok(Some((frame.sequence, Bytes::copy_from_slice(frame.page()))))
+            Track::Audio => None,
+        };
+        let message = Bytes::copy_from_slice(frame.page());
+        Ok(Some((frame.sequence, message, holds)))
     }
 
     /// Reads what the lane has into its framer; or, at its end, says how it ended. Dropped
@@ -431,9 +440,13 @@ type Connecting<'d, S> = Pin<Box<dyn Future<Output = Result<Connected<S>, End>> 
 /// already answered), then the capability written on it.
 type Attaching<'k, S> = Pin<Box<dyn Future<Output = Result<Open<S>, End>> + Send + 'k>>;
 
-/// The lane opened through `door` and attached with `key`.
-fn attaching<'k, D: Door + 'k>(door: D, key: &'k Capability) -> Attaching<'k, D::Stream> {
-    Box::pin(async move { door.connect().await?.attach(key).await })
+/// The lane opened through `door` and attached with `key`, its page holding `holds`.
+fn attaching<'k, D: Door + 'k>(
+    door: D,
+    key: &'k Capability,
+    holds: Holds,
+) -> Attaching<'k, D::Stream> {
+    Box::pin(async move { door.connect().await?.attach(key, holds).await })
 }
 
 /// The lane before the session's capability came: nothing can be written on it.
@@ -505,12 +518,22 @@ impl<'k, S: AsyncRead + AsyncWrite + Unpin> Lane<'k, S> {
     }
 
     /// Gives the page the lane's next frame, if the page holds none and one is in: the turn
-    /// is spent on it, and `hand` holds what the page was given before the page does.
-    async fn give(self, hand: &Hand, page: &mut impl Page) -> Result<Lane<'k, S>, End> {
+    /// is spent on it, and `hand` holds what the page was given before the page does. An
+    /// update given is what the page `holds` of the stream once it took it; and a lane is
+    /// opened again only with the page's turn in hand, so then it took every frame given.
+    async fn give(
+        self,
+        hand: &Hand,
+        page: &mut impl Page,
+        holds: &mut Holds,
+    ) -> Result<Lane<'k, S>, End> {
         match self {
             Lane::Free { mut open, turn } => match open.frame()? {
                 None => Ok(Lane::Free { open, turn }),
-                Some((sequence, message)) => {
+                Some((sequence, message, shows)) => {
+                    if let Some(shows) = shows {
+                        *holds = shows;
+                    }
                     hand.give(turn.give(sequence));
                     page.send(Message::Binary(message)).await?;
                     Ok(Lane::Held { open })
@@ -690,12 +713,15 @@ async fn serve<D: Door>(
         };
     };
     let key = &key;
+    // What the page holds of the stream: nothing before its first update, then the last
+    // update it was given, which it took before any lane is opened again.
+    let mut holds = Holds::Nothing;
     let mut lane: Lane<'_, D::Stream> = Lane::Attaching {
         attaching: match unkeyed {
             Unkeyed::Asking(connecting) => {
-                Box::pin(async move { connecting.await?.attach(key).await })
+                Box::pin(async move { connecting.await?.attach(key, holds).await })
             }
-            Unkeyed::Connected(connected) => Box::pin(connected.attach(key)),
+            Unkeyed::Connected(connected) => Box::pin(connected.attach(key, holds)),
         },
     };
     loop {
@@ -720,7 +746,7 @@ async fn serve<D: Door>(
                 }
             };
         }
-        lane = lane.give(hand, page).await?;
+        lane = lane.give(hand, page, &mut holds).await?;
         lane = match lane {
             Lane::Attaching { mut attaching } => tokio::select! {
                 n = control.read(&mut buf) => {
@@ -761,7 +787,7 @@ async fn serve<D: Door>(
                     (Err(why), Standing::Attached) => {
                         log::info!("the lane ended ({why}): it opens again");
                         Lane::Opening {
-                            attaching: attaching(door.clone(), key),
+                            attaching: attaching(door.clone(), key, holds),
                             turn,
                         }
                     }
@@ -1009,12 +1035,14 @@ mod tests {
     }
 
     /// A frame the fake daemon writes on the lane: as the lane carries it, as the page is
-    /// to be given it, and its name, which the daemon is to be told when the page took it.
+    /// to be given it, its name, which the daemon is to be told when the page took it, and,
+    /// of an update, the version its header says.
     #[derive(Clone)]
     struct Written {
         lane: Vec<u8>,
         page: Vec<u8>,
         sequence: Sequence,
+        shows: Option<wire::Version>,
     }
 
     impl Written {
@@ -1023,6 +1051,12 @@ mod tests {
                 lane: frame(sequence, track, bytes),
                 page: [&[track.byte()][..], bytes].concat(),
                 sequence,
+                shows: match track {
+                    Track::Video => Some(wire::Version(u32::from_be_bytes(
+                        bytes[1..5].try_into().unwrap(),
+                    ))),
+                    Track::Audio => None,
+                },
             }
         }
     }
@@ -1098,8 +1132,9 @@ mod tests {
         }
     }
 
-    /// The lane attached: its first bytes are the session's capability.
-    async fn attached(lane: &mut DuplexStream, key: &Capability) {
+    /// The lane attached: its first bytes are the session's capability, and then what the
+    /// page holds of the stream, which is returned.
+    async fn attached(lane: &mut DuplexStream, key: &Capability) -> Holds {
         let mut first = [0u8; wire::CAPABILITY];
         within("attach the lane", lane.read_exact(&mut first))
             .await
@@ -1108,6 +1143,16 @@ mod tests {
             Capability::presented(&first).matches(key),
             "the lane's first bytes are not the session's capability"
         );
+        let mut said = vec![0u8; 1];
+        within("say what the page holds", lane.read_exact(&mut said))
+            .await
+            .expect("the lane is open");
+        let after = Holds::after(said[0]).expect("a lane says what its page holds");
+        said.resize(1 + after, 0);
+        within("say what the page holds", lane.read_exact(&mut said[1..]))
+            .await
+            .expect("the lane is open");
+        Holds::decode(&said).expect("a lane says what its page holds")
     }
 
     /// How a fake session starts: what the relay has when.
@@ -1160,6 +1205,8 @@ mod tests {
     /// - the daemon is told what the page said, as it said it, in order, and for the page's
     ///   word after a frame, update or packet alike, that frame's name;
     /// - a confirmed lane that ends is asked for again, and loses nothing it carried whole;
+    ///   a session's first lane says its page holds nothing, and each lane opened again
+    ///   says the last update written before it, on any lane, which the page took;
     /// - the session goes on until the page closes, and then ends for that.
     #[tokio::test(start_paused = true)]
     async fn the_page_is_given_one_frame_at_a_time_and_the_daemon_is_told() {
@@ -1167,6 +1214,8 @@ mod tests {
         let mut rng = Xorshift::new(0x3c6e_f372_fe94_f82b);
         let (mut reopened, mut held_back, mut told_in_hand, mut tooks) = (0, 0, 0, 0);
         let (mut lane_first, mut unread, mut again, mut starts) = (0, 0, 0, [0; 3]);
+        // Lanes opened again that said their page held an update.
+        let held_through = Arc::new(AtomicUsize::new(0));
         // Where each lane's standing is met, by the page's turn (no hello yet, free,
         // holding a frame) and the standing (unconfirmed, attached), as the plan orders the
         // two streams: the standing is an axis of its own, and every pair comes.
@@ -1320,6 +1369,7 @@ mod tests {
                     .collect(),
             );
             let (hand_over, handed) = tokio::sync::oneshot::channel::<DuplexStream>();
+            let held_through = held_through.clone();
             let on_lane = {
                 let (arrived, done, greeted) = (arrived.clone(), done.clone(), greeted.clone());
                 let (plan, went, before) = (plan.clone(), went.clone(), before.clone());
@@ -1347,11 +1397,15 @@ mod tests {
                             answer(&mut asks).await
                         }
                     };
-                    attached(&mut lane, &key).await;
+                    // A session's first lane says its page holds nothing.
+                    assert_eq!(attached(&mut lane, &key).await, Holds::Nothing);
                     hand_over
                         .send(control)
                         .expect("the control stream's task waits");
                     let mut written = 0;
+                    // The last update written, on any lane: the page took it before the lane
+                    // it came on was ended.
+                    let mut shown = Holds::Nothing;
                     for (does, before) in plan.iter().zip(before.iter()) {
                         match does {
                             Does::Frame(frame) => {
@@ -1359,6 +1413,9 @@ mod tests {
                                 went.0.notify_waiters();
                                 lane.write_all(&framed(&frame.lane)).await.unwrap();
                                 written += 1;
+                                if let Some(version) = frame.shows {
+                                    shown = Holds::Through(version);
+                                }
                             }
                             Does::EndLane => {
                                 wait(&went.0, || {
@@ -1370,7 +1427,12 @@ mod tests {
                                 settle().await;
                                 drop(lane);
                                 lane = answer(&mut asks).await;
-                                attached(&mut lane, &key).await;
+                                let says = attached(&mut lane, &key).await;
+                                assert_eq!(says, shown, "what a lane opened again says");
+                                held_through.fetch_add(
+                                    usize::from(shown != Holds::Nothing),
+                                    Ordering::SeqCst,
+                                );
                                 went.1[ENDED].fetch_add(1, Ordering::SeqCst);
                                 went.0.notify_waiters();
                             }
@@ -1560,6 +1622,8 @@ mod tests {
             lane_first > 5 && unread > 5 && again > 5 && starts == [20; 3],
             "{lane_first} {unread} {again} {starts:?}"
         );
+        let held_through = held_through.load(Ordering::SeqCst);
+        assert!(held_through > 10, "{held_through} lanes said an update");
         assert!(
             axes.iter().flatten().all(|&n| n > 5),
             "the turn and the standing: {axes:?}"
@@ -1840,7 +1904,7 @@ mod tests {
     }
 
     /// A lane's stream comes from the proxy by a CONNECT, and attaching it sends the
-    /// session's capability and nothing else. Against a proxy on 127.0.0.1 that answers the
+    /// session's capability, what its page holds, and nothing else. Against a proxy on 127.0.0.1 that answers the
     /// CONNECT and reads what follows until the relay's end closes.
     #[tokio::test]
     async fn a_lane_attaches_with_the_capability() {
@@ -1875,17 +1939,20 @@ mod tests {
             .connect()
             .await
             .unwrap_or_else(|end| panic!("{end}"));
+        let mut rng = Xorshift::new(0xa54f_f53a_5f1d_36f1);
+        let holds = Holds::Through(wire::Version(rng.next() as u32));
         let open = connected
-            .attach(&capability)
+            .attach(&capability, holds)
             .await
             .unwrap_or_else(|end| panic!("{end}"));
         assert_eq!(open.standing, Standing::Unconfirmed);
         // The relay's end closes: the proxy has read all the lane sent.
         drop(open);
         let sent = proxy.await.unwrap();
-        let Ok(presented) = <&[u8; wire::CAPABILITY]>::try_from(&sent[..]) else {
+        let Some((presented, said)) = sent.split_first_chunk::<{ wire::CAPABILITY }>() else {
             panic!("the lane sent {} bytes", sent.len());
         };
         assert!(Capability::presented(presented).matches(&capability));
+        assert_eq!(Holds::decode(said), Ok(holds));
     }
 }

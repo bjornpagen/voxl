@@ -98,7 +98,7 @@ pub(super) enum Handed {
 
 impl Handed {
     /// What was handed, with `more` handed after it.
-    fn and(self, more: Handed) -> Handed {
+    pub(super) fn and(self, more: Handed) -> Handed {
         match (self, more) {
             (Handed::Nothing, handed) | (handed, Handed::Nothing) => handed,
             (Handed::One(_) | Handed::Many, Handed::One(_) | Handed::Many) => Handed::Many,

@@ -1,7 +1,9 @@
 // The worker's record of the screen: its one decoder. The session's hello names the codec,
-// which stays the session's (the daemon declares the level of the largest desktop). The lane
-// is one stream that carries every update in order, and a viewer's lane begins with a
-// keyframe: a keyframe starts the decoder, and every update after it decodes, in the order
+// which stays the session's (the daemon declares the level of the largest desktop). A lane
+// is one stream that carries every update in order; a session's first begins with a
+// keyframe, and one opened in its place goes on with the update after the last this page
+// took, or begins with a keyframe again (the relay says what the page took, and the daemon
+// decides): a keyframe starts the decoder, and every update after it decodes, in the order
 // it came. An update before the hello or a delta before the first keyframe is a fault, as is
 // a second hello, a decoder error or a codec the browser cannot decode: each ends the session
 // for its cause. Nothing asks for a keyframe, and nothing is reconfigured.

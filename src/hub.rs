@@ -6,6 +6,7 @@ use crate::histogram::Histogram;
 use crate::session::control::Audio;
 use crate::session::link::{Gate, Path};
 use crate::session::sender::{Sender, Writer};
+pub use crate::wire::Holds;
 use crate::wire::{Capability, Sequence, Version};
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -199,17 +200,6 @@ pub struct Resize {
     pub scale: f64,
 }
 
-/// What a viewer holds of the stream while it is not in the chain: the picture of a frame
-/// its lane carried, if every frame of the stream up to it went on that lane, in order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Holds {
-    /// Nothing it can go on from: it starts on a keyframe.
-    Nothing,
-    /// The stream's frames from a keyframe through the one named here: if that is still the
-    /// stream's newest, it goes on from it with the next frame.
-    Through(Version),
-}
-
 /// What a client is to the stream. Each change is a method of `Client`, named for the step
 /// that makes it, and each method's rule is one of the pure functions below.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -231,15 +221,27 @@ pub enum Viewer {
     Started { through: Version },
 }
 
-/// What starting over makes of a viewer (the stream is rebuilt, or a new lane carries it):
+/// What starting over makes of a viewer (the stream is rebuilt):
 /// one that watches starts on a keyframe, and one that does not holds nothing. A keyframe
-/// planned for it, and what it held, went with the old stream or lane.
+/// planned for it, and what it held, went with the old stream.
 pub(crate) fn restarted(viewer: Viewer) -> Viewer {
     match viewer {
         Viewer::NotWatching(_) => Viewer::NotWatching(Holds::Nothing),
         Viewer::Watching(_) | Viewer::Promised | Viewer::Started { .. } => {
             Viewer::Watching(Holds::Nothing)
         }
+    }
+}
+
+/// What a new lane makes of a viewer whose page holds `holds`, as the lane said when it
+/// attached: it holds that, and nothing else it held or was promised, since only what the
+/// page decoded counts, and bytes the lane before took may never have reached it. One that
+/// watches is not in the chain until the first capture its gate is open for, which says
+/// whether it goes on from what its page holds or starts on a keyframe (`planned`).
+pub(crate) fn reattached(viewer: Viewer, holds: Holds) -> Viewer {
+    match viewer {
+        Viewer::NotWatching(_) => Viewer::NotWatching(holds),
+        Viewer::Watching(_) | Viewer::Promised | Viewer::Started { .. } => Viewer::Watching(holds),
     }
 }
 
@@ -500,11 +502,11 @@ impl Client {
         v.viewer = stopped(v.viewer);
     }
 
-    /// The stream starts over for it (it is rebuilt, or a display switch failed): if it
-    /// watches, it starts on a keyframe of what follows, which carries the new size. Under
-    /// the lock a keyframe is planned, sent and taken under, so one planned before is not
-    /// sent it.
-    pub fn start_over(&self) {
+    /// The stream starts over for it, as for every client (it is rebuilt:
+    /// `Hub::restart_clients`): if it watches, it starts on a keyframe of what follows, which
+    /// carries the new size. Under the lock a keyframe is planned, sent and taken under, so
+    /// one planned before is not sent it.
+    fn start_over(&self) {
         let mut v = self.viewing.lock();
         v.viewer = restarted(v.viewer);
     }
@@ -560,13 +562,14 @@ impl Client {
     }
 
     /// A lane attached with its capability, in place of any before, its path `path` (not
-    /// stated, or not yet): the viewer starts over on a keyframe sent on it, since bytes a
-    /// lane before took may never have reached the page. The lane's writer's hold on it, if
-    /// the session took it.
-    pub fn attach(&self, path: Path) -> Option<Writer> {
+    /// stated, or not yet), its page holding `holds`: the viewer holds that (`reattached`),
+    /// so a page that decoded the stream's newest frame goes on with the next on this lane,
+    /// and any other starts on a keyframe sent on it. The lane's writer's hold on it, if the
+    /// session took it.
+    pub fn attach(&self, path: Path, holds: Holds) -> Option<Writer> {
         let mut v = self.viewing.lock();
         let writer = v.sender.attach(path)?;
-        v.viewer = restarted(v.viewer);
+        v.viewer = reattached(v.viewer, holds);
         Some(writer)
     }
 }
@@ -780,15 +783,20 @@ impl Hub {
 
     /// A lane presenting a capability: it joins the session whose capability it is, which
     /// is told so on its control stream. Every open session's capability is compared, each
-    /// in constant time. The lane's path is `path` as it attaches. The session that took it
-    /// and the lane's writer's hold on it, if one did.
-    pub fn attach(&self, presented: &Capability, path: Path) -> Option<(Arc<Client>, Writer)> {
+    /// in constant time. The lane's path is `path` as it attaches, and its page holds
+    /// `holds`. The session that took it and the lane's writer's hold on it, if one did.
+    pub fn attach(
+        &self,
+        presented: &Capability,
+        path: Path,
+        holds: Holds,
+    ) -> Option<(Arc<Client>, Writer)> {
         let clients = self.clients.lock().clone();
         let whose = clients.into_iter().fold(None, |found, c| {
             let is = c.lane(|s| s.is(presented));
             found.or(is.then_some(c))
         })?;
-        let writer = whose.attach(path)?;
+        let writer = whose.attach(path, holds)?;
         whose.send(Out::Attached);
         self.wake();
         Some((whose, writer))
@@ -903,10 +911,8 @@ pub(crate) mod tests {
         Watch(usize),
         /// `v,0`.
         StopWatching(usize),
-        /// The hello after a failed display switch: the stream starts over for this client
-        /// alone, and what the encoder holds is still sent.
-        StartOver(usize),
-        /// A lane attaches, replacing any before (the relay reopened it).
+        /// A lane attaches, replacing any before (the relay reopened it), and says what its
+        /// page last decoded.
         Attach(usize),
         /// The lane's socket breaks.
         Lose(usize),
@@ -942,7 +948,6 @@ pub(crate) mod tests {
                 Kind::Page => steps.extend([
                     Step::Watch(i),
                     Step::StopWatching(i),
-                    Step::StartOver(i),
                     Step::Attach(i),
                     Step::Lose(i),
                     Step::Leave(i),
@@ -973,13 +978,16 @@ pub(crate) mod tests {
     /// the frame it showed.
     type Page = Option<Version>;
 
-    /// A client as the model keeps it: what it is to the stream, its way out, its page, and
-    /// what its link says (a recording's is always open).
+    /// A client as the model keeps it: what it is to the stream, its way out, its page, the
+    /// update its page last decoded on any lane and of any stream (what its relay says when
+    /// a lane attaches: the page keeps it through a lost lane, and its relay knows of no
+    /// stream rebuilt), and what its link says (a recording's is always open).
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     struct Seat {
         viewer: Viewer,
         lane: Lane,
         page: Page,
+        decoded: Option<Version>,
         gate: Gate,
     }
 
@@ -994,6 +1002,7 @@ pub(crate) mod tests {
                 viewer,
                 lane,
                 page: None,
+                decoded: None,
                 gate: Gate::Open,
             }
         }
@@ -1046,14 +1055,22 @@ pub(crate) mod tests {
         match step {
             Step::Watch(i) => m.c[i].viewer = watching(m.c[i].viewer),
             Step::StopWatching(i) => m.c[i].viewer = stopped(m.c[i].viewer),
-            // The page starts over: its decoder too.
-            Step::StartOver(i) => (m.c[i].viewer, m.c[i].page) = (restarted(m.c[i].viewer), None),
-            // A new lane starts its viewer over: what the lane before took may be lost.
+            // A new lane says what the page last decoded, and the viewer holds that and
+            // nothing else: what the lane before took beyond it is lost. The page shows what
+            // it showed.
             Step::Attach(i) => {
                 let c = &mut m.c[i];
-                (c.viewer, c.lane, c.page) = (restarted(c.viewer), Lane::Live, None);
+                let holds = c.decoded.map_or(Holds::Nothing, Holds::Through);
+                c.viewer = match c.viewer {
+                    Viewer::NotWatching(_) => Viewer::NotWatching(holds),
+                    Viewer::Watching(_) | Viewer::Promised | Viewer::Started { .. } => {
+                        Viewer::Watching(holds)
+                    }
+                };
+                c.lane = Lane::Live;
             }
-            Step::Lose(i) => (m.c[i].lane, m.c[i].page) = (Lane::Lost, None),
+            // The page shows what it showed: frames go on without it.
+            Step::Lose(i) => m.c[i].lane = Lane::Lost,
             Step::Leave(i) => m.c[i] = Seat::joined(Kind::Page),
             Step::Link(i, gate) => m.c[i].gate = gate,
             Step::Restart => {
@@ -1112,7 +1129,7 @@ pub(crate) mod tests {
                         *through = version;
                         sent.push(i);
                         if matches!(c.lane, Lane::Live | Lane::Recording) {
-                            c.page = Some(version);
+                            (c.page, c.decoded) = (Some(version), Some(version));
                         }
                     }
                 }
@@ -1132,16 +1149,15 @@ pub(crate) mod tests {
             Step::Link(i, gate) => m.c[i].gate != gate,
             Step::Watch(_)
             | Step::StopWatching(_)
-            | Step::StartOver(_)
             | Step::Attach(_)
             | Step::Leave(_)
             | Step::Restart => true,
         }
     }
 
-    /// A lane attaches to `c`: its writer's hold on it.
-    fn attach(c: &Client) -> Writer {
-        c.attach(Path::Unstated)
+    /// A lane attaches to `c`, its page holding `holds`: its writer's hold on it.
+    fn attach(c: &Client, holds: Holds) -> Writer {
+        c.attach(Path::Unstated, holds)
             .expect("an open session takes a lane")
     }
 
@@ -1159,7 +1175,7 @@ pub(crate) mod tests {
                 let c = hub.add_client(tx, Sender::new(Capability::mint().unwrap()));
                 let writer = match lane {
                     Lane::None => None,
-                    Lane::Live | Lane::Lost | Lane::Recording => Some(attach(&c)),
+                    Lane::Live | Lane::Lost | Lane::Recording => Some(attach(&c, Holds::Nothing)),
                 };
                 if let (Lane::Lost, Some(w)) = (lane, &writer) {
                     c.lane(|s| s.lost(w));
@@ -1194,6 +1210,8 @@ pub(crate) mod tests {
         passed: usize,
         /// Frames planned while a viewer seen had its gate shut.
         despite: usize,
+        /// Lanes attached whose page held the chain's newest frame.
+        holding: usize,
     }
 
     /// The same step, by the methods, on real clients of `hub` set to `m`, the capture loop's
@@ -1206,7 +1224,8 @@ pub(crate) mod tests {
     ///   is shut is;
     /// - a keyframe goes only to a viewer whose page does not show the chain's newest frame;
     /// - a frame is sent only to a viewer whose gate was open when it was planned;
-    /// - a page is never sent a delta that does not follow the frame it showed;
+    /// - a page is never sent a delta that does not follow the frame it showed, on the lane
+    ///   it had or on one attached since, which said what it last decoded;
     /// - a recording is sent every frame.
     fn new_step(
         hub: &Hub,
@@ -1223,19 +1242,15 @@ pub(crate) mod tests {
         match step {
             Step::Watch(i) => c[i].0.watch(),
             Step::StopWatching(i) => c[i].0.stop_watching(),
-            Step::StartOver(i) => {
-                c[i].0.start_over();
-                after.c[i].page = None;
-            }
             Step::Attach(i) => {
-                c[i].1 = Some(attach(&c[i].0));
-                after.c[i].page = None;
+                let holds = m.c[i].decoded.map_or(Holds::Nothing, Holds::Through);
+                c[i].1 = Some(attach(&c[i].0, holds));
+                count.holding += usize::from(m.head.is_some() && m.c[i].decoded == m.head);
             }
             Step::Lose(i) => {
                 if let Some(w) = &c[i].1 {
                     c[i].0.lane(|s| s.lost(w));
                 }
-                after.c[i].page = None;
             }
             Step::Leave(i) => {
                 hub.remove_client(c[i].0.id);
@@ -1246,6 +1261,7 @@ pub(crate) mod tests {
                 c[i] = client(hub, &Seat::joined(Kind::Page));
                 // A new session's link has nothing on the way.
                 (after.c[i].page, after.c[i].gate) = (None, Gate::Open);
+                after.c[i].decoded = None;
             }
             Step::Link(i, gate) => after.c[i].gate = gate,
             // The capture loop of the rebuilt stream starts a chain of its own.
@@ -1333,6 +1349,7 @@ pub(crate) mod tests {
                             let follows = key.is_some() || *page == m.coded;
                             assert!(follows, "{what}: a delta {i} cannot decode");
                             *page = Some(version);
+                            after.c[i].decoded = Some(version);
                         }
                     }
                 }
@@ -1489,12 +1506,14 @@ pub(crate) mod tests {
             resumed,
             passed,
             despite,
+            holding,
         } = count;
         println!(
-            "{} states, {steps} steps, {resumed} resumed, {passed} passed by",
+            "{} states, {steps} steps, {resumed} resumed, {passed} passed by, {holding} lanes \
+             attached holding the newest",
             seen.len()
         );
-        assert!(steps > 0 && resumed > 0 && passed > 0 && despite > 0);
+        assert!(steps > 0 && resumed > 0 && passed > 0 && despite > 0 && holding > 0);
     }
 
     /// No viewer holds another back: the oracles of each step and the rule, over generated
@@ -1523,11 +1542,7 @@ pub(crate) mod tests {
                     Step::Capture | Step::Send => 24,
                     Step::Watch(_) | Step::Attach(_) => 4,
                     Step::Link(_, _) => 2,
-                    Step::StopWatching(_)
-                    | Step::StartOver(_)
-                    | Step::Lose(_)
-                    | Step::Leave(_)
-                    | Step::Restart => 1,
+                    Step::StopWatching(_) | Step::Lose(_) | Step::Leave(_) | Step::Restart => 1,
                 };
                 std::iter::repeat_n(step, weight)
             })
@@ -1546,7 +1561,6 @@ pub(crate) mod tests {
                     Step::Link(_, Gate::Full | Gate::Late)
                     | Step::Watch(_)
                     | Step::StopWatching(_)
-                    | Step::StartOver(_)
                     | Step::Attach(_)
                     | Step::Lose(_)
                     | Step::Leave(_)
@@ -1566,9 +1580,13 @@ pub(crate) mod tests {
             resumed,
             passed,
             despite,
+            holding,
         } = count;
-        println!("{steps} steps, {resumed} resumed, {passed} passed by, {despite} despite");
-        assert!(passed > 100 && despite > 1000);
+        println!(
+            "{steps} steps, {resumed} resumed, {passed} passed by, {despite} despite, {holding} \
+             lanes attached holding the newest"
+        );
+        assert!(passed > 100 && despite > 1000 && holding > 20);
     }
 
     /// The tests' generator, drawing the hub's values.

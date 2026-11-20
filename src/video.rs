@@ -1468,7 +1468,7 @@ pub(crate) mod tests {
                 if f == reopen || f == again {
                     lanes.push(std::mem::take(&mut now));
                     moved
-                        .attach(Path::Unstated)
+                        .attach(Path::Unstated, Holds::Nothing)
                         .expect("an open session takes a lane");
                 }
                 let mut seen = Vec::new();

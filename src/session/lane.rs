@@ -1,9 +1,10 @@
 //! The lane socket: where a proxy's connections to the lane port arrive, and the writer that
 //! sends each lane's queue.
 //!
-//! A lane's first bytes are a session's capability, and they are the only bytes the daemon
-//! ever reads from a lane. A lane that opens with a capability no open session has is closed
-//! unanswered; a lane attached is never read again.
+//! A lane's first bytes are a session's capability and what its page holds of the stream
+//! (`wire::Holds`), and they are the only bytes the daemon ever reads from a lane. A lane
+//! that opens with a capability no open session has, or with anything else after it, is
+//! closed unanswered; a lane attached is never read again.
 //!
 //! With those bytes the lane's transport hands over its statement of the path, a
 //! descriptor (`statement`): read for as long as the lane is its session's, each path it
@@ -16,7 +17,7 @@ use super::link::Path;
 use super::sender::{Next, Writer};
 use super::statement::{self, Handed, Said, Statement};
 use crate::hub::{Client, Hub};
-use crate::wire::{Capability, CAPABILITY};
+use crate::wire::{Capability, Holds, CAPABILITY};
 use std::sync::Arc;
 use tokio::net::unix::OwnedWriteHalf;
 #[cfg(target_os = "linux")]
@@ -35,9 +36,9 @@ pub async fn lanes(listener: UnixListener, hub: Arc<Hub>) {
     }
 }
 
-/// A lane: the capability it presents, read into a buffer of that size and nothing more,
-/// with the statement of its path, if one was handed over with it; then, attached, its
-/// writer, and beside it the reader of its statement. When the lane ends the capture loop
+/// A lane: the capability it presents and what its page holds, read into buffers of their
+/// sizes and nothing more, with the statement of its path, if one was handed over with
+/// them; then, attached, its writer, and beside it the reader of its statement. When the lane ends the capture loop
 /// is woken, to look again at who watches with a lane.
 pub(super) async fn lane(stream: tokio::net::UnixStream, hub: Arc<Hub>) {
     let mut first = [0u8; CAPABILITY];
@@ -47,6 +48,22 @@ pub(super) async fn lane(stream: tokio::net::UnixStream, hub: Arc<Hub>) {
     let presented = Capability::presented(&first);
     // The capability is read; the buffer that held it is zeroed.
     zero(&mut first);
+    // What the page holds: its tag, which says how many bytes follow it, and those.
+    let mut said = [0u8; 1 + std::mem::size_of::<u32>()];
+    let Ok(with_tag) = statement::first(&stream, &mut said[..1]).await else {
+        return;
+    };
+    let Ok(after) = Holds::after(said[0]) else {
+        return;
+    };
+    let said = &mut said[..1 + after];
+    let Ok(with_rest) = statement::first(&stream, &mut said[1..]).await else {
+        return;
+    };
+    let Ok(holds) = Holds::decode(said) else {
+        return;
+    };
+    let handed = handed.and(with_tag).and(with_rest);
     let statement = match handed {
         Handed::Nothing => None,
         Handed::One(descriptor) => match Statement::of(descriptor) {
@@ -65,7 +82,7 @@ pub(super) async fn lane(stream: tokio::net::UnixStream, hub: Arc<Hub>) {
         None => Path::Unstated,
         Some(_) => Path::Unknown,
     };
-    let Some((session, writer)) = hub.attach(&presented, path) else {
+    let Some((session, writer)) = hub.attach(&presented, path, holds) else {
         return;
     };
     let (read, write) = stream.into_split();

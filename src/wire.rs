@@ -1,9 +1,9 @@
 //! Every message the lane and the control stream carry, and the one way each is written and
 //! read.
 //!
-//! The lane is one stream through the transport's proxy: the session's [`Capability`] (relay
-//! to daemon, the lane's first bytes and its only ones that way), then frames (daemon to
-//! relay, [`Frame`]): each named by its [`Sequence`], and each a message for the page, a
+//! The lane is one stream through the transport's proxy: the session's [`Capability`] and
+//! what its page holds of the stream ([`Holds`]) (relay to daemon, the lane's first bytes
+//! and its only ones that way), then frames (daemon to relay, [`Frame`]): each named by its [`Sequence`], and each a message for the page, a
 //! video update (its [`Header`], then its picture) or an Opus packet.
 //! The control stream is the stdio of `voxl attach` over ssh: [`Down`] (daemon to relay) and
 //! [`Up`] (relay to daemon), which also tells the daemon each lane message the page took:
@@ -64,6 +64,72 @@ impl Sequence {
 /// [`Sequence`] on each, and nothing that tells delivery reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Version(pub u32);
+
+/// What a viewer's page holds of the stream: the picture of a frame its lanes carried, if
+/// every frame of the stream up to it reached the page, in order, and the page decoded
+/// each. A lane says it as it attaches, after the capability: its relay knows the last
+/// update the page took, and a page that holds the stream's newest frame goes on from it
+/// with the next, on the new lane, with no keyframe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Holds {
+    /// Nothing it can go on from: it starts on a keyframe.
+    Nothing,
+    /// The stream's frames from a keyframe through the one named here: if that is still the
+    /// stream's newest, it goes on from it with the next frame.
+    Through(Version),
+}
+
+/// The first byte of what a lane says its page holds: which it is.
+#[derive(Clone, Copy)]
+enum HoldsTag {
+    Nothing,
+    Through,
+}
+
+impl Byte for HoldsTag {
+    const ALL: &'static [HoldsTag] = &[HoldsTag::Nothing, HoldsTag::Through];
+
+    fn byte(self) -> u8 {
+        match self {
+            HoldsTag::Nothing => 0,
+            HoldsTag::Through => 1,
+        }
+    }
+}
+
+impl Holds {
+    /// Appends it to `out` as a lane's first bytes carry it, after the capability: its tag,
+    /// and the version it holds through, if any. It goes after no length: its tag says how
+    /// long it is.
+    pub fn encode(self, out: &mut Vec<u8>) {
+        match self {
+            Holds::Nothing => out.push(HoldsTag::Nothing.byte()),
+            Holds::Through(version) => {
+                out.push(HoldsTag::Through.byte());
+                out.extend_from_slice(&version.0.to_be_bytes());
+            }
+        }
+    }
+
+    /// How many bytes follow the tag `tag`, which the daemon reads before it reads them.
+    pub fn after(tag: u8) -> Result<usize, Malformed> {
+        match HoldsTag::of(tag).ok_or(Malformed::Tag(tag))? {
+            HoldsTag::Nothing => Ok(0),
+            HoldsTag::Through => Ok(std::mem::size_of::<u32>()),
+        }
+    }
+
+    /// Reads it whole: its tag and exactly what follows it.
+    pub fn decode(b: &[u8]) -> Result<Holds, Malformed> {
+        let mut r = Reader(b);
+        let holds = match r.member::<HoldsTag>(Malformed::Tag)? {
+            HoldsTag::Nothing => Holds::Nothing,
+            HoldsTag::Through => Holds::Through(Version(u32::from_be_bytes(*r.chunk()?))),
+        };
+        r.end()?;
+        Ok(holds)
+    }
+}
 
 /// The capability that lets a lane attach to a session: 32 random bytes the daemon mints
 /// per control connection and forgets when it closes.
@@ -666,15 +732,27 @@ mod tests {
         }
     }
 
+    /// What a lane says its page holds, as the lane carries it.
+    fn holds(rng: &mut Xorshift) -> Vec<u8> {
+        let mut out = Vec::new();
+        match rng.below(2) {
+            0 => Holds::Nothing,
+            1.. => Holds::Through(Version(rng.next() as u32)),
+        }
+        .encode(&mut out);
+        out
+    }
+
     /// The kinds of message this module reads.
     #[derive(Clone, Copy, Debug)]
     enum Kind {
         Frame,
         Down,
         Up,
+        Holds,
     }
 
-    const KINDS: [Kind; 3] = [Kind::Frame, Kind::Down, Kind::Up];
+    const KINDS: [Kind; 4] = [Kind::Frame, Kind::Down, Kind::Up, Kind::Holds];
 
     /// A valid message of `kind`.
     fn valid(kind: Kind, rng: &mut Xorshift) -> Vec<u8> {
@@ -682,6 +760,7 @@ mod tests {
             Kind::Frame => frame(rng),
             Kind::Down => down(rng),
             Kind::Up => up(rng),
+            Kind::Holds => holds(rng),
         }
     }
 
@@ -696,6 +775,14 @@ mod tests {
             }
             Kind::Down => Down::decode(b)?.encode(&mut out),
             Kind::Up => Up::decode(b)?.encode(&mut out),
+            // It goes after no length.
+            Kind::Holds => {
+                let holds = Holds::decode(b)?;
+                // The daemon reads as many bytes after the tag as the tag says follow.
+                assert_eq!(Holds::after(b[0]), Ok(b.len() - 1));
+                holds.encode(&mut out);
+                return Ok(out);
+            }
         };
         Ok(out[PREFIX..].to_vec())
     }
@@ -708,7 +795,7 @@ mod tests {
     fn every_input_is_a_message_or_a_typed_error() {
         let mut rng = Xorshift::new(0x082E_FA98_EC4E_6C89);
         for _ in 0..20_000 {
-            let kind = KINDS[rng.below(3) as usize];
+            let kind = KINDS[rng.below(4) as usize];
             let valid = valid(kind, &mut rng);
             assert_eq!(again(kind, &valid), Ok(valid.clone()), "{kind:?}");
             // One time in four, random bytes; else the valid message.
