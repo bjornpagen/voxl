@@ -31,7 +31,7 @@ use crate::hub::Out;
 use crate::wire::{Capability, Frame, Sequence, Track, PLAYER_PACKETS};
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// A viewer's way out, as `voxl stats` says it.
 #[derive(Debug, serde::Serialize)]
@@ -90,7 +90,7 @@ impl Session {
         let sequence = self.next;
         self.next = sequence.next();
         lane.push(sequence, track, bytes);
-        lane.sent.sent(sequence, bytes.len() as u64, now);
+        lane.sent.sent(sequence, track, bytes.len() as u64, now);
     }
 
     /// The Opus packets `lane` holds go onto it, oldest first, each while the gate is open
@@ -300,11 +300,12 @@ impl Sender {
 
     /// The relay said at `now` that the page took the frame named `sequence`, which may open
     /// the gate to the sound the lane holds. A session with no lane has nothing on the way; a
-    /// recording and a closed session are told nothing.
-    pub fn took(&mut self, sequence: Sequence, now: Instant) {
+    /// recording and a closed session are told nothing. `taken` is told each frame the took
+    /// took: its track, and how long it was on the way (`link::Outstanding::took`).
+    pub fn took(&mut self, sequence: Sequence, now: Instant, taken: impl FnMut(Track, Duration)) {
         match &mut self.state {
             State::Attached(s, lane) => {
-                lane.sent.took(sequence);
+                lane.sent.took(sequence, now, taken);
                 s.flow(lane, now);
             }
             State::Unattached(_) | State::Recording(_) | State::Closed => {}
@@ -460,7 +461,7 @@ impl Sender {
     pub(crate) fn delivered(&mut self, now: Instant) -> Vec<Vec<u8>> {
         let frames = self.frames();
         for (sequence, _, _) in &frames {
-            self.took(*sequence, now);
+            self.took(*sequence, now, |_, _| {});
         }
         video(frames)
     }
@@ -593,6 +594,9 @@ mod tests {
     /// - a took takes exactly the frames up to the one it names on the lane, and a took of
     ///   any other name takes nothing: what is on the way is the model's frames, video and
     ///   audio alike, byte for byte;
+    /// - each frame a took takes is told once, in the lane's order, with its track and the
+    ///   time from its going onto the lane to that took, by the model's own record of when
+    ///   each went; a frame of a lane replaced, and a took that names nothing, tell none;
     /// - the lane's path is exactly what its own statement said last, or what it attached
     ///   with;
     /// - the gate's bound covers the sound's bytes: with the path unknown, frames on the way
@@ -604,12 +608,18 @@ mod tests {
         let (mut shut, mut dropped, mut released, mut stale) = (0, 0, 0, 0);
         let (mut sound_alone, mut over_window, mut cumulative) = (0, 0, 0);
         let (mut stated, mut stale_stated) = (0, 0);
+        let (mut told_video, mut told_audio, mut long) = (0, 0, 0);
         for case in 0..400 {
             let (mut s, mut writer) = Sender::with_lane();
             let (mut path, mut old) = (Path::Unstated, None);
             let mut now = Instant::now();
             let mut held: VecDeque<u32> = VecDeque::new();
             let mut on: Vec<(Sequence, Track, u64)> = Vec::new();
+            // When each frame on the lane went onto it, in step with `on`; and every frame
+            // told taken, its track and its time on the way, as the model has them (`taken`)
+            // and as the sender told them (`told`).
+            let mut went: Vec<Instant> = Vec::new();
+            let (mut taken, mut told) = (Vec::new(), Vec::new());
             let mut names: HashSet<Sequence> = HashSet::new();
             let mut gone: Vec<Sequence> = Vec::new();
             let mut packets = 0u32;
@@ -646,9 +656,24 @@ mod tests {
                         0 => {}
                         n @ 1.. => {
                             let upto = rng.below(n as u64) as usize;
-                            s.took(on[upto].0, now);
+                            s.took(on[upto].0, now, |track, time| told.push((track, time)));
                             cumulative += upto;
-                            gone.extend(on.drain(..=upto).map(|(name, _, _)| name));
+                            // Each frame it took, by when the frame went onto the lane.
+                            for ((name, track, _), sent) in
+                                on.drain(..=upto).zip(went.drain(..=upto))
+                            {
+                                taken.push((track, now - sent));
+                                gone.push(name);
+                                match track {
+                                    Track::Video => told_video += 1,
+                                    Track::Audio => told_audio += 1,
+                                }
+                            }
+                            long += usize::from(
+                                taken
+                                    .last()
+                                    .is_some_and(|(_, t)| *t > Duration::from_secs(1)),
+                            );
                         }
                     },
                     Step::Stale => {
@@ -661,7 +686,7 @@ mod tests {
                                 }
                             },
                         };
-                        s.took(name, now);
+                        s.took(name, now, |track, time| told.push((track, time)));
                         stale += 1;
                     }
                     Step::Stall => now += Duration::from_millis(rng.range(500, 30_000)),
@@ -671,6 +696,7 @@ mod tests {
                         let new = s.attach(path).expect("an open session takes a lane");
                         old = Some(std::mem::replace(&mut writer, new));
                         gone.extend(on.drain(..).map(|(name, _, _)| name));
+                        went.clear();
                         held.clear();
                     }
                     Step::State => {
@@ -703,6 +729,7 @@ mod tests {
                         }
                     }
                     on.push((sequence, track, bytes.len() as u64));
+                    went.push(now);
                 }
                 assert!(s.held() <= PLAYER_PACKETS, "{at}");
                 assert_eq!(s.held(), held.len(), "{at}");
@@ -713,6 +740,7 @@ mod tests {
                 };
                 assert_eq!(stats.outstanding_frames, on.len(), "{at}");
                 assert_eq!(stats.path, path, "{at}");
+                assert_eq!(told, taken, "{at}: the frames a took took, and their times");
                 match (stats.gate, held.len()) {
                     (Gate::Open, 0) | (Gate::Full | Gate::Late, _) => {}
                     (Gate::Open, 1..) => panic!("{at}: sound waits at an open gate"),
@@ -744,6 +772,10 @@ mod tests {
         assert!(
             stated > 4_000 && stale_stated > 1_000,
             "{stated} {stale_stated}"
+        );
+        assert!(
+            told_video > 1_000 && told_audio > 4_000 && long > 500,
+            "{told_video} {told_audio} {long}"
         );
     }
 }

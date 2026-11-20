@@ -221,7 +221,7 @@ fn handle(d: &Daemon, c: &Arc<Client>, up: Up<'_>) {
         // Delivery, told: the session's link counts the frame taken, which may open the
         // gate.
         Up::Took { sequence } => {
-            c.took(sequence);
+            c.took(sequence, &d.hub.stats.took);
             d.hub.wake();
         }
     }

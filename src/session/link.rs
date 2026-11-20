@@ -26,7 +26,7 @@
 //! earlier than the one before it. The session's lock orders them and the clock is read
 //! under it (`hub::Client`), so a later time less an earlier one is taken as it is.
 
-use crate::wire::Sequence;
+use crate::wire::{Sequence, Track};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -146,6 +146,8 @@ pub enum Gate {
 #[derive(Clone, Copy, Debug)]
 pub struct Sent {
     pub sequence: Sequence,
+    /// What it is: an update's time to its took and a packet's are told apart.
+    pub track: Track,
     pub at: Instant,
     pub bytes: u64,
 }
@@ -167,10 +169,11 @@ pub struct Stats {
 }
 
 impl Outstanding {
-    /// A frame of `bytes`, named `sequence`, went onto the lane at `now`.
-    pub fn sent(&mut self, sequence: Sequence, bytes: u64, now: Instant) {
+    /// A frame of `track` and `bytes`, named `sequence`, went onto the lane at `now`.
+    pub fn sent(&mut self, sequence: Sequence, track: Track, bytes: u64, now: Instant) {
         self.frames.push_back(Sent {
             sequence,
+            track,
             at: now,
             bytes,
         });
@@ -178,10 +181,20 @@ impl Outstanding {
 
     /// The page took the frame named `sequence`, and so every frame the lane carried before
     /// it: they are on the way no longer. If no frame on the way has that name, nothing
-    /// is taken: a took of a lane since replaced, or of nothing ever sent.
-    pub fn took(&mut self, sequence: Sequence) {
+    /// is taken: a took of a lane since replaced, or of nothing ever sent. The took came at
+    /// `now`: `taken` is told each frame it took, its track and how long it was on the way,
+    /// from its going onto the lane to this took (`voxl stats`' `took`). This is where a took
+    /// meets its send, so it is the one place that time is known.
+    pub fn took(
+        &mut self,
+        sequence: Sequence,
+        now: Instant,
+        mut taken: impl FnMut(Track, Duration),
+    ) {
         if let Some(at) = self.frames.iter().position(|s| s.sequence == sequence) {
-            self.frames.drain(..=at);
+            for frame in self.frames.drain(..=at) {
+                taken(frame.track, now - frame.at);
+            }
         }
     }
 
@@ -234,7 +247,7 @@ impl Outstanding {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{BytesPerSecond, Gate, Known, Outstanding, Path, Stats, RESPONSE};
-    use crate::wire::Sequence;
+    use crate::wire::{Sequence, Track};
     use crate::xorshift::Xorshift;
     use std::collections::VecDeque;
     use std::time::{Duration, Instant};
@@ -254,12 +267,13 @@ pub(crate) mod tests {
             }
         }
 
+        /// An update goes onto the lane.
         pub(crate) fn sent(&mut self, sequence: Sequence, bytes: u64, now: Instant) {
-            self.on.sent(sequence, bytes, now);
+            self.on.sent(sequence, Track::Video, bytes, now);
         }
 
-        pub(crate) fn took(&mut self, sequence: Sequence) {
-            self.on.took(sequence);
+        pub(crate) fn took(&mut self, sequence: Sequence, now: Instant) {
+            self.on.took(sequence, now, |_, _| {});
         }
 
         pub(crate) fn gate(&self, now: Instant) -> Gate {
@@ -431,7 +445,7 @@ pub(crate) mod tests {
         let mut frames: Vec<Frame> = Vec::new();
         let (mut now, mut next) = (from, 0);
         while now < from + long {
-            path.tell(now, |sequence, _| link.took(sequence));
+            path.tell(now, |sequence, at| link.took(sequence, at));
             match link.gate(now) {
                 Gate::Open => {}
                 Gate::Full => {

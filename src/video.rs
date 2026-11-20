@@ -2599,8 +2599,8 @@ pub(crate) mod tests {
                     Turn::Watch => viewer = crate::hub::watching(viewer),
                 }
             }
-            path.tell(now, |sequence, _| {
-                link.took(sequence);
+            path.tell(now, |sequence, at| {
+                link.took(sequence, at);
                 measured = true;
             });
             if measured {

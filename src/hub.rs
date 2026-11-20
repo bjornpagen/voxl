@@ -7,7 +7,7 @@ use crate::session::control::Audio;
 use crate::session::link::{Gate, Path};
 use crate::session::sender::{Sender, Writer};
 pub use crate::wire::Holds;
-use crate::wire::{Capability, Sequence, Version};
+use crate::wire::{Capability, Sequence, Track, Version};
 use bytes::Bytes;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -452,10 +452,13 @@ impl Client {
         }
     }
 
-    /// The relay said that this session's page took the lane message named `sequence`.
-    pub fn took(&self, sequence: Sequence) {
+    /// The relay said that this session's page took the lane message named `sequence`: each
+    /// message that took is counted in `tooks`, by how long it was on the way.
+    pub fn took(&self, sequence: Sequence, tooks: &Tooks) {
         let mut v = self.viewing.lock();
-        v.sender.took(sequence, Instant::now());
+        v.sender.took(sequence, Instant::now(), |track, time| {
+            tooks.took(track, time)
+        });
     }
 
     /// The statement of the lane `writer` writes said its path is `path`.
@@ -661,6 +664,31 @@ pub struct Stats {
     /// From when a frame's change could first be captured to the frame on its viewers'
     /// lanes: the pipeline's whole time, which the frame's header carries (`wire::Pipe`).
     pub send: Histogram,
+    pub took: Tooks,
+}
+
+/// How long each lane message a page took was on the way: from the daemon giving it to its
+/// lane to the relay's word that the page took it arriving at the daemon, both on the
+/// daemon's clock, every session's together. It is delivery as the daemon is told it: the
+/// lane's queue, the transport, the relay's hand-off, the page's decode, and the took's way
+/// back up the control stream. An update's and an Opus packet's are kept apart, since they
+/// are two populations (a packet is a few hundred bytes, a hundred a second; an update is
+/// whatever the screen made it, and its count is the frames a page was shown), and `voxl
+/// stats` says each and both together.
+#[derive(Default)]
+pub struct Tooks {
+    video: Histogram,
+    audio: Histogram,
+}
+
+impl Tooks {
+    /// A page took a message of `track` that was `time` on the way.
+    pub fn took(&self, track: Track, time: std::time::Duration) {
+        match track {
+            Track::Video => self.video.took(time),
+            Track::Audio => self.audio.took(time),
+        }
+    }
 }
 
 pub struct Hub {
@@ -837,6 +865,9 @@ impl Hub {
             "convert": st.convert.stats(),
             "encode": st.encode.stats(),
             "send": st.send.stats(),
+            "took": Histogram::together(&[&st.took.video, &st.took.audio]),
+            "took_video": st.took.video.stats(),
+            "took_audio": st.took.audio.stats(),
             "clients": clients,
         })
     }

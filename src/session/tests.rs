@@ -1029,11 +1029,14 @@ async fn carried(lane: &mut UnixStream, framer: &mut Framer) -> Vec<(Sequence, T
 /// lane and says some taken, each up to the one it names; the lane is replaced now and then,
 /// which drops what the old one was sent; and the relay goes on saying frames of the old
 /// lane taken. After every step what the link has outstanding is the model's: the current
-/// lane's frames not yet named, as many and of as many bytes.
+/// lane's frames not yet named, as many and of as many bytes; and what `voxl stats` says was
+/// taken is the model's: `took` counts every frame a took took, `took_video` the updates
+/// among them and `took_audio` the packets, and none of a lane replaced.
 #[tokio::test]
 async fn a_took_counts_for_the_lane_it_was_sent_on() {
     let mut rng = crate::xorshift::Xorshift::new(0x7137_449f_23ef_65cd);
     let (mut stale, mut counted, mut sound) = (0, 0, 0);
+    let mut both = 0;
     for _ in 0..40 {
         let hub = Hub::new(crate::hub::tests::hello()).unwrap();
         let d = daemon(&hub);
@@ -1047,6 +1050,10 @@ async fn a_took_counts_for_the_lane_it_was_sent_on() {
         // and bytes; every name ever sent on a lane before it.
         let mut outstanding: Vec<(Sequence, u64)> = Vec::new();
         let mut gone: Vec<Sequence> = Vec::new();
+        // Each outstanding frame's track, in step with them; the updates and the packets
+        // told taken so far.
+        let mut tracks: Vec<Track> = Vec::new();
+        let (mut updates, mut packets) = (0u64, 0u64);
         for _ in 0..rng.range(5, 40) {
             match rng.below(6) {
                 0 | 1 => {
@@ -1064,6 +1071,12 @@ async fn a_took_counts_for_the_lane_it_was_sent_on() {
                         let sequence = outstanding[upto].0;
                         relay.say(Up::Took { sequence }).await;
                         gone.extend(outstanding.drain(..=upto).map(|(name, _)| name));
+                        for track in tracks.drain(..=upto) {
+                            match track {
+                                Track::Video => updates += 1,
+                                Track::Audio => packets += 1,
+                            }
+                        }
                         counted += 1;
                     }
                 },
@@ -1077,6 +1090,7 @@ async fn a_took_counts_for_the_lane_it_was_sent_on() {
                 },
                 5.. => {
                     gone.extend(outstanding.drain(..).map(|(name, _)| name));
+                    tracks.clear();
                     lane = open_lane(&hub, &attach(&c)).await;
                     framer = Framer::new();
                     assert_eq!(relay.next().await.0, Said::Attached);
@@ -1085,6 +1099,7 @@ async fn a_took_counts_for_the_lane_it_was_sent_on() {
             for (name, track, bytes) in carried(&mut lane, &mut framer).await {
                 sound += usize::from(track == Track::Audio);
                 outstanding.push((name, bytes));
+                tracks.push(track);
             }
             let Way::Lane(stats) = client.lane(|s| s.stats(Instant::now())) else {
                 panic!("a session with a lane says its lane");
@@ -1092,12 +1107,19 @@ async fn a_took_counts_for_the_lane_it_was_sent_on() {
             let bytes: u64 = outstanding.iter().map(|(_, b)| b).sum();
             assert_eq!(stats.outstanding_bytes, bytes);
             assert_eq!(stats.outstanding_frames, outstanding.len());
+            let said = hub.stats();
+            let taken = |key: &str| said[key]["count"].as_u64();
+            assert_eq!(
+                [taken("took"), taken("took_video"), taken("took_audio")],
+                [Some(updates + packets), Some(updates), Some(packets)]
+            );
+            both += usize::from(updates > 0 && packets > 0);
         }
         drop(lane);
     }
     assert!(
-        stale > 30 && counted > 30 && sound > 30,
-        "{stale} stale, {counted} counted, {sound} packets"
+        stale > 30 && counted > 30 && sound > 30 && both > 30,
+        "{stale} stale, {counted} counted, {sound} packets, {both} with both taken"
     );
 }
 

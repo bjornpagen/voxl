@@ -112,21 +112,22 @@ impl Histogram {
         self.sum.fetch_add(micros, Ordering::Relaxed);
     }
 
-    fn read(&self) -> Reading {
-        Reading(
-            self.buckets
-                .iter()
-                .map(|b| b.load(Ordering::Relaxed))
-                .collect(),
-        )
+    /// What `voxl stats` says of it: `together` of it alone.
+    pub fn stats(&self) -> serde_json::Value {
+        Histogram::together(&[self])
     }
 
-    /// What `voxl stats` says of it: how many times, their sum, the median and the time 99
-    /// in 100 are within (each the least time of its bucket, so under the true one by less
-    /// than a sixteenth; null of no times), and every bucket that holds any, as its least
-    /// time and its count.
-    pub fn stats(&self) -> serde_json::Value {
-        let reading = self.read();
+    /// What `voxl stats` says of the times counted in `parts`, all together: how many times,
+    /// their sum, the median and the time 99 in 100 are within (each the least time of its
+    /// bucket, so under the true one by less than a sixteenth; null of no times), and every
+    /// bucket that holds any, as its least time and its count.
+    pub fn together(parts: &[&Histogram]) -> serde_json::Value {
+        let count = |index: usize| -> u64 {
+            let counted = |h: &&Histogram| h.buckets[index].load(Ordering::Relaxed);
+            parts.iter().map(counted).sum()
+        };
+        let reading = Reading((0..BUCKETS).map(count).collect());
+        let sum = parts.iter().map(|h| h.sum.load(Ordering::Relaxed));
         let held: Vec<_> = reading
             .0
             .iter()
@@ -136,7 +137,7 @@ impl Histogram {
             .collect();
         serde_json::json!({
             "count": reading.count(),
-            "sum_us": self.sum.load(Ordering::Relaxed),
+            "sum_us": sum.fold(0u64, u64::wrapping_add),
             "p50_us": reading.within(HALF),
             "p99_us": reading.within(TAIL),
             "buckets_us": held,
@@ -212,7 +213,8 @@ mod tests {
     /// apart in order, the count is theirs, the sum theirs, the median and the 99th
     /// percentile are the leading bits of the times at places `ceil(n/2)` and
     /// `ceil(99n/100)` in order, null of none, and the buckets are exactly the times'
-    /// leading bits, each with how many times have them, in order.
+    /// leading bits, each with how many times have them, in order. And the same times
+    /// counted in two histograms, each in either, read together as the one does.
     #[test]
     fn a_reading_is_what_was_counted() {
         let mut rng = Xorshift::new(0x1b87_3593_cc9e_2d51);
@@ -257,6 +259,14 @@ mod tests {
                 "buckets_us": buckets,
             });
             assert_eq!(h.stats(), want, "run {run}");
+            // The same times counted in two histograms, any of them in either, are the same
+            // reading together.
+            let parts = [Histogram::default(), Histogram::default()];
+            for &t in &times {
+                parts[rng.below(2) as usize].took(Duration::from_micros(t));
+            }
+            let together = Histogram::together(&[&parts[0], &parts[1]]);
+            assert_eq!(together, want, "run {run}, in two");
             empty += usize::from(n == 0);
             narrow += usize::from(band && n > 1);
         }
