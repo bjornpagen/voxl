@@ -476,6 +476,17 @@ async fn to_the_end(lane: &mut UnixStream) -> Vec<u8> {
     }
 }
 
+/// The most bytes a lane's socket holds unread, as the kernel says of the pair's ends, which
+/// are made alike: the greater of the room to send and the room to receive (Linux holds a
+/// stream's unread bytes against the sender's, macOS against the receiver's). A test that
+/// needs updates to wait for the socket sizes them from this, on every platform.
+fn socket_room(lane: &UnixStream) -> u64 {
+    use nix::sys::socket::{getsockopt, sockopt};
+    let send = getsockopt(lane, sockopt::SndBuf).unwrap();
+    let receive = getsockopt(lane, sockopt::RcvBuf).unwrap();
+    send.max(receive) as u64
+}
+
 /// Ten minutes of a still desktop, on tokio's paused clock, send nothing after the hello:
 /// not on the control stream, not on a lane attached, with the viewer watching and
 /// listening. The daemon sends nothing it was not asked for, and no time wakes it.
@@ -917,8 +928,10 @@ async fn only_the_lane_is_the_groups() {
 }
 
 /// A lane whose socket breaks ends, and the next attaches in its place: over generated
-/// sessions (updates of generated sizes; the relay reading what has come; the relay's end of
-/// the lane vanishing at any point, idle, with updates waiting or mid-update), once the next
+/// sessions (updates of generated sizes, up to twice what the lane's socket holds unread, as
+/// the kernel says it, so that some wait for the socket whatever its size; the relay reading
+/// what has come; the relay's end of the lane vanishing at any point, idle, with updates
+/// waiting or mid-update), once the next
 /// update finds the socket broken the session holds no capture back (it has no way to be
 /// sent frames on), the control stream says nothing of it, and the next lane attaches and
 /// carries the updates sent after it, whole and in order. What the broken lane held is dropped: its viewer starts
@@ -935,9 +948,10 @@ async fn a_broken_lane_ends_and_the_next_attaches() {
         let mut lane = open_lane(&hub, &attach(&c)).await;
         assert_eq!(relay.next().await.0, Said::Attached);
         let client = hub.clients.lock()[0].clone();
+        let most = 2 * socket_room(&lane);
         let mut sent = 0u8;
         let mut send = |rng: &mut crate::xorshift::Xorshift| {
-            let frame = bytes::Bytes::from(vec![sent; rng.range(1, 60_000) as usize]);
+            let frame = bytes::Bytes::from(vec![sent; rng.range(1, most) as usize]);
             client.lane(|s| s.video(&frame, Instant::now()));
             sent = sent.wrapping_add(1);
             sent.wrapping_sub(1)
@@ -947,7 +961,7 @@ async fn a_broken_lane_ends_and_the_next_attaches() {
                 send(&mut rng);
             }
             settle().await;
-            let mut buf = vec![0u8; rng.range(1, 70_000) as usize];
+            let mut buf = vec![0u8; rng.range(1, most) as usize];
             drop(lane.try_read(&mut buf));
             waited += usize::from(client.lane(|s| s.queued()) > 0);
             drop(lane);
@@ -983,7 +997,7 @@ async fn a_broken_lane_ends_and_the_next_attaches() {
             assert_eq!(got, [first, second], "whole and in order");
         }
     }
-    assert!(waited > 0, "no lane broke with updates waiting");
+    assert!(waited > 10, "{waited} lanes broke with updates waiting");
 }
 
 /// Every frame a lane carried, read with `framer` as far as it has come, with every task run
