@@ -254,8 +254,9 @@ pub struct Header {
     pub pipe: Pipe,
 }
 
-/// Capture to send, as a video frame carries it: in tenths of a millisecond, at most
-/// `u32::MAX` of them (119 hours).
+/// The daemon's time for a video frame, as the frame carries it: from when what it shows
+/// could first be captured (drawn, with some viewer's gate open: `video::Hold`) to its
+/// send, in tenths of a millisecond, at most `u32::MAX` of them (119 hours).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Pipe(u32);
 

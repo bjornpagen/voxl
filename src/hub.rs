@@ -2,6 +2,7 @@
 //! sessions that watch them.
 
 use crate::event::Switch;
+use crate::histogram::Histogram;
 use crate::session::control::Audio;
 use crate::session::link::Gate;
 use crate::session::sender::{Sender, Writer};
@@ -629,19 +630,27 @@ pub fn wait_any<const N: usize>(
     }
 }
 
-/// What the pipeline has done since voxl started, for `voxl stats`: counts, and
-/// microseconds spent in each step, all frames together.
+/// What the pipeline has done since voxl started, for `voxl stats`: counts, and how long
+/// each step took, as a distribution of its times (`Histogram`).
 #[derive(Default)]
 pub struct Stats {
     pub captured: AtomicU64,
     pub encoded: AtomicU64,
     pub bytes: AtomicU64,
-    pub encode_us: AtomicU64,
-    pub grab_us: AtomicU64,
-    pub convert_us: AtomicU64,
     pub keyframes: AtomicU64,
-    pub damage_wait_us: AtomicU64,
-    pub send_lat_us: AtomicU64,
+    /// How long what a capture shows waited while no capture was let go: nobody watched, or
+    /// no watching viewer's gate was open (`video::Hold`). It is the viewers' links' time,
+    /// and no part of any time below.
+    pub gate_wait: Histogram,
+    /// From when a capture's change could first be captured to its capture: the rest of the
+    /// least interval, and the encoder busy with the frame before.
+    pub capture_wait: Histogram,
+    pub grab: Histogram,
+    pub convert: Histogram,
+    pub encode: Histogram,
+    /// From when a frame's change could first be captured to the frame on its viewers'
+    /// lanes: the pipeline's whole time, which the frame's header carries (`wire::Pipe`).
+    pub send: Histogram,
 }
 
 pub struct Hub {
@@ -795,8 +804,8 @@ impl Hub {
         into.extend(self.clients.lock().iter().cloned());
     }
 
-    /// What `voxl stats` says: the pipeline's counts and times since the hub was made, and
-    /// each client as one read of it sees it.
+    /// What `voxl stats` says: the pipeline's counts and each step's times since the hub was
+    /// made, and each client as one read of it sees it.
     pub fn stats(&self) -> serde_json::Value {
         let st = &self.stats;
         let n = |a: &AtomicU64| a.load(Ordering::Relaxed);
@@ -806,12 +815,13 @@ impl Hub {
             "captured": n(&st.captured),
             "encoded": n(&st.encoded),
             "bytes": n(&st.bytes),
-            "encode_us_total": n(&st.encode_us),
-            "grab_us_total": n(&st.grab_us),
-            "convert_us_total": n(&st.convert_us),
             "keyframes": n(&st.keyframes),
-            "damage_wait_us_total": n(&st.damage_wait_us),
-            "send_lat_us_total": n(&st.send_lat_us),
+            "gate_wait": st.gate_wait.stats(),
+            "capture_wait": st.capture_wait.stats(),
+            "grab": st.grab.stats(),
+            "convert": st.convert.stats(),
+            "encode": st.encode.stats(),
+            "send": st.send.stats(),
             "clients": clients,
         })
     }

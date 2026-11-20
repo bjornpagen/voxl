@@ -100,7 +100,8 @@ export interface VideoHeader {
 	 * it and makes nothing of it: what it took is told by the lane message's own name,
 	 * which the relay keeps and the page never sees. */
 	version: number;
-	/** Server-side pipeline time (capture to send), in 0.1 ms. */
+	/** The server's time for the update, from when its change could first be captured to
+	 * its send, in 0.1 ms. */
 	pipe: number;
 }
 

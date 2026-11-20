@@ -24,6 +24,8 @@ mod files;
 #[cfg(any(target_os = "linux", test))]
 mod help;
 #[cfg(any(target_os = "linux", test))]
+mod histogram;
+#[cfg(any(target_os = "linux", test))]
 mod hub;
 #[cfg(target_os = "linux")]
 mod input;

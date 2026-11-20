@@ -5,7 +5,7 @@
 import { Frames } from './frames';
 import { DESKTOP_AUDIO, frameMicros, VIDEO_HEADER_BYTES } from './protocol';
 import { Session, type Told } from './session';
-import { Count, holds } from './stats';
+import { Count, holds, Timed, took } from './stats';
 import type { FromWorker, PcmChunk, ToWorker } from './protocol';
 
 declare const self: DedicatedWorkerGlobalScope;
@@ -104,8 +104,7 @@ function start(init: Init) {
 		hello: (codec) => frames.hello(codec),
 		update(at, header, picture) {
 			Atomics.add(counts, Count.Bytes, VIDEO_HEADER_BYTES + picture.length);
-			Atomics.add(counts, Count.Updates, 1);
-			Atomics.add(counts, Count.PipeTenths, header.pipe);
+			took(counts, Timed.Pipe, header.pipe);
 			frames.part(at, header, picture);
 		},
 		screenClosed: () => frames.closed(),
@@ -193,7 +192,7 @@ function start(init: Init) {
 		letGo: (frame) => frame.close(),
 		present(frame) {
 			Atomics.add(counts, Count.Frames, 1);
-			Atomics.add(counts, Count.DecodeUs, micros(now()) - frame.timestamp);
+			took(counts, Timed.Decode, micros(now()) - frame.timestamp);
 			post({ t: 'frame', frame }, [frame]);
 			session.decoded();
 		},

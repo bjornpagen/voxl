@@ -90,9 +90,9 @@ struct Job {
     /// Its name, given when it was planned (`hub::Chain::name`).
     version: Version,
     frame: Plan<Starts>,
-    /// When the screen first changed for it: its timestamp, and the start of its pipeline
+    /// When what it shows could first be captured (`Waited`): the start of its pipeline
     /// time (`Pipe`).
-    damage: Instant,
+    origin: Instant,
     /// What the bench loadgen's marker said when the frame was captured, while
     /// `VOXL_DEBUG_MARKER` is set (see `marker_reading`).
     marker_ms: Option<u32>,
@@ -339,6 +339,14 @@ impl Damage {
         };
     }
 
+    /// When the first of the rows drawn since the last take were drawn, if any were.
+    pub(crate) fn first(&self) -> Option<Instant> {
+        match *self {
+            Damage::Rows { first, .. } => Some(first),
+            Damage::None | Damage::Unreported => None,
+        }
+    }
+
     /// The rows drawn since the last take, aligned to even rows for 4:2:0 within a
     /// picture `height` tall; nothing is left.
     pub(crate) fn take(&mut self, height: u32) -> Option<Band> {
@@ -350,6 +358,104 @@ impl Damage {
             Damage::None | Damage::Unreported => None,
         }
     }
+}
+
+/// Whether the capture loop's looks let a capture go: some watching viewer's gate is open
+/// (`hub::Audience`), or none is, since the look that first saw so.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Gateway {
+    Open,
+    Shut { since: Instant },
+}
+
+/// How long the damage the next capture takes has been held: the time, since its first
+/// rows were drawn, during which the loop's looks let no capture go (nobody watched, or no
+/// watching viewer's gate was open). That time is the viewers' links', not the pipeline's:
+/// taken out of a frame's pipeline time, what is left is only time in which the pipeline
+/// could have captured it and had not sent it. Measured from the damage's first rows
+/// alone, a frame's time kept growing while nobody watched and across a shut gate: seen
+/// live, 1.13 s a frame in the mean beside 10 ms of converting and coding.
+///
+/// It is told every look and asked at every capture, and both are total: whatever the looks
+/// were, the time held is the time they showed shut since the damage's first rows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Hold {
+    /// Held through the looks so far, up to the gateway's last opening.
+    held: Duration,
+    gateway: Gateway,
+}
+
+/// What a capture waited: how long behind every gate, and when what it shows could first
+/// be captured, which its pipeline time counts from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Waited {
+    gate: Duration,
+    origin: Instant,
+}
+
+/// How long damage first drawn at `first` was held by a gateway shut from `since` until
+/// `until`: from the later of the two. No damage is held by nothing.
+fn shut_for(since: Instant, first: Option<Instant>, until: Instant) -> Duration {
+    first.map_or(Duration::ZERO, |first| {
+        until.saturating_duration_since(since.max(first))
+    })
+}
+
+impl Hold {
+    /// As a capture loop starts: nothing held, and no look has seen the gateway shut.
+    fn new() -> Hold {
+        Hold {
+            held: Duration::ZERO,
+            gateway: Gateway::Open,
+        }
+    }
+
+    /// A look at `now` saw `audience`, with damage first drawn at `first`, if any is
+    /// pending: a gateway that opens has held that damage since it shut, or since the
+    /// damage was drawn.
+    fn look(&mut self, audience: Audience, first: Option<Instant>, now: Instant) {
+        match (self.gateway, audience) {
+            (Gateway::Open, Audience::Nobody) => self.gateway = Gateway::Shut { since: now },
+            (Gateway::Shut { since }, Audience::Chain | Audience::Starting) => {
+                self.held += shut_for(since, first, now);
+                self.gateway = Gateway::Open;
+            }
+            (Gateway::Open, Audience::Chain | Audience::Starting)
+            | (Gateway::Shut { .. }, Audience::Nobody) => {}
+        }
+    }
+
+    /// A capture at `t0` takes the damage first drawn at `first`: what it waited, and
+    /// nothing is held of the damage to come. A capture nothing was drawn for (a viewer's
+    /// keyframe of a still screen) waited for nothing: it starts at `t0`.
+    fn take(&mut self, first: Option<Instant>, t0: Instant) -> Waited {
+        let shut = match self.gateway {
+            Gateway::Open => Duration::ZERO,
+            Gateway::Shut { since } => shut_for(since, first, t0),
+        };
+        let gate = std::mem::take(&mut self.held) + shut;
+        match first {
+            Some(first) => Waited {
+                gate,
+                origin: first + gate,
+            },
+            None => Waited {
+                gate: Duration::ZERO,
+                origin: t0,
+            },
+        }
+    }
+}
+
+/// A capture is counted: what it `waited`, and the times it began, had grabbed and had
+/// converted.
+#[cfg(target_os = "linux")]
+fn counted(stats: &crate::hub::Stats, waited: Waited, [began, grabbed, converted]: [Instant; 3]) {
+    stats.gate_wait.took(waited.gate);
+    stats.capture_wait.took(began - waited.origin);
+    stats.grab.took(grabbed - began);
+    stats.convert.took(converted - grabbed);
+    stats.captured.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Where the capture loop's buffer is: home, with what is home (the buffer itself in the
@@ -588,6 +694,8 @@ fn capture_loop(
     // What the loop saw of each watching viewer when it last looked: kept, so that a look
     // allocates nothing once there is room for every viewer.
     let mut seen: Vec<(Arc<crate::hub::Client>, Seen)> = Vec::new();
+    // How long the pending damage has been held behind every gate (`Hold`).
+    let mut hold = Hold::new();
 
     loop {
         // The wake is taken before anything it may stand for is read: a request that
@@ -640,6 +748,8 @@ fn capture_loop(
         // The capture itself is stamped `t0` below, after any wait for a buffer.
         let now = Instant::now();
         hub.look_into(&mut seen);
+        let audience = chain.audience(&seen);
+        hold.look(audience, cap.damage().first(), now);
         if seen.is_empty() {
             // Nobody watches: nothing is captured, and the encoder waits as it was, for a
             // viewer that holds its newest frame to go on from (`hub::Holds`). What changes
@@ -648,7 +758,7 @@ fn capture_loop(
             continue;
         }
         let look = Look {
-            audience: chain.audience(&seen),
+            audience,
             damage: *cap.damage(),
             now,
             captured,
@@ -665,20 +775,22 @@ fn capture_loop(
                 Step::Start(()) => {
                     if let Some(starts) = chain.parts(&seen) {
                         let (cw, ch) = cap.size();
+                        let t0 = Instant::now();
+                        let waited = hold.take(cap.damage().first(), t0);
                         cap.grab(cap.full())?;
                         // The whole screen is grabbed: it holds what was drawn while
                         // nobody watched, so that damage is taken with it.
                         cap.damage().take(ch);
-                        let t0 = Instant::now();
+                        let t1 = Instant::now();
                         let mut buf = Box::new(I420::new(cw as usize, ch as usize));
                         cap.convert(&mut buf, 0, ch as usize)?;
-                        hub.stats.captured.fetch_add(1, Ordering::Relaxed);
+                        counted(&hub.stats, waited, [t0, t1, Instant::now()]);
                         captured = t0;
                         let first = Job {
                             buf,
                             version: chain.name(&hub),
                             frame: Plan::Key(starts),
-                            damage: t0,
+                            origin: waited.origin,
                             marker_ms: None,
                         };
                         let started = Stream::start(&hub, coded, first, cfg.debug)?;
@@ -699,13 +811,7 @@ fn capture_loop(
             Step::Capture(buf) => buf,
         };
         let t0 = Instant::now();
-        let origin = match *cap.damage() {
-            Damage::Rows { first, .. } => first,
-            Damage::None | Damage::Unreported => t0,
-        };
-        hub.stats
-            .damage_wait_us
-            .fetch_add((t0 - origin).as_micros() as u64, Ordering::Relaxed);
+        let waited = hold.take(cap.damage().first(), t0);
         let band = cap.take_damage();
         if let Some(b) = band {
             cap.grab(b)?;
@@ -733,21 +839,14 @@ fn capture_loop(
             let pic: &mut I420 = &mut buf;
             cap.convert(pic, b.y0 as usize, b.y1 as usize)?;
         }
-        let t2 = Instant::now();
-        hub.stats
-            .grab_us
-            .fetch_add((t1 - t0).as_micros() as u64, Ordering::Relaxed);
-        hub.stats
-            .convert_us
-            .fetch_add((t2 - t1).as_micros() as u64, Ordering::Relaxed);
-        hub.stats.captured.fetch_add(1, Ordering::Relaxed);
+        counted(&hub.stats, waited, [t0, t1, Instant::now()]);
         captured = t0;
         if s.job_tx
             .send(Job {
                 buf,
                 version: chain.name(&hub),
                 frame,
-                damage: origin,
+                origin: waited.origin,
                 marker_ms,
             })
             .is_err()
@@ -940,16 +1039,17 @@ fn encode_frames(
             coding,
             message: mut bytes,
         } = coded;
-        let enc_us = t0.elapsed().as_micros() as u64;
+        let coded_in = t0.elapsed();
+        let enc_us = coded_in.as_micros();
         let version = job.version;
         let header = Header {
             coding,
             version,
-            pipe: Pipe::of(job.damage.elapsed()),
+            pipe: Pipe::of(job.origin.elapsed()),
         };
         bytes[..Header::LEN].copy_from_slice(&header.bytes());
         let bytes = bytes.freeze();
-        hub.stats.encode_us.fetch_add(enc_us, Ordering::Relaxed);
+        hub.stats.encode.took(coded_in);
         hub.stats.encoded.fetch_add(1, Ordering::Relaxed);
         hub.stats
             .bytes
@@ -969,9 +1069,7 @@ fn encode_frames(
         // taken back.
         drop(bytes);
         viewers.clear();
-        hub.stats
-            .send_lat_us
-            .fetch_add(job.damage.elapsed().as_micros() as u64, Ordering::Relaxed);
+        hub.stats.send.took(job.origin.elapsed());
         if let Some(ms) = job.marker_ms {
             match marker_age(ms) {
                 Ok(age) => log::info!("marker sent age {age} ms (encode {enc_us} us)"),
@@ -1107,7 +1205,7 @@ pub(crate) mod tests {
             buf: Box::new(buf),
             version,
             frame,
-            damage: Instant::now(),
+            origin: Instant::now(),
             marker_ms: None,
         }
     }
@@ -2260,8 +2358,84 @@ pub(crate) mod tests {
                     (None, false) => Damage::None,
                 };
                 assert_eq!(damage, want, "sequence {seq}, event {i}");
+                assert_eq!(damage.first(), drawn.map(|(first, _, _)| first));
             }
         }
+    }
+
+    /// A capture's pipeline time holds no time at which no capture was let go. Over generated
+    /// runs of the loop's events at times that never go back (rows drawn; a look that sees
+    /// nobody's gate open, the chain's, or a viewer starting; a capture, which takes the
+    /// damage), against a record kept apart of every look: the time a capture waited behind
+    /// the gate is exactly the time, from its damage's first rows to the capture, at which
+    /// the newest look before had seen no gate open (before any look, none is shut); its
+    /// origin is its first rows' time and that, so the time from its origin to the capture
+    /// is exactly the time some gate was open; and a capture nothing was drawn for waited
+    /// for nothing and starts at itself. A capture is asked for after any look, a shut one
+    /// too, which the loop never does: the rule holds whatever the looks were.
+    #[test]
+    fn a_captures_time_holds_no_time_behind_a_shut_gate() {
+        let mut rng = Xorshift::new(0x94d0_49bb_1331_11eb);
+        let audiences = [Audience::Nobody, Audience::Chain, Audience::Starting];
+        let start = Instant::now();
+        let (mut held, mut whole, mut drawn_shut, mut twice, mut still) = (0, 0, 0, 0, 0);
+        for run in 0..3_000 {
+            let mut hold = Hold::new();
+            let mut now = start;
+            // The record: each look's time and whether it saw every gate shut.
+            let mut looks: Vec<(Instant, bool)> = Vec::new();
+            let mut first: Option<Instant> = None;
+            for event in 0..rng.range(1, 60) {
+                now += Duration::from_micros(rng.below(4) * rng.below(20_000));
+                let shut_now = looks.last().is_some_and(|(_, shut)| *shut);
+                match rng.below(5) {
+                    0 | 1 => {
+                        drawn_shut += usize::from(first.is_none() && shut_now);
+                        first = first.or(Some(now));
+                    }
+                    2 | 3 => {
+                        let audience = audiences[rng.below(3) as usize];
+                        hold.look(audience, first, now);
+                        looks.push((now, audience == Audience::Nobody));
+                    }
+                    4.. => {
+                        let got = hold.take(first, now);
+                        // Each look holds from its time to the next look's, or to now.
+                        let ends = looks.iter().skip(1).map(|(at, _)| *at).chain([now]);
+                        let shut_runs = looks.iter().zip(ends).filter(|((_, shut), _)| *shut);
+                        let (mut gate, mut runs) = (Duration::ZERO, 0);
+                        if let Some(first) = first {
+                            for ((from, _), until) in shut_runs {
+                                let part = until.saturating_duration_since((*from).max(first));
+                                runs += usize::from(part > Duration::ZERO);
+                                gate += part;
+                            }
+                        }
+                        let want = match first {
+                            Some(first) => Waited {
+                                gate,
+                                origin: first + gate,
+                            },
+                            None => Waited {
+                                gate: Duration::ZERO,
+                                origin: now,
+                            },
+                        };
+                        assert_eq!(got, want, "run {run}, event {event}: {looks:?}");
+                        assert!(got.origin <= now, "run {run}, event {event}");
+                        held += usize::from(gate > Duration::ZERO);
+                        whole += usize::from(first.is_some_and(|f| f < now && got.origin == now));
+                        twice += usize::from(runs > 1);
+                        still += usize::from(first.is_none());
+                        first = None;
+                    }
+                }
+            }
+        }
+        assert!(
+            held > 2_000 && whole > 300 && drawn_shut > 2_000 && twice > 200 && still > 2_000,
+            "{held} {whole} {drawn_shut} {twice} {still}"
+        );
     }
 
     /// A frame a simulated session showed: when its change was drawn (a keyframe with no
