@@ -300,6 +300,38 @@ const INTRA_BLOCK_COPY: c_int = 0;
 /// and block-copy vector ones followed
 const COST_UPDATES: c_int = 3;
 
+/// No motion vector is projected from the reference frames' own (`AV1E_SET_ENABLE_REF_FRAME_MVS`,
+/// the sequence header's `enable_ref_frame_mvs`): libaom builds that motion field for every
+/// delta, changed or not, and a screen's motion (a scroll, a window dragged) is found
+/// without it.
+///
+/// @limitKind measured
+/// @owner the daemon's AV1 encoder
+/// @unit libaom control, 0 (off) or 1
+/// @scope every frame
+/// @evidence an A/B of the encoder as configured here against the same with one tool off,
+/// measured 2026-11-19, not in this repository; each run decoded by libaom's decoder and
+/// compared with the encoder's reconstruction
+/// @observed 2026-11-19
+/// @environment libaom 3.15.1 on an M2 Max laptop, 1 thread; the settings of this module
+/// @workload generated dark terminal pages at 3024x1896, a keyframe and 90 deltas each:
+/// typing, a blinking cursor, a pane's scroll and a whole-screen scroll of 48 px a frame;
+/// baselines interleaved with each run, two or three of each
+/// @result CPU a frame, off against on: typing 8.08 against 9.33 ms (-13%), a blinking
+/// cursor 8.12 against 9.69 (-16%), a pane's scroll 23.3 against 25.2 (-7%), a whole-screen
+/// scroll 30.2 against 31.5 (-4%), where a baseline's runs differ by up to 4%. Bytes a
+/// frame the same typing and blinking, 0.17% and 0.16% more scrolling; PSNR the same, then
+/// 0.02 and 0.07 dB lower; the decoder's output identical to the encoder's reconstruction.
+/// Of the others tried off the same way: loop restoration, global motion and warped motion
+/// changed no byte (realtime at this speed never uses them) and no time beyond the runs'
+/// own spread, nor did 3 reference frames for the default; OBMC off changed at most 4
+/// bytes a frame and no time; CDEF off cost 0.4 to 0.8
+/// dB for no time; the loop filter off saved 20% typing and cost 0.2 dB; the CDF update
+/// off tripled a typed frame's bytes
+/// @decision 0, set explicitly; the rest left at libaom's defaults
+/// @revalidate a libaom release, or a change of speed or tune
+const REFERENCE_MOTION_VECTORS: c_int = 0;
+
 /// The sequence header's colour description: what the capture is. The X framebuffer is
 /// sRGB (BT.709 primaries, the sRGB transfer), converted to I420 by libyuv's ARGBToI420,
 /// BT.601's matrix at its studio range; the chroma's position, a 2x2 average, is none AV1
@@ -520,6 +552,11 @@ impl Context {
                 "block copy vector cost updates",
                 ffi::AV1E_SET_DV_COST_UPD_FREQ,
                 COST_UPDATES,
+            )?;
+            e.control(
+                "reference motion vectors",
+                ffi::AV1E_SET_ENABLE_REF_FRAME_MVS,
+                REFERENCE_MOTION_VECTORS,
             )?;
             e.control(
                 "primaries",
